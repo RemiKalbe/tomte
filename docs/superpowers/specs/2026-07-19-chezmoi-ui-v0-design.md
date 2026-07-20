@@ -2,7 +2,7 @@
 
 Date: 2026-07-19
 Status: Approved pending final user review
-Platform: macOS (v1), GPUI 0.2.2 (pinned), chezmoi ≥ 2.70
+Platform: macOS (v0), GPUI 0.2.2 (pinned), chezmoi ≥ 2.70
 
 ## 1. Purpose
 
@@ -13,18 +13,18 @@ machines) — and reconciling them today means a context-free nvim 3-way merge w
 answer to "which of these changed, when, and which panes are which?", plus the constant
 risk of clobbering templated values.
 
-v1 owns the **full sync loop**: fetch/pull from GitHub → visualize drift across all
+v0 owns the **full sync loop**: fetch/pull from GitHub → visualize drift across all
 states → resolve visually (3-way merge with template protection) → write back to source
 → apply to targets → commit & push. Later versions may grow toward broader chezmoi
-command coverage; v1 does not.
+command coverage; v0 does not.
 
 ## 2. Product decisions (settled during brainstorming)
 
 | Decision | Choice |
 |---|---|
-| v1 scope | Full sync loop incl. git fetch/merge/commit/push |
+| v0 scope | Full sync loop incl. git fetch/merge/commit/push |
 | Drift history | Always-running watcher daemon + drift journal + notifications |
-| Platform | macOS only for v1; platform-specific code isolated for later Linux |
+| Platform | macOS only for v0; platform-specific code isolated for later Linux |
 | Templates | Protected spans + verified auto write-back; assisted manual fallback |
 | Git conflicts | Unified resolution queue (one decision per file, staged under the hood) |
 | Architecture | Split: headless watcher daemon + GPUI app (IPC over unix socket) |
@@ -121,7 +121,7 @@ Classification enum: `InSync`, `DestinationDrift`, `SourceAhead`, `RemoteAhead`,
 `EvalFailed` (template/secret/decrypt errors — a first-class state carrying the
 captured error and a remediation hint, never a silent gap).
 
-Entry-type scope v1: files, symlinks, dirs. Scripts (`run_*`) shown in status ("will
+Entry-type scope v0: files, symlinks, dirs. Scripts (`run_*`) shown in status ("will
 run on apply") but never merged. Encrypted files merge only when decryptable.
 Externals read-only. `modify_` files: assisted manual mode only. Unmanaged files out
 of scope.
@@ -222,7 +222,24 @@ Status item icon = state (calm / amber dot drift / red dot conflict) + count. Po
 
 One resolution surface, ever. No merging from the popup.
 
-### 7.5 Notifications
+### 7.5 Visual design
+
+Zed-inspired design language — not a copy, an idiom: compact density, flat surfaces,
+hairline borders, muted chrome, restrained type scale, monospace where content is
+code. Rationale is speed as much as taste: Zed is the canonical large GPUI codebase,
+so when a component pattern is needed (lists, split panes, tab bars, overlays), the
+answer is in `zed-industries/zed` source rather than invented — the fastest path to
+v0.
+
+Color: light **and** dark themes from day one, following system appearance, with a
+palette inspired by Zed's GitHub theme (light + dark variants). Theme values live in
+a single token module in `app` (semantic roles — surface, border, accent, drift-amber,
+conflict-red, ok-green — not raw hex scattered through views).
+
+During planning, evaluate `gpui-component` (longbridge) as a component base vs
+hand-rolled Zed-style components; adopt only if it pays for itself.
+
+### 7.6 Notifications
 
 On new drift discovery (coalesced per burst: "3 files drifted after starship update")
 and on remote pushes from other machines. Never for self-caused changes; no repeat
@@ -249,7 +266,7 @@ App settings live in a shared config file (`~/Library/Application
 Support/ChezmoiUI/settings.toml`) read by both app and daemon. No secrets stored —
 only non-sensitive context like account identifiers.
 
-**1Password (required for v1):** a "secrets context" settings section where the user
+**1Password (required for v0):** a "secrets context" settings section where the user
 selects the 1Password account (and default vault where applicable), enumerated via
 `op account list` / `op vault list` — a real picker, not free text. Every chezmoi/op
 subprocess in both processes runs non-interactively with `OP_ACCOUNT` (and vault
@@ -304,7 +321,7 @@ path override.
   hooks all just work). chezmoi is the single source of truth for chezmoi semantics —
   no reimplementation of templating/encryption/ignore logic beyond the lexer in §6.2.
 
-## 13. Non-goals (v1)
+## 13. Non-goals (v0)
 
 Linux/Windows GUI; script (`run_*`) merging; chezmoi command palette; secrets
 management UI; auto-resolution beyond the zero-decision "Sync all"; multi-repo;
