@@ -23,6 +23,7 @@ pub enum GitError {
     },
 }
 
+#[derive(Clone)]
 pub struct GitClient {
     runner: Arc<dyn CommandRunner>,
     repo: PathBuf,
@@ -57,6 +58,10 @@ impl GitClient {
     pub fn fetch(&self, remote: &str) -> Result<(), GitError> {
         self.run(&["fetch", "--quiet", remote], Duration::from_secs(120))?;
         Ok(())
+    }
+
+    pub fn rev_parse(&self, rev: &str) -> Result<String, GitError> {
+        Ok(self.run_utf8(&["rev-parse", rev])?.trim().to_string())
     }
 
     pub fn head_branch(&self) -> Result<String, GitError> {
@@ -244,6 +249,14 @@ mod tests {
             c.blob_at("origin/main", Path::new("missing.txt")).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn rev_parse_returns_sha() {
+        let (_g, work) = scratch();
+        let sha = client(&work).rev_parse("HEAD").unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

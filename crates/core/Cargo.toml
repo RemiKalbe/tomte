@@ -7,6 +7,9 @@ license.workspace = true
 [lib]
 name = "czui_core"
 
+[features]
+test-support = ["dep:tempfile"]
+
 [dependencies]
 imara-diff.workspace = true
 thiserror.workspace = true
@@ -14,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 wait-timeout.workspace = true
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -28,6 +28,7 @@ impl Default for ChezmoiOptions {
     }
 }
 
+#[derive(Clone)]
 pub struct ChezmoiClient {
     runner: Arc<dyn CommandRunner>,
     opts: ChezmoiOptions,

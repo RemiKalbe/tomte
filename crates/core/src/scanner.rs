@@ -149,6 +149,18 @@ impl DriftScanner {
         })
     }
 
+    /// Probe a single target on demand (daemon per-event path). `None` = in sync.
+    pub fn probe_one(&self, target: &Path) -> Result<Option<FileDrift>, ScanError> {
+        let source_dir = self.chezmoi.source_dir()?;
+        let dump = self.chezmoi.state_dump()?;
+        let last = dump
+            .entry_state
+            .get(target)
+            .and_then(|e| e.contents_sha256.as_deref())
+            .and_then(ContentHash::from_hex);
+        self.probe_file(&source_dir, target, last)
+    }
+
     fn probe_file(
         &self,
         source_dir: &Path,

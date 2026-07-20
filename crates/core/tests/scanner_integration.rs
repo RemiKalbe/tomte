@@ -53,6 +53,23 @@ fn remote_push_is_remote_ahead() {
 }
 
 #[test]
+fn probe_one_detects_single_file_drift() {
+    let s = Scratch::new();
+    std::fs::write(s.home.join(".testrc"), "a=changed\n").unwrap();
+    let scanner = s.scanner();
+    let fd = scanner.probe_one(&s.home.join(".testrc")).unwrap().unwrap();
+    assert_eq!(fd.class, DriftClass::DestinationDrift);
+    // untouched target probes clean after re-write back
+    std::fs::write(s.home.join(".testrc"), "a=1\n").unwrap();
+    assert!(
+        scanner
+            .probe_one(&s.home.join(".testrc"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn disk_and_remote_change_is_conflict() {
     let s = Scratch::new();
     std::fs::write(s.home.join(".testrc"), "a=local\n").unwrap();
