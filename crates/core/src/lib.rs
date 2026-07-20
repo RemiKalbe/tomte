@@ -4,3 +4,4 @@ pub mod drift;
 pub mod git;
 pub mod merge;
 pub mod scanner;
+pub mod template;
