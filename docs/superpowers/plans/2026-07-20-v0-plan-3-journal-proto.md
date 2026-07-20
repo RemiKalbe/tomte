@@ -52,7 +52,7 @@ Single-file crates are deliberate: `journal` is one cohesive responsibility over
   - `Journal::machine(&self) -> &str`
   - `JournalError::{Sqlite(rusqlite::Error), Corrupt(String)}` (thiserror, `#[from]` for Sqlite)
 
-- [ ] **Step 1: Create the crate and write the failing tests**
+- [x] **Step 1: Create the crate and write the failing tests**
 
 `crates/journal/Cargo.toml`:
 ```toml
@@ -116,12 +116,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-journal`
 Expected: compile errors (crate empty / types undefined). Add the member to the workspace first so cargo finds it.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/journal/src/lib.rs`:
 ```rust
@@ -223,12 +223,12 @@ impl Journal {
 
 Also add `"crates/journal"` to the workspace `members` and the two new `[workspace.dependencies]` entries.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-journal`
 Expected: 3 passed. (First build compiles bundled SQLite — takes a minute.)
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -252,7 +252,7 @@ git commit -m "feat(journal): czui-journal crate with SQLite schema and WAL"
   - `Journal::has_blob(&self, hash: &str) -> Result<bool, JournalError>`
   - `Journal::blob_store_size(&self) -> Result<u64, JournalError>` — total compressed bytes
 
-- [ ] **Step 1: Write the failing tests** (append to the test module)
+- [x] **Step 1: Write the failing tests** (append to the test module)
 
 ```rust
     #[test]
@@ -280,12 +280,12 @@ git commit -m "feat(journal): czui-journal crate with SQLite schema and WAL"
     }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-journal blob`
 Expected: compile errors (`put_blob` undefined).
 
-- [ ] **Step 3: Implement** (append to `impl Journal`)
+- [x] **Step 3: Implement** (append to `impl Journal`)
 
 ```rust
     pub fn put_blob(&self, content: &[u8], now_ts: u64) -> Result<String, JournalError> {
@@ -338,12 +338,12 @@ Expected: compile errors (`put_blob` undefined).
     }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-journal`
 Expected: 5 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -373,7 +373,7 @@ git commit -m "feat(journal): content-addressed zstd blob store with dedup"
   - `Journal::begin_session(&self, ts: u64) -> Result<i64, JournalError>`, `add_decision(&self, session: i64, decision: &serde_json::Value)`, `end_session(&self, session: i64, ts: u64, summary: &str)`
   - `Journal::gc_blobs(&self) -> Result<u32, JournalError>` — deletes blobs referenced by no event's `from_hash`/`to_hash`; returns count deleted
 
-- [ ] **Step 1: Write the failing tests** (append)
+- [x] **Step 1: Write the failing tests** (append)
 
 ```rust
     use std::path::Path;
@@ -495,12 +495,12 @@ git commit -m "feat(journal): content-addressed zstd blob store with dedup"
 ```
 
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-journal`
 Expected: compile errors (`NewEvent`, `EventKind` undefined).
 
-- [ ] **Step 3: Implement** (append; `use std::path::{Path, PathBuf};` at top)
+- [x] **Step 3: Implement** (append; `use std::path::{Path, PathBuf};` at top)
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -784,12 +784,12 @@ Add this regression test alongside the others (it guards `entry_id_for` never cl
     }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-journal`
 Expected: 10 passed (3 + 2 + 5 new).
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -820,7 +820,7 @@ git commit -m "feat(journal): entries, events, sessions, timeline queries, and b
   - `check_hello(client_version: u32) -> Result<(), String>` (message names both versions)
   - All enums use `#[serde(tag = "type", rename_all = "snake_case")]`; `ServerFrame` uses `#[serde(tag = "frame", rename_all = "snake_case")]`.
 
-- [ ] **Step 1: Create the crate and write the failing tests**
+- [x] **Step 1: Create the crate and write the failing tests**
 
 `crates/proto/Cargo.toml`:
 ```toml
@@ -920,12 +920,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-proto`
 Expected: compile errors.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/proto/src/lib.rs`:
 ```rust
@@ -1040,12 +1040,12 @@ pub fn check_hello(client_version: u32) -> Result<(), String> {
 
 Implementer note: `#[serde(flatten)]` on an internally-tagged enum inside a struct is a known-working serde pattern, but verify the wire shape the tests assert (`"type":"expect_changes"` alongside `"id":7`). If serde rejects the flatten+tag combination at runtime, fall back to non-flattened fields (`{ id, request: {...} }` / `{ frame, response: {...} }`) AND update the two wire-shape assertions to match — the framing contract (one JSON object per line, ids echoed on replies, pushes id-less) is what matters, not the exact nesting.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-proto`
 Expected: 4 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
