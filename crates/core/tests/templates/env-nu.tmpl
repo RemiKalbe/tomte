@@ -1,0 +1,3 @@
+$env.EDITOR = "hx"
+{{ if .work }}$env.AWS_PROFILE = "work"
+{{ end }}$env.HOSTNAME = "{{ .hostname }}"
