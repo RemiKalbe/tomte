@@ -56,7 +56,7 @@ crates/core/
 **Interfaces:**
 - Produces: compiling empty workspace; module skeleton `czui_core::{cmd, chezmoi, git, drift, scanner}` filled in by Tasks 2–6.
 
-- [ ] **Step 1: Create workspace files**
+- [x] **Step 1: Create workspace files**
 
 `Cargo.toml`:
 ```toml
@@ -116,12 +116,12 @@ pub mod scanner;
 
 Create empty placeholder files so it compiles: `src/cmd.rs`, `src/chezmoi.rs`, `src/git.rs`, `src/drift.rs`, `src/scanner.rs` (each may start with just `//! see plan task N`).
 
-- [ ] **Step 2: Verify it builds**
+- [x] **Step 2: Verify it builds**
 
 Run: `cargo check --workspace`
 Expected: `Finished` with no errors.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add Cargo.toml rust-toolchain.toml crates
@@ -144,7 +144,7 @@ git commit -m "chore: scaffold cargo workspace with czui-core"
   - `trait CommandRunner: Send + Sync { fn run(&self, req: CommandRequest) -> Result<CommandOutput, CommandError>; }`
   - `SystemRunner` (real), `fake::FakeRunner` (queued responses + recorded calls).
 
-- [ ] **Step 1: Write the failing tests** (in `cmd.rs` `#[cfg(test)]` module)
+- [x] **Step 1: Write the failing tests** (in `cmd.rs` `#[cfg(test)]` module)
 
 ```rust
 #[cfg(test)]
@@ -189,12 +189,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core cmd`
 Expected: compile errors — types not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/cmd.rs`:
 ```rust
@@ -405,12 +405,12 @@ impl CommandRunner for FakeRunner {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core cmd`
 Expected: 4 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/core/src/cmd.rs crates/core/src/cmd
@@ -444,7 +444,7 @@ git commit -m "feat(core): CommandRunner seam with SystemRunner and FakeRunner"
   - `EvalFailure { kind: EvalFailureKind, raw_stderr: String, hint: String }`, `EvalFailureKind::{OnePasswordMultipleAccounts, OnePasswordAuth, AgeDecrypt, GpgDecrypt, TemplateError, Unknown}`
   - `classify_eval_stderr(stderr: &str) -> Option<EvalFailure>` (pub — the scanner and daemon reuse it)
 
-- [ ] **Step 1: Write the failing tests** (`#[cfg(test)]` in `chezmoi.rs`)
+- [x] **Step 1: Write the failing tests** (`#[cfg(test)]` in `chezmoi.rs`)
 
 The 1Password fixture below is verbatim from this machine (2026-07-19):
 
@@ -542,12 +542,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core chezmoi`
 Expected: compile errors — types not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/chezmoi.rs`:
 ```rust
@@ -800,12 +800,12 @@ impl ChezmoiClient {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core chezmoi`
 Expected: 5 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/core/src/chezmoi.rs
@@ -833,7 +833,7 @@ git commit -m "feat(core): ChezmoiClient with status/state parsers and eval-fail
   - `GitError::{Command(CommandError), Exit { code, stderr }, Parse { context, detail }}`
 - Tests build **real temp repos** with `SystemRunner` — hermetic, no fakes.
 
-- [ ] **Step 1: Write the failing tests** (`#[cfg(test)]` in `git.rs`)
+- [x] **Step 1: Write the failing tests** (`#[cfg(test)]` in `git.rs`)
 
 ```rust
 #[cfg(test)]
@@ -916,12 +916,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core git`
 Expected: compile errors — types not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/git.rs`:
 ```rust
@@ -1044,12 +1044,12 @@ impl GitClient {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core git`
 Expected: 3 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/core/src/git.rs
@@ -1078,7 +1078,7 @@ Classification rules (verbatim from spec §4, resolved to logic):
 3. git.local_ahead && git.remote_ahead → `LocalSourceDiverged`, upgraded to `Conflict` if `dest_drift`.
 4. Else count {dest_drift, source_moved, remote}: 0 → `InSync`; exactly one → the matching single class; ≥2 → `Conflict`.
 
-- [ ] **Step 1: Write the failing table-driven test**
+- [x] **Step 1: Write the failing table-driven test**
 
 ```rust
 #[cfg(test)]
@@ -1147,12 +1147,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core drift`
 Expected: compile errors.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/drift.rs`:
 ```rust
@@ -1235,12 +1235,12 @@ pub fn classify(probe: &StateProbe) -> DriftClass {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core drift`
 Expected: 3 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/core/src/drift.rs
@@ -1273,7 +1273,7 @@ git commit -m "feat(core): four-state drift model and pure classifier"
 3. Per candidate (managed files only): build `StateProbe` — destination hash from fs; rendered from `cat` (per-file `Eval` error → `Err(EvalFailure)` in the probe); last_written from dump (`ContentHash::from_hex`); `GitSignals` from `commits_touching("{remote}..HEAD", src_rel)` / `commits_touching("HEAD..{remote}", src_rel)`.
 4. `classify`, collect non-`InSync` into `drifted`; `in_sync_count = managed_files - drifted.len()`.
 
-- [ ] **Step 1: Write the scratch-home support helper**
+- [x] **Step 1: Write the scratch-home support helper**
 
 `crates/core/tests/support/mod.rs`:
 ```rust
@@ -1362,7 +1362,7 @@ impl Scratch {
 }
 ```
 
-- [ ] **Step 2: Write the failing integration tests**
+- [x] **Step 2: Write the failing integration tests**
 
 `crates/core/tests/scanner_integration.rs`:
 ```rust
@@ -1433,12 +1433,12 @@ fn disk_and_remote_change_is_conflict() {
 }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Run: `cargo test -p czui-core --test scanner_integration`
 Expected: compile errors (`DriftScanner` undefined).
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 `crates/core/src/scanner.rs`:
 ```rust
@@ -1618,17 +1618,17 @@ impl DriftScanner {
 }
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run: `cargo test -p czui-core --test scanner_integration`
 Expected: 5 passed. (Requires `chezmoi` and `git` on PATH; the `Scratch::new` expect message says so if missing.)
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: all green.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/core/src/scanner.rs crates/core/tests
@@ -1646,7 +1646,7 @@ git commit -m "feat(core): DriftScanner with degradation on eval failure and scr
 - Consumes: `DriftScanner`, `ChezmoiClient`, `GitClient`, `SystemRunner`.
 - Produces: `cargo run -p czui-core --bin drift-scan [--fetch] [--json]` against the real machine. This is Plan 1's working-software deliverable and the manual smoke tool for later plans.
 
-- [ ] **Step 1: Implement** (debug tool: `unwrap`-style exits via error printing are fine here — it's a bin, not a lib)
+- [x] **Step 1: Implement** (debug tool: `unwrap`-style exits via error printing are fine here — it's a bin, not a lib)
 
 ```rust
 use std::process::ExitCode;
@@ -1704,7 +1704,7 @@ fn main() -> ExitCode {
 }
 ```
 
-- [ ] **Step 2: Build and run on the real machine**
+- [x] **Step 2: Build and run on the real machine**
 
 Run: `cargo run -p czui-core --bin drift-scan`
 Expected on this machine today: a `degraded scan:` line mentioning OP_ACCOUNT (the 1Password multi-account issue), plus any genuinely drifted files, plus the summary line. No panic, exit 0.
@@ -1712,7 +1712,7 @@ Expected on this machine today: a `degraded scan:` line mentioning OP_ACCOUNT (t
 Run: `OP_ACCOUNT=<account> cargo run -p czui-core --bin drift-scan` (once an account shorthand is chosen)
 Expected: no degraded line; full classification including rendered-side drift. (`ChezmoiOptions.env` injection is exercised by the daemon/app later; the binary inherits the process env, which chezmoi passes to `op`.)
 
-- [ ] **Step 3: Full suite + commit**
+- [x] **Step 3: Full suite + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: all green.
