@@ -242,6 +242,71 @@ impl MergeDocument {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    Ours,
+    Theirs,
+    Base,
+    Edited(String),
+}
+
+#[derive(Debug, Default)]
+pub struct Resolution {
+    choices: std::collections::HashMap<usize, Choice>,
+}
+
+impl Resolution {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn set(&mut self, region_index: usize, choice: Choice) {
+        self.choices.insert(region_index, choice);
+    }
+    pub fn get(&self, region_index: usize) -> Option<&Choice> {
+        self.choices.get(&region_index)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AssembleError {
+    #[error("region {region} is a conflict with no choice made")]
+    Unresolved { region: usize },
+}
+
+impl MergeDocument {
+    pub fn assemble(&self, res: &Resolution) -> Result<String, AssembleError> {
+        let mut out = String::new();
+        for (idx, region) in self.regions.iter().enumerate() {
+            let choice = res.get(idx);
+            match (choice, region.kind) {
+                (Some(Choice::Ours), _) => {
+                    out.push_str(&self.ours_lines[region.ours.clone()].concat())
+                }
+                (Some(Choice::Theirs), _) => {
+                    out.push_str(&self.theirs_lines[region.theirs.clone()].concat())
+                }
+                (Some(Choice::Base), _) => {
+                    out.push_str(&self.base_lines[region.base.clone()].concat())
+                }
+                (Some(Choice::Edited(text)), _) => out.push_str(text),
+                (None, RegionKind::Unchanged) => {
+                    out.push_str(&self.base_lines[region.base.clone()].concat())
+                }
+                (None, RegionKind::OursOnly | RegionKind::BothSame) => {
+                    out.push_str(&self.ours_lines[region.ours.clone()].concat())
+                }
+                (None, RegionKind::TheirsOnly) => {
+                    out.push_str(&self.theirs_lines[region.theirs.clone()].concat())
+                }
+                (None, RegionKind::Conflict) => {
+                    return Err(AssembleError::Unresolved { region: idx });
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +400,36 @@ mod tests {
     fn missing_trailing_newline_roundtrips() {
         let doc = MergeDocument::compute("a\nb", "a\nb", "a\nb", MergeOptions::default());
         assert_eq!(doc.base_lines().concat(), "a\nb");
+    }
+
+    #[test]
+    fn assemble_applies_defaults_and_choices() {
+        let base = "a\nv = 1\nz\n";
+        let ours = "a\nv = 2\nz\n";
+        let theirs = "a\nv = 3\nz\n";
+        let doc = MergeDocument::compute(base, ours, theirs, MergeOptions::default());
+        let conflict = doc.required_decisions()[0];
+
+        let mut res = Resolution::new();
+        assert!(matches!(
+            doc.assemble(&res),
+            Err(AssembleError::Unresolved { region }) if region == conflict
+        ));
+
+        res.set(conflict, Choice::Theirs);
+        assert_eq!(doc.assemble(&res).unwrap(), "a\nv = 3\nz\n");
+
+        res.set(conflict, Choice::Edited("v = 23\n".to_string()));
+        assert_eq!(doc.assemble(&res).unwrap(), "a\nv = 23\nz\n");
+    }
+
+    #[test]
+    fn assemble_override_beats_default() {
+        // OursOnly region defaults to ours, but an explicit Base choice wins
+        let doc = MergeDocument::compute("old\n", "new\n", "old\n", MergeOptions::default());
+        assert_eq!(doc.assemble(&Resolution::new()).unwrap(), "new\n");
+        let mut res = Resolution::new();
+        res.set(0, Choice::Base);
+        assert_eq!(doc.assemble(&res).unwrap(), "old\n");
     }
 }
