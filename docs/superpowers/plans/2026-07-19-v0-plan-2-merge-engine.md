@@ -594,8 +594,7 @@ Expected: compile errors.
 
 use std::ops::Range;
 
-use imara_diff::intern::InternedInput;
-use imara_diff::{Algorithm, Diff};
+use imara_diff::{Algorithm, Diff, InternedInput};
 
 use super::SliceTokens;
 
@@ -1555,8 +1554,7 @@ Expected: compile errors.
 
 use std::ops::Range;
 
-use imara_diff::intern::InternedInput;
-use imara_diff::{Algorithm, Diff};
+use imara_diff::{Algorithm, Diff, InternedInput};
 
 use crate::merge::{split_lines, SliceTokens};
 use crate::template::anchor::{SpanMap, SpanOrigin};
