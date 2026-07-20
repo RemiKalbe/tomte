@@ -323,6 +323,9 @@ path override.
 - gpui = 0.2.2 exact (pre-1.0, breaking changes between versions; local rustdoc
   generated from the pinned version is the API reference — the bundled gpui skill is
   ~6 months stale and must not be trusted over the crate source).
+- Build requirement (discovered 2026-07-20): gpui's build script compiles Metal
+  shaders, which requires full Xcode **plus the Metal Toolchain component**
+  (`xcodebuild -downloadComponent MetalToolchain`) — Xcode 26 ships without it.
 - imara-diff (merge engine), notify (FSEvents), rusqlite (journal), zstd, objc2 +
   objc2-app-kit (status item, activation policy, notifications), serde.
 - chezmoi ≥ 2.70 and user's own `git` binary invoked as CLIs (SSH keys, signing,
