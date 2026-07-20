@@ -56,7 +56,7 @@ crates/core/tests/template_roundtrip.rs
   - `MergeDocument { pub regions: Vec<MergeRegion>, … }` with `base_lines()/ours_lines()/theirs_lines() -> &[String]` accessors (lines keep their `\n`, split via `split_inclusive`)
   - `MergeDocument::required_decisions(&self) -> Vec<usize>` (indices of `Conflict` regions)
 
-- [ ] **Step 1: Write the failing tests** (`#[cfg(test)]` in `merge.rs`)
+- [x] **Step 1: Write the failing tests** (`#[cfg(test)]` in `merge.rs`)
 
 ```rust
 #[cfg(test)]
@@ -139,12 +139,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core merge`
 Expected: compile errors — types not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/merge.rs`:
 ```rust
@@ -384,12 +384,12 @@ impl MergeDocument {
 
 Note for the implementer: `pub mod worddiff;` requires the file to exist — create `crates/core/src/merge/worddiff.rs` containing only `//! see plan task 3` so the crate compiles (Task 3 fills it).
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core merge`
 Expected: 7 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: all green (27 tests total: 20 prior + 7 new).
@@ -413,7 +413,7 @@ git commit -m "feat(core): MergeDocument 3-way region model over imara-diff"
   - `AssembleError::Unresolved { region: usize }` (thiserror)
   - `MergeDocument::assemble(&self, res: &Resolution) -> Result<String, AssembleError>` — defaults: `Unchanged`→base, `OursOnly`→ours, `TheirsOnly`→theirs, `BothSame`→ours; `Conflict` requires a choice; an explicit choice on ANY region overrides its default (spec §5: merge editor always available, including on auto regions).
 
-- [ ] **Step 1: Write the failing tests** (append to `merge.rs` tests)
+- [x] **Step 1: Write the failing tests** (append to `merge.rs` tests)
 
 ```rust
     #[test]
@@ -448,12 +448,12 @@ git commit -m "feat(core): MergeDocument 3-way region model over imara-diff"
     }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core merge`
 Expected: compile errors (`Resolution` not defined).
 
-- [ ] **Step 3: Implement** (append to `merge.rs`)
+- [x] **Step 3: Implement** (append to `merge.rs`)
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,12 +516,12 @@ impl MergeDocument {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core merge`
 Expected: 9 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -544,7 +544,7 @@ git commit -m "feat(core): resolution assembly with per-region choices and overr
   - `word_diff(a: &str, b: &str) -> WordDiff`
   - Tokens: maximal runs of either word bytes (`alphanumeric | '_' | '.' | '-'`) or non-word bytes; if either side exceeds 5000 tokens, fall back to whole-string ranges.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -581,12 +581,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core worddiff`
 Expected: compile errors.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/merge/worddiff.rs`:
 ```rust
@@ -665,12 +665,12 @@ pub fn word_diff(a: &str, b: &str) -> WordDiff {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core worddiff`
 Expected: 3 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -699,7 +699,7 @@ git commit -m "feat(core): word-level diff spans for intra-region highlighting"
   - Control keywords (first word of action body): `if`, `range`, `with`, `block`, `define` → `ControlOpen`; `else` → `ControlElse`; `end` → `ControlClose`; everything else (including `template`, variables, pipelines) → `Value`.
   - String handling inside actions: `"…"` with `\` escapes and `` `…` `` raw strings — `}}` inside either does not close the action.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -784,12 +784,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core template::lexer`
 Expected: compile errors.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/template.rs`:
 ```rust
@@ -980,12 +980,12 @@ pub fn lex(src: &str) -> Result<Vec<Segment>, LexError> {
 
 Implementer note on `find_close`'s `trim_after` detection: Go's syntax for a right trim marker is `` `-}}` preceded by a space `` (i.e. ``" -}}"``), which is what the two-byte lookback checks. If the trim-marker tests fail against `chezmoi execute-template` behavior in Task 7, adjust here — the contract is "record what Go text/template would trim".
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core template::lexer`
 Expected: 6 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -1020,7 +1020,7 @@ git commit -m "feat(core): Go-template lexer with trim markers, strings, and nes
    - Anything else (multiple adjacent value actions, unmatched conditional literals, leftovers) ⇒ `Unmapped`.
 4. Comments produce no rendered bytes and are skipped everywhere.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -1120,12 +1120,12 @@ mod tests {
 
 Note: in `if_block_present_and_absent`, the second assertion block contains a deliberately trivial `|| true` guard in the first `assert!` — remove that line entirely when implementing; the meaningful assertions are the `inside` span lookup and the `map2` all-mapped check. (Do not ship an `assert!(… || true)`.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core template::anchor`
 Expected: compile errors.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/template/anchor.rs`:
 ```rust
@@ -1447,12 +1447,12 @@ fn fill_gap(
 
 Implementer note: this algorithm is deliberately conservative — when in doubt, `Unmapped` (protected). The tests define the contract; if an assertion about *which* protected origin (Action vs Unmapped) fails, prefer adjusting toward `Unmapped` rather than loosening protection. The tiling invariant and the Literal-bytes-equality invariant are non-negotiable.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core template::anchor`
 Expected: 6 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -1475,7 +1475,7 @@ git commit -m "feat(core): rendered-span anchoring with conservative protection"
   - `write_back(template: &str, map: &SpanMap, rendered: &str, resolved: &str) -> Result<String, WriteBackError>`
   - Semantics: line-diff `rendered → resolved`; convert line hunks to byte hunks; each hunk must fall strictly inside a single non-repeated `Literal` span (insertions must land strictly inside one, or at the very start/end of the document when that edge byte belongs to a literal span); map the hunk through the span's `src` range and splice into the template (back-to-front). Any hunk overlapping an `Action`/`Unmapped` span ⇒ `ProtectedSpanTouched`; overlapping a repeated literal ⇒ `RepeatedLiteral`; anything else unplaceable ⇒ `EditOutsideLiteral`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -1541,12 +1541,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-core template::writeback`
 Expected: compile errors.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/core/src/template/writeback.rs`:
 ```rust
@@ -1671,12 +1671,12 @@ pub fn write_back(
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-core template::writeback`
 Expected: 5 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -1699,7 +1699,7 @@ git commit -m "feat(core): span-mapped write-back with protected-span rejection"
   - `VerifyError::{Chezmoi(ChezmoiError), Mismatch { expected: Vec<u8>, actual: Vec<u8> }}`
   - `verify_write_back(chezmoi: &ChezmoiClient, new_template: &str, expected: &str) -> Result<(), VerifyError>` — re-renders and byte-compares (spec §6.2 step 4: never trust the mapping blindly).
 
-- [ ] **Step 1: Create the corpus fixtures**
+- [x] **Step 1: Create the corpus fixtures**
 
 `crates/core/tests/templates/gitconfig.tmpl`:
 ```
@@ -1724,7 +1724,7 @@ $env.EDITOR = "hx"
 {{ end }}# end
 ```
 
-- [ ] **Step 2: Implement the verify helper**
+- [x] **Step 2: Implement the verify helper**
 
 `crates/core/src/template/verify.rs`:
 ```rust
@@ -1753,7 +1753,7 @@ pub fn verify_write_back(
 }
 ```
 
-- [ ] **Step 3: Write the integration tests**
+- [x] **Step 3: Write the integration tests**
 
 `crates/core/tests/template_roundtrip.rs`:
 ```rust
@@ -1876,12 +1876,12 @@ fn range_block_output_edits_are_rejected() {
 }
 ```
 
-- [ ] **Step 4: Run the integration tests**
+- [x] **Step 4: Run the integration tests**
 
 Run: `cargo test -p czui-core --test template_roundtrip`
 Expected: 5 passed. These exercise real `chezmoi execute-template`; if any anchoring/trim assumption disagrees with chezmoi's actual rendering, fix the lexer/anchorer (Tasks 4–5), NOT the test.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
@@ -1901,7 +1901,7 @@ git commit -m "feat(core): re-render verification and corpus round-trip integrat
 - Consumes: `ChezmoiClient` (real), lexer/anchor.
 - Produces: `cargo run -p czui-core --bin template-spans -- <target-path>` — resolves the target's source via `chezmoi source-path`, renders via `chezmoi cat`, prints the rendered text with protected spans wrapped in `⟦…⟧` and a coverage summary. Read-only; Plan 2's real-machine smoke deliverable.
 
-- [ ] **Step 1: Implement**
+- [x] **Step 1: Implement**
 
 ```rust
 use std::path::PathBuf;
@@ -1976,13 +1976,13 @@ fn main() -> ExitCode {
 }
 ```
 
-- [ ] **Step 2: Smoke-run on the real machine (read-only)**
+- [x] **Step 2: Smoke-run on the real machine (read-only)**
 
 Run: `chezmoi managed -i templates --path-style=absolute | head -5` and pick a template target, preferring one without secret functions. Then:
 `cargo run -p czui-core --bin template-spans -- <picked-target>`
 Expected: the rendered file with `⟦A:…⟧` around template-derived values (or an `EvalFailed`-style error mentioning the secret manager for 1Password-dependent templates — that is also a correct outcome; try another target then). No panic either way.
 
-- [ ] **Step 3: Full gate + commit**
+- [x] **Step 3: Full gate + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
