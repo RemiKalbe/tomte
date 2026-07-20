@@ -1,0 +1,18 @@
+[package]
+name = "czui-core"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "czui_core"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+wait-timeout.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
