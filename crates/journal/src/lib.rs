@@ -95,6 +95,59 @@ impl Journal {
     pub fn machine(&self) -> &str {
         &self.machine
     }
+
+    pub fn put_blob(&self, content: &[u8], now_ts: u64) -> Result<String, JournalError> {
+        let hash = czui_core::drift::ContentHash::of(content).to_hex();
+        let compressed = zstd::encode_all(content, 3)
+            .map_err(|e| JournalError::Corrupt(format!("zstd encode: {e}")))?;
+        self.conn.execute(
+            "INSERT INTO blobs(hash, content_zstd, size_raw, created_ts)
+             VALUES(?1, ?2, ?3, ?4) ON CONFLICT(hash) DO NOTHING",
+            rusqlite::params![hash, compressed, content.len() as i64, now_ts as i64],
+        )?;
+        Ok(hash)
+    }
+
+    pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>, JournalError> {
+        let row: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT content_zstd FROM blobs WHERE hash = ?1",
+                [hash],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match row {
+            Some(compressed) => {
+                let raw = zstd::decode_all(compressed.as_slice())
+                    .map_err(|e| JournalError::Corrupt(format!("zstd decode for {hash}: {e}")))?;
+                Ok(Some(raw))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn has_blob(&self, hash: &str) -> Result<bool, JournalError> {
+        let n: u32 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM blobs WHERE hash = ?1", [hash], |r| {
+                    r.get(0)
+                })?;
+        Ok(n > 0)
+    }
+
+    pub fn blob_store_size(&self) -> Result<u64, JournalError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(content_zstd)), 0) FROM blobs",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +183,32 @@ mod tests {
     fn in_memory_open_works() {
         let j = Journal::open_in_memory("m").unwrap();
         assert_eq!(j.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn blob_roundtrip_and_dedup() {
+        let j = Journal::open_in_memory("m").unwrap();
+        let content = b"export EDITOR=hx\nexport VISUAL=hx\n".repeat(50);
+        let h1 = j.put_blob(&content, 100).unwrap();
+        let h2 = j.put_blob(&content, 200).unwrap();
+        assert_eq!(h1, h2, "same content must dedup to the same hash");
+        let n: u32 = j
+            .conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(j.get_blob(&h1).unwrap().unwrap(), content);
+        assert!(j.has_blob(&h1).unwrap());
+        assert!(!j.has_blob("deadbeef").unwrap());
+        assert!(j.get_blob("deadbeef").unwrap().is_none());
+        // repetitive content must actually compress
+        assert!(j.blob_store_size().unwrap() < content.len() as u64);
+    }
+
+    #[test]
+    fn blob_hash_matches_core_content_hash() {
+        let j = Journal::open_in_memory("m").unwrap();
+        let h = j.put_blob(b"abc", 1).unwrap();
+        assert_eq!(h, czui_core::drift::ContentHash::of(b"abc").to_hex());
     }
 }
