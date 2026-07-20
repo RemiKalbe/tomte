@@ -1,13 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/journal", "crates/proto"]
+members = ["crates/core", "crates/daemon", "crates/journal", "crates/proto"]
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+gethostname = "1"
 imara-diff = "0.2"
+notify = "8"
+toml = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
 thiserror = "2"
