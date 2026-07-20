@@ -72,6 +72,14 @@ Strictly an **observer**: it never mutates managed files, the source repo (beyon
 - All mutations happen here, user-present: merge write-backs, per-target
   `chezmoi apply`, `git` merge/commit/push, re-add.
 - Pre-announces expected changes to the daemon before mutating.
+- **Never blocks the UI on subprocesses:** chezmoi/git can be slow, so no
+  `CommandRunner` call may ever run on the GPUI main thread. All app-side
+  subprocess work (per-file `cat`, `apply`, `execute-template`, git operations)
+  is dispatched to GPUI's background executor / worker threads with the standard
+  per-command timeout; results return to entities as events on the main thread,
+  and in-flight operations render as progress states, never frozen frames. Bulk
+  work (scans, watching, fetch) already lives in the daemon process and cannot
+  block the app by construction.
 - Owns notifications (UNUserNotificationCenter via objc2); the app autostarts at
   login, so it is the notification surface. Daemon emits events only.
 
