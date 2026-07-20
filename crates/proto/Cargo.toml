@@ -1,0 +1,13 @@
+[package]
+name = "czui-proto"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "czui_proto"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
