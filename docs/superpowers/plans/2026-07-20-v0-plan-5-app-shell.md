@@ -98,7 +98,7 @@ czui-core = { path = "../core", features = ["test-support"] }
 tempfile.workspace = true
 ```
 
-- [ ] **Step 1: Write the theme + its test**
+- [x] **Step 1: Write the theme + its test**
 
 `crates/app/src/theme.rs`:
 ```rust
@@ -180,7 +180,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Write the mac platform layer** (spike-derived; the `define_class!` block, `MenuTarget::new`, and policy flip are compile-verified)
+- [x] **Step 2: Write the mac platform layer** (spike-derived; the `define_class!` block, `MenuTarget::new`, and policy flip are compile-verified)
 
 `crates/app/src/platform_mac.rs`:
 ```rust
@@ -342,7 +342,7 @@ impl StatusItem {
 }
 ```
 
-- [ ] **Step 3: Shell root view and main**
+- [x] **Step 3: Shell root view and main**
 
 `crates/app/src/views/mod.rs`:
 ```rust
@@ -503,12 +503,12 @@ fn main() {
 
 Implementer note: the `let _keep_alive = status;` line as written drops at the closure's end, which is the app's lifetime — if the status item vanishes from the bar at launch, leak it instead: `std::mem::forget(status);` (acceptable: one item for the process lifetime). `Bounds::centered` — verify against source (`grep -n "pub fn centered" src/geometry.rs`); fall back to `WindowOptions::default()` if absent.
 
-- [ ] **Step 4: Verify it builds and the unit test passes**
+- [x] **Step 4: Verify it builds and the unit test passes**
 
 Run: `cargo test -p czui-app` (theme test) and `cargo build -p czui-app`
 Expected: 1 test passed; binary builds. Do NOT `cargo run` the GUI (it would flash windows on the user's desktop while they're away); the runtime smoke is Step 6 of Task 7, flagged for the user.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 Gate (separate commands): `cargo fmt --all`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace`.
 
@@ -534,7 +534,7 @@ git commit -m "feat(app): czui-app shell — theme, status item, accessory polic
   - `IpcError::{Io(std::io::Error), Proto(String), Timeout, Rejected(String)}`
 - Internals: writer half behind `Mutex<UnixStream>`; reader thread parses `ServerFrame` lines — `Reply` routed to a `Mutex<HashMap<u64, mpsc::Sender<Response>>>`, `Push` forwarded to the events channel.
 
-- [ ] **Step 1: Write the failing integration test** — mirror `crates/daemon/tests/server_ipc.rs`'s setup (scratch + `DaemonCore` + `serve` on a thread), then:
+- [x] **Step 1: Write the failing integration test** — mirror `crates/daemon/tests/server_ipc.rs`'s setup (scratch + `DaemonCore` + `serve` on a thread), then:
 
 ```rust
 //! IpcClient against the real daemon server.
@@ -588,12 +588,12 @@ fn version_rejection_surfaces_as_error() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p czui-app --test ipc_client`
 Expected: compile errors (`IpcClient` undefined). (The test file needs `czui_app` as a lib — add to `crates/app/Cargo.toml`: `[lib] name = "czui_app"` plus `src/lib.rs` re-exporting `pub mod ipc; pub mod model; pub mod theme;` — main.rs then uses `czui_app::…` imports for those modules instead of `mod` declarations for the shared ones. Views/platform stay bin-only modules.)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/app/src/ipc.rs`:
 ```rust
@@ -723,12 +723,12 @@ impl IpcClient {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p czui-app --test ipc_client`
 Expected: 2 passed.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 ```bash
 git add crates/app
@@ -750,9 +750,9 @@ git commit -m "feat(app): blocking IPC client with id correlation and push subsc
   - `SyncModel::hydrate_status(&mut self, drifted, in_sync, degraded)`, `hydrate_timeline(&mut self, rows: Vec<czui_journal::EventRow>)` (maps meta.class), `apply_event(&mut self, ev: Event)` (updates drifted list, prepends synthetic timeline rows, tracks last_fetch_ts), `needs_attention(&self) -> usize` (conflict-ish classes count), `status_title(&self) -> String` ("cz" / "cz ●N"), `menu_spec(&self, now_ts: u64) -> MenuSpec`-shaped data as `(String, String, Option<String>, bool)` (header, freshness, review label, sync-all enabled = `drifted.is_empty() && connected`)
 - Pure — no gpui imports in `model.rs`; fully unit-tested.
 
-- [ ] **Steps 1–4: TDD** — write table-driven tests first (hydrate → apply Drift/LeftManagement/FetchDone events → assert drifted list dedups by target, needs_attention counts conflict+local_source_diverged+eval_failed, status_title formats, timeline caps at 500 rows), verify failure, implement, verify 5+ model tests pass. Test `open_read_only`: open a temp journal read-write, write an event, reopen read-only, read timeline ✓, and assert a `record_event` through the read-only handle errors.
+- [x] **Steps 1–4: TDD** — write table-driven tests first (hydrate → apply Drift/LeftManagement/FetchDone events → assert drifted list dedups by target, needs_attention counts conflict+local_source_diverged+eval_failed, status_title formats, timeline caps at 500 rows), verify failure, implement, verify 5+ model tests pass. Test `open_read_only`: open a temp journal read-write, write an event, reopen read-only, read timeline ✓, and assert a `record_event` through the read-only handle errors.
 
-- [ ] **Step 5: Full gate + commit**
+- [x] **Step 5: Full gate + commit**
 
 ```bash
 git add crates/journal/src/lib.rs crates/app/src/model.rs
@@ -776,8 +776,8 @@ git commit -m "feat(app): pure SyncModel with event ingestion; read-only journal
 
 No new tests (wiring); the gate is `cargo build` + all prior tests + a `--version`-style headless check: add `--print-status` flag to the binary that connects, prints status counts to stdout, and exits without any UI (this validates the whole boot path headlessly in CI/agents).
 
-- [ ] Implement per the behavior list, keeping ALL IpcClient/journal calls on the background executor. Run: `cargo build -p czui-app`, then with a scratch daemon running (reuse the ipc test setup pattern manually if needed) `CZUI_SOCKET=… cargo run -p czui-app --bin chezmoi-ui -- --print-status`.
-- [ ] Full gate + commit:
+- [x] Implement per the behavior list, keeping ALL IpcClient/journal calls on the background executor. Run: `cargo build -p czui-app`, then with a scratch daemon running (reuse the ipc test setup pattern manually if needed) `CZUI_SOCKET=… cargo run -p czui-app --bin chezmoi-ui -- --print-status`.
+- [x] Full gate + commit:
 
 ```bash
 git add crates/app/src/main.rs
@@ -799,7 +799,7 @@ git commit -m "feat(app): live status item wired to daemon over IPC with print-s
 
 **Interfaces:** `DashboardView { state: Entity<SyncModel>, now_ts: fn() -> u64 }` (clock injected for testable relative-time formatting — the formatter itself is a pure fn `fn time_ago(now: u64, ts: u64) -> String` with unit tests: "just now", "3h ago", "2d ago").
 
-- [ ] TDD the pure parts (`time_ago`, glyph mapping); build the view; wire `Route::Dashboard`; gate; commit `feat(app): dashboard with health tiles and chronological timeline`.
+- [x] TDD the pure parts (`time_ago`, glyph mapping); build the view; wire `Route::Dashboard`; gate; commit `feat(app): dashboard with health tiles and chronological timeline`.
 
 ---
 
@@ -815,7 +815,7 @@ git commit -m "feat(app): live status item wired to daemon over IPC with print-s
 
 **Interfaces:** `ReviewView { state: Entity<SyncModel>, selected: Option<PathBuf>, preview: PreviewState }`, `PreviewState::{Empty, Loading, Ready(MergeDocument), EvalFailed(String), Error(String)}`.
 
-- [ ] TDD the pure grouping fn (`fn severity_groups(&[DriftSummary]) -> (Vec<_>, Vec<_>)`); build the view with background preview loading; gate; commit `feat(app): review shell with severity sidebar and read-only diff preview`.
+- [x] TDD the pure grouping fn (`fn severity_groups(&[DriftSummary]) -> (Vec<_>, Vec<_>)`); build the view with background preview loading; gate; commit `feat(app): review shell with severity sidebar and read-only diff preview`.
 
 ---
 
@@ -831,7 +831,7 @@ git commit -m "feat(app): live status item wired to daemon over IPC with print-s
 
 **Notifications (spec §7.6):** `notify_osa::notify(title, body)` shells `osascript -e 'display notification …'` (args escaped, via CommandRunner, background executor). Hook into the event loop: coalesce `Drift` events in 5s windows → one notification ("3 files drifted"); `RemoteAdvanced` → "machine X pushed…" when not self-caused. Never for `applied`/expected events (the daemon already filtered those).
 
-- [ ] TDD pure parts (interval clamping, op-account JSON parsing with a canned fixture, osascript arg escaping); implement; gate; commit `feat(app): settings with 1Password account picker, osascript notifications`.
+- [x] TDD pure parts (interval clamping, op-account JSON parsing with a canned fixture, osascript arg escaping); implement; gate; commit `feat(app): settings with 1Password account picker, osascript notifications`.
 
 - [ ] **Final step — runtime smoke (REQUIRES THE USER):** this needs a human at the machine: `cargo run -p czui-app --bin chezmoi-ui` → verify the menubar item appears with live counts, no Dock icon, menu opens the window on each route, notifications fire on a manufactured drift (`echo test >> ~/.claude/settings.json` style — pick an already-drifted file to avoid new noise). Do NOT run this while the user is away; leave it as the handoff item in the final report.
 
