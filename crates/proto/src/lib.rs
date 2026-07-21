@@ -82,6 +82,11 @@ pub enum Response {
         drifted: Vec<DriftSummary>,
         in_sync: u64,
         degraded: Option<String>,
+        /// True while the daemon cannot serve real data yet (starting, or a
+        /// scan holds the core) — clients must render "scanning", never
+        /// "all in sync" (first-launch data-consistency bug).
+        #[serde(default)]
+        scanning: bool,
     },
     Timeline {
         events: Vec<EventSummary>,

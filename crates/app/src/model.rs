@@ -39,6 +39,8 @@ pub struct SyncModel {
     pub timeline: Vec<TimelineRow>,
     pub last_fetch_ts: Option<u64>,
     pub connected: bool,
+    /// Daemon is starting or mid-scan: render "scanning", never "in sync".
+    pub scanning: bool,
 }
 
 impl SyncModel {
@@ -47,7 +49,9 @@ impl SyncModel {
         drifted: Vec<DriftSummary>,
         in_sync: u64,
         degraded: Option<String>,
+        scanning: bool,
     ) {
+        self.scanning = scanning;
         self.drifted.clear();
         for d in drifted {
             if !self.drifted.iter().any(|e| e.target == d.target) {
@@ -163,6 +167,9 @@ impl SyncModel {
 
     /// NSStatusItem title: "cz", or "cz ●N" when N targets need a human.
     pub fn status_title(&self) -> String {
+        if !self.connected || self.scanning {
+            return "cz …".to_string();
+        }
         match self.needs_attention() {
             0 => "cz".to_string(),
             n => format!("cz ●{n}"),
@@ -175,6 +182,8 @@ impl SyncModel {
     pub fn menu_spec(&self, now_ts: u64) -> (String, String, Option<String>, bool) {
         let header = if !self.connected {
             "chezmoid not connected".to_string()
+        } else if self.scanning {
+            "scanning…".to_string()
         } else if self.drifted.is_empty() {
             format!("All in sync · {} files", self.in_sync)
         } else {
@@ -191,7 +200,10 @@ impl SyncModel {
             let n = self.drifted.len();
             format!("Review {n}\u{2026}")
         });
-        let sync_all_enabled = self.drifted.is_empty() && self.connected;
+        // Never enabled on placeholder data: a scan in progress or a
+        // degraded evaluation might be hiding drift (spec §7.4).
+        let sync_all_enabled =
+            self.drifted.is_empty() && self.connected && !self.scanning && self.degraded.is_none();
         (header, freshness, review_label, sync_all_enabled)
     }
 
@@ -310,6 +322,7 @@ mod tests {
             ],
             12,
             Some("chezmoi doctor".into()),
+            false,
         );
         assert_eq!(m.in_sync, 12);
         assert_eq!(m.degraded.as_deref(), Some("chezmoi doctor"));
@@ -501,6 +514,7 @@ mod tests {
                     .collect(),
                 0,
                 None,
+                false,
             );
             assert_eq!(m.needs_attention(), want, "classes {classes:?}");
         }
@@ -519,6 +533,7 @@ mod tests {
         ];
         for (classes, want) in cases {
             let mut m = SyncModel::default();
+            m.connected = true; // the title only reports counts once live
             m.hydrate_status(
                 classes
                     .iter()
@@ -527,6 +542,7 @@ mod tests {
                     .collect(),
                 0,
                 None,
+                false,
             );
             assert_eq!(m.status_title(), want, "classes {classes:?}");
         }
@@ -544,7 +560,7 @@ mod tests {
 
         // connected + clean: sync-all enabled, no review entry
         m.connected = true;
-        m.hydrate_status(vec![], 42, None);
+        m.hydrate_status(vec![], 42, None, false);
         m.last_fetch_ts = Some(1_000 - 30);
         let (header, freshness, review, sync_all) = m.menu_spec(1_000);
         assert_eq!(header, "All in sync · 42 files");

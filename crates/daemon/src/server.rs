@@ -213,6 +213,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                 drifted: Vec::new(),
                 in_sync: 0,
                 degraded: Some(format!("chezmoid starting: {why}")),
+                scanning: true,
             },
             _ => Response::Error {
                 message: format!("chezmoid still starting: {why}"),
@@ -231,6 +232,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     drifted: Vec::new(),
                     in_sync: 0,
                     degraded: Some("initial scan in progress…".into()),
+                    scanning: true,
                 },
                 _ => Response::Error {
                     message: "daemon busy (scan in progress) — retry shortly".into(),
@@ -251,6 +253,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                 drifted,
                 in_sync,
                 degraded,
+                scanning: false,
             }
         }
         Request::Timeline { limit, before_id } => match c.journal().timeline(limit, before_id) {

@@ -121,6 +121,7 @@ fn verify_connectivity(paths: &Paths) -> ExitCode {
             drifted,
             in_sync,
             degraded,
+            ..
         }) => println!(
             "[3/5] status ok: {} drifted, {in_sync} in sync, degraded: {}",
             drifted.len(),
@@ -196,7 +197,9 @@ fn print_status(socket: &Path) -> ExitCode {
             drifted,
             in_sync,
             degraded,
+            scanning,
         }) => {
+            let _ = scanning;
             let mut line = format!("{} drifted, {} in sync", drifted.len(), in_sync);
             if let Some(hint) = degraded {
                 line.push_str(&format!(", degraded: {hint}"));
@@ -342,6 +345,35 @@ fn apply_and_signal(model: &mut SyncModel, ev: Event) -> NotifySignal {
 /// Boot the daemon link on the background executor (connect-or-spawn, Status,
 /// read-only journal hydrate, subscribe), then apply live pushes to the model
 /// entity. Every blocking IpcClient/journal call stays off the main thread.
+/// Re-request Status and hydrate the model. Returns false when the app has
+/// been released and the caller should stop.
+async fn refresh_status(
+    client: &std::sync::Arc<IpcClient>,
+    state: &Entity<SyncModel>,
+    cx: &mut gpui::AsyncApp,
+) -> bool {
+    let c = client.clone();
+    let resp = cx
+        .background_executor()
+        .spawn(async move { c.request(Request::Status) })
+        .await;
+    if let Ok(Response::Status {
+        drifted,
+        in_sync,
+        degraded,
+        scanning,
+    }) = resp
+    {
+        return cx
+            .update_entity(state, |model, cx| {
+                model.hydrate_status(drifted, in_sync, degraded, scanning);
+                cx.notify();
+            })
+            .is_ok();
+    }
+    true
+}
+
 fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Paths) {
     cx.spawn(async move |cx| {
         // Reconnect forever: chezmoid may still be mid-initial-scan at app
@@ -405,9 +437,10 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                     drifted,
                     in_sync,
                     degraded,
+                    scanning,
                 } = status_resp
                 {
-                    model.hydrate_status(drifted, in_sync, degraded);
+                    model.hydrate_status(drifted, in_sync, degraded, scanning);
                 }
                 model.hydrate_timeline(rows);
                 cx.notify();
@@ -422,6 +455,10 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
             // executor (plan Task 7).
             let mut pending_drift: usize = 0;
             let mut drift_window_started: Option<Instant> = None;
+            // Periodic safety net: a ScanDone push can be missed (app booted
+            // after the scan), so poll Status every 30s regardless — the
+            // first-launch bug was exactly this staleness.
+            let mut last_status_refresh = Instant::now();
             loop {
                 // Flush an expired coalescing window: exactly one notification
                 // per window, no matter how many pushes landed inside it.
@@ -437,11 +474,18 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                 }
                 match events.try_recv() {
                     Ok(ev) => {
+                        let is_scan_done = matches!(ev, Event::ScanDone { .. });
                         let signal = cx.update_entity(&state, |model, cx| {
                             let signal = apply_and_signal(model, ev);
                             cx.notify();
                             signal
                         });
+                        if is_scan_done {
+                            last_status_refresh = Instant::now();
+                            if !refresh_status(&client, &state, cx).await {
+                                return;
+                            }
+                        }
                         match signal {
                             Err(_) => break, // app released
                             Ok(NotifySignal::NewDrift) => {
@@ -466,6 +510,12 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                         cx.background_executor()
                             .timer(Duration::from_millis(100))
                             .await;
+                        if last_status_refresh.elapsed() >= Duration::from_secs(30) {
+                            last_status_refresh = Instant::now();
+                            if !refresh_status(&client, &state, cx).await {
+                                return;
+                            }
+                        }
                     }
                     Err(TryRecvError::Disconnected) => {
                         // Daemon went away (settings restart, crash): show it,
