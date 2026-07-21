@@ -26,7 +26,12 @@ fn setup() -> (Scratch, Arc<Mutex<DaemonCore>>, UnixStream) {
     let sock = s.root.path().join("d.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let served = core.clone();
-    std::thread::spawn(move || serve(listener, served, || 1000, std::sync::Arc::new(|| {})));
+    std::thread::spawn(move || {
+        serve(
+            listener,
+            czui_daemon::server::ServeCtx::new(served, || 1000, Arc::new(|| {})),
+        )
+    });
     let stream = UnixStream::connect(&sock).unwrap();
     (s, core, stream)
 }
@@ -191,9 +196,11 @@ fn shutdown_replies_ok_then_fires_hook() {
     std::thread::spawn(move || {
         serve(
             listener,
-            core,
-            || 1000,
-            Arc::new(move || hook_flag.store(true, Ordering::SeqCst)),
+            czui_daemon::server::ServeCtx::new(
+                core,
+                || 1000,
+                Arc::new(move || hook_flag.store(true, Ordering::SeqCst)),
+            ),
         )
     });
 
@@ -219,4 +226,67 @@ fn shutdown_replies_ok_then_fires_hook() {
     // hook fires right after the reply; give the thread a beat
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(fired.load(Ordering::SeqCst));
+}
+
+#[test]
+fn handshake_and_status_survive_a_long_scan_holding_the_core() {
+    let s = Scratch::new();
+    let chezmoi: ChezmoiClient = s.chezmoi();
+    let git = GitClient::new(Arc::new(SystemRunner), s.source.clone());
+    let journal = Journal::open_in_memory("busy-test").unwrap();
+    let core = Arc::new(Mutex::new(
+        DaemonCore::new(chezmoi, git, journal, "origin/main".into()).unwrap(),
+    ));
+    let sock = s.root.path().join("busy.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    // ServeCtx must be built BEFORE the lock is contended (as the binary does).
+    let ctx = czui_daemon::server::ServeCtx::new(core.clone(), || 7, Arc::new(|| {}));
+    std::thread::spawn(move || serve(listener, ctx));
+
+    // Simulate a minutes-long initial scan: hold the core lock for the whole test.
+    let _scan_guard = core.lock().unwrap();
+
+    let mut stream = UnixStream::connect(&sock).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // Hello must answer instantly (no core lock involved).
+    send(
+        &mut stream,
+        1,
+        Request::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    );
+    assert!(matches!(
+        recv(&mut reader),
+        ServerFrame::Reply {
+            id: 1,
+            response: Response::HelloOk { .. }
+        }
+    ));
+
+    // Subscribe must succeed instantly too.
+    send(&mut stream, 2, Request::Subscribe);
+    assert!(matches!(
+        recv(&mut reader),
+        ServerFrame::Reply {
+            id: 2,
+            response: Response::Ok
+        }
+    ));
+
+    // Status degrades honestly instead of hanging until the client times out.
+    send(&mut stream, 3, Request::Status);
+    match recv(&mut reader) {
+        ServerFrame::Reply {
+            id: 3,
+            response: Response::Status {
+                drifted, degraded, ..
+            },
+        } => {
+            assert!(drifted.is_empty());
+            assert_eq!(degraded.as_deref(), Some("initial scan in progress…"));
+        }
+        other => panic!("expected degraded status, got {other:?}"),
+    }
 }

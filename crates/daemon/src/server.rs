@@ -6,24 +6,52 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
 use czui_proto::{
-    ClientFrame, EventSummary, PROTOCOL_VERSION, Request, Response, ServerFrame, check_hello,
-    write_frame,
+    ClientFrame, Event, EventSummary, PROTOCOL_VERSION, Request, Response, ServerFrame,
+    check_hello, write_frame,
 };
 
 use crate::core::DaemonCore;
 
-pub fn serve(
-    listener: UnixListener,
-    core: Arc<Mutex<DaemonCore>>,
-    now_fn: fn() -> u64,
-    on_shutdown: Arc<dyn Fn() + Send + Sync>,
-) -> std::io::Result<()> {
+/// Everything a connection needs that must NOT wait on the core lock:
+/// Hello (machine name) and Subscribe (shared sender list) stay instant even
+/// while a long scan holds the core (spec §3.2 responsiveness).
+#[derive(Clone)]
+pub struct ServeCtx {
+    pub core: Arc<Mutex<DaemonCore>>,
+    pub subscribers: Arc<Mutex<Vec<std::sync::mpsc::Sender<Event>>>>,
+    pub machine: String,
+    pub now_fn: fn() -> u64,
+    pub on_shutdown: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl ServeCtx {
+    /// Build from a core that is not yet contended (call BEFORE the first
+    /// scan starts).
+    pub fn new(
+        core: Arc<Mutex<DaemonCore>>,
+        now_fn: fn() -> u64,
+        on_shutdown: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let (subscribers, machine) = {
+            let c = core.lock().expect("core uncontended at setup");
+            (c.subscriber_handle(), c.machine().to_string())
+        };
+        Self {
+            core,
+            subscribers,
+            machine,
+            now_fn,
+            on_shutdown,
+        }
+    }
+}
+
+pub fn serve(listener: UnixListener, ctx: ServeCtx) -> std::io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
-        let core = core.clone();
-        let on_shutdown = on_shutdown.clone();
+        let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, core, now_fn, on_shutdown);
+            let _ = handle_connection(stream, ctx);
         });
     }
     Ok(())
@@ -34,12 +62,7 @@ fn reply(out: &Arc<Mutex<UnixStream>>, id: u64, response: Response) -> std::io::
     write_frame(&mut *w, &ServerFrame::Reply { id, response })
 }
 
-fn handle_connection(
-    stream: UnixStream,
-    core: Arc<Mutex<DaemonCore>>,
-    now_fn: fn() -> u64,
-    on_shutdown: Arc<dyn Fn() + Send + Sync>,
-) -> std::io::Result<()> {
+fn handle_connection(stream: UnixStream, ctx: ServeCtx) -> std::io::Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
     let out = Arc::new(Mutex::new(stream));
     let mut hello_done = false;
@@ -67,7 +90,7 @@ fn handle_connection(
                 Request::Hello { version } => match check_hello(version) {
                     Ok(()) => {
                         hello_done = true;
-                        let machine = core.lock().expect("core poisoned").machine().to_string();
+                        let machine = ctx.machine.clone();
                         reply(
                             &out,
                             id,
@@ -99,10 +122,10 @@ fn handle_connection(
         // hook runs (the binary's hook is process::exit).
         if matches!(frame.request, Request::Shutdown) {
             reply(&out, id, Response::Ok)?;
-            on_shutdown();
+            (ctx.on_shutdown)();
             return Ok(());
         }
-        let response = dispatch(&core, frame.request, &out, now_fn);
+        let response = dispatch(&ctx, frame.request, &out);
         reply(&out, id, response)?;
     }
     Ok(())
@@ -119,28 +142,22 @@ fn event_summaries(rows: Vec<czui_journal::EventRow>) -> Vec<EventSummary> {
         .collect()
 }
 
-fn dispatch(
-    core: &Arc<Mutex<DaemonCore>>,
-    request: Request,
-    out: &Arc<Mutex<UnixStream>>,
-    now_fn: fn() -> u64,
-) -> Response {
-    let now = now_fn();
-    let mut c = match core.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return Response::Error {
-                message: "daemon state poisoned".into(),
+fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> Response {
+    let now = (ctx.now_fn)();
+
+    // Requests that must never wait behind a long-running scan:
+    match &request {
+        Request::Hello { .. } => {
+            return Response::HelloOk {
+                version: PROTOCOL_VERSION,
+                machine: ctx.machine.clone(),
             };
         }
-    };
-    match request {
-        Request::Hello { .. } => Response::HelloOk {
-            version: PROTOCOL_VERSION,
-            machine: c.machine().to_string(),
-        },
         Request::Subscribe => {
-            let rx = c.subscribe();
+            let (tx, rx) = std::sync::mpsc::channel();
+            if let Ok(mut subs) = ctx.subscribers.lock() {
+                subs.push(tx);
+            }
             let out = out.clone();
             std::thread::spawn(move || {
                 for ev in rx {
@@ -151,8 +168,36 @@ fn dispatch(
                     }
                 }
             });
-            Response::Ok
+            return Response::Ok;
         }
+        _ => {}
+    }
+
+    // Everything else needs the core. Never block indefinitely: if a scan
+    // holds the lock, degrade honestly (spec §10) instead of timing out the
+    // client.
+    let mut c = match ctx.core.try_lock() {
+        Ok(c) => c,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return match request {
+                Request::Status => Response::Status {
+                    drifted: Vec::new(),
+                    in_sync: 0,
+                    degraded: Some("initial scan in progress…".into()),
+                },
+                _ => Response::Error {
+                    message: "daemon busy (scan in progress) — retry shortly".into(),
+                },
+            };
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Response::Error {
+                message: "daemon state poisoned".into(),
+            };
+        }
+    };
+    match request {
+        Request::Hello { .. } | Request::Subscribe => unreachable!("handled above"),
         Request::Status => {
             let (drifted, in_sync, degraded) = c.status_snapshot();
             Response::Status {

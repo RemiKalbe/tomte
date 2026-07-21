@@ -113,10 +113,12 @@ fn main() -> ExitCode {
     };
     println!("chezmoid: listening on {}", socket_path.display());
     let server = {
-        let core = core.clone();
+        // ServeCtx grabs machine + subscriber handle now, while the core is
+        // still uncontended (the scan below can hold it for minutes).
+        let on_shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(0));
+        let ctx = czui_daemon::server::ServeCtx::new(core.clone(), now_ts, on_shutdown);
         std::thread::spawn(move || {
-            let on_shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(0));
-            if let Err(e) = serve(listener, core, now_ts, on_shutdown) {
+            if let Err(e) = serve(listener, ctx) {
                 eprintln!("chezmoid: server failed: {e}");
             }
         })

@@ -291,7 +291,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                 })
                 .await;
 
-            let (client, status_resp, rows, events) = match boot {
+            let (raw_client, status_resp, rows, events) = match boot {
                 Ok(parts) => {
                     backoff_secs = 1;
                     parts
@@ -307,6 +307,9 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                     continue;
                 }
             };
+            // Arc: the event loop issues background Status refreshes on
+            // ScanDone while the connection stays owned by this task.
+            let client = std::sync::Arc::new(raw_client);
             let hydrated = cx.update_entity(&state, |model, cx| {
                 model.connected = true;
                 if let Response::Status {

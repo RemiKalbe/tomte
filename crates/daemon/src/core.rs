@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use czui_core::chezmoi::{ChezmoiClient, ChezmoiError};
@@ -59,7 +60,10 @@ pub struct DaemonCore {
     in_sync_count: u64,
     degraded: Option<String>,
     paused: bool,
-    subscribers: Vec<Sender<Event>>,
+    /// Shared with the socket server so Subscribe never needs the core
+    /// lock (the initial scan can hold it for minutes on secret-manager
+    /// timeouts — head-of-line blocking the handshake was a real bug).
+    subscribers: std::sync::Arc<Mutex<Vec<Sender<Event>>>>,
 }
 
 impl DaemonCore {
@@ -85,7 +89,7 @@ impl DaemonCore {
             in_sync_count: 0,
             degraded: None,
             paused: false,
-            subscribers: Vec::new(),
+            subscribers: std::sync::Arc::default(),
         })
     }
 
@@ -101,14 +105,23 @@ impl DaemonCore {
         self.paused = paused;
     }
 
+    /// Clone of the shared subscriber list for lock-free-of-core Subscribe.
+    pub fn subscriber_handle(&self) -> std::sync::Arc<Mutex<Vec<Sender<Event>>>> {
+        self.subscribers.clone()
+    }
+
     pub fn subscribe(&mut self) -> Receiver<Event> {
         let (tx, rx) = channel();
-        self.subscribers.push(tx);
+        if let Ok(mut subs) = self.subscribers.lock() {
+            subs.push(tx);
+        }
         rx
     }
 
     fn emit(&mut self, ev: Event) {
-        self.subscribers.retain(|s| s.send(ev.clone()).is_ok());
+        if let Ok(mut subs) = self.subscribers.lock() {
+            subs.retain(|s| s.send(ev.clone()).is_ok());
+        }
     }
 
     pub fn expect_changes(&mut self, paths: &[PathBuf], ttl_secs: u32, now_ts: u64) {

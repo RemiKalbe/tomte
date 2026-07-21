@@ -40,7 +40,12 @@ fn print_status_reports_counts_from_a_live_daemon() {
     let sock = s.root.path().join("d.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let core = Arc::new(Mutex::new(core));
-    std::thread::spawn(move || serve(listener, core, || 42, std::sync::Arc::new(|| {})));
+    std::thread::spawn(move || {
+        serve(
+            listener,
+            czui_daemon::server::ServeCtx::new(core, || 42, std::sync::Arc::new(|| {})),
+        )
+    });
 
     let out = print_status(&sock);
     assert!(
