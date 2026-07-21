@@ -152,7 +152,9 @@ fn verify_connectivity(paths: &Paths) -> ExitCode {
     for _ in 0..60 {
         match client.request(Request::Rescan) {
             Ok(Response::Ok) => break,
-            Ok(Response::Error { message }) if message.contains("busy") => {
+            Ok(Response::Error { message })
+                if message.contains("busy") || message.contains("starting") =>
+            {
                 std::thread::sleep(Duration::from_secs(1));
             }
             Ok(other) => {

@@ -167,3 +167,53 @@ fn second_daemon_defers_to_the_first() {
     assert!(out.status.success(), "second daemon errored: {text}");
     assert!(text.contains("already running"), "{text}");
 }
+
+#[test]
+fn daemon_serves_degraded_status_while_chezmoi_is_unavailable() {
+    // The bug that ate a whole evening: chezmoi hanging (locked secret
+    // manager) used to kill chezmoid at startup, leaving the app retrying a
+    // dead socket forever. Now the daemon binds first and reports why it's
+    // stuck. Simulate "chezmoi unavailable" with a PATH that has no chezmoi.
+    let e2e = E2e::new();
+    let mut daemon = Command::new(&e2e.chezmoid)
+        .env("CZUI_SOCKET", e2e.socket())
+        .env(
+            "CZUI_JOURNAL",
+            e2e.scratch.root.path().join("deg-journal.db"),
+        )
+        .env(
+            "CZUI_SETTINGS",
+            e2e.scratch.root.path().join("deg-settings.toml"),
+        )
+        .env("HOME", &e2e.scratch.home)
+        .env("PATH", "/usr/bin:/bin") // no chezmoi here
+        .spawn()
+        .expect("start chezmoid");
+    let sock = e2e.socket();
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(sock.exists(), "daemon must bind BEFORE resolving chezmoi");
+
+    let out = Command::new(chezmoi_ui_bin())
+        .arg("--print-status")
+        .env("CZUI_SOCKET", &sock)
+        .env("HOME", &e2e.scratch.home)
+        .output()
+        .expect("print-status");
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "print-status failed: {text}");
+    assert!(
+        text.contains("degraded: chezmoid starting"),
+        "expected a 'starting' degraded status, got: {text}"
+    );
+}

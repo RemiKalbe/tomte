@@ -27,7 +27,7 @@ fn connect_status_subscribe_roundtrip() {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::new(served, || 42, std::sync::Arc::new(|| {})),
+            czui_daemon::server::ServeCtx::ready(served, || 42, std::sync::Arc::new(|| {})),
         )
     });
 

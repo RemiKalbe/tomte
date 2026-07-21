@@ -21,7 +21,10 @@ impl Default for ChezmoiOptions {
     fn default() -> Self {
         Self {
             bin: "chezmoi".into(),
-            base_args: Vec::new(),
+            // Never let a subprocess sit on an interactive prompt (spec §9):
+            // a locked 1Password otherwise turns every templated call into a
+            // 30s hang instead of a fast, classifiable failure.
+            base_args: vec!["--no-tty".into(), "--no-pager".into()],
             env: Vec::new(),
             timeout: Duration::from_secs(30),
         }

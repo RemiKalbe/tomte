@@ -47,6 +47,34 @@ fn env_path(var: &str, default: PathBuf) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or(default)
 }
 
+/// Everything that needs a working chezmoi: clients, source dir, journal,
+/// core. Fails fast; the caller decides whether to retry.
+fn build_core(
+    settings: &Settings,
+    journal_path: &std::path::Path,
+    machine: &str,
+    subscribers: Option<Arc<Mutex<Vec<std::sync::mpsc::Sender<czui_proto::Event>>>>>,
+) -> Result<DaemonCore, Box<dyn std::error::Error>> {
+    let runner = Arc::new(SystemRunner);
+    let chezmoi = ChezmoiClient::new(
+        runner.clone(),
+        ChezmoiOptions {
+            env: settings.chezmoi_env(),
+            ..ChezmoiOptions::default()
+        },
+    );
+    let source_dir = chezmoi.source_dir()?;
+    let git = GitClient::new(runner, source_dir);
+    let branch = git.head_branch().unwrap_or_else(|_| "main".into());
+    let remote_ref = format!("origin/{branch}");
+    let journal = Journal::open(journal_path, machine)?;
+    let core = match subscribers {
+        Some(subs) => DaemonCore::new_with_subscribers(chezmoi, git, journal, remote_ref, subs)?,
+        None => DaemonCore::new(chezmoi, git, journal, remote_ref)?,
+    };
+    Ok(core)
+}
+
 fn main() -> ExitCode {
     let once = std::env::args().any(|a| a == "--once");
     let support = app_support_dir();
@@ -61,44 +89,17 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let runner = Arc::new(SystemRunner);
-    let chezmoi = ChezmoiClient::new(
-        runner.clone(),
-        ChezmoiOptions {
-            env: settings.chezmoi_env(),
-            ..ChezmoiOptions::default()
-        },
-    );
-    let source_dir = match chezmoi.source_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("chezmoid: cannot locate chezmoi source dir: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let git = GitClient::new(runner, source_dir.clone());
-    let branch = git.head_branch().unwrap_or_else(|_| "main".into());
-    let remote_ref = format!("origin/{branch}");
     let machine = gethostname::gethostname().to_string_lossy().into_owned();
-    let journal = match Journal::open(&journal_path, &machine) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!(
-                "chezmoid: cannot open journal {}: {e}",
-                journal_path.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut core = match DaemonCore::new(chezmoi, git, journal, remote_ref) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("chezmoid: init failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     if once {
+        // CLI smoke mode: build everything inline, failing fast is correct.
+        let mut core = match build_core(&settings, &journal_path, &machine, None) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("chezmoid: init failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         return match core.full_rescan(now_ts()) {
             Ok(drifted) => {
                 let (list, in_sync, degraded) = core.status_snapshot();
@@ -117,8 +118,6 @@ fn main() -> ExitCode {
             }
         };
     }
-
-    let core = Arc::new(Mutex::new(core));
 
     // Single-instance guard: if a healthy daemon already answers on the
     // socket, exit instead of stealing the path from it (spawn races from
@@ -141,17 +140,45 @@ fn main() -> ExitCode {
         }
     };
     println!("chezmoid: listening on {}", socket_path.display());
+    // Serve immediately with an empty core: clients get instant Hello and an
+    // honest "starting" status while we fight a possibly-slow chezmoi below
+    // (a locked secret manager can stall it for minutes).
+    let subscribers: Arc<Mutex<Vec<std::sync::mpsc::Sender<czui_proto::Event>>>> = Arc::default();
+    let on_shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(0));
+    let ctx = czui_daemon::server::ServeCtx::starting(
+        subscribers.clone(),
+        machine.clone(),
+        now_ts,
+        on_shutdown,
+    );
     let server = {
-        // ServeCtx grabs machine + subscriber handle now, while the core is
-        // still uncontended (the scan below can hold it for minutes).
-        let on_shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(0));
-        let ctx = czui_daemon::server::ServeCtx::new(core.clone(), now_ts, on_shutdown);
+        let ctx = ctx.clone();
         std::thread::spawn(move || {
             if let Err(e) = serve(listener, ctx) {
                 eprintln!("chezmoid: server failed: {e}");
             }
         })
     };
+
+    // Build the core, retrying forever: chezmoi being slow or broken is a
+    // state to report, never a reason to die (spec §10).
+    let core = loop {
+        match build_core(
+            &settings,
+            &journal_path,
+            &machine,
+            Some(subscribers.clone()),
+        ) {
+            Ok(core) => break Arc::new(Mutex::new(core)),
+            Err(e) => {
+                eprintln!("chezmoid: startup blocked ({e}); retrying in 10s");
+                ctx.set_starting_error(e.to_string());
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        }
+    };
+    ctx.set_core(core.clone());
+    println!("chezmoid: core ready");
 
     // Initial scan. A failure must not kill the daemon — the hourly rescan
     // and manual Rescan requests can recover it (spec §10).
@@ -176,6 +203,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    let source_dir = core.lock().expect("core lock").source_dir().to_path_buf();
     {
         let c = core.lock().expect("core lock");
         for p in c.watch_paths() {

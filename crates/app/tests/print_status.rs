@@ -43,7 +43,7 @@ fn print_status_reports_counts_from_a_live_daemon() {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::new(core, || 42, std::sync::Arc::new(|| {})),
+            czui_daemon::server::ServeCtx::ready(core, || 42, std::sync::Arc::new(|| {})),
         )
     });
 

@@ -29,7 +29,7 @@ fn setup() -> (Scratch, Arc<Mutex<DaemonCore>>, UnixStream) {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::new(served, || 1000, Arc::new(|| {})),
+            czui_daemon::server::ServeCtx::ready(served, || 1000, Arc::new(|| {})),
         )
     });
     let stream = UnixStream::connect(&sock).unwrap();
@@ -196,7 +196,7 @@ fn shutdown_replies_ok_then_fires_hook() {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::new(
+            czui_daemon::server::ServeCtx::ready(
                 core,
                 || 1000,
                 Arc::new(move || hook_flag.store(true, Ordering::SeqCst)),
@@ -240,7 +240,7 @@ fn handshake_and_status_survive_a_long_scan_holding_the_core() {
     let sock = s.root.path().join("busy.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     // ServeCtx must be built BEFORE the lock is contended (as the binary does).
-    let ctx = czui_daemon::server::ServeCtx::new(core.clone(), || 7, Arc::new(|| {}));
+    let ctx = czui_daemon::server::ServeCtx::ready(core.clone(), || 7, Arc::new(|| {}));
     std::thread::spawn(move || serve(listener, ctx));
 
     // Simulate a minutes-long initial scan: hold the core lock for the whole test.

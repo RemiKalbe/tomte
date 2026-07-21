@@ -12,22 +12,43 @@ use czui_proto::{
 
 use crate::core::DaemonCore;
 
-/// Everything a connection needs that must NOT wait on the core lock:
-/// Hello (machine name) and Subscribe (shared sender list) stay instant even
-/// while a long scan holds the core (spec §3.2 responsiveness).
+/// Everything a connection needs that must NOT wait on the core — or on the
+/// core even EXISTING: the daemon binds its socket before it can talk to
+/// chezmoi at all (a locked secret manager can stall chezmoi for minutes),
+/// so Hello/Subscribe answer instantly and Status degrades honestly until
+/// the core is ready (spec §3.2, §10).
 #[derive(Clone)]
 pub struct ServeCtx {
-    pub core: Arc<Mutex<DaemonCore>>,
+    /// Set once startup manages to build the core; empty while starting.
+    pub core: Arc<std::sync::OnceLock<Arc<Mutex<DaemonCore>>>>,
     pub subscribers: Arc<Mutex<Vec<std::sync::mpsc::Sender<Event>>>>,
     pub machine: String,
+    /// Last startup error, shown as degraded status while `core` is empty.
+    pub starting_error: Arc<Mutex<String>>,
     pub now_fn: fn() -> u64,
     pub on_shutdown: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl ServeCtx {
-    /// Build from a core that is not yet contended (call BEFORE the first
-    /// scan starts).
-    pub fn new(
+    /// A context whose core arrives later via [`ServeCtx::set_core`].
+    pub fn starting(
+        subscribers: Arc<Mutex<Vec<std::sync::mpsc::Sender<Event>>>>,
+        machine: String,
+        now_fn: fn() -> u64,
+        on_shutdown: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            core: Arc::new(std::sync::OnceLock::new()),
+            subscribers,
+            machine,
+            starting_error: Arc::new(Mutex::new("starting".to_string())),
+            now_fn,
+            on_shutdown,
+        }
+    }
+
+    /// Build from an already-ready core (tests; call while uncontended).
+    pub fn ready(
         core: Arc<Mutex<DaemonCore>>,
         now_fn: fn() -> u64,
         on_shutdown: Arc<dyn Fn() + Send + Sync>,
@@ -36,12 +57,18 @@ impl ServeCtx {
             let c = core.lock().expect("core uncontended at setup");
             (c.subscriber_handle(), c.machine().to_string())
         };
-        Self {
-            core,
-            subscribers,
-            machine,
-            now_fn,
-            on_shutdown,
+        let ctx = Self::starting(subscribers, machine, now_fn, on_shutdown);
+        ctx.set_core(core);
+        ctx
+    }
+
+    pub fn set_core(&self, core: Arc<Mutex<DaemonCore>>) {
+        let _ = self.core.set(core);
+    }
+
+    pub fn set_starting_error(&self, message: String) {
+        if let Ok(mut e) = self.starting_error.lock() {
+            *e = message;
         }
     }
 }
@@ -173,10 +200,30 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
         _ => {}
     }
 
+    // Startup may still be fighting a slow chezmoi (locked secret manager):
+    // no core yet means "starting", not an outage.
+    let Some(core) = ctx.core.get() else {
+        let why = ctx
+            .starting_error
+            .lock()
+            .map(|e| e.clone())
+            .unwrap_or_else(|_| "starting".to_string());
+        return match request {
+            Request::Status => Response::Status {
+                drifted: Vec::new(),
+                in_sync: 0,
+                degraded: Some(format!("chezmoid starting: {why}")),
+            },
+            _ => Response::Error {
+                message: format!("chezmoid still starting: {why}"),
+            },
+        };
+    };
+
     // Everything else needs the core. Never block indefinitely: if a scan
     // holds the lock, degrade honestly (spec §10) instead of timing out the
     // client.
-    let mut c = match ctx.core.try_lock() {
+    let mut c = match core.try_lock() {
         Ok(c) => c,
         Err(std::sync::TryLockError::WouldBlock) => {
             return match request {

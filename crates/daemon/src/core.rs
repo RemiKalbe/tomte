@@ -73,6 +73,18 @@ impl DaemonCore {
         journal: Journal,
         remote_ref: String,
     ) -> Result<Self, DaemonError> {
+        Self::new_with_subscribers(chezmoi, git, journal, remote_ref, std::sync::Arc::default())
+    }
+
+    /// Like [`DaemonCore::new`], but sharing an externally-owned subscriber
+    /// list — the server hands out subscriptions before the core exists.
+    pub fn new_with_subscribers(
+        chezmoi: ChezmoiClient,
+        git: GitClient,
+        journal: Journal,
+        remote_ref: String,
+        subscribers: std::sync::Arc<Mutex<Vec<Sender<Event>>>>,
+    ) -> Result<Self, DaemonError> {
         let source_dir = chezmoi.source_dir()?;
         let managed: BTreeSet<PathBuf> = chezmoi.managed()?.into_iter().collect();
         let scanner = DriftScanner::new(chezmoi.clone(), git.clone(), remote_ref.clone());
@@ -89,8 +101,14 @@ impl DaemonCore {
             in_sync_count: 0,
             degraded: None,
             paused: false,
-            subscribers: std::sync::Arc::default(),
+            subscribers,
         })
+    }
+
+    /// The resolved chezmoi source directory (watcher needs it for the
+    /// recursive-watch decision).
+    pub fn source_dir(&self) -> &Path {
+        &self.source_dir
     }
 
     pub fn journal(&self) -> &Journal {
