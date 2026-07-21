@@ -23,6 +23,26 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
+/// Probe the socket: connect, send Hello, expect a reply within 1s.
+fn healthy_daemon_at(socket: &std::path::Path) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let frame = czui_proto::ClientFrame {
+        id: 0,
+        request: czui_proto::Request::Hello {
+            version: czui_proto::PROTOCOL_VERSION,
+        },
+    };
+    if czui_proto::write_frame(&mut stream, &frame).is_err() || stream.flush().is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).is_ok() && line.contains("hello_ok")
+}
+
 fn env_path(var: &str, default: PathBuf) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or(default)
 }
@@ -99,6 +119,15 @@ fn main() -> ExitCode {
     }
 
     let core = Arc::new(Mutex::new(core));
+
+    // Single-instance guard: if a healthy daemon already answers on the
+    // socket, exit instead of stealing the path from it (spawn races from
+    // the app must converge on ONE daemon). A stale socket file (no
+    // listener / no Hello reply) is reclaimed below.
+    if healthy_daemon_at(&socket_path) {
+        println!("chezmoid: already running at {}", socket_path.display());
+        return ExitCode::SUCCESS;
+    }
 
     // Bind the socket BEFORE the initial scan: the scan takes seconds on
     // large dotfile sets and clients must be able to connect immediately

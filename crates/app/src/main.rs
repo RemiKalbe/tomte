@@ -100,6 +100,82 @@ fn resolve_paths() -> Paths {
     }
 }
 
+/// End-to-end connectivity diagnostic (also driven by the e2e test): the
+/// exact GUI boot path — spawn if needed, hello, status, subscribe, first
+/// push — with one line per step so failures name their step.
+fn verify_connectivity(paths: &Paths) -> ExitCode {
+    use std::time::Instant;
+    println!("[1/5] socket: {}", paths.socket.display());
+    println!("      chezmoid: {}", paths.chezmoid.display());
+    let t0 = Instant::now();
+    let client = match IpcClient::connect_or_spawn(&paths.socket, &paths.chezmoid) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[2/5] FAIL connect_or_spawn: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("[2/5] connected + hello ok in {:?}", t0.elapsed());
+    match client.request(Request::Status) {
+        Ok(Response::Status {
+            drifted,
+            in_sync,
+            degraded,
+        }) => println!(
+            "[3/5] status ok: {} drifted, {in_sync} in sync, degraded: {}",
+            drifted.len(),
+            degraded.as_deref().unwrap_or("no")
+        ),
+        Ok(other) => {
+            eprintln!("[3/5] FAIL status: unexpected reply {other:?}");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("[3/5] FAIL status: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let events = match client.subscribe() {
+        Ok(rx) => {
+            println!("[4/5] subscribe ok");
+            rx
+        }
+        Err(e) => {
+            eprintln!("[4/5] FAIL subscribe: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Force a fresh scan so a push is guaranteed even if the initial scan
+    // finished before we subscribed. The daemon may be mid-scan (busy) —
+    // retry until it accepts.
+    println!("[5/5] requesting rescan and waiting for a push, up to 120s…");
+    for _ in 0..60 {
+        match client.request(Request::Rescan) {
+            Ok(Response::Ok) => break,
+            Ok(Response::Error { message }) if message.contains("busy") => {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Ok(other) => {
+                eprintln!("[5/5] FAIL rescan: unexpected reply {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("[5/5] FAIL rescan: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    match events.recv_timeout(Duration::from_secs(120)) {
+        Ok(ev) => println!("[5/5] push received after {:?}: {ev:?}", t0.elapsed()),
+        Err(e) => {
+            eprintln!("[5/5] FAIL: no push within 120s ({e})");
+            return ExitCode::FAILURE;
+        }
+    }
+    println!("CONNECTIVITY OK");
+    ExitCode::SUCCESS
+}
+
 /// Headless status probe for CI/agents: connect (never spawn a daemon),
 /// print the drift counts, exit. No windows, no status item.
 fn print_status(socket: &Path) -> ExitCode {
@@ -270,16 +346,27 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
         // launch, may be restarted after a settings save (Shutdown request),
         // or may crash — the app heals the connection on its own.
         let mut backoff_secs: u64 = 1;
+        let mut last_spawn: Option<Instant> = None;
         loop {
             let (socket, journal, chezmoid) = (
                 paths.socket.clone(),
                 paths.journal.clone(),
                 paths.chezmoid.clone(),
             );
+            // Spawn at most once per minute — a dying daemon must not turn
+            // the reconnect loop into a spawn storm.
+            let may_spawn = last_spawn.is_none_or(|t| t.elapsed() > Duration::from_secs(60));
+            if may_spawn {
+                last_spawn = Some(Instant::now());
+            }
             let boot = cx
                 .background_executor()
                 .spawn(async move {
-                    let client = IpcClient::connect_or_spawn(&socket, &chezmoid)?;
+                    let client = if may_spawn {
+                        IpcClient::connect_or_spawn(&socket, &chezmoid)?
+                    } else {
+                        IpcClient::connect(&socket)?
+                    };
                     let status = client.request(Request::Status)?;
                     // Read-only timeline hydrate: a missing journal (fresh
                     // install, daemon not yet scanned) is fine — start empty.
@@ -421,6 +508,9 @@ fn spawn_freshness_loop(cx: &mut App, state: Entity<SyncModel>, status: Rc<Statu
 
 fn main() -> ExitCode {
     let paths = resolve_paths();
+    if std::env::args().any(|a| a == "--verify-connectivity") {
+        return verify_connectivity(&resolve_paths());
+    }
     if std::env::args().any(|a| a == "--print-status") {
         return print_status(&paths.socket);
     }

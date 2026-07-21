@@ -19,10 +19,19 @@ pub enum IpcError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Proto(String),
-    #[error("request timed out")]
+    #[error("request timed out (connected, but no reply within 10s)")]
     Timeout,
     #[error("daemon rejected connection: {0}")]
     Rejected(String),
+    #[error(
+        "spawned chezmoid but could not connect within {waited_secs}s; last error: {last}. \
+         Daemon stderr (if any) is in {log}"
+    )]
+    SpawnedButUnreachable {
+        waited_secs: u64,
+        last: String,
+        log: String,
+    },
 }
 
 pub struct IpcClient {
@@ -115,19 +124,44 @@ impl IpcClient {
     }
 
     pub fn connect_or_spawn(socket: &Path, chezmoid_bin: &Path) -> Result<Self, IpcError> {
-        if let Ok(c) = Self::connect(socket) {
-            return Ok(c);
-        }
-        let _child = std::process::Command::new(chezmoid_bin)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        for _ in 0..25 {
-            std::thread::sleep(Duration::from_millis(200));
-            if let Ok(c) = Self::connect(socket) {
-                return Ok(c);
+        match Self::connect(socket) {
+            Ok(c) => return Ok(c),
+            Err(first) => {
+                eprintln!(
+                    "chezmoi-ui: no daemon at {} ({first}); spawning chezmoid",
+                    socket.display()
+                );
             }
         }
-        Err(IpcError::Timeout)
+        // Capture the daemon's output — a silently dying child was
+        // undiagnosable when this was Stdio::null() (first-launch bug).
+        let log_path = socket.with_file_name("chezmoid.spawn.log");
+        let log = std::fs::File::create(&log_path)?;
+        let log_err = log.try_clone()?;
+        let mut child = std::process::Command::new(chezmoid_bin)
+            .stdout(log)
+            .stderr(log_err)
+            .spawn()?;
+        let mut last = String::from("never attempted");
+        for _ in 0..75 {
+            std::thread::sleep(Duration::from_millis(200));
+            // A dead child will never bind — fail fast with its exit status.
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(IpcError::SpawnedButUnreachable {
+                    waited_secs: 0,
+                    last: format!("chezmoid exited at startup with {status}"),
+                    log: log_path.display().to_string(),
+                });
+            }
+            match Self::connect(socket) {
+                Ok(c) => return Ok(c),
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(IpcError::SpawnedButUnreachable {
+            waited_secs: 15,
+            last,
+            log: log_path.display().to_string(),
+        })
     }
 }
