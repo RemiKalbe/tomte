@@ -266,115 +266,132 @@ fn apply_and_signal(model: &mut SyncModel, ev: Event) -> NotifySignal {
 /// entity. Every blocking IpcClient/journal call stays off the main thread.
 fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Paths) {
     cx.spawn(async move |cx| {
-        let Paths {
-            socket,
-            journal,
-            chezmoid,
-            ..
-        } = paths;
-        let boot = cx
-            .background_executor()
-            .spawn(async move {
-                let client = IpcClient::connect_or_spawn(&socket, &chezmoid)?;
-                let status = client.request(Request::Status)?;
-                // Read-only timeline hydrate: a missing journal (fresh
-                // install, daemon not yet scanned) is fine — start empty.
-                let rows = Journal::open_read_only(&journal, "app")
-                    .and_then(|j| j.timeline(TIMELINE_CAP as u32, None))
-                    .unwrap_or_default();
-                let events = client.subscribe()?;
-                Ok::<_, IpcError>((client, status, rows, events))
-            })
-            .await;
-
-        let (client, status_resp, rows, events) = match boot {
-            Ok(parts) => parts,
-            Err(e) => {
-                // Model stays connected=false; the menu already says so.
-                eprintln!("chezmoi-ui: daemon connection failed: {e}");
-                return;
-            }
-        };
-        // Keep the connection (writer + reader thread) alive for the app's
-        // lifetime; later plan tasks reuse it for on-demand requests.
-        let _client = client;
-
-        let hydrated = cx.update_entity(&state, |model, cx| {
-            model.connected = true;
-            if let Response::Status {
-                drifted,
-                in_sync,
-                degraded,
-            } = status_resp
-            {
-                model.hydrate_status(drifted, in_sync, degraded);
-            }
-            model.hydrate_timeline(rows);
-            cx.notify();
-        });
-        if hydrated.is_err() {
-            return; // app released
-        }
-
-        // Live pushes: poll without blocking the main thread (same pattern
-        // as the menu-command loop; push rates are low). New drift coalesces
-        // into 5s notification windows; osascript runs on the background
-        // executor (plan Task 7).
-        let mut pending_drift: usize = 0;
-        let mut drift_window_started: Option<Instant> = None;
+        // Reconnect forever: chezmoid may still be mid-initial-scan at app
+        // launch, may be restarted after a settings save (Shutdown request),
+        // or may crash — the app heals the connection on its own.
+        let mut backoff_secs: u64 = 1;
         loop {
-            // Flush an expired coalescing window: exactly one notification
-            // per window, no matter how many pushes landed inside it.
-            if let Some(started) = drift_window_started
-                && started.elapsed() >= DRIFT_NOTIFY_WINDOW
-            {
-                let body = drift_body(pending_drift);
-                pending_drift = 0;
-                drift_window_started = None;
-                cx.background_executor()
-                    .spawn(async move { notify(&SystemRunner, "chezmoi-ui", &body) })
-                    .detach();
+            let (socket, journal, chezmoid) = (
+                paths.socket.clone(),
+                paths.journal.clone(),
+                paths.chezmoid.clone(),
+            );
+            let boot = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = IpcClient::connect_or_spawn(&socket, &chezmoid)?;
+                    let status = client.request(Request::Status)?;
+                    // Read-only timeline hydrate: a missing journal (fresh
+                    // install, daemon not yet scanned) is fine — start empty.
+                    let rows = Journal::open_read_only(&journal, "app")
+                        .and_then(|j| j.timeline(TIMELINE_CAP as u32, None))
+                        .unwrap_or_default();
+                    let events = client.subscribe()?;
+                    Ok::<_, IpcError>((client, status, rows, events))
+                })
+                .await;
+
+            let (client, status_resp, rows, events) = match boot {
+                Ok(parts) => {
+                    backoff_secs = 1;
+                    parts
+                }
+                Err(e) => {
+                    eprintln!(
+                        "chezmoi-ui: daemon connection failed (retrying in {backoff_secs}s): {e}"
+                    );
+                    cx.background_executor()
+                        .timer(Duration::from_secs(backoff_secs))
+                        .await;
+                    backoff_secs = (backoff_secs * 2).min(15);
+                    continue;
+                }
+            };
+            let hydrated = cx.update_entity(&state, |model, cx| {
+                model.connected = true;
+                if let Response::Status {
+                    drifted,
+                    in_sync,
+                    degraded,
+                } = status_resp
+                {
+                    model.hydrate_status(drifted, in_sync, degraded);
+                }
+                model.hydrate_timeline(rows);
+                cx.notify();
+            });
+            if hydrated.is_err() {
+                return; // app released
             }
-            match events.try_recv() {
-                Ok(ev) => {
-                    let signal = cx.update_entity(&state, |model, cx| {
-                        let signal = apply_and_signal(model, ev);
-                        cx.notify();
-                        signal
-                    });
-                    match signal {
-                        Err(_) => break, // app released
-                        Ok(NotifySignal::NewDrift) => {
-                            pending_drift += 1;
-                            drift_window_started.get_or_insert_with(Instant::now);
+
+            // Live pushes: poll without blocking the main thread (same pattern
+            // as the menu-command loop; push rates are low). New drift coalesces
+            // into 5s notification windows; osascript runs on the background
+            // executor (plan Task 7).
+            let mut pending_drift: usize = 0;
+            let mut drift_window_started: Option<Instant> = None;
+            loop {
+                // Flush an expired coalescing window: exactly one notification
+                // per window, no matter how many pushes landed inside it.
+                if let Some(started) = drift_window_started
+                    && started.elapsed() >= DRIFT_NOTIFY_WINDOW
+                {
+                    let body = drift_body(pending_drift);
+                    pending_drift = 0;
+                    drift_window_started = None;
+                    cx.background_executor()
+                        .spawn(async move { notify(&SystemRunner, "chezmoi-ui", &body) })
+                        .detach();
+                }
+                match events.try_recv() {
+                    Ok(ev) => {
+                        let signal = cx.update_entity(&state, |model, cx| {
+                            let signal = apply_and_signal(model, ev);
+                            cx.notify();
+                            signal
+                        });
+                        match signal {
+                            Err(_) => break, // app released
+                            Ok(NotifySignal::NewDrift) => {
+                                pending_drift += 1;
+                                drift_window_started.get_or_insert_with(Instant::now);
+                            }
+                            Ok(NotifySignal::RemoteAdvanced(target)) => {
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        notify(
+                                            &SystemRunner,
+                                            "chezmoi-ui",
+                                            &remote_advanced_body(&target),
+                                        );
+                                    })
+                                    .detach();
+                            }
+                            Ok(NotifySignal::None) => {}
                         }
-                        Ok(NotifySignal::RemoteAdvanced(target)) => {
-                            cx.background_executor()
-                                .spawn(async move {
-                                    notify(
-                                        &SystemRunner,
-                                        "chezmoi-ui",
-                                        &remote_advanced_body(&target),
-                                    );
-                                })
-                                .detach();
+                    }
+                    Err(TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        // Daemon went away (settings restart, crash): show it,
+                        // then fall through to the reconnect loop.
+                        if cx
+                            .update_entity(&state, |model, cx| {
+                                model.connected = false;
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            return; // app released
                         }
-                        Ok(NotifySignal::None) => {}
+                        break;
                     }
                 }
-                Err(TryRecvError::Empty) => {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(100))
-                        .await;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    let _ = cx.update_entity(&state, |model, cx| {
-                        model.connected = false;
-                        cx.notify();
-                    });
-                    break;
-                }
             }
+            drop(client);
         }
     })
     .detach();

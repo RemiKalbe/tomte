@@ -24,7 +24,7 @@ fn connect_status_subscribe_roundtrip() {
     let sock = s.root.path().join("d.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let served = core.clone();
-    std::thread::spawn(move || serve(listener, served, || 42));
+    std::thread::spawn(move || serve(listener, served, || 42, std::sync::Arc::new(|| {})));
 
     let client = IpcClient::connect(&sock).unwrap();
     match client.request(Request::Status).unwrap() {

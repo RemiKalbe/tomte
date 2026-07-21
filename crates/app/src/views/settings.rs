@@ -4,9 +4,9 @@
 //! gpui has no stock text input, so every control is a stepper or a picker
 //! row. All blocking work — the settings.toml read/write and `op account
 //! list` — runs on the background executor and lands back in the entity via
-//! `WeakEntity::update` (spec §3.2 non-blocking rule). Saving shows a
-//! "restart chezmoid to apply" notice instead of restarting the daemon: it
-//! reads settings at boot only, and v0 never kills a daemon it may not own.
+//! `WeakEntity::update` (spec §3.2 non-blocking rule). Saving writes the
+//! TOML, then asks the daemon to Shutdown; the app's reconnect loop respawns
+//! it with the new settings — no user action needed (spec §9).
 
 use std::path::{Path, PathBuf};
 
@@ -158,8 +158,8 @@ fn load_accounts_blocking(runner: &dyn CommandRunner) -> AccountsState {
 enum SaveState {
     Idle,
     Saving,
-    /// Written. The daemon reads settings at boot, so the user must restart
-    /// chezmoid — v0 shows the notice rather than auto-restarting.
+    /// Written, and the daemon was asked to restart (the reconnect loop
+    /// respawns it with the new settings).
     Saved,
     Error(String),
 }
@@ -255,6 +255,7 @@ impl SettingsView {
         let path = self.paths.settings.clone();
         self.save = SaveState::Saving;
         cx.notify();
+        let socket = self.paths.socket.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -262,7 +263,15 @@ impl SettingsView {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&path, text)
+                    std::fs::write(&path, text)?;
+                    // Restart chezmoid so the new settings apply without user
+                    // action: ask it to exit; the app's reconnect loop
+                    // respawns it (spec §9). Failure to reach the daemon is
+                    // fine — it simply wasn't running.
+                    if let Ok(client) = czui_app::ipc::IpcClient::connect(&socket) {
+                        let _ = client.request(czui_proto::Request::Shutdown);
+                    }
+                    Ok::<(), std::io::Error>(())
                 })
                 .await;
             this.update(cx, |view, cx| {
@@ -436,7 +445,7 @@ impl SettingsView {
                 div()
                     .text_sm()
                     .text_color(theme.drift)
-                    .child("Saved — restart chezmoid to apply"),
+                    .child("Saved — chezmoid restarting with new settings"),
             ),
             SaveState::Error(e) => row.child(
                 div()

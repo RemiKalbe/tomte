@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -30,6 +30,9 @@ pub enum Request {
         ttl_secs: u32,
     },
     Rescan,
+    /// Ask the daemon to exit cleanly (the app respawns it after settings
+    /// changes; spec §9 restart-to-apply without user action).
+    Shutdown,
     Pause,
     Resume,
     SnapshotBlobs {
@@ -246,6 +249,7 @@ mod tests {
                 ttl_secs: 1,
             },
             Request::Rescan,
+            Request::Shutdown,
             Request::Pause,
             Request::Resume,
             Request::SnapshotBlobs {

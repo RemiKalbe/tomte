@@ -26,7 +26,7 @@ fn setup() -> (Scratch, Arc<Mutex<DaemonCore>>, UnixStream) {
     let sock = s.root.path().join("d.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let served = core.clone();
-    std::thread::spawn(move || serve(listener, served, || 1000));
+    std::thread::spawn(move || serve(listener, served, || 1000, std::sync::Arc::new(|| {})));
     let stream = UnixStream::connect(&sock).unwrap();
     (s, core, stream)
 }
@@ -171,4 +171,52 @@ fn session_flow_over_ipc() {
     let kinds: Vec<_> = tl.iter().map(|e| e.kind.as_str().to_string()).collect();
     assert!(kinds.contains(&"session_start".to_string()));
     assert!(kinds.contains(&"session_end".to_string()));
+}
+
+#[test]
+fn shutdown_replies_ok_then_fires_hook() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let s = Scratch::new();
+    let chezmoi: ChezmoiClient = s.chezmoi();
+    let git = GitClient::new(Arc::new(SystemRunner), s.source.clone());
+    let journal = Journal::open_in_memory("shutdown-test").unwrap();
+    let core = Arc::new(Mutex::new(
+        DaemonCore::new(chezmoi, git, journal, "origin/main".into()).unwrap(),
+    ));
+    let sock = s.root.path().join("sd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let fired = Arc::new(AtomicBool::new(false));
+    let hook_flag = fired.clone();
+    std::thread::spawn(move || {
+        serve(
+            listener,
+            core,
+            || 1000,
+            Arc::new(move || hook_flag.store(true, Ordering::SeqCst)),
+        )
+    });
+
+    let mut stream = UnixStream::connect(&sock).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    send(
+        &mut stream,
+        1,
+        Request::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    );
+    recv(&mut reader);
+    send(&mut stream, 2, Request::Shutdown);
+    // the Ok reply must arrive BEFORE the hook (binary's hook is exit(0))
+    assert!(matches!(
+        recv(&mut reader),
+        ServerFrame::Reply {
+            id: 2,
+            response: Response::Ok
+        }
+    ));
+    // hook fires right after the reply; give the thread a beat
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(fired.load(Ordering::SeqCst));
 }

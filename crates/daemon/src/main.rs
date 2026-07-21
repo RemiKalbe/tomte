@@ -78,27 +78,56 @@ fn main() -> ExitCode {
         }
     };
 
-    match core.full_rescan(now_ts()) {
-        Ok(drifted) => {
-            let (list, in_sync, degraded) = core.status_snapshot();
-            if let Some(hint) = &degraded {
-                eprintln!("degraded scan: {hint}");
-            }
-            for d in &list {
-                println!("{:<22} {}", d.class, d.target.display());
-            }
-            println!("-- {drifted} drifted, {in_sync} in sync");
-        }
-        Err(e) => {
-            eprintln!("chezmoid: initial scan failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
     if once {
-        return ExitCode::SUCCESS;
+        return match core.full_rescan(now_ts()) {
+            Ok(drifted) => {
+                let (list, in_sync, degraded) = core.status_snapshot();
+                if let Some(hint) = &degraded {
+                    eprintln!("degraded scan: {hint}");
+                }
+                for d in &list {
+                    println!("{:<22} {}", d.class, d.target.display());
+                }
+                println!("-- {drifted} drifted, {in_sync} in sync");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("chezmoid: initial scan failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let core = Arc::new(Mutex::new(core));
+
+    // Bind the socket BEFORE the initial scan: the scan takes seconds on
+    // large dotfile sets and clients must be able to connect immediately
+    // (their requests block on the core mutex until the scan finishes).
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("chezmoid: cannot bind {}: {e}", socket_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("chezmoid: listening on {}", socket_path.display());
+    let server = {
+        let core = core.clone();
+        std::thread::spawn(move || {
+            let on_shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(0));
+            if let Err(e) = serve(listener, core, now_ts, on_shutdown) {
+                eprintln!("chezmoid: server failed: {e}");
+            }
+        })
+    };
+
+    // Initial scan. A failure must not kill the daemon — the hourly rescan
+    // and manual Rescan requests can recover it (spec §10).
+    match core.lock().expect("core lock").full_rescan(now_ts()) {
+        Ok(drifted) => println!("chezmoid: initial scan done, {drifted} drifted"),
+        Err(e) => eprintln!("chezmoid: initial scan failed: {e}"),
+    }
 
     // watcher → debouncer
     let (debouncer, tx) = Debouncer::new(Duration::from_millis(500));
@@ -187,19 +216,7 @@ fn main() -> ExitCode {
         });
     }
 
-    // socket server (foreground)
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("chezmoid: cannot bind {}: {e}", socket_path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    println!("chezmoid: listening on {}", socket_path.display());
-    if let Err(e) = serve(listener, core, now_ts) {
-        eprintln!("chezmoid: server failed: {e}");
-        return ExitCode::FAILURE;
-    }
+    // The accept loop owns the process from here.
+    let _ = server.join();
     ExitCode::SUCCESS
 }

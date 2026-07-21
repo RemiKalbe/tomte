@@ -16,12 +16,14 @@ pub fn serve(
     listener: UnixListener,
     core: Arc<Mutex<DaemonCore>>,
     now_fn: fn() -> u64,
+    on_shutdown: Arc<dyn Fn() + Send + Sync>,
 ) -> std::io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         let core = core.clone();
+        let on_shutdown = on_shutdown.clone();
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, core, now_fn);
+            let _ = handle_connection(stream, core, now_fn, on_shutdown);
         });
     }
     Ok(())
@@ -36,6 +38,7 @@ fn handle_connection(
     stream: UnixStream,
     core: Arc<Mutex<DaemonCore>>,
     now_fn: fn() -> u64,
+    on_shutdown: Arc<dyn Fn() + Send + Sync>,
 ) -> std::io::Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
     let out = Arc::new(Mutex::new(stream));
@@ -92,6 +95,13 @@ fn handle_connection(
             continue;
         }
 
+        // Shutdown is special: the reply must reach the client BEFORE the
+        // hook runs (the binary's hook is process::exit).
+        if matches!(frame.request, Request::Shutdown) {
+            reply(&out, id, Response::Ok)?;
+            on_shutdown();
+            return Ok(());
+        }
         let response = dispatch(&core, frame.request, &out, now_fn);
         reply(&out, id, response)?;
     }
@@ -171,6 +181,7 @@ fn dispatch(
             c.expect_changes(&paths, ttl_secs, now);
             Response::Ok
         }
+        Request::Shutdown => Response::Ok, // handled in handle_connection
         Request::Rescan => match c.full_rescan(now) {
             Ok(_) => Response::Ok,
             Err(e) => Response::Error {
