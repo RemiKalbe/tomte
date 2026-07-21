@@ -69,6 +69,20 @@ impl Journal {
         Self::init(Connection::open_in_memory()?, machine)
     }
 
+    /// Read-only handle for the app (spec §8: single writer = daemon). Never
+    /// creates or migrates the database: opening a missing file is an error,
+    /// and every write through this handle fails at the SQLite layer.
+    pub fn open_read_only(path: &Path, machine: &str) -> Result<Self, JournalError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self {
+            conn,
+            machine: machine.to_string(),
+        })
+    }
+
     fn init(conn: Connection, machine: &str) -> Result<Self, JournalError> {
         conn.execute_batch(SCHEMA)?;
         conn.execute(
@@ -594,6 +608,72 @@ mod tests {
         assert_eq!(j.gc_blobs().unwrap(), 1);
         assert!(j.has_blob(&kept).unwrap());
         assert!(!j.has_blob(&orphan).unwrap());
+    }
+
+    #[test]
+    fn open_read_only_reads_but_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let rw = Journal::open(&path, "writer").unwrap();
+        rw.record_event(NewEvent {
+            target: Some(Path::new("/home/u/.zshrc")),
+            ts: 10,
+            kind: EventKind::DestChanged,
+            from_hash: None,
+            to_hash: None,
+            meta: Some(serde_json::json!({"class": "destination_drift"})),
+        })
+        .unwrap();
+
+        // reads work while the writer connection is still open (WAL)
+        let ro = Journal::open_read_only(&path, "reader").unwrap();
+        assert_eq!(ro.machine(), "reader");
+        assert_eq!(ro.schema_version().unwrap(), 1);
+        let tl = ro.timeline(10, None).unwrap();
+        assert_eq!(tl.len(), 1);
+        assert_eq!(tl[0].kind, "dest_changed");
+        assert_eq!(tl[0].machine, "writer");
+        assert_eq!(tl[0].meta.as_ref().unwrap()["class"], "destination_drift");
+
+        // writes through the read-only handle must fail
+        let err = ro
+            .record_event(NewEvent {
+                target: Some(Path::new("/home/u/.zshrc")),
+                ts: 20,
+                kind: EventKind::Applied,
+                from_hash: None,
+                to_hash: None,
+                meta: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("readonly"),
+            "expected a readonly-database error, got: {err}"
+        );
+        assert!(ro.put_blob(b"nope", 30).is_err());
+
+        // and the writer is unaffected
+        rw.record_event(NewEvent {
+            target: None,
+            ts: 40,
+            kind: EventKind::Fetch,
+            from_hash: None,
+            to_hash: None,
+            meta: None,
+        })
+        .unwrap();
+        assert_eq!(ro.timeline(10, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn open_read_only_missing_file_fails_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-journal.db");
+        assert!(Journal::open_read_only(&missing, "m").is_err());
+        assert!(
+            !missing.exists(),
+            "read-only open must never create the file"
+        );
     }
 
     #[test]
