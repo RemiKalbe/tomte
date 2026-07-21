@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/daemon", "crates/journal", "crates/proto"]
+members = ["crates/app", "crates/core", "crates/daemon", "crates/journal", "crates/proto"]
 
 [workspace.package]
 edition = "2024"
@@ -8,6 +8,10 @@ license = "MIT"
 
 [workspace.dependencies]
 gethostname = "1"
+gpui = "=0.2.2"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
 imara-diff = "0.2"
 notify = "8"
 toml = "1"

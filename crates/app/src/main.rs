@@ -1,0 +1,555 @@
+//! chezmoi-ui — menubar-resident GPUI app (spec §3.2).
+
+// Shared modules (ipc, model, theme) live in the czui_app lib target;
+// views and the AppKit platform layer stay bin-only.
+mod notify_osa;
+mod platform_mac;
+mod views;
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::rc::Rc;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use czui_app::ipc::{IpcClient, IpcError};
+use czui_app::model::{SyncModel, TIMELINE_CAP};
+use czui_core::cmd::SystemRunner;
+use czui_journal::Journal;
+use czui_proto::{Event, Request, Response};
+use gpui::{
+    App, AppContext as _, Application, Bounds, Entity, WindowBounds, WindowOptions, px, size,
+};
+use objc2::MainThreadMarker;
+
+use notify_osa::{drift_body, notify, remote_advanced_body};
+use platform_mac::{MenuCommand, MenuSpec, StatusItem, set_accessory_policy};
+use views::settings::SettingsPaths;
+use views::{Route, Shell};
+
+fn now_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Resolved daemon-facing paths. Env overrides and defaults must match
+/// chezmoid's (`czui_daemon::settings`): both sides of the socket have to
+/// agree on where it lives.
+struct Paths {
+    socket: PathBuf,
+    journal: PathBuf,
+    /// Written and displayed by the Settings view; resolved here so all
+    /// path policy lives in one place.
+    settings: PathBuf,
+    /// The chezmoid binary `connect_or_spawn` launches when the daemon is
+    /// not already running.
+    chezmoid: PathBuf,
+}
+
+impl Paths {
+    /// The subset the Settings view displays and writes (plan Task 7),
+    /// handed through the Shell so views never re-derive path policy.
+    fn view_paths(&self) -> SettingsPaths {
+        SettingsPaths {
+            socket: self.socket.clone(),
+            journal: self.journal.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+}
+
+fn env_path(var: &str, default: PathBuf) -> PathBuf {
+    std::env::var_os(var).map(PathBuf::from).unwrap_or(default)
+}
+
+/// Mirror of `czui_daemon::settings::app_support_dir` (the daemon crate is a
+/// dev-dependency only, so the three lines are duplicated rather than linked).
+fn app_support_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("Library/Application Support/ChezmoiUI")
+}
+
+/// CZUI_CHEZMOID env override, else a `chezmoid` sibling of this binary
+/// (how a bundled .app ships), else bare `chezmoid` resolved via PATH.
+fn resolve_chezmoid() -> PathBuf {
+    if let Some(p) = std::env::var_os("CZUI_CHEZMOID") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("chezmoid");
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    PathBuf::from("chezmoid")
+}
+
+fn resolve_paths() -> Paths {
+    let support = app_support_dir();
+    Paths {
+        socket: env_path("CZUI_SOCKET", support.join("daemon.sock")),
+        journal: env_path("CZUI_JOURNAL", support.join("journal.db")),
+        settings: env_path("CZUI_SETTINGS", support.join("settings.toml")),
+        chezmoid: resolve_chezmoid(),
+    }
+}
+
+/// Headless status probe for CI/agents: connect (never spawn a daemon),
+/// print the drift counts, exit. No windows, no status item.
+fn print_status(socket: &Path) -> ExitCode {
+    let client = match IpcClient::connect(socket) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "chezmoi-ui: cannot connect to chezmoid at {}: {e}",
+                socket.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    match client.request(Request::Status) {
+        Ok(Response::Status {
+            drifted,
+            in_sync,
+            degraded,
+        }) => {
+            let mut line = format!("{} drifted, {} in sync", drifted.len(), in_sync);
+            if let Some(hint) = degraded {
+                line.push_str(&format!(", degraded: {hint}"));
+            }
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Ok(other) => {
+            eprintln!("chezmoi-ui: unexpected status reply: {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("chezmoi-ui: status request failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: SettingsPaths) {
+    cx.activate(true);
+    let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            ..Default::default()
+        },
+        |_, cx| {
+            cx.new(|cx| {
+                // Views read the model in render; re-render this window
+                // whenever the entity notifies.
+                cx.observe(&state, |_, _, cx| cx.notify()).detach();
+                Shell {
+                    route,
+                    state,
+                    review: None,
+                    settings: None,
+                    paths,
+                }
+            })
+        },
+    )
+    .ok();
+}
+
+/// Rebuild the status item title + menu from the current model. Main thread
+/// only (AppKit): callers hold `&mut App`, so the marker always exists.
+fn refresh_status_item(status: &StatusItem, model: &SyncModel) {
+    let mtm = MainThreadMarker::new().expect("status item is only touched with App access");
+    status.set_title(mtm, &model.status_title());
+    let (header, freshness, review_label, sync_all_enabled) = model.menu_spec(now_ts());
+    status.set_menu(
+        mtm,
+        &MenuSpec {
+            header,
+            freshness,
+            review_label,
+            sync_all_enabled,
+        },
+    );
+}
+
+/// Poll the AppKit menu channel and route commands (v0: open a fresh shell
+/// window per command; focusing an existing one arrives with the views work).
+fn spawn_menu_command_loop(
+    cx: &mut App,
+    rx: Receiver<MenuCommand>,
+    state: Entity<SyncModel>,
+    paths: SettingsPaths,
+) {
+    cx.spawn(async move |cx| {
+        loop {
+            match rx.try_recv() {
+                Ok(MenuCommand::OpenApp) => {
+                    let _ = cx.update(|cx| {
+                        open_shell(cx, Route::Dashboard, state.clone(), paths.clone())
+                    });
+                }
+                Ok(MenuCommand::Review) => {
+                    let _ =
+                        cx.update(|cx| open_shell(cx, Route::Review, state.clone(), paths.clone()));
+                }
+                Ok(MenuCommand::Settings) => {
+                    let _ = cx
+                        .update(|cx| open_shell(cx, Route::Settings, state.clone(), paths.clone()));
+                }
+                Ok(MenuCommand::SyncAll) => { /* Plan 6 */ }
+                Ok(MenuCommand::Quit) => {
+                    let _ = cx.update(|cx| cx.quit());
+                    break;
+                }
+                Err(TryRecvError::Empty) => {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    })
+    .detach();
+}
+
+/// Coalescing window for drift notifications (spec §7.6, plan Task 7): every
+/// gated new-drift push inside an open window folds into one
+/// "N file(s) drifted" notification.
+const DRIFT_NOTIFY_WINDOW: Duration = Duration::from_secs(5);
+
+/// What one applied push means for the notifier (plan 5 Task 7).
+#[derive(Debug, PartialEq, Eq)]
+enum NotifySignal {
+    /// Nothing user-facing: applied/expected events, fetches, scans, and
+    /// repeat drift observations stay silent.
+    None,
+    /// A drift push carried news → count it into the coalescing window.
+    NewDrift,
+    /// Origin moved for this target → notify immediately (the daemon already
+    /// filtered self-caused pushes).
+    RemoteAdvanced(PathBuf),
+}
+
+/// Apply one push to the model and classify it for the notifier. The drift
+/// gate rides on `SyncModel::apply_event`'s own dedup: a Drift/EvalFailed
+/// push only notifies when it actually changed the drifted picture — the set
+/// grew, or a class escalated into needs-attention territory. Repeat
+/// observations, de-escalations, and back-in-sync transitions are silent.
+fn apply_and_signal(model: &mut SyncModel, ev: Event) -> NotifySignal {
+    if let Event::RemoteAdvanced { target, .. } = &ev {
+        let target = target.clone();
+        model.apply_event(ev);
+        return NotifySignal::RemoteAdvanced(target);
+    }
+    let driftish = matches!(ev, Event::Drift { .. } | Event::EvalFailed { .. });
+    let (len_before, attention_before) = (model.drifted.len(), model.needs_attention());
+    model.apply_event(ev);
+    if driftish && (model.drifted.len() > len_before || model.needs_attention() > attention_before)
+    {
+        NotifySignal::NewDrift
+    } else {
+        NotifySignal::None
+    }
+}
+
+/// Boot the daemon link on the background executor (connect-or-spawn, Status,
+/// read-only journal hydrate, subscribe), then apply live pushes to the model
+/// entity. Every blocking IpcClient/journal call stays off the main thread.
+fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Paths) {
+    cx.spawn(async move |cx| {
+        let Paths {
+            socket,
+            journal,
+            chezmoid,
+            ..
+        } = paths;
+        let boot = cx
+            .background_executor()
+            .spawn(async move {
+                let client = IpcClient::connect_or_spawn(&socket, &chezmoid)?;
+                let status = client.request(Request::Status)?;
+                // Read-only timeline hydrate: a missing journal (fresh
+                // install, daemon not yet scanned) is fine — start empty.
+                let rows = Journal::open_read_only(&journal, "app")
+                    .and_then(|j| j.timeline(TIMELINE_CAP as u32, None))
+                    .unwrap_or_default();
+                let events = client.subscribe()?;
+                Ok::<_, IpcError>((client, status, rows, events))
+            })
+            .await;
+
+        let (client, status_resp, rows, events) = match boot {
+            Ok(parts) => parts,
+            Err(e) => {
+                // Model stays connected=false; the menu already says so.
+                eprintln!("chezmoi-ui: daemon connection failed: {e}");
+                return;
+            }
+        };
+        // Keep the connection (writer + reader thread) alive for the app's
+        // lifetime; later plan tasks reuse it for on-demand requests.
+        let _client = client;
+
+        let hydrated = cx.update_entity(&state, |model, cx| {
+            model.connected = true;
+            if let Response::Status {
+                drifted,
+                in_sync,
+                degraded,
+            } = status_resp
+            {
+                model.hydrate_status(drifted, in_sync, degraded);
+            }
+            model.hydrate_timeline(rows);
+            cx.notify();
+        });
+        if hydrated.is_err() {
+            return; // app released
+        }
+
+        // Live pushes: poll without blocking the main thread (same pattern
+        // as the menu-command loop; push rates are low). New drift coalesces
+        // into 5s notification windows; osascript runs on the background
+        // executor (plan Task 7).
+        let mut pending_drift: usize = 0;
+        let mut drift_window_started: Option<Instant> = None;
+        loop {
+            // Flush an expired coalescing window: exactly one notification
+            // per window, no matter how many pushes landed inside it.
+            if let Some(started) = drift_window_started
+                && started.elapsed() >= DRIFT_NOTIFY_WINDOW
+            {
+                let body = drift_body(pending_drift);
+                pending_drift = 0;
+                drift_window_started = None;
+                cx.background_executor()
+                    .spawn(async move { notify(&SystemRunner, "chezmoi-ui", &body) })
+                    .detach();
+            }
+            match events.try_recv() {
+                Ok(ev) => {
+                    let signal = cx.update_entity(&state, |model, cx| {
+                        let signal = apply_and_signal(model, ev);
+                        cx.notify();
+                        signal
+                    });
+                    match signal {
+                        Err(_) => break, // app released
+                        Ok(NotifySignal::NewDrift) => {
+                            pending_drift += 1;
+                            drift_window_started.get_or_insert_with(Instant::now);
+                        }
+                        Ok(NotifySignal::RemoteAdvanced(target)) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    notify(
+                                        &SystemRunner,
+                                        "chezmoi-ui",
+                                        &remote_advanced_body(&target),
+                                    );
+                                })
+                                .detach();
+                        }
+                        Ok(NotifySignal::None) => {}
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let _ = cx.update_entity(&state, |model, cx| {
+                        model.connected = false;
+                        cx.notify();
+                    });
+                    break;
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+/// Every 30s rebuild the menu from the latest model so relative freshness
+/// ("fetched 3m ago") stays honest even when no events arrive.
+fn spawn_freshness_loop(cx: &mut App, state: Entity<SyncModel>, status: Rc<StatusItem>) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(30))
+                .await;
+            if cx
+                .update(|cx| refresh_status_item(&status, state.read(cx)))
+                .is_err()
+            {
+                break; // app released
+            }
+        }
+    })
+    .detach();
+}
+
+fn main() -> ExitCode {
+    let paths = resolve_paths();
+    if std::env::args().any(|a| a == "--print-status") {
+        return print_status(&paths.socket);
+    }
+
+    Application::new().run(move |cx: &mut App| {
+        let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
+        set_accessory_policy(mtm);
+        let (status, menu_rx) = StatusItem::install(mtm);
+        let status = Rc::new(status);
+        // The status item must live for the app's lifetime, but this closure
+        // is `on_finish_launching` — it returns right after launch (gpui
+        // app.rs:180), so leak one strong ref (plan Task 1 implementer note):
+        // one item for the process lifetime.
+        std::mem::forget(Rc::clone(&status));
+
+        let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
+
+        // Initial (disconnected) title + menu straight from the default
+        // model: header reads "chezmoid not connected" until hello lands.
+        refresh_status_item(&status, state.read(cx));
+
+        // Single choke point for "after every model change, update AppKit":
+        // everything else just updates the entity and notifies.
+        cx.observe(&state, {
+            let status = Rc::clone(&status);
+            move |state, cx| refresh_status_item(&status, state.read(cx))
+        })
+        .detach();
+
+        spawn_menu_command_loop(cx, menu_rx, state.clone(), paths.view_paths());
+        spawn_boot_and_event_loop(cx, state.clone(), paths);
+        spawn_freshness_loop(cx, state, status);
+    });
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use czui_app::model::SyncModel;
+    use czui_proto::Event;
+
+    use super::{NotifySignal, apply_and_signal};
+
+    fn drift(target: &str, class: &str, ts: u64) -> Event {
+        Event::Drift {
+            target: PathBuf::from(target),
+            class: class.into(),
+            ts,
+        }
+    }
+
+    #[test]
+    fn drift_notifies_only_on_news() {
+        let mut m = SyncModel::default();
+        // brand-new drift → notify
+        assert_eq!(
+            apply_and_signal(&mut m, drift("/a", "destination_drift", 1)),
+            NotifySignal::NewDrift
+        );
+        // repeat observation of the same state → silent (model dedup)
+        assert_eq!(
+            apply_and_signal(&mut m, drift("/a", "destination_drift", 2)),
+            NotifySignal::None
+        );
+        // class escalation into needs-attention → notify
+        assert_eq!(
+            apply_and_signal(&mut m, drift("/a", "conflict", 3)),
+            NotifySignal::NewDrift
+        );
+        // de-escalation → silent
+        assert_eq!(
+            apply_and_signal(&mut m, drift("/a", "destination_drift", 4)),
+            NotifySignal::None
+        );
+        // back in sync → silent
+        assert_eq!(
+            apply_and_signal(&mut m, drift("/a", "in_sync", 5)),
+            NotifySignal::None
+        );
+        assert!(m.drifted.is_empty(), "model still ingested every event");
+    }
+
+    #[test]
+    fn eval_failed_counts_as_drift_news_once() {
+        let mut m = SyncModel::default();
+        assert_eq!(
+            apply_and_signal(
+                &mut m,
+                Event::EvalFailed {
+                    target: Some(PathBuf::from("/tpl")),
+                    hint: "bad template".into(),
+                    ts: 1,
+                }
+            ),
+            NotifySignal::NewDrift
+        );
+        // the follow-up Drift push for the same class is not news
+        assert_eq!(
+            apply_and_signal(&mut m, drift("/tpl", "eval_failed", 2)),
+            NotifySignal::None
+        );
+        // a target-less eval failure can't join the drifted set → silent
+        assert_eq!(
+            apply_and_signal(
+                &mut m,
+                Event::EvalFailed {
+                    target: None,
+                    hint: "doctor".into(),
+                    ts: 3,
+                }
+            ),
+            NotifySignal::None
+        );
+    }
+
+    #[test]
+    fn remote_advanced_notifies_and_lifecycle_events_stay_silent() {
+        let mut m = SyncModel::default();
+        assert_eq!(
+            apply_and_signal(
+                &mut m,
+                Event::RemoteAdvanced {
+                    target: PathBuf::from("/b"),
+                    ts: 1,
+                }
+            ),
+            NotifySignal::RemoteAdvanced(PathBuf::from("/b"))
+        );
+        assert_eq!(
+            apply_and_signal(&mut m, Event::FetchDone { ts: 2, behind: 3 }),
+            NotifySignal::None
+        );
+        assert_eq!(
+            apply_and_signal(&mut m, Event::ScanDone { ts: 3, drifted: 0 }),
+            NotifySignal::None
+        );
+        assert_eq!(
+            apply_and_signal(
+                &mut m,
+                Event::LeftManagement {
+                    target: PathBuf::from("/b"),
+                    ts: 4,
+                }
+            ),
+            NotifySignal::None
+        );
+        // the model still ingested the pushes
+        assert_eq!(m.last_fetch_ts, Some(2));
+    }
+}
