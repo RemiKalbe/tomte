@@ -231,7 +231,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                 Request::Status => Response::Status {
                     drifted: Vec::new(),
                     in_sync: 0,
-                    degraded: Some("initial scan in progress…".into()),
+                    degraded: Some("scan in progress…".into()),
                     scanning: true,
                 },
                 _ => Response::Error {

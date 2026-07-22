@@ -60,6 +60,8 @@ pub struct DaemonCore {
     in_sync_count: u64,
     degraded: Option<String>,
     paused: bool,
+    /// Outcome of the previous full scan — journal scans only on change.
+    last_scan_drifted: Option<u32>,
     /// Shared with the socket server so Subscribe never needs the core
     /// lock (the initial scan can hold it for minutes on secret-manager
     /// timeouts — head-of-line blocking the handshake was a real bug).
@@ -101,6 +103,7 @@ impl DaemonCore {
             in_sync_count: 0,
             degraded: None,
             paused: false,
+            last_scan_drifted: None,
             subscribers,
         })
     }
@@ -450,14 +453,20 @@ impl DaemonCore {
         for fd in &report.drifted {
             self.journal_probe(fd, now_ts)?;
         }
-        self.journal.record_event(NewEvent {
-            target: None,
-            ts: now_ts,
-            kind: EventKind::Fetch,
-            from_hash: None,
-            to_hash: None,
-            meta: Some(serde_json::json!({"scan": true, "drifted": drifted})),
-        })?;
+        // Journal the scan only when its outcome CHANGED — routine no-change
+        // scans (hourly safety net, app-requested) were flooding the
+        // timeline with thousands of identical "scan" rows.
+        if self.last_scan_drifted != Some(drifted) {
+            self.journal.record_event(NewEvent {
+                target: None,
+                ts: now_ts,
+                kind: EventKind::Fetch,
+                from_hash: None,
+                to_hash: None,
+                meta: Some(serde_json::json!({"scan": true, "drifted": drifted})),
+            })?;
+        }
+        self.last_scan_drifted = Some(drifted);
         self.emit(Event::ScanDone {
             ts: now_ts,
             drifted,

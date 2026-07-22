@@ -285,7 +285,7 @@ fn handshake_and_status_survive_a_long_scan_holding_the_core() {
             },
         } => {
             assert!(drifted.is_empty());
-            assert_eq!(degraded.as_deref(), Some("initial scan in progress…"));
+            assert_eq!(degraded.as_deref(), Some("scan in progress…"));
         }
         other => panic!("expected degraded status, got {other:?}"),
     }

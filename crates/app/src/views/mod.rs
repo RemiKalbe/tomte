@@ -43,6 +43,9 @@ pub struct Shell {
     /// Daemon-facing paths the Settings view displays and writes — resolved
     /// once in main.rs so all path policy stays in one place.
     pub paths: SettingsPaths,
+    /// Expanded scan-groups in the dashboard timeline, keyed by the group's
+    /// newest event timestamp (stable across refreshes).
+    pub expanded_scans: std::collections::HashSet<u64>,
 }
 
 impl Shell {

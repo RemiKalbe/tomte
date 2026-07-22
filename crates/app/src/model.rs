@@ -52,6 +52,16 @@ impl SyncModel {
         scanning: bool,
     ) {
         self.scanning = scanning;
+        // A scan in progress reports placeholder zeros — keep showing the
+        // last known numbers instead of wiping the UI (the "everything reset
+        // to 0 during rescan" complaint); real data replaces them when the
+        // scan lands.
+        let placeholder = scanning && drifted.is_empty() && in_sync == 0;
+        let have_data = !self.drifted.is_empty() || self.in_sync > 0;
+        if placeholder && have_data {
+            self.degraded = degraded;
+            return;
+        }
         self.drifted.clear();
         for d in drifted {
             if !self.drifted.iter().any(|e| e.target == d.target) {
@@ -262,6 +272,49 @@ pub fn time_ago(now_ts: u64, ts: u64) -> String {
 /// Timeline glyph for a journal event kind (spec §7.1, approved mockup B+C).
 /// Kinds outside the glyph vocabulary (fetch, source_changed, future kinds)
 /// fall back to a neutral dot.
+/// A dashboard timeline item after collapsing noise: either a real row or a
+/// group of consecutive info rows (scans/fetches) folded into one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineItem {
+    Row(TimelineRow),
+    /// `newest_ts` doubles as the stable expansion key across refreshes.
+    ScanGroup {
+        count: usize,
+        newest_ts: u64,
+        rows: Vec<TimelineRow>,
+    },
+}
+
+/// Collapse runs of ≥2 consecutive target-less info rows (scan/fetch) into a
+/// single expandable group; everything else passes through in order.
+pub fn group_timeline(rows: &[TimelineRow]) -> Vec<TimelineItem> {
+    let mut items = Vec::new();
+    let mut run: Vec<TimelineRow> = Vec::new();
+    let is_info = |r: &TimelineRow| r.target.is_none() && r.class.is_none();
+    let flush = |run: &mut Vec<TimelineRow>, items: &mut Vec<TimelineItem>| match run.len() {
+        0 => {}
+        1 => items.push(TimelineItem::Row(run.remove(0))),
+        _ => {
+            let newest_ts = run.first().map(|r| r.ts).unwrap_or(0);
+            items.push(TimelineItem::ScanGroup {
+                count: run.len(),
+                newest_ts,
+                rows: std::mem::take(run),
+            });
+        }
+    };
+    for row in rows {
+        if is_info(row) {
+            run.push(row.clone());
+        } else {
+            flush(&mut run, &mut items);
+            items.push(TimelineItem::Row(row.clone()));
+        }
+    }
+    flush(&mut run, &mut items);
+    items
+}
+
 /// Human label for a drift class — raw enum names ("destination_drift")
 /// never reach the UI.
 pub fn class_label(class: &str) -> &'static str {
@@ -706,5 +759,73 @@ mod tests {
         assert_eq!(m.timeline[0].ts, 509, "newest first");
         assert_eq!(m.timeline[TIMELINE_CAP - 1].ts, 10, "oldest rows trimmed");
         assert_eq!(m.drifted.len(), 510, "drift list is not capped");
+    }
+
+    #[test]
+    fn rescan_placeholder_does_not_wipe_known_stats() {
+        let mut m = SyncModel {
+            connected: true,
+            ..Default::default()
+        };
+        m.hydrate_status(
+            vec![summary("/a", "destination_drift", Some(1))],
+            954,
+            None,
+            false,
+        );
+        // rescan begins: daemon reports placeholder zeros + scanning
+        m.hydrate_status(vec![], 0, Some("scan in progress…".into()), true);
+        assert_eq!(m.in_sync, 954, "stats must survive a rescan");
+        assert_eq!(m.drifted.len(), 1);
+        assert!(m.scanning);
+        // scan lands: real data replaces
+        m.hydrate_status(vec![], 955, None, false);
+        assert_eq!(m.in_sync, 955);
+        assert!(m.drifted.is_empty());
+        assert!(!m.scanning);
+    }
+
+    #[test]
+    fn group_timeline_collapses_consecutive_info_rows() {
+        let info = |ts| TimelineRow {
+            ts,
+            kind: "fetch".into(),
+            target: None,
+            machine: "m".into(),
+            class: None,
+        };
+        let drift = |ts| TimelineRow {
+            ts,
+            kind: "dest_changed".into(),
+            target: Some(PathBuf::from("/f")),
+            machine: "m".into(),
+            class: Some("destination_drift".into()),
+        };
+        let rows = vec![
+            info(10),
+            info(9),
+            info(8),
+            drift(7),
+            info(6),
+            drift(5),
+            info(4),
+        ];
+        let items = group_timeline(&rows);
+        assert_eq!(items.len(), 5);
+        match &items[0] {
+            TimelineItem::ScanGroup {
+                count: 3,
+                newest_ts: 10,
+                rows,
+            } => {
+                assert_eq!(rows.len(), 3)
+            }
+            other => panic!("expected group, got {other:?}"),
+        }
+        assert!(matches!(&items[1], TimelineItem::Row(r) if r.ts == 7));
+        // single info row passes through un-grouped
+        assert!(matches!(&items[2], TimelineItem::Row(r) if r.ts == 6));
+        assert!(matches!(&items[3], TimelineItem::Row(r) if r.ts == 5));
+        assert!(matches!(&items[4], TimelineItem::Row(r) if r.ts == 4));
     }
 }

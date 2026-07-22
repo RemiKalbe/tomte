@@ -244,6 +244,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     review: None,
                     settings: None,
                     paths,
+                    expanded_scans: Default::default(),
                 }
             })
         },
