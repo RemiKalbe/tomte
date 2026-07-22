@@ -466,6 +466,13 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
             // after the scan), so poll Status every 30s regardless — the
             // first-launch bug was exactly this staleness.
             let mut last_status_refresh = Instant::now();
+            // Sick-daemon detector: a daemon reporting scanning/starting for
+            // this long is stuck (healthy full scans take seconds; startup
+            // retries are capped at 5min daemon-side). Shoot it — the
+            // reconnect loop respawns a fresh one. This is what finally kills
+            // the "zombie daemon squats the socket forever" class.
+            const STUCK_LIMIT: Duration = Duration::from_secs(180);
+            let mut stuck_since: Option<Instant> = None;
             loop {
                 // Flush an expired coalescing window: exactly one notification
                 // per window, no matter how many pushes landed inside it.
@@ -521,6 +528,27 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                             last_status_refresh = Instant::now();
                             if !refresh_status(&client, &state, cx).await {
                                 return;
+                            }
+                            let scanning = cx
+                                .update_entity(&state, |model, _| model.scanning)
+                                .unwrap_or(false);
+                            match (scanning, stuck_since) {
+                                (false, _) => stuck_since = None,
+                                (true, None) => stuck_since = Some(Instant::now()),
+                                (true, Some(since)) if since.elapsed() > STUCK_LIMIT => {
+                                    eprintln!(
+                                        "chezmoi-ui: daemon stuck in scanning/starting for {}s — restarting it",
+                                        since.elapsed().as_secs()
+                                    );
+                                    let c = client.clone();
+                                    cx.background_executor()
+                                        .spawn(async move {
+                                            let _ = c.request(Request::Shutdown);
+                                        })
+                                        .detach();
+                                    stuck_since = None;
+                                }
+                                (true, Some(_)) => {}
                             }
                         }
                     }

@@ -183,8 +183,11 @@ fn main() -> ExitCode {
         })
     };
 
-    // Build the core, retrying forever: chezmoi being slow or broken is a
-    // state to report, never a reason to die (spec §10).
+    // Build the core with retries — but NOT forever: a daemon that cannot
+    // reach chezmoi is squatting the socket and blocking healthy respawns
+    // (the single-instance guard defers to it). Better dead: the app's
+    // reconnect loop respawns us in a fresh context.
+    let startup_deadline = std::time::Instant::now() + Duration::from_secs(300);
     let core = loop {
         match build_core(
             &settings,
@@ -199,6 +202,13 @@ fn main() -> ExitCode {
                     now_ts()
                 );
                 ctx.set_starting_error(e.to_string());
+                if std::time::Instant::now() > startup_deadline {
+                    eprintln!(
+                        "chezmoid[t={}]: startup failed for 5 minutes — exiting so a fresh spawn can take over",
+                        now_ts()
+                    );
+                    return ExitCode::FAILURE;
+                }
                 std::thread::sleep(Duration::from_secs(10));
             }
         }
