@@ -1,8 +1,24 @@
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::Duration;
 use wait_timeout::ChildExt;
+
+/// How long a finished child's output pipes may stay open (held by lingering
+/// grandchildren) before the whole process group is killed. Learned the hard
+/// way: a hung helper spawned by chezmoi inherited our pipes, survived the
+/// child's death, and wedged the reader joins for minutes.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+/// SIGKILL the child's entire process group (the child was made a group
+/// leader via `process_group(0)`), so grandchildren die with it.
+fn kill_group(child_pid: u32) {
+    unsafe {
+        libc::kill(-(child_pid as i32), libc::SIGKILL);
+    }
+}
 
 pub mod fake;
 
@@ -109,6 +125,9 @@ impl CommandRunner for SystemRunner {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Own process group: on timeout (or lingering pipe-holders) the WHOLE
+        // subprocess tree is killed, not just the direct child.
+        cmd.process_group(0);
         for (k, v) in &req.env {
             cmd.env(k, v);
         }
@@ -119,6 +138,7 @@ impl CommandRunner for SystemRunner {
             program: req.program.clone(),
             source,
         })?;
+        let pid = child.id();
         let io_err = |source| CommandError::Io {
             program: req.program.clone(),
             source,
@@ -131,36 +151,68 @@ impl CommandRunner for SystemRunner {
             pipe.write_all(bytes).map_err(io_err)?;
             // pipe drops here, closing stdin
         }
-        // Read pipes on threads to avoid deadlock on full pipe buffers.
+        // Read pipes on threads (avoids deadlock on full pipe buffers) and
+        // collect through a channel so waiting is BOUNDED — a grandchild
+        // holding the pipe open must never wedge us.
         let mut stdout_pipe = child.stdout.take().expect("stdout piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
-        let out_handle = std::thread::spawn(move || {
+        let (tx_out, rx_out) = channel();
+        let (tx_err, rx_err) = channel();
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
-            stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+            let res = stdout_pipe.read_to_end(&mut buf).map(|_| buf);
+            let _ = tx_out.send(res);
         });
-        let err_handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
-            stderr_pipe.read_to_end(&mut buf).map(|_| buf)
+            let res = stderr_pipe.read_to_end(&mut buf).map(|_| buf);
+            let _ = tx_err.send(res);
         });
+
         let status = match child.wait_timeout(req.timeout).map_err(io_err)? {
             Some(status) => status,
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(pid);
+                let _ = child.wait(); // reap; the group kill already landed
                 return Err(CommandError::Timeout {
                     program: req.program.clone(),
                     timeout: req.timeout,
                 });
             }
         };
-        let stdout = out_handle
-            .join()
-            .expect("stdout reader panicked")
-            .map_err(io_err)?;
-        let stderr = err_handle
-            .join()
-            .expect("stderr reader panicked")
-            .map_err(io_err)?;
+
+        // The child exited; give the pipes a short grace to close. If they
+        // don't (a backgrounded grandchild inherited them), kill the group
+        // and try once more — error rather than silently truncate.
+        let collect = |rx: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+                       killed: &mut bool|
+         -> Result<Vec<u8>, CommandError> {
+            match rx.recv_timeout(PIPE_GRACE) {
+                Ok(res) => res.map_err(io_err),
+                Err(RecvTimeoutError::Timeout) => {
+                    if !*killed {
+                        kill_group(pid);
+                        *killed = true;
+                    }
+                    match rx.recv_timeout(PIPE_GRACE) {
+                        Ok(res) => res.map_err(io_err),
+                        Err(_) => Err(CommandError::Io {
+                            program: req.program.clone(),
+                            source: std::io::Error::other(
+                                "output pipes held open after exit (orphaned grandchild?)",
+                            ),
+                        }),
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => Err(CommandError::Io {
+                    program: req.program.clone(),
+                    source: std::io::Error::other("output reader died"),
+                }),
+            }
+        };
+        let mut killed = false;
+        let stdout = collect(&rx_out, &mut killed)?;
+        let stderr = collect(&rx_err, &mut killed)?;
         Ok(CommandOutput {
             exit_code: status.code().unwrap_or(-1),
             stdout,
@@ -201,6 +253,49 @@ mod tests {
             .run(CommandRequest::new("/bin/cat").stdin(b"data".to_vec()))
             .unwrap();
         assert_eq!(out.stdout, b"data");
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        // A child that spawns a pipe-holding grandchild and hangs: the old
+        // runner killed only the child and then wedged for minutes on the
+        // reader joins (the 24h-stuck-daemon bug). Must return promptly.
+        let start = std::time::Instant::now();
+        let err = SystemRunner
+            .run(
+                CommandRequest::new("/bin/sh")
+                    .arg("-c")
+                    .arg("sleep 60 & sleep 60")
+                    .timeout(Duration::from_millis(300)),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CommandError::Timeout { .. }), "{err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "timeout path must not block on orphaned pipe holders: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn lingering_grandchild_after_exit_cannot_wedge_collection() {
+        // Child exits 0 immediately but leaves a backgrounded grandchild
+        // holding the stdout pipe. Collection must grace out, kill the
+        // group, and still return the child's output.
+        let start = std::time::Instant::now();
+        let out = SystemRunner
+            .run(
+                CommandRequest::new("/bin/sh")
+                    .arg("-c")
+                    .arg("echo hi; sleep 60 &"),
+            )
+            .unwrap();
+        assert_eq!(out.stdout_utf8().trim(), "hi");
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "success path must be bounded: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

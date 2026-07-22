@@ -1270,6 +1270,7 @@ name = "czui-core"
 version = "0.0.1"
 dependencies = [
  "imara-diff",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",

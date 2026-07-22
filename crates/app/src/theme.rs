@@ -51,6 +51,12 @@ impl Theme {
         }
     }
 
+    /// A translucent wash of a token — hover layers and chip backgrounds
+    /// (Zed layers ghost elements the same way).
+    pub fn wash(c: Rgba, a: f32) -> Rgba {
+        Rgba { a, ..c }
+    }
+
     pub fn class_color(&self, class: &str) -> Rgba {
         match class {
             "conflict" | "local_source_diverged" | "eval_failed" => self.conflict,

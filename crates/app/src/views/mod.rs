@@ -1,15 +1,25 @@
+//! Shell: left sidebar navigation (Zed settings-window shape — fixed-width
+//! panel, bordered, compact nav rows) over a routed content pane.
+
 pub mod dashboard;
 pub mod review;
 pub mod settings;
 
-use gpui::{AppContext as _, Context, Entity, SharedString, Window, div, prelude::*};
+use std::path::PathBuf;
 
-use czui_app::model::SyncModel;
+use gpui::{
+    AppContext as _, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px,
+};
+
+use czui_app::model::{SyncModel, time_ago};
 use czui_app::theme::Theme;
 
 use dashboard::DashboardView;
 use review::ReviewView;
 use settings::{SettingsPaths, SettingsView};
+
+/// Zed's settings sidebar is 226px; ours carries shorter labels.
+const SIDEBAR_WIDTH: f32 = 200.;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -36,27 +46,141 @@ pub struct Shell {
 }
 
 impl Shell {
-    fn nav_button(
+    /// Route to Review, optionally selecting a target (dashboard row click).
+    pub fn open_review(&mut self, target: Option<PathBuf>, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        let review = self
+            .review
+            .get_or_insert_with(|| cx.new(|cx| ReviewView::new(state, cx)))
+            .clone();
+        if let Some(target) = target {
+            review.update(cx, |view, cx| view.select(target, cx));
+        }
+        self.route = Route::Review;
+        cx.notify();
+    }
+
+    fn nav_item(
         &self,
         theme: &Theme,
         label: &'static str,
         route: Route,
+        badge: Option<(String, gpui::Rgba)>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.route == route;
         div()
             .id(label)
-            .px_3()
-            .py_1()
-            .rounded_md()
+            .h_7()
+            .px_2()
+            .rounded_sm()
             .cursor_pointer()
-            .when(active, |el| el.bg(theme.surface))
-            .text_color(if active { theme.text } else { theme.text_muted })
-            .child(SharedString::from(label))
+            .flex()
+            .items_center()
+            .justify_between()
+            .when(active, |el| el.bg(Theme::wash(theme.text, 0.08)))
+            .hover(|el| el.bg(Theme::wash(theme.text, 0.05)))
+            .child(
+                div()
+                    .text_sm()
+                    .when(active, |el| el.font_weight(FontWeight::MEDIUM))
+                    .text_color(if active { theme.text } else { theme.text_muted })
+                    .child(SharedString::from(label)),
+            )
+            .when_some(badge, |el, (text, color)| {
+                el.child(
+                    div()
+                        .px_1p5()
+                        .rounded_sm()
+                        .bg(Theme::wash(color, 0.15))
+                        .text_xs()
+                        .text_color(color)
+                        .child(text),
+                )
+            })
             .on_click(cx.listener(move |shell, _ev, _window, cx| {
-                shell.route = route;
-                cx.notify();
+                if route == Route::Review {
+                    shell.open_review(None, cx);
+                } else {
+                    shell.route = route;
+                    cx.notify();
+                }
             }))
+    }
+
+    fn sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let model = self.state.read(cx);
+        let attention = model.needs_attention();
+        let drifted = model.drifted.len();
+        let review_badge = if attention > 0 {
+            Some((attention.to_string(), theme.conflict))
+        } else if drifted > 0 {
+            Some((drifted.to_string(), theme.drift))
+        } else {
+            None
+        };
+
+        // Footer facts: connection dot + freshness, always honest (spec §10).
+        let (dot_color, status_line): (gpui::Rgba, String) = if !model.connected {
+            (theme.conflict, "daemon not connected".into())
+        } else if model.scanning {
+            (theme.drift, "scanning…".into())
+        } else if let Some(hint) = &model.degraded {
+            (theme.drift, hint.clone())
+        } else if drifted > 0 {
+            (theme.drift, format!("{drifted} drifted"))
+        } else {
+            (theme.ok, format!("in sync · {} files", model.in_sync))
+        };
+        let freshness = match model.last_fetch_ts {
+            Some(ts) => format!("origin: fetched {}", time_ago(dashboard::system_now(), ts)),
+            None => "origin: never fetched".to_string(),
+        };
+
+        div()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_px()
+            .pt_10() // room for the macOS traffic lights (Zed does the same)
+            .px_2()
+            .pb_2()
+            .bg(theme.surface)
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child("CHEZMOI UI"),
+            )
+            .child(self.nav_item(theme, "Dashboard", Route::Dashboard, None, cx))
+            .child(self.nav_item(theme, "Review", Route::Review, review_badge, cx))
+            .child(self.nav_item(theme, "Settings", Route::Settings, None, cx))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().text_color(dot_color).child("●"))
+                            .child(div().flex_1().min_w_0().truncate().child(status_line)),
+                    )
+                    .child(div().truncate().child(freshness)),
+            )
     }
 }
 
@@ -65,42 +189,39 @@ impl Render for Shell {
         let theme = Theme::for_appearance(window.appearance());
         div()
             .flex()
-            .flex_col()
             .size_full()
             .bg(theme.bg)
             .text_color(theme.text)
+            .child(self.sidebar(&theme, cx))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
                     .flex()
-                    .gap_1()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(self.nav_button(&theme, "Dashboard", Route::Dashboard, cx))
-                    .child(self.nav_button(&theme, "Review", Route::Review, cx))
-                    .child(self.nav_button(&theme, "Settings", Route::Settings, cx)),
+                    .flex_col()
+                    .child(match self.route {
+                        Route::Dashboard => DashboardView {
+                            state: self.state.clone(),
+                            now_ts: dashboard::system_now,
+                        }
+                        .render(theme, cx)
+                        .into_any_element(),
+                        Route::Review => {
+                            let state = self.state.clone();
+                            self.review
+                                .get_or_insert_with(|| cx.new(|cx| ReviewView::new(state, cx)))
+                                .clone()
+                                .into_any_element()
+                        }
+                        Route::Settings => {
+                            let paths = self.paths.clone();
+                            self.settings
+                                .get_or_insert_with(|| cx.new(|cx| SettingsView::new(paths, cx)))
+                                .clone()
+                                .into_any_element()
+                        }
+                    }),
             )
-            .child(match self.route {
-                Route::Dashboard => DashboardView {
-                    state: self.state.clone(),
-                    now_ts: dashboard::system_now,
-                }
-                .render(theme, cx)
-                .into_any_element(),
-                Route::Review => {
-                    let state = self.state.clone();
-                    self.review
-                        .get_or_insert_with(|| cx.new(|cx| ReviewView::new(state, cx)))
-                        .clone()
-                        .into_any_element()
-                }
-                Route::Settings => {
-                    let paths = self.paths.clone();
-                    self.settings
-                        .get_or_insert_with(|| cx.new(|cx| SettingsView::new(paths, cx)))
-                        .clone()
-                        .into_any_element()
-                }
-            })
     }
 }

@@ -1,22 +1,22 @@
-//! Dashboard: health tiles, degraded banner, chronological timeline
-//! (spec §7.1, approved mockup B+C; plan 5 Task 5).
+//! Dashboard: compact stat strip + chronological activity list (spec §7.1,
+//! restyled after Zed's git panel: fixed-height rows, ghost hover, filename +
+//! muted path, humanized status chips). Rows with a target are clickable and
+//! open Review with that file selected.
 //!
-//! Pure logic (relative time, kind glyphs) lives in `czui_app::model` where it
-//! is unit-tested; this module is rendering only. Never blocks: everything it
-//! shows is already in the [`SyncModel`] entity.
+//! Pure logic (relative time, glyphs, labels) lives in `czui_app::model`;
+//! this module is rendering only and never blocks.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use czui_app::model::{SyncModel, kind_glyph, time_ago};
+use czui_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
 use czui_app::theme::Theme;
 use gpui::{
-    AppContext as _, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful,
-    WeakEntity, Window, div, prelude::*, uniform_list,
+    Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, WeakEntity, Window, div,
+    prelude::*, uniform_list,
 };
 
-use super::{Route, Shell};
+use super::Shell;
 
 /// Seconds since the Unix epoch — the production clock injected into
 /// [`DashboardView::now_ts`] (tests inject fixed values into the pure fns).
@@ -33,43 +33,54 @@ struct RowData {
     time: SharedString,
     glyph: &'static str,
     name: SharedString,
-    /// Muted full path shown next to the file name (target rows only).
-    path: Option<SharedString>,
-    machine: SharedString,
+    /// Muted parent directory (target rows only), truncated in render.
+    dir: Option<SharedString>,
+    /// (label, colored) chip. Colored=false renders muted (info rows).
+    chip: (SharedString, bool),
     class: Option<SharedString>,
-    /// Target is currently in `SyncModel::drifted` → show the action buttons.
-    actionable: bool,
+    /// Click opens Review focused on this target.
+    target: Option<PathBuf>,
 }
 
 impl RowData {
-    fn new(row: &czui_app::model::TimelineRow, now: u64, drifted: &HashSet<PathBuf>) -> Self {
-        let (name, path) = match &row.target {
+    fn new(row: &czui_app::model::TimelineRow, now: u64) -> Self {
+        let (name, dir) = match &row.target {
             Some(target) => (
                 target
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| target.display().to_string()),
-                Some(SharedString::from(target.display().to_string())),
+                target
+                    .parent()
+                    .map(|p| SharedString::from(shorten_home(&p.display().to_string()))),
             ),
-            // Target-less rows (fetch, global eval failures) show the kind.
-            None => (row.kind.clone(), None),
+            None => (kind_label(&row.kind).to_string(), None),
+        };
+        let chip = match &row.class {
+            Some(class) => (SharedString::from(class_label(class)), true),
+            None => (SharedString::from(kind_label(&row.kind)), false),
         };
         Self {
             time: time_ago(now, row.ts).into(),
             glyph: kind_glyph(&row.kind),
             name: name.into(),
-            path,
-            machine: SharedString::from(row.machine.clone()),
+            dir,
+            chip,
             class: row.class.clone().map(SharedString::from),
-            actionable: row.target.as_ref().is_some_and(|t| drifted.contains(t)),
+            target: row.target.clone(),
         }
     }
 }
 
-/// Hover tooltip for the disabled Plan-6 action stubs (shared with the
-/// review view). gpui tooltips are arbitrary views
-/// (`StatefulInteractiveElement::tooltip` returns `AnyView`), so this is the
-/// minimal themed text bubble.
+/// `$HOME/...` → `~/...` — paths read better and truncate less.
+fn shorten_home(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
+        _ => path.to_string(),
+    }
+}
+
+/// Hover tooltip (shared with review/settings): the minimal themed bubble.
 pub(super) struct TextTooltip {
     pub(super) text: SharedString,
 }
@@ -103,20 +114,17 @@ impl DashboardView {
         let model = self.state.read(cx);
 
         let needs_attention = model.needs_attention();
+        let drifted_count = model.drifted.len();
         let in_sync = model.in_sync;
+        let scanning = model.scanning;
+        let connected = model.connected;
         let degraded = model.degraded.clone();
-        let freshness: SharedString = match model.last_fetch_ts {
-            Some(ts) => format!("fetched {}", time_ago(now, ts)).into(),
-            None => "never fetched".into(),
-        };
-        let all_clear = model.drifted.is_empty() && model.timeline.is_empty();
 
-        let drifted: HashSet<PathBuf> = model.drifted.iter().map(|d| d.target.clone()).collect();
         let rows: Rc<Vec<RowData>> = Rc::new(
             model
                 .timeline
                 .iter()
-                .map(|row| RowData::new(row, now, &drifted))
+                .map(|row| RowData::new(row, now))
                 .collect(),
         );
         let shell = cx.weak_entity();
@@ -126,47 +134,53 @@ impl DashboardView {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .gap_3()
-            .p_4()
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(tile(
-                        theme,
-                        needs_attention.to_string(),
-                        "need attention",
-                        if needs_attention > 0 {
-                            theme.conflict
-                        } else {
-                            theme.text_muted
-                        },
-                    ))
-                    .child(tile(theme, freshness.to_string(), "origin", theme.text))
-                    .child(tile(theme, in_sync.to_string(), "in sync", theme.ok)),
-            )
+            .child(stat_strip(
+                theme,
+                connected,
+                scanning,
+                needs_attention,
+                drifted_count,
+                in_sync,
+            ))
             .when_some(degraded, |el, hint| {
                 el.child(
                     div()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(theme.surface)
-                        .border_1()
-                        .border_color(theme.drift)
-                        .text_sm()
+                        .mx_4()
+                        .mb_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(Theme::wash(theme.drift, 0.12))
+                        .text_xs()
                         .text_color(theme.drift)
-                        .child(format!("degraded: {hint}")),
+                        .child(hint),
                 )
             })
-            .child(if all_clear {
+            .child(
+                div()
+                    .px_4()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child("ACTIVITY"),
+            )
+            .child(if rows.is_empty() {
+                let (text, color) = if scanning {
+                    ("scanning your dotfiles…", theme.text_muted)
+                } else if !connected {
+                    ("waiting for chezmoid…", theme.text_muted)
+                } else {
+                    ("everything in sync", theme.ok)
+                };
                 div()
                     .flex_1()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(theme.ok)
-                    .child("everything in sync")
+                    .text_sm()
+                    .text_color(color)
+                    .child(text)
                     .into_any_element()
             } else {
                 uniform_list(
@@ -179,29 +193,21 @@ impl DashboardView {
                     },
                 )
                 .flex_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
+                .px_2()
                 .into_any_element()
             })
     }
 }
 
-/// One health tile: a big value over a muted label.
-fn tile(theme: Theme, value: String, label: &'static str, color: Rgba) -> Div {
+/// One inline stat: colored value + muted label, Zed-git-panel density.
+fn stat(theme: Theme, value: String, label: &'static str, color: Rgba) -> Div {
     div()
-        .flex_1()
         .flex()
-        .flex_col()
+        .items_baseline()
         .gap_1()
-        .p_3()
-        .rounded_md()
-        .bg(theme.surface)
-        .border_1()
-        .border_color(theme.border)
         .child(
             div()
-                .text_lg()
+                .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(color)
                 .child(value),
@@ -209,21 +215,75 @@ fn tile(theme: Theme, value: String, label: &'static str, color: Rgba) -> Div {
         .child(div().text_xs().text_color(theme.text_muted).child(label))
 }
 
-/// One uniform-height timeline row: time · glyph · name + muted path · machine
-/// · class chip, plus the action button group when the target is drifted.
-fn timeline_row(ix: usize, row: &RowData, theme: Theme, shell: WeakEntity<Shell>) -> Div {
-    div()
-        .h_9()
+fn stat_strip(
+    theme: Theme,
+    connected: bool,
+    scanning: bool,
+    needs_attention: usize,
+    drifted: usize,
+    in_sync: u64,
+) -> Div {
+    let strip = div()
+        .flex()
+        .items_center()
+        .gap_4()
+        .px_4()
+        .py_3()
+        .flex_none();
+    if scanning || !connected {
+        return strip.child(
+            div()
+                .text_sm()
+                .text_color(theme.text_muted)
+                .child(if scanning {
+                    "scanning…"
+                } else {
+                    "connecting to chezmoid…"
+                }),
+        );
+    }
+    strip
+        .child(stat(
+            theme,
+            needs_attention.to_string(),
+            "need attention",
+            if needs_attention > 0 {
+                theme.conflict
+            } else {
+                theme.text_muted
+            },
+        ))
+        .child(stat(
+            theme,
+            drifted.to_string(),
+            "drifted",
+            if drifted > 0 {
+                theme.drift
+            } else {
+                theme.text_muted
+            },
+        ))
+        .child(stat(theme, in_sync.to_string(), "in sync", theme.ok))
+}
+
+/// One compact activity row. The whole row is clickable when it has a target.
+fn timeline_row(
+    ix: usize,
+    row: &RowData,
+    theme: Theme,
+    shell: WeakEntity<Shell>,
+) -> gpui::AnyElement {
+    let base = div()
+        .h_7()
+        .px_2()
+        .rounded_sm()
         .flex()
         .items_center()
         .gap_2()
-        .px_3()
-        .border_b_1()
-        .border_color(theme.border)
         .child(
             div()
-                .w_16()
-                .flex_shrink_0()
+                .w_12()
+                .flex_none()
                 .text_xs()
                 .text_color(theme.text_muted)
                 .child(row.time.clone()),
@@ -231,8 +291,9 @@ fn timeline_row(ix: usize, row: &RowData, theme: Theme, shell: WeakEntity<Shell>
         .child(
             div()
                 .w_4()
-                .flex_shrink_0()
+                .flex_none()
                 .text_sm()
+                .text_center()
                 .text_color(match &row.class {
                     Some(class) => theme.class_color(class),
                     None => theme.text_muted,
@@ -249,101 +310,54 @@ fn timeline_row(ix: usize, row: &RowData, theme: Theme, shell: WeakEntity<Shell>
                 .child(
                     div()
                         .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.text)
                         .whitespace_nowrap()
                         .child(row.name.clone()),
                 )
-                .when_some(row.path.clone(), |el, path| {
+                .when_some(row.dir.clone(), |el, dir| {
                     el.child(
                         div()
                             .min_w_0()
                             .text_xs()
                             .text_color(theme.text_muted)
                             .truncate()
-                            .child(path),
+                            .child(dir),
                     )
                 }),
         )
-        .child(
+        .child({
+            let (label, colored) = row.chip.clone();
+            let color = if colored {
+                row.class
+                    .as_deref()
+                    .map(|c| theme.class_color(c))
+                    .unwrap_or(theme.text_muted)
+            } else {
+                theme.text_muted
+            };
             div()
-                .flex_shrink_0()
+                .flex_none()
+                .px_1p5()
+                .rounded_sm()
+                .when(colored, |el| el.bg(Theme::wash(color, 0.12)))
                 .text_xs()
-                .text_color(theme.text_muted)
-                .child(row.machine.clone()),
-        )
-        .when_some(row.class.clone(), |el, class| {
-            let color = theme.class_color(&class);
-            el.child(
-                div()
-                    .flex_shrink_0()
-                    .px_1p5()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color)
-                    .text_xs()
-                    .text_color(color)
-                    .child(class),
-            )
-        })
-        .when(row.actionable, |el| {
-            el.child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .ml_auto()
-                    .child(review_button(ix, theme, shell))
-                    .child(disabled_button(ix, "keep-disk", "keep disk", theme))
-                    .child(disabled_button(ix, "keep-source", "keep source", theme))
-                    .child(disabled_button(ix, "merge", "Merge…", theme)),
-            )
-        })
-}
+                .text_color(color)
+                .child(label)
+        });
 
-/// Enabled per-row action: routes the shell to the Review view. Target
-/// selection is Task 6's state; v0 routing switches the view only.
-fn review_button(ix: usize, theme: Theme, shell: WeakEntity<Shell>) -> Stateful<Div> {
-    div()
-        .id(ElementId::named_usize("review", ix))
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.accent)
-        .text_xs()
-        .text_color(theme.accent)
-        .cursor_pointer()
-        .child("Review →")
-        .on_click(move |_event, _window, cx| {
-            let _ = shell.update(cx, |shell, cx| {
-                shell.route = Route::Review;
-                cx.notify();
-            });
-        })
-}
-
-/// Disabled Plan-6 stub: muted, no click handler, hover tooltip explains why.
-fn disabled_button(
-    ix: usize,
-    id: &'static str,
-    label: &'static str,
-    theme: Theme,
-) -> Stateful<Div> {
-    div()
-        .id(ElementId::named_usize(id, ix))
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .text_xs()
-        .text_color(theme.text_muted)
-        .child(label)
-        .tooltip(|_window, cx| {
-            cx.new(|_| TextTooltip {
-                text: "arrives with the sync pipeline".into(),
+    match row.target.clone() {
+        Some(target) => base
+            .id(ElementId::named_usize("activity-row", ix))
+            .cursor_pointer()
+            .hover(|el| el.bg(Theme::wash(theme.text, 0.05)))
+            .on_click(move |_event, _window, cx| {
+                let target = target.clone();
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.open_review(Some(target.clone()), cx);
+                });
             })
-            .into()
-        })
+            .into_any_element(),
+        None => base.into_any_element(),
+    }
 }

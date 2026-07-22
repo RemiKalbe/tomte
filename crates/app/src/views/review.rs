@@ -329,7 +329,7 @@ impl ReviewView {
     /// Select a target and kick off the background detail load (journal
     /// provenance + `chezmoi cat` + destination read). Re-selecting the same
     /// target reloads — a free refresh.
-    fn select(&mut self, target: PathBuf, cx: &mut Context<Self>) {
+    pub fn select(&mut self, target: PathBuf, cx: &mut Context<Self>) {
         self.selected = Some(target.clone());
         self.preview = PreviewState::Loading;
         self.provenance.clear();
@@ -392,7 +392,7 @@ impl ReviewView {
     ) -> impl IntoElement + use<> {
         let mut ix = 0usize;
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (label, group) in [("Needs you", needs_you), ("One click", one_click)] {
+        for (label, group) in [("NEEDS YOU", needs_you), ("ONE CLICK", one_click)] {
             if group.is_empty() {
                 continue;
             }

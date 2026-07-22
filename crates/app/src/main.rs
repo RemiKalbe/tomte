@@ -224,6 +224,13 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Zed-style chrome: the sidebar runs to the top of the window,
+            // traffic lights float over it (sidebar reserves pt_10).
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("chezmoi ui".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(gpui::point(px(12.), px(12.))),
+            }),
             ..Default::default()
         },
         |_, cx| {

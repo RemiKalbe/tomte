@@ -262,6 +262,38 @@ pub fn time_ago(now_ts: u64, ts: u64) -> String {
 /// Timeline glyph for a journal event kind (spec §7.1, approved mockup B+C).
 /// Kinds outside the glyph vocabulary (fetch, source_changed, future kinds)
 /// fall back to a neutral dot.
+/// Human label for a drift class — raw enum names ("destination_drift")
+/// never reach the UI.
+pub fn class_label(class: &str) -> &'static str {
+    match class {
+        "destination_drift" => "modified on disk",
+        "source_ahead" => "source updated",
+        "remote_ahead" => "origin ahead",
+        "local_source_diverged" => "diverged from origin",
+        "conflict" => "conflict",
+        "eval_failed" => "can't evaluate",
+        "in_sync" => "in sync",
+        _ => "changed",
+    }
+}
+
+/// Human label for a journal/timeline event kind.
+pub fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "dest_changed" => "modified on disk",
+        "source_changed" => "source changed",
+        "remote_advanced" => "origin advanced",
+        "applied" => "applied",
+        "readded" => "re-added",
+        "resolved" => "resolved",
+        "eval_failed" => "can't evaluate",
+        "fetch" => "scan",
+        "left_management" => "left management",
+        "session_start" | "session_end" => "session",
+        _ => "event",
+    }
+}
+
 pub fn kind_glyph(kind: &str) -> &'static str {
     match kind {
         "dest_changed" => "Δ",
@@ -532,8 +564,10 @@ mod tests {
             ),
         ];
         for (classes, want) in cases {
-            let mut m = SyncModel::default();
-            m.connected = true; // the title only reports counts once live
+            let mut m = SyncModel {
+                connected: true, // the title only reports counts once live
+                ..Default::default()
+            };
             m.hydrate_status(
                 classes
                     .iter()
