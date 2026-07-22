@@ -277,12 +277,23 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
             Response::Ok
         }
         Request::Shutdown => Response::Ok, // handled in handle_connection
-        Request::Rescan => match c.full_rescan(now) {
-            Ok(_) => Response::Ok,
-            Err(e) => Response::Error {
-                message: e.to_string(),
-            },
-        },
+        Request::Rescan => {
+            // Scans take ~15s on real dotfile trees — far beyond the client's
+            // request timeout. Acknowledge now, scan on a thread; completion
+            // arrives as the ScanDone push.
+            drop(c);
+            let core = ctx.core.get().cloned();
+            let now_fn = ctx.now_fn;
+            std::thread::spawn(move || {
+                if let Some(core) = core
+                    && let Ok(mut c) = core.lock()
+                    && let Err(e) = c.full_rescan(now_fn())
+                {
+                    eprintln!("chezmoid: requested rescan failed: {e}");
+                }
+            });
+            Response::Ok
+        }
         Request::Pause => {
             c.set_paused(true);
             Response::Ok
