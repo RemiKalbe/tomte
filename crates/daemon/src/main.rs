@@ -194,7 +194,10 @@ fn main() -> ExitCode {
         ) {
             Ok(core) => break Arc::new(Mutex::new(core)),
             Err(e) => {
-                eprintln!("chezmoid: startup blocked ({e}); retrying in 10s");
+                eprintln!(
+                    "chezmoid[t={}]: startup blocked ({e}); retrying in 10s",
+                    now_ts()
+                );
                 ctx.set_starting_error(e.to_string());
                 std::thread::sleep(Duration::from_secs(10));
             }

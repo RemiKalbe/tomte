@@ -98,8 +98,17 @@ pub enum CommandError {
         #[source]
         source: std::io::Error,
     },
-    #[error("{program} timed out after {timeout:?}")]
-    Timeout { program: String, timeout: Duration },
+    #[error(
+        "{program} timed out after {timeout:?}; stderr tail: {stderr_tail:?}; stdout tail: {stdout_tail:?}"
+    )]
+    Timeout {
+        program: String,
+        timeout: Duration,
+        /// Last output the child produced before the group kill — usually
+        /// names exactly what it was doing or waiting for.
+        stderr_tail: String,
+        stdout_tail: String,
+    },
     #[error("i/o error running {program}: {source}")]
     Io {
         program: String,
@@ -174,9 +183,31 @@ impl CommandRunner for SystemRunner {
             None => {
                 kill_group(pid);
                 let _ = child.wait(); // reap; the group kill already landed
+                // The group is dead → pipes closed → readers finish promptly.
+                // Their partial buffers are the diagnostic evidence.
+                let tail = |rx: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>| match rx
+                    .recv_timeout(PIPE_GRACE)
+                {
+                    Ok(Ok(buf)) => {
+                        let text = String::from_utf8_lossy(&buf);
+                        let tail: String = text
+                            .lines()
+                            .rev()
+                            .take(5)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        tail.chars().take(500).collect()
+                    }
+                    _ => String::from("<unavailable>"),
+                };
                 return Err(CommandError::Timeout {
                     program: req.program.clone(),
                     timeout: req.timeout,
+                    stderr_tail: tail(&rx_err),
+                    stdout_tail: tail(&rx_out),
                 });
             }
         };
