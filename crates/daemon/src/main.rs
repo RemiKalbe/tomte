@@ -75,8 +75,31 @@ fn build_core(
     Ok(core)
 }
 
+/// Drop PATH entries under /var/folders (per-session temp shims, e.g.
+/// terminal-app CLI wrappers): a long-lived daemon inheriting them ends up
+/// resolving tools through shims whose session died — the 24h-wedge bug.
+fn sanitize_path() {
+    let Some(path) = std::env::var_os("PATH") else {
+        return;
+    };
+    let kept: Vec<_> = std::env::split_paths(&path)
+        .filter(|p| {
+            let ephemeral = p.starts_with("/var/folders") || p.starts_with("/private/var/folders");
+            if ephemeral {
+                eprintln!("chezmoid: dropping ephemeral PATH entry {}", p.display());
+            }
+            !ephemeral
+        })
+        .collect();
+    if let Ok(joined) = std::env::join_paths(kept) {
+        // Single-threaded at this point in main; no concurrent env access.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
+}
+
 fn main() -> ExitCode {
     let once = std::env::args().any(|a| a == "--once");
+    sanitize_path();
     let support = app_support_dir();
     let settings = Settings::load(&env_path("CZUI_SETTINGS", support.join("settings.toml")));
     let journal_path = env_path("CZUI_JOURNAL", support.join("journal.db"));

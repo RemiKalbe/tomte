@@ -35,8 +35,8 @@ struct RowData {
     name: SharedString,
     /// Muted parent directory (target rows only), truncated in render.
     dir: Option<SharedString>,
-    /// (label, colored) chip. Colored=false renders muted (info rows).
-    chip: (SharedString, bool),
+    /// Colored status chip (class rows only).
+    chip: Option<SharedString>,
     class: Option<SharedString>,
     /// Click opens Review focused on this target.
     target: Option<PathBuf>,
@@ -56,10 +56,12 @@ impl RowData {
             ),
             None => (kind_label(&row.kind).to_string(), None),
         };
-        let chip = match &row.class {
-            Some(class) => (SharedString::from(class_label(class)), true),
-            None => (SharedString::from(kind_label(&row.kind)), false),
-        };
+        // Class rows get a colored chip; info rows (fetch/scan) already say
+        // what they are in the name — no chip (was rendering "scan scan").
+        let chip = row
+            .class
+            .as_ref()
+            .map(|class| SharedString::from(class_label(class)));
         Self {
             time: time_ago(now, row.ts).into(),
             glyph: kind_glyph(&row.kind),
@@ -326,24 +328,22 @@ fn timeline_row(
                     )
                 }),
         )
-        .child({
-            let (label, colored) = row.chip.clone();
-            let color = if colored {
-                row.class
-                    .as_deref()
-                    .map(|c| theme.class_color(c))
-                    .unwrap_or(theme.text_muted)
-            } else {
-                theme.text_muted
-            };
-            div()
-                .flex_none()
-                .px_1p5()
-                .rounded_sm()
-                .when(colored, |el| el.bg(Theme::wash(color, 0.12)))
-                .text_xs()
-                .text_color(color)
-                .child(label)
+        .when_some(row.chip.clone(), |el, label| {
+            let color = row
+                .class
+                .as_deref()
+                .map(|c| theme.class_color(c))
+                .unwrap_or(theme.text_muted);
+            el.child(
+                div()
+                    .flex_none()
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(Theme::wash(color, 0.12))
+                    .text_xs()
+                    .text_color(color)
+                    .child(label),
+            )
         });
 
     match row.target.clone() {
