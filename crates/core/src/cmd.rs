@@ -3,8 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, channel};
-use std::time::Duration;
-use wait_timeout::ChildExt;
+use std::time::{Duration, Instant};
 
 /// How long a finished child's output pipes may stay open (held by lingering
 /// grandchildren) before the whole process group is killed. Learned the hard
@@ -178,7 +177,20 @@ impl CommandRunner for SystemRunner {
             let _ = tx_err.send(res);
         });
 
-        let status = match child.wait_timeout(req.timeout).map_err(io_err)? {
+        // Poll for exit instead of wait-timeout's SIGCHLD self-pipe: signal
+        // delivery races in a multithreaded daemon made waits miss exits and
+        // burn the whole timeout while the child lay dead (the "chezmoi
+        // timed out but its stdout has the answer" bug). WNOHANG polling has
+        // no failure mode.
+        let deadline = Instant::now() + req.timeout;
+        let exit = loop {
+            match child.try_wait().map_err(io_err)? {
+                Some(status) => break Some(status),
+                None if Instant::now() >= deadline => break None,
+                None => std::thread::sleep(Duration::from_millis(25)),
+            }
+        };
+        let status = match exit {
             Some(status) => status,
             None => {
                 kill_group(pid);

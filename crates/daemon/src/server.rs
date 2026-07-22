@@ -208,16 +208,21 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
             .lock()
             .map(|e| e.clone())
             .unwrap_or_else(|_| "starting".to_string());
+        // Before the first failure the placeholder reason is "starting" —
+        // don't render the comical "chezmoid starting: starting".
+        let why = if why == "starting" {
+            "chezmoid starting…".to_string()
+        } else {
+            format!("chezmoid starting: {why}")
+        };
         return match request {
             Request::Status => Response::Status {
                 drifted: Vec::new(),
                 in_sync: 0,
-                degraded: Some(format!("chezmoid starting: {why}")),
+                degraded: Some(why.clone()),
                 scanning: true,
             },
-            _ => Response::Error {
-                message: format!("chezmoid still starting: {why}"),
-            },
+            _ => Response::Error { message: why },
         };
     };
 

@@ -26,6 +26,7 @@ thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 czui-daemon = { path = "../daemon" }
 czui-core = { path = "../core", features = ["test-support"] }
 tempfile.workspace = true

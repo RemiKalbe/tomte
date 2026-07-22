@@ -144,6 +144,9 @@ fn build_lines(model: &SyncModel, now: u64, expanded: &HashSet<u64>) -> Vec<Line
 pub struct DashboardView {
     pub state: Entity<SyncModel>,
     pub now_ts: fn() -> u64,
+    /// Cloned from `Shell::expanded_scans` by the caller — reading the Shell
+    /// entity from inside its own render panics ("already being updated").
+    pub expanded_scans: HashSet<u64>,
 }
 
 impl DashboardView {
@@ -151,7 +154,7 @@ impl DashboardView {
     /// the shell re-renders whenever the model entity notifies.
     pub fn render(self, theme: Theme, cx: &mut Context<Shell>) -> impl IntoElement + use<> {
         let now = (self.now_ts)();
-        let expanded = cx.entity().read(cx).expanded_scans.clone();
+        let expanded = self.expanded_scans;
         let model = self.state.read(cx);
 
         let needs_attention = model.needs_attention();

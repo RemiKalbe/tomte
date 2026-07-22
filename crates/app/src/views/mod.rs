@@ -207,6 +207,7 @@ impl Render for Shell {
                         Route::Dashboard => DashboardView {
                             state: self.state.clone(),
                             now_ts: dashboard::system_now,
+                            expanded_scans: self.expanded_scans.clone(),
                         }
                         .render(theme, cx)
                         .into_any_element(),
@@ -226,5 +227,110 @@ impl Render for Shell {
                         }
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod render_smoke {
+    //! Render every route in a real (headless) gpui window. Catches the
+    //! whole class of render-path panics the pure-logic tests can't see —
+    //! e.g. reading an entity from inside its own render ("cannot read …
+    //! while it is already being updated"), which shipped and crashed the
+    //! app on open.
+
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use czui_app::model::{SyncModel, TimelineRow};
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    fn model_with_data() -> SyncModel {
+        let mut m = SyncModel {
+            connected: true,
+            ..Default::default()
+        };
+        m.hydrate_status(
+            vec![czui_proto::DriftSummary {
+                target: PathBuf::from("/tmp/smoke/.zshrc"),
+                class: "destination_drift".into(),
+                since_ts: Some(10),
+            }],
+            42,
+            Some("degraded hint".into()),
+            false,
+        );
+        let info = |ts: u64| TimelineRow {
+            ts,
+            kind: "fetch".into(),
+            target: None,
+            machine: "m".into(),
+            class: None,
+        };
+        m.timeline = vec![
+            info(30),
+            info(29),
+            info(28),
+            TimelineRow {
+                ts: 27,
+                kind: "dest_changed".into(),
+                target: Some(PathBuf::from("/tmp/smoke/.zshrc")),
+                machine: "m".into(),
+                class: Some("destination_drift".into()),
+            },
+        ];
+        m
+    }
+
+    #[gpui::test]
+    fn shell_renders_every_route_without_panicking(cx: &mut TestAppContext) {
+        for route in [Route::Dashboard, Route::Review, Route::Settings] {
+            let (_view, vis) = cx.add_window_view(|_window, cx| {
+                let state = cx.new(|_| model_with_data());
+                // exercise the expanded scan-group render path too
+                let mut expanded_scans = HashSet::new();
+                expanded_scans.insert(30u64);
+                Shell {
+                    route,
+                    state,
+                    review: None,
+                    settings: None,
+                    paths: SettingsPaths {
+                        socket: PathBuf::from("/tmp/smoke.sock"),
+                        journal: PathBuf::from("/tmp/smoke-journal.db"),
+                        settings: PathBuf::from("/tmp/smoke-settings.toml"),
+                    },
+                    expanded_scans,
+                }
+            });
+            vis.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    fn shell_renders_empty_and_scanning_states(cx: &mut TestAppContext) {
+        for (connected, scanning) in [(false, false), (true, true)] {
+            let (_view, vis) = cx.add_window_view(|_window, cx| {
+                let state = cx.new(|_| SyncModel {
+                    connected,
+                    scanning,
+                    ..Default::default()
+                });
+                Shell {
+                    route: Route::Dashboard,
+                    state,
+                    review: None,
+                    settings: None,
+                    paths: SettingsPaths {
+                        socket: PathBuf::from("/tmp/smoke.sock"),
+                        journal: PathBuf::from("/tmp/smoke-journal.db"),
+                        settings: PathBuf::from("/tmp/smoke-settings.toml"),
+                    },
+                    expanded_scans: HashSet::new(),
+                }
+            });
+            vis.run_until_parked();
+        }
     }
 }
