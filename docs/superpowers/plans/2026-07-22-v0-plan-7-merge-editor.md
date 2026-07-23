@@ -138,11 +138,11 @@ Commit: `test(app): merge-resolution e2e stories incl. template write-back`.
 
 **Files:** create `scripts/bundle.sh`, `scripts/install-launchagent.sh`, `bundle/Info.plist`.
 
-- [ ] `bundle/Info.plist`: CFBundleIdentifier `com.remikalbe.chezmoi-ui`, CFBundleName "Chezmoi UI", CFBundleExecutable `chezmoi-ui`, **LSUIElement true** (accessory — no Dock), CFBundleShortVersionString 0.1.0, LSMinimumSystemVersion 13.0.
-- [ ] `scripts/bundle.sh`: `cargo build --release -p czui-app -p czui-daemon` → assemble `target/bundle/Chezmoi UI.app/Contents/{MacOS/{chezmoi-ui,chezmoid},Info.plist}` → `codesign --force --deep -s - "…app"` (ad-hoc) → print the path. Idempotent; `set -euo pipefail`.
-- [ ] `scripts/install-launchagent.sh`: writes `~/Library/LaunchAgents/com.remikalbe.chezmoid.plist` (ProgramArguments → the BUNDLED chezmoid, RunAtLoad, KeepAlive true, StandardOut/ErrPath → `~/Library/Application Support/ChezmoiUI/chezmoid.launchd.log`) then `launchctl bootstrap gui/$UID` (with bootout-first for idempotence). Prints how to uninstall. DOES NOT run automatically — user-invoked.
-- [ ] Smoke (agent-safe): run bundle.sh, assert bundle structure + codesign verifies + `"…/Contents/MacOS/chezmoid" --once` works with CZUI_JOURNAL in a temp dir. Do NOT install the LaunchAgent and do NOT launch the .app GUI (user-attended).
-- [ ] Commit: `feat: bundle script, Info.plist, and LaunchAgent installer`.
+- [x] `bundle/Info.plist`: CFBundleIdentifier `com.remikalbe.chezmoi-ui`, CFBundleName "Chezmoi UI", CFBundleExecutable `chezmoi-ui`, **LSUIElement true** (accessory — no Dock), CFBundleShortVersionString 0.1.0, LSMinimumSystemVersion 13.0.
+- [x] `scripts/bundle.sh`: `cargo build --release -p czui-app -p czui-daemon` → assemble `target/bundle/Chezmoi UI.app/Contents/{MacOS/{chezmoi-ui,chezmoid},Info.plist}` → `codesign --force --deep -s - "…app"` (ad-hoc) → print the path. Idempotent; `set -euo pipefail`.
+- [x] `scripts/install-launchagent.sh`: writes `~/Library/LaunchAgents/com.remikalbe.chezmoid.plist` (ProgramArguments → the BUNDLED chezmoid, RunAtLoad, KeepAlive true, StandardOut/ErrPath → `~/Library/Application Support/ChezmoiUI/chezmoid.launchd.log`) then `launchctl bootstrap gui/$UID` (with bootout-first for idempotence). Prints how to uninstall. DOES NOT run automatically — user-invoked.
+- [x] Smoke (agent-safe): run bundle.sh, assert bundle structure + codesign verifies + `"…/Contents/MacOS/chezmoid" --once` works with CZUI_JOURNAL in a temp dir. Do NOT install the LaunchAgent and do NOT launch the .app GUI (user-attended).
+- [x] Commit: `feat: bundle script, Info.plist, and LaunchAgent installer`.
 
 ---
 
