@@ -410,6 +410,33 @@ impl Journal {
         Ok(())
     }
 
+    /// Newest finished session (`finished_ts NOT NULL`), as
+    /// `(id, decisions JSON array)`. Unfinished sessions never count: a crash
+    /// mid-resolution must not become undoable state.
+    pub fn last_finished_session(&self) -> Result<Option<(i64, serde_json::Value)>, JournalError> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, decisions FROM sessions
+                 WHERE finished_ts IS NOT NULL ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match row {
+            Some((id, decisions)) => {
+                let value: serde_json::Value = serde_json::from_str(&decisions)
+                    .map_err(|e| JournalError::Corrupt(format!("session {id} decisions: {e}")))?;
+                Ok(Some((id, value)))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn gc_blobs(&self) -> Result<u32, JournalError> {
         let n = self.conn.execute(
             "DELETE FROM blobs WHERE hash NOT IN (
@@ -589,6 +616,44 @@ mod tests {
         assert_eq!(summary.as_deref(), Some("resolved 2 files"));
         let arr: serde_json::Value = serde_json::from_str(&decisions).unwrap();
         assert_eq!(arr.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn last_finished_session_returns_newest_finished_only() {
+        let j = Journal::open_in_memory("m").unwrap();
+        let a = j.begin_session(10).unwrap();
+        j.add_decision(
+            a,
+            &serde_json::json!({"action": "keep_disk", "target": "/x"}),
+        )
+        .unwrap();
+        j.end_session(a, 20, "one").unwrap();
+        let b = j.begin_session(30).unwrap();
+        j.add_decision(
+            b,
+            &serde_json::json!({"action": "keep_source", "target": "/y"}),
+        )
+        .unwrap();
+        j.end_session(b, 40, "two").unwrap();
+        let _unfinished = j.begin_session(50).unwrap(); // newest, but not finished
+
+        let (id, decisions) = j.last_finished_session().unwrap().unwrap();
+        assert_eq!(id, b, "must skip the unfinished session");
+        let arr = decisions.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["action"], "keep_source");
+        assert_eq!(arr[0]["target"], "/y");
+    }
+
+    #[test]
+    fn last_finished_session_none_when_only_unfinished() {
+        let j = Journal::open_in_memory("m").unwrap();
+        assert!(j.last_finished_session().unwrap().is_none());
+        let _s = j.begin_session(10).unwrap();
+        assert!(
+            j.last_finished_session().unwrap().is_none(),
+            "an unfinished session must not count"
+        );
     }
 
     #[test]

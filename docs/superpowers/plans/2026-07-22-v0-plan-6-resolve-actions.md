@@ -54,9 +54,9 @@ crates/app/tests/resolve_e2e.rs   # drift stories: keep_disk/keep_source/sync_al
 
 TDD: hermetic tests in each file's existing test module — git ops against the existing `scratch()` temp-repo helper (commit asserts sha changes + `-c commit.gpgsign=false` in the helper already handles signing); `re_add` via FakeRunner asserting args `["re-add", <target>]`; `update` asserting args + timeout; journal query via in-memory sessions. Commit: `feat(core,journal): mutation primitives for resolution actions`.
 
-- [ ] Write failing tests (5 new: add_all+commit+push roundtrip in a scratch repo asserting a second commit exists and the bare remote received it; re_add args; update args; last_finished_session returns newest finished only)
-- [ ] Implement (each method ~5 lines following existing patterns; `update` passes `Duration::from_secs(120)` like `fetch`)
-- [ ] Full gate; commit.
+- [x] Write failing tests (6 new: add_all+commit+push roundtrip in a scratch repo asserting a second commit exists and the bare remote received it; commit-failure error surface; re_add args; update args+timeout; last_finished_session returns newest finished only / None when unfinished)
+- [x] Implement (each method ~5 lines following existing patterns; `update` passes `Duration::from_secs(120)` like `fetch`)
+- [x] Full gate; commit.
 
 ---
 

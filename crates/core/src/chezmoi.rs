@@ -174,7 +174,16 @@ impl ChezmoiClient {
     }
 
     fn run_ok(&self, args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>, ChezmoiError> {
-        let mut req = self.request(args);
+        self.run_ok_with_timeout(args, stdin, self.opts.timeout)
+    }
+
+    fn run_ok_with_timeout(
+        &self,
+        args: &[&str],
+        stdin: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ChezmoiError> {
+        let mut req = self.request(args).timeout(timeout);
         if let Some(bytes) = stdin {
             req = req.stdin(bytes);
         }
@@ -277,6 +286,20 @@ impl ChezmoiClient {
         };
         Ok(())
     }
+
+    /// Re-add a modified target into the source state. NOTE: chezmoi silently
+    /// ignores templated sources — callers must pre-detect `.tmpl` and refuse.
+    pub fn re_add(&self, target: &Path) -> Result<(), ChezmoiError> {
+        self.run_ok(&["re-add", &target.to_string_lossy()], None)?;
+        Ok(())
+    }
+
+    /// Pull changes from the source repo and apply them. Network op: 120s
+    /// timeout like git fetch, overriding the configured default.
+    pub fn update(&self) -> Result<(), ChezmoiError> {
+        self.run_ok_with_timeout(&["update"], None, Duration::from_secs(120))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +384,32 @@ mod tests {
             call.env
                 .contains(&("OP_ACCOUNT".to_string(), "acct".to_string()))
         );
+    }
+
+    #[test]
+    fn re_add_passes_target_with_default_timeout() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "", "");
+        client(fake.clone())
+            .re_add(std::path::Path::new("/Users/x/.zshrc"))
+            .unwrap();
+        let call = &fake.calls()[0];
+        assert_eq!(
+            call.args,
+            vec!["--no-tty", "--no-pager", "re-add", "/Users/x/.zshrc"]
+        );
+        assert_eq!(call.timeout, ChezmoiOptions::default().timeout);
+    }
+
+    #[test]
+    fn update_uses_network_timeout() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "", "");
+        client(fake.clone()).update().unwrap();
+        let call = &fake.calls()[0];
+        assert_eq!(call.args, vec!["--no-tty", "--no-pager", "update"]);
+        // update pulls over the network: 120s like git fetch, not the 30s default
+        assert_eq!(call.timeout, Duration::from_secs(120));
     }
 
     #[test]

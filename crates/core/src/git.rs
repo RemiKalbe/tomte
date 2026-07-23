@@ -128,6 +128,28 @@ impl GitClient {
             })
     }
 
+    pub fn add_all(&self) -> Result<(), GitError> {
+        self.run(&["add", "-A"], Duration::from_secs(30))?;
+        Ok(())
+    }
+
+    /// Commit staged changes and return the new HEAD sha. A signing failure
+    /// (e.g. locked 1Password) surfaces as `GitError::Exit` with git's stderr.
+    pub fn commit(&self, message: &str) -> Result<String, GitError> {
+        self.run(&["commit", "-m", message], Duration::from_secs(30))?;
+        self.rev_parse("HEAD")
+    }
+
+    pub fn push(&self, remote: &str) -> Result<(), GitError> {
+        // network op: same generous timeout as fetch
+        self.run(&["push", "--quiet", remote], Duration::from_secs(120))?;
+        Ok(())
+    }
+
+    pub fn head_sha(&self) -> Result<String, GitError> {
+        self.rev_parse("HEAD")
+    }
+
     pub fn dirty_files(&self) -> Result<Vec<PathBuf>, GitError> {
         Ok(self
             .run_utf8(&["status", "--porcelain"])?
@@ -186,6 +208,12 @@ mod tests {
             &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
         );
         git(&work, &["init", "-b", "main"]);
+        // Local config: GitClient::commit runs WITHOUT the -c overrides above,
+        // so the repo itself must carry identity and disable signing (the
+        // machine's global config may have 1Password SSH signing enabled).
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
         std::fs::write(work.join("f.txt"), "one\n").unwrap();
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "c1"]);
@@ -257,6 +285,44 @@ mod tests {
         let sha = client(&work).rev_parse("HEAD").unwrap();
         assert_eq!(sha.len(), 40);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn add_all_commit_push_roundtrip_lands_on_origin() {
+        let (guard, work) = scratch();
+        let c = client(&work);
+        let first = c.head_sha().unwrap();
+
+        std::fs::write(work.join("f.txt"), "two\n").unwrap();
+        std::fs::write(work.join("new.txt"), "fresh\n").unwrap();
+        c.add_all().unwrap();
+        let second = c.commit("chezmoi-ui: keep_disk f.txt").unwrap();
+
+        assert_ne!(second, first, "commit must move HEAD");
+        assert_eq!(second.len(), 40);
+        assert_eq!(second, c.head_sha().unwrap());
+        // the new commit sits on top of the old head → a second commit exists
+        assert_eq!(c.rev_parse("HEAD~1").unwrap(), first);
+
+        c.push("origin").unwrap();
+        let origin = GitClient::new(Arc::new(SystemRunner), guard.path().join("origin.git"));
+        assert_eq!(
+            origin.rev_parse("HEAD").unwrap(),
+            second,
+            "push must land the new commit on the bare origin"
+        );
+    }
+
+    #[test]
+    fn commit_failure_surfaces_exit_with_stderr() {
+        // Nothing staged → git commit exits non-zero. Signing failures (locked
+        // 1Password) arrive through the exact same GitError::Exit surface.
+        let (_g, work) = scratch();
+        let err = client(&work).commit("nothing to do").unwrap_err();
+        match err {
+            GitError::Exit { code, .. } => assert_ne!(code, 0),
+            other => panic!("expected GitError::Exit, got {other:?}"),
+        }
     }
 
     #[test]
