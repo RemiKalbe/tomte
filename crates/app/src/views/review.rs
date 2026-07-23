@@ -477,6 +477,11 @@ impl ReviewView {
     /// provenance + `chezmoi cat` + destination read). Re-selecting the same
     /// target reloads — a free refresh.
     pub fn select(&mut self, target: PathBuf, cx: &mut Context<Self>) {
+        // Outcome banners belong to the file they acted on — switching files
+        // must not carry a stale "committed & pushed" (or its Undo) along.
+        if self.selected.as_deref() != Some(target.as_path()) {
+            self.last_outcome = None;
+        }
         self.selected = Some(target.clone());
         self.preview = PreviewState::Loading;
         self.provenance.clear();
