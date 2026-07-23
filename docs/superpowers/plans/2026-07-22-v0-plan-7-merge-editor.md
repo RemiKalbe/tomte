@@ -118,7 +118,7 @@ Unit tests: conflict bookkeeping, pick/override, next_unresolved wrap-around, as
 
 Commit: `feat(app): three-pane merge editor with per-region choices`.
 
-- [ ] Implement per contract → smoke test → gate → commit.
+- [x] Implement per contract → smoke test → gate → commit.
 
 ---
 

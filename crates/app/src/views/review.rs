@@ -7,8 +7,9 @@
 //! `WeakEntity::update` (spec §3.2 non-blocking rule). One-click resolutions
 //! ("keep disk" / "keep source" / undo, plan 6 Task 3) go through the
 //! [`ResolveEngine`] published in the [`crate::EngineSlot`] global; their
-//! outcomes render as a slim banner above the diff. The merge editor
-//! (conflicts, templated files) stays a Plan 7 stub.
+//! outcomes render as a slim banner above the diff. "Open merge editor"
+//! (conflicts, templated files) hands the selected target to the Shell's
+//! full-window merge editor (plan 7 Task 3).
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -25,9 +26,10 @@ use czui_journal::{EventRow, Journal};
 use czui_proto::DriftSummary;
 use gpui::{
     AnyElement, Context, Div, ElementId, Entity, FontWeight, HighlightStyle, Rgba, SharedString,
-    Stateful, StyledText, Window, div, prelude::*, px, uniform_list,
+    Stateful, StyledText, WeakEntity, Window, div, prelude::*, px, uniform_list,
 };
 
+use super::Shell;
 use super::dashboard::{TextTooltip, system_now};
 
 /// Fixed sidebar width per the approved mockup A (~260px).
@@ -111,9 +113,9 @@ impl From<EventRow> for ProvRow {
 
 /// Journal location: CZUI_JOURNAL override, else the app-support default.
 /// Mirror of `resolve_paths` in main.rs (which mirrors
-/// `czui_daemon::settings`) — kept local so views don't reach into the binary
-/// root module.
-fn journal_path() -> PathBuf {
+/// `czui_daemon::settings`) — kept in the views tree (shared with the merge
+/// editor) so views don't reach into the binary root module.
+pub(super) fn journal_path() -> PathBuf {
     if let Some(p) = std::env::var_os("CZUI_JOURNAL") {
         return PathBuf::from(p);
     }
@@ -208,15 +210,16 @@ impl ResolveAction {
 
 /// Theme token the outcome banner is tinted with (kept symbolic so the
 /// mapping stays pure and testable; resolved to a color at render).
+/// `pub(crate)` because `Shell::merge_done` carries a banner in its signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BannerTint {
+pub(crate) enum BannerTint {
     Ok,
     Drift,
     Conflict,
 }
 
 impl BannerTint {
-    fn color(self, theme: Theme) -> Rgba {
+    pub(crate) fn color(self, theme: Theme) -> Rgba {
         match self {
             Self::Ok => theme.ok,
             Self::Drift => theme.drift,
@@ -226,13 +229,14 @@ impl BannerTint {
 }
 
 /// The slim banner above the diff reporting the last action's outcome
-/// (spec §10: honest, including degraded commit/push results).
+/// (spec §10: honest, including degraded commit/push results). Shared with
+/// the merge editor, which hands its success banners back to this view.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct OutcomeBanner {
-    pub(super) text: SharedString,
-    pub(super) tint: BannerTint,
+pub(crate) struct OutcomeBanner {
+    pub(crate) text: SharedString,
+    pub(crate) tint: BannerTint,
     /// Successful resolutions offer an Undo button (spec §6.3).
-    pub(super) undoable: bool,
+    pub(crate) undoable: bool,
 }
 
 /// Map an action result onto its banner. Tint policy: a `note` means the
@@ -332,7 +336,7 @@ struct DiffLine {
     highlights: Vec<Range<usize>>,
 }
 
-fn display_text(line: &str) -> &str {
+pub(super) fn display_text(line: &str) -> &str {
     line.strip_suffix('\n').unwrap_or(line)
 }
 
@@ -450,6 +454,9 @@ fn per_line_ranges(lines: &[String], ranges: &[Range<usize>]) -> Vec<Vec<Range<u
 
 pub struct ReviewView {
     state: Entity<SyncModel>,
+    /// Back-reference for cross-view navigation ("Open merge editor" routes
+    /// through [`Shell::open_merge`]). Weak: the shell owns this view.
+    shell: WeakEntity<Shell>,
     /// `pub(super)` so the render-smoke tests can pose a selected target
     /// without spawning the background detail load.
     pub(super) selected: Option<PathBuf>,
@@ -466,12 +473,13 @@ pub struct ReviewView {
 }
 
 impl ReviewView {
-    pub fn new(state: Entity<SyncModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<SyncModel>, shell: WeakEntity<Shell>, cx: &mut Context<Self>) -> Self {
         // Re-render whenever the shared model changes so new drift rows land
         // in the sidebar without user interaction.
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         Self {
             state,
+            shell,
             selected: None,
             preview: PreviewState::Empty,
             provenance: Vec::new(),
@@ -611,6 +619,52 @@ impl ReviewView {
             .ok();
         })
         .detach();
+    }
+
+    /// Hand the selected target to the Shell's full-window merge editor
+    /// (plan 7 Task 3). The button gating guarantees a selection and a live
+    /// engine, but both are re-checked structurally here.
+    fn open_merge_editor(&self, cx: &mut Context<Self>) {
+        let Some(target) = self.selected.clone() else {
+            return;
+        };
+        self.shell
+            .update(cx, |shell, cx| shell.open_merge(target, cx))
+            .ok();
+    }
+
+    /// "Open merge editor" — live when the engine global exists (`detail()`
+    /// already implies a selection).
+    fn merge_editor_button(
+        &self,
+        enabled: bool,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let base = div()
+            .id("open-merge-editor")
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .text_xs()
+            .child("Open merge editor");
+        if enabled {
+            base.border_color(theme.accent)
+                .text_color(theme.accent)
+                .cursor_pointer()
+                .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
+                .on_click(cx.listener(|view, _ev, _window, cx| view.open_merge_editor(cx)))
+        } else {
+            base.border_color(theme.border)
+                .text_color(theme.text_muted)
+                .tooltip(|_window, cx| {
+                    cx.new(|_| TextTooltip {
+                        text: "daemon not connected".into(),
+                    })
+                    .into()
+                })
+        }
     }
 
     /// One header action button. Enabled needs a live engine (daemon
@@ -812,6 +866,10 @@ impl ReviewView {
             .into();
         let path: SharedString = selected.display().to_string().into();
 
+        let engine_ready = cx
+            .try_global::<crate::EngineSlot>()
+            .is_some_and(|slot| slot.0.is_some());
+
         let body = match &self.preview {
             PreviewState::Empty | PreviewState::Loading => {
                 centered_note(theme, "loading preview…".into(), theme.text_muted)
@@ -869,9 +927,6 @@ impl ReviewView {
                             .child("working…")
                             .into_any_element()
                     } else {
-                        let engine_ready = cx
-                            .try_global::<crate::EngineSlot>()
-                            .is_some_and(|slot| slot.0.is_some());
                         div()
                             .flex()
                             .items_center()
@@ -892,25 +947,7 @@ impl ReviewView {
                             ))
                             .into_any_element()
                     })
-                    .child(
-                        // Plan 7 stub: disabled, tooltip explains why.
-                        div()
-                            .id("open-merge-editor")
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child("Open merge editor")
-                            .tooltip(|_window, cx| {
-                                cx.new(|_| TextTooltip {
-                                    text: "arrives with the merge editor (next milestone)".into(),
-                                })
-                                .into()
-                            }),
-                    )
+                    .child(self.merge_editor_button(engine_ready, theme, cx))
                     .child(
                         div()
                             .id("open-in-editor")
@@ -968,7 +1005,7 @@ fn group_header(label: &'static str, theme: Theme) -> Div {
         .child(label)
 }
 
-fn centered_note(theme: Theme, text: SharedString, color: Rgba) -> AnyElement {
+pub(super) fn centered_note(theme: Theme, text: SharedString, color: Rgba) -> AnyElement {
     let _ = theme;
     div()
         .flex_1()
@@ -983,7 +1020,7 @@ fn centered_note(theme: Theme, text: SharedString, color: Rgba) -> AnyElement {
 
 /// Error/eval-failure box: title + detail + optional muted remediation line
 /// (spec §10: errors are states, not gaps).
-fn message_box(
+pub(super) fn message_box(
     theme: Theme,
     title: &'static str,
     detail: String,

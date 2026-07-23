@@ -2,6 +2,7 @@
 //! panel, bordered, compact nav rows) over a routed content pane.
 
 pub mod dashboard;
+pub mod merge;
 pub mod review;
 pub mod settings;
 
@@ -15,7 +16,8 @@ use czui_app::model::{SyncModel, time_ago};
 use czui_app::theme::Theme;
 
 use dashboard::DashboardView;
-use review::ReviewView;
+use merge::MergeView;
+use review::{OutcomeBanner, ReviewView};
 use settings::{SettingsPaths, SettingsView};
 
 /// Zed's settings sidebar is 226px; ours carries shorter labels.
@@ -26,6 +28,9 @@ pub enum Route {
     Dashboard,
     Review,
     Settings,
+    /// Full-window merge editor (plan 7 Task 3). Not a sidebar item — entered
+    /// via Review's "Open merge editor", left via Cancel/Save.
+    Merge,
 }
 
 pub struct Shell {
@@ -40,6 +45,9 @@ pub struct Shell {
     /// Same lifetime rationale as `review`: stepper/picker edits and the
     /// background loads survive route switches.
     pub settings: Option<Entity<SettingsView>>,
+    /// Lazy like `review`; kept alive so the loaded merge inputs and the
+    /// user's per-region choices survive a route switch and back.
+    pub merge: Option<Entity<MergeView>>,
     /// Daemon-facing paths the Settings view displays and writes — resolved
     /// once in main.rs so all path policy stays in one place.
     pub paths: SettingsPaths,
@@ -56,14 +64,49 @@ pub struct Shell {
 impl Shell {
     /// Route to Review, optionally selecting a target (dashboard row click).
     pub fn open_review(&mut self, target: Option<PathBuf>, cx: &mut Context<Self>) {
-        let state = self.state.clone();
-        let review = self
-            .review
-            .get_or_insert_with(|| cx.new(|cx| ReviewView::new(state, cx)))
-            .clone();
+        let review = self.ensure_review(cx);
         if let Some(target) = target {
             review.update(cx, |view, cx| view.select(target, cx));
         }
+        self.route = Route::Review;
+        cx.notify();
+    }
+
+    /// The lazily created Review entity (shared by routing, rendering, and
+    /// the merge editor's banner hand-off).
+    fn ensure_review(&mut self, cx: &mut Context<Self>) -> Entity<ReviewView> {
+        let state = self.state.clone();
+        let shell = cx.weak_entity();
+        self.review
+            .get_or_insert_with(|| cx.new(|cx| ReviewView::new(state, shell, cx)))
+            .clone()
+    }
+
+    /// Open the full-window merge editor for `target` (plan 7 Task 3):
+    /// ensure the lazy entity, kick the background inputs load, route.
+    pub fn open_merge(&mut self, target: PathBuf, cx: &mut Context<Self>) {
+        let shell = cx.weak_entity();
+        let merge = self
+            .merge
+            .get_or_insert_with(|| cx.new(|_| MergeView::new(shell)))
+            .clone();
+        merge.update(cx, |view, cx| view.load(target, cx));
+        self.route = Route::Merge;
+        cx.notify();
+    }
+
+    /// Land a successful merge save: hand the outcome banner to Review (its
+    /// banner owns the Undo button), reload its preview so the diff reflects
+    /// the converged reality, and route back.
+    pub fn merge_done(&mut self, banner: OutcomeBanner, cx: &mut Context<Self>) {
+        let review = self.ensure_review(cx);
+        review.update(cx, |view, cx| {
+            view.last_outcome = Some(banner);
+            if let Some(target) = view.selected.clone() {
+                view.select(target, cx);
+            }
+            cx.notify();
+        });
         self.route = Route::Review;
         cx.notify();
     }
@@ -217,17 +260,18 @@ impl Render for Shell {
                         }
                         .render(theme, cx)
                         .into_any_element(),
-                        Route::Review => {
-                            let state = self.state.clone();
-                            self.review
-                                .get_or_insert_with(|| cx.new(|cx| ReviewView::new(state, cx)))
-                                .clone()
-                                .into_any_element()
-                        }
+                        Route::Review => self.ensure_review(cx).into_any_element(),
                         Route::Settings => {
                             let paths = self.paths.clone();
                             self.settings
                                 .get_or_insert_with(|| cx.new(|cx| SettingsView::new(paths, cx)))
+                                .clone()
+                                .into_any_element()
+                        }
+                        Route::Merge => {
+                            let shell = cx.weak_entity();
+                            self.merge
+                                .get_or_insert_with(|| cx.new(|_| MergeView::new(shell)))
                                 .clone()
                                 .into_any_element()
                         }
@@ -299,7 +343,14 @@ mod render_smoke {
 
     #[gpui::test]
     fn shell_renders_every_route_without_panicking(cx: &mut TestAppContext) {
-        for route in [Route::Dashboard, Route::Review, Route::Settings] {
+        for route in [
+            Route::Dashboard,
+            Route::Review,
+            Route::Settings,
+            // lazily created with no target: the "open a file from Review"
+            // empty state
+            Route::Merge,
+        ] {
             let (_view, vis) = cx.add_window_view(|_window, cx| {
                 let state = cx.new(|_| model_with_data());
                 // exercise the expanded scan-group render path too
@@ -310,6 +361,7 @@ mod render_smoke {
                     state,
                     review: None,
                     settings: None,
+                    merge: None,
                     paths: smoke_paths(),
                     expanded_scans,
                     dashboard_action_in_flight: false,
@@ -350,8 +402,9 @@ mod render_smoke {
         ] {
             let (_view, vis) = cx.add_window_view(|_window, cx| {
                 let state = cx.new(|_| model_with_data());
+                let shell = cx.weak_entity();
                 let review = cx.new(|cx| {
-                    let mut view = ReviewView::new(state.clone(), cx);
+                    let mut view = ReviewView::new(state.clone(), shell, cx);
                     view.selected = Some(PathBuf::from("/tmp/smoke/.zshrc"));
                     view.last_outcome = banner.clone();
                     view.action_in_flight = in_flight;
@@ -362,6 +415,7 @@ mod render_smoke {
                     state,
                     review: Some(review),
                     settings: None,
+                    merge: None,
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
                     // also exercises the dashboard's "working…" swap when the
@@ -380,6 +434,7 @@ mod render_smoke {
                 state,
                 review: None,
                 settings: None,
+                merge: None,
                 paths: smoke_paths(),
                 expanded_scans: HashSet::new(),
                 dashboard_action_in_flight: true,
@@ -402,6 +457,114 @@ mod render_smoke {
                     state,
                     review: None,
                     settings: None,
+                    merge: None,
+                    paths: smoke_paths(),
+                    expanded_scans: HashSet::new(),
+                    dashboard_action_in_flight: false,
+                }
+            });
+            vis.run_until_parked();
+        }
+    }
+
+    /// Plan 7 Task 3: render the merge editor's states in a real (headless)
+    /// window — loading, load failure, a plain conflict (placeholder row with
+    /// pick buttons incl. `base`), the fully resolved document (Save enabled),
+    /// a degraded 2-way templated file (watermark, 🔒 rows, no `base`
+    /// button), and a save in flight with a sticky banner. Inputs are
+    /// synthetic; no subprocess runs.
+    #[gpui::test]
+    fn merge_view_renders_all_states_without_panicking(cx: &mut TestAppContext) {
+        use czui_app::merge_inputs::MergeInputs;
+        use czui_core::merge::Choice;
+        use czui_core::template::{anchor::anchor, lexer::lex};
+        use merge::{LoadedMerge, MergeView};
+        use review::BannerTint;
+        use std::sync::Arc;
+
+        fn plain_conflict() -> MergeInputs {
+            MergeInputs {
+                target: PathBuf::from("/tmp/smoke/.testrc"),
+                ours: "a\nv = 2\nz\n".into(),
+                theirs: "a\nv = 3\nz\n".into(),
+                base: Some("a\nv = 1\nz\n".into()),
+                source_path: PathBuf::from("/tmp/smoke/src/dot_testrc"),
+                templated: false,
+                span_map: None,
+            }
+        }
+
+        fn templated_degraded() -> MergeInputs {
+            let template = "email = {{ .email }}\neditor = hx\n";
+            let theirs = "email = a@b.c\neditor = hx\n";
+            let span_map = anchor(template, &lex(template).expect("template lexes"), theirs);
+            MergeInputs {
+                target: PathBuf::from("/tmp/smoke/.testrc"),
+                ours: "email = a@b.c\neditor = nvim\n".into(),
+                theirs: theirs.into(),
+                base: None,
+                source_path: PathBuf::from("/tmp/smoke/src/dot_testrc.tmpl"),
+                templated: true,
+                span_map: Some(span_map),
+            }
+        }
+
+        type Pose = Box<dyn Fn(&mut MergeView)>;
+        let poses: Vec<Pose> = vec![
+            Box::new(|view| {
+                view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
+                view.loading = true;
+            }),
+            Box::new(|view| {
+                view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
+                view.error =
+                    Some("binary content — the merge editor handles UTF-8 text only".into());
+            }),
+            Box::new(|view| {
+                // one unresolved conflict: placeholder + ours/theirs/base
+                view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
+                view.loaded = Some(LoadedMerge::new(Arc::new(plain_conflict())));
+            }),
+            Box::new(|view| {
+                // fully resolved: Save enabled, progress in the ok tint
+                view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
+                let mut loaded = LoadedMerge::new(Arc::new(plain_conflict()));
+                let region = loaded.state.conflicts()[0];
+                loaded.state.pick(region, Choice::Ours);
+                view.loaded = Some(loaded);
+            }),
+            Box::new(|view| {
+                // degraded 2-way templated: watermark pane, 🔒 rows, no base
+                view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
+                view.loaded = Some(LoadedMerge::new(Arc::new(templated_degraded())));
+            }),
+            Box::new(|view| {
+                // save in flight plus a sticky (protected-span) banner
+                view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
+                view.loaded = Some(LoadedMerge::new(Arc::new(templated_degraded())));
+                view.saving = true;
+                view.banner = Some(review::OutcomeBanner {
+                    text: "this change touches a templated value — protected span".into(),
+                    tint: BannerTint::Drift,
+                    undoable: false,
+                });
+            }),
+        ];
+        for pose in poses {
+            let (_view, vis) = cx.add_window_view(|_window, cx| {
+                let state = cx.new(|_| model_with_data());
+                let shell = cx.weak_entity();
+                let merge = cx.new(|_| {
+                    let mut view = MergeView::new(shell);
+                    pose(&mut view);
+                    view
+                });
+                Shell {
+                    route: Route::Merge,
+                    state,
+                    review: None,
+                    settings: None,
+                    merge: Some(merge),
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
                     dashboard_action_in_flight: false,
