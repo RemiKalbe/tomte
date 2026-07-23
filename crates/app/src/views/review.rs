@@ -2,10 +2,13 @@
 //! preview (spec §7.2, approved mockup A; plan 5 Task 6).
 //!
 //! Everything blocking — `chezmoi cat`, `chezmoi source-path`, the read-only
-//! journal, destination fs reads — runs on the background executor and lands
-//! back in the entity via `WeakEntity::update` (spec §3.2 non-blocking rule).
-//! Mutating actions (merge editor, apply) are Plan 6; the only enabled action
-//! is the read-only "open in editor" escape hatch (`open -t <source-path>`).
+//! journal, destination fs reads, and the resolve-engine actions — runs on
+//! the background executor and lands back in the entity via
+//! `WeakEntity::update` (spec §3.2 non-blocking rule). One-click resolutions
+//! ("keep disk" / "keep source" / undo, plan 6 Task 3) go through the
+//! [`ResolveEngine`] published in the [`crate::EngineSlot`] global; their
+//! outcomes render as a slim banner above the diff. The merge editor
+//! (conflicts, templated files) stays a Plan 7 stub.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -13,6 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use czui_app::model::{SyncModel, kind_glyph, time_ago};
+use czui_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use czui_app::theme::Theme;
 use czui_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
 use czui_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
@@ -164,6 +168,139 @@ fn load_preview_blocking(target: &Path) -> PreviewState {
     ))
 }
 
+/// The two one-click resolutions (spec §5), shared with the dashboard's
+/// inline row actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResolveAction {
+    KeepDisk,
+    KeepSource,
+}
+
+impl ResolveAction {
+    /// Short imperative label for buttons and failure messages.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::KeepDisk => "keep disk",
+            Self::KeepSource => "keep source",
+        }
+    }
+
+    /// Past-tense verb for success messages.
+    pub(super) fn verb(self) -> &'static str {
+        match self {
+            Self::KeepDisk => "kept disk version",
+            Self::KeepSource => "restored chezmoi's version",
+        }
+    }
+
+    /// Run the matching engine method. Blocking — background executor only.
+    pub(super) fn run(
+        self,
+        engine: &ResolveEngine,
+        target: &Path,
+    ) -> Result<ResolveOutcome, ResolveError> {
+        match self {
+            Self::KeepDisk => engine.keep_disk(target),
+            Self::KeepSource => engine.keep_source(target),
+        }
+    }
+}
+
+/// Theme token the outcome banner is tinted with (kept symbolic so the
+/// mapping stays pure and testable; resolved to a color at render).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BannerTint {
+    Ok,
+    Drift,
+    Conflict,
+}
+
+impl BannerTint {
+    fn color(self, theme: Theme) -> Rgba {
+        match self {
+            Self::Ok => theme.ok,
+            Self::Drift => theme.drift,
+            Self::Conflict => theme.conflict,
+        }
+    }
+}
+
+/// The slim banner above the diff reporting the last action's outcome
+/// (spec §10: honest, including degraded commit/push results).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct OutcomeBanner {
+    pub(super) text: SharedString,
+    pub(super) tint: BannerTint,
+    /// Successful resolutions offer an Undo button (spec §6.3).
+    pub(super) undoable: bool,
+}
+
+/// Map an action result onto its banner. Tint policy: a `note` means the
+/// resolution succeeded locally but commit/push degraded (drift tint, note
+/// shown); no note is full success (ok tint); engine errors are conflicts.
+fn outcome_banner(
+    action: ResolveAction,
+    result: &Result<ResolveOutcome, ResolveError>,
+) -> OutcomeBanner {
+    match result {
+        Ok(ResolveOutcome::Done {
+            note: None,
+            committed,
+            pushed,
+            ..
+        }) => OutcomeBanner {
+            // keep_source runs no commit phase, so only advertise the
+            // commit/push when they actually happened.
+            text: if *committed && *pushed {
+                format!("{} — committed & pushed", action.verb()).into()
+            } else {
+                action.verb().into()
+            },
+            tint: BannerTint::Ok,
+            undoable: true,
+        },
+        Ok(ResolveOutcome::Done {
+            note: Some(note), ..
+        }) => OutcomeBanner {
+            text: format!("{} — {note}", action.verb()).into(),
+            tint: BannerTint::Drift,
+            undoable: true,
+        },
+        Ok(ResolveOutcome::NeedsMergeEditor) => OutcomeBanner {
+            text: "templated file — needs the merge editor, arriving next milestone".into(),
+            tint: BannerTint::Drift,
+            undoable: false,
+        },
+        Err(e) => OutcomeBanner {
+            text: format!("{} failed: {e}", action.label()).into(),
+            tint: BannerTint::Conflict,
+            undoable: false,
+        },
+    }
+}
+
+/// Banner for the undo action itself (never undoable again: the undo session
+/// journals no destination blobs, so a second undo would restore nothing).
+fn undo_banner(result: &Result<Option<i64>, ResolveError>) -> OutcomeBanner {
+    match result {
+        Ok(Some(_)) => OutcomeBanner {
+            text: "restored files from snapshots".into(),
+            tint: BannerTint::Ok,
+            undoable: false,
+        },
+        Ok(None) => OutcomeBanner {
+            text: "nothing to undo".into(),
+            tint: BannerTint::Drift,
+            undoable: false,
+        },
+        Err(e) => OutcomeBanner {
+            text: format!("undo failed: {e}").into(),
+            tint: BannerTint::Conflict,
+            undoable: false,
+        },
+    }
+}
+
 /// Which side of the drift a preview line belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineTint {
@@ -306,11 +443,19 @@ fn per_line_ranges(lines: &[String], ranges: &[Range<usize>]) -> Vec<Vec<Range<u
 
 pub struct ReviewView {
     state: Entity<SyncModel>,
-    selected: Option<PathBuf>,
+    /// `pub(super)` so the render-smoke tests can pose a selected target
+    /// without spawning the background detail load.
+    pub(super) selected: Option<PathBuf>,
     preview: PreviewState,
     /// Provenance for the selected target, newest first (background-loaded
     /// together with the preview).
     provenance: Vec<ProvRow>,
+    /// Outcome of the last resolve/undo action, rendered as a banner above
+    /// the diff. `pub(super)` for the render-smoke tests.
+    pub(super) last_outcome: Option<OutcomeBanner>,
+    /// A resolve/undo action is running on the background executor: buttons
+    /// disable and the header shows "working…". `pub(super)` for smoke tests.
+    pub(super) action_in_flight: bool,
 }
 
 impl ReviewView {
@@ -323,6 +468,8 @@ impl ReviewView {
             selected: None,
             preview: PreviewState::Empty,
             provenance: Vec::new(),
+            last_outcome: None,
+            action_in_flight: false,
         }
     }
 
@@ -379,6 +526,154 @@ impl ReviewView {
                 }
             })
             .detach();
+    }
+
+    /// Run a one-click resolution for the selected target on the background
+    /// executor; the outcome lands back as a banner and the preview reloads
+    /// through the existing `select()` path.
+    fn run_action(&mut self, action: ResolveAction, cx: &mut Context<Self>) {
+        if self.action_in_flight {
+            return;
+        }
+        let Some(target) = self.selected.clone() else {
+            return;
+        };
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            return;
+        };
+        self.action_in_flight = true;
+        self.last_outcome = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = {
+                let target = target.clone();
+                cx.background_executor()
+                    .spawn(async move { action.run(&engine, &target) })
+                    .await
+            };
+            this.update(cx, |view, cx| {
+                view.action_in_flight = false;
+                view.last_outcome = Some(outcome_banner(action, &result));
+                // Reload the preview so the diff reflects the new reality
+                // (re-selecting is the established refresh path).
+                if view.selected.as_deref() == Some(target.as_path()) {
+                    view.select(target.clone(), cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Undo the last finished session (restore destination files from their
+    /// journaled snapshots), reported through the same banner.
+    fn run_undo(&mut self, cx: &mut Context<Self>) {
+        if self.action_in_flight {
+            return;
+        }
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            return;
+        };
+        self.action_in_flight = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { engine.undo_last() })
+                .await;
+            this.update(cx, |view, cx| {
+                view.action_in_flight = false;
+                view.last_outcome = Some(undo_banner(&result));
+                if let Some(target) = view.selected.clone() {
+                    view.select(target, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// One header action button. Enabled needs a live engine (daemon
+    /// connected) — `run_action` itself re-checks selection and in-flight.
+    fn action_button(
+        &self,
+        id: &'static str,
+        action: ResolveAction,
+        enabled: bool,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let base = div()
+            .id(id)
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .text_xs()
+            .child(SharedString::from(action.label()));
+        if enabled {
+            base.border_color(theme.accent)
+                .text_color(theme.accent)
+                .cursor_pointer()
+                .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
+                .on_click(cx.listener(move |view, _ev, _window, cx| view.run_action(action, cx)))
+        } else {
+            base.border_color(theme.border)
+                .text_color(theme.text_muted)
+                .tooltip(|_window, cx| {
+                    cx.new(|_| TextTooltip {
+                        text: "daemon not connected".into(),
+                    })
+                    .into()
+                })
+        }
+    }
+
+    /// The slim outcome banner above the diff, with an Undo button on
+    /// successful resolutions.
+    fn banner_el(&self, banner: &OutcomeBanner, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let color = banner.tint.color(theme);
+        div()
+            .mx_3()
+            .mt_2()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(Theme::wash(color, 0.12))
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(color)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(banner.text.clone()),
+            )
+            .when(banner.undoable && !self.action_in_flight, |el| {
+                el.child(
+                    div()
+                        .id("outcome-undo")
+                        .flex_none()
+                        .px_1p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(color)
+                        .cursor_pointer()
+                        .child("Undo")
+                        .on_click(cx.listener(|view, _ev, _window, cx| view.run_undo(cx))),
+                )
+            })
     }
 
     fn sidebar(
@@ -555,8 +850,38 @@ impl ReviewView {
                                     .child(path),
                             ),
                     )
+                    .child(if self.action_in_flight {
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child("working…")
+                            .into_any_element()
+                    } else {
+                        let engine_ready = cx
+                            .try_global::<crate::EngineSlot>()
+                            .is_some_and(|slot| slot.0.is_some());
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.action_button(
+                                "keep-disk",
+                                ResolveAction::KeepDisk,
+                                engine_ready,
+                                theme,
+                                cx,
+                            ))
+                            .child(self.action_button(
+                                "keep-source",
+                                ResolveAction::KeepSource,
+                                engine_ready,
+                                theme,
+                                cx,
+                            ))
+                            .into_any_element()
+                    })
                     .child(
-                        // Plan 6 stub: disabled, tooltip explains why.
+                        // Plan 7 stub: disabled, tooltip explains why.
                         div()
                             .id("open-merge-editor")
                             .px_2()
@@ -569,7 +894,7 @@ impl ReviewView {
                             .child("Open merge editor")
                             .tooltip(|_window, cx| {
                                 cx.new(|_| TextTooltip {
-                                    text: "arrives with the merge editor (Plan 6)".into(),
+                                    text: "arrives with the merge editor (next milestone)".into(),
                                 })
                                 .into()
                             }),
@@ -591,6 +916,9 @@ impl ReviewView {
                             ),
                     ),
             )
+            .when_some(self.last_outcome.clone(), |el, banner| {
+                el.child(self.banner_el(&banner, theme, cx))
+            })
             .when(!self.provenance.is_empty(), |el| {
                 el.child(provenance_section(&self.provenance, now, theme))
             })
@@ -812,10 +1140,14 @@ fn diff_row(line: &DiffLine, theme: Theme) -> Div {
 mod tests {
     use std::path::Path;
 
+    use czui_app::resolve::{ResolveError, ResolveOutcome};
     use czui_core::merge::{MergeDocument, MergeOptions, RegionKind};
     use czui_proto::DriftSummary;
 
-    use super::{DiffLine, LineTint, flatten_document, per_line_ranges, severity_groups};
+    use super::{
+        BannerTint, DiffLine, LineTint, ResolveAction, flatten_document, outcome_banner,
+        per_line_ranges, severity_groups, undo_banner,
+    };
 
     fn s(target: &str, class: &str) -> DriftSummary {
         DriftSummary {
@@ -986,6 +1318,79 @@ mod tests {
         let doc = two_way("only\n", "");
         let lines = flatten_document(&doc);
         assert_eq!(shape(&lines), [("only", LineTint::Rendered, "−")]);
+    }
+
+    fn done(committed: bool, pushed: bool, note: Option<&str>) -> ResolveOutcome {
+        ResolveOutcome::Done {
+            session: 7,
+            committed,
+            pushed,
+            note: note.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn outcome_banner_full_success_is_ok_tinted_and_undoable() {
+        // keep_disk: commit phase ran and fully succeeded
+        let b = outcome_banner(ResolveAction::KeepDisk, &Ok(done(true, true, None)));
+        assert_eq!(b.text.as_ref(), "kept disk version — committed & pushed");
+        assert_eq!(b.tint, BannerTint::Ok);
+        assert!(b.undoable);
+
+        // keep_source: no commit phase — the banner must not claim one
+        let b = outcome_banner(ResolveAction::KeepSource, &Ok(done(false, false, None)));
+        assert_eq!(b.text.as_ref(), "restored chezmoi's version");
+        assert_eq!(b.tint, BannerTint::Ok);
+        assert!(b.undoable);
+    }
+
+    #[test]
+    fn outcome_banner_degraded_commit_shows_note_in_drift_tint() {
+        let b = outcome_banner(
+            ResolveAction::KeepDisk,
+            &Ok(done(true, false, Some("push failed: locked"))),
+        );
+        assert_eq!(b.text.as_ref(), "kept disk version — push failed: locked");
+        assert_eq!(b.tint, BannerTint::Drift);
+        assert!(b.undoable, "the resolution itself succeeded");
+    }
+
+    #[test]
+    fn outcome_banner_templated_and_error_are_not_undoable() {
+        let b = outcome_banner(
+            ResolveAction::KeepDisk,
+            &Ok(ResolveOutcome::NeedsMergeEditor),
+        );
+        assert_eq!(
+            b.text.as_ref(),
+            "templated file — needs the merge editor, arriving next milestone"
+        );
+        assert_eq!(b.tint, BannerTint::Drift);
+        assert!(!b.undoable);
+
+        let b = outcome_banner(
+            ResolveAction::KeepSource,
+            &Err(ResolveError::Failed("daemon gone".into())),
+        );
+        assert_eq!(b.text.as_ref(), "keep source failed: daemon gone");
+        assert_eq!(b.tint, BannerTint::Conflict);
+        assert!(!b.undoable);
+    }
+
+    #[test]
+    fn undo_banner_covers_restored_nothing_and_error() {
+        let b = undo_banner(&Ok(Some(3)));
+        assert_eq!(b.text.as_ref(), "restored files from snapshots");
+        assert_eq!(b.tint, BannerTint::Ok);
+        assert!(!b.undoable);
+
+        let b = undo_banner(&Ok(None));
+        assert_eq!(b.text.as_ref(), "nothing to undo");
+        assert_eq!(b.tint, BannerTint::Drift);
+
+        let b = undo_banner(&Err(ResolveError::Failed("blob missing".into())));
+        assert_eq!(b.text.as_ref(), "undo failed: blob missing");
+        assert_eq!(b.tint, BannerTint::Conflict);
     }
 
     #[test]

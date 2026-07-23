@@ -6,20 +6,26 @@
 //! `czui_app::model`; this module renders and never blocks.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use czui_app::model::{
     SyncModel, TimelineItem, TimelineRow, class_label, group_timeline, kind_glyph, kind_label,
     time_ago,
 };
+use czui_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use czui_app::theme::Theme;
+use czui_core::cmd::SystemRunner;
 use gpui::{
-    Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, WeakEntity, Window, div,
-    prelude::*, uniform_list,
+    App, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful, WeakEntity,
+    Window, div, prelude::*, uniform_list,
 };
 
+use crate::notify_osa::notify;
+
 use super::Shell;
+use super::review::ResolveAction;
 
 /// Seconds since the Unix epoch — the production clock injected into
 /// [`DashboardView::now_ts`] (tests inject fixed values into the pure fns).
@@ -72,6 +78,9 @@ enum Line {
         target: Option<PathBuf>,
         /// Rendered indented under an expanded scan group.
         indented: bool,
+        /// The target is CURRENTLY drifted (in `model.drifted`) → the row
+        /// carries inline keep-disk / keep-source quick actions.
+        drifted: bool,
     },
     /// Collapsed run of scans/fetches; click toggles expansion.
     Group {
@@ -83,7 +92,7 @@ enum Line {
 }
 
 impl Line {
-    fn event(row: &TimelineRow, now: u64, indented: bool) -> Self {
+    fn event(row: &TimelineRow, now: u64, indented: bool, drifted: bool) -> Self {
         let (name, dir) = match &row.target {
             Some(target) => (
                 target
@@ -108,8 +117,17 @@ impl Line {
             class: row.class.clone().map(SharedString::from),
             target: row.target.clone(),
             indented,
+            drifted,
         }
     }
+}
+
+/// Whether a timeline row's target is currently drifted — those rows carry
+/// the inline quick actions (plan 6 Task 3).
+fn is_drifted(model: &SyncModel, row: &TimelineRow) -> bool {
+    row.target
+        .as_ref()
+        .is_some_and(|t| model.drifted.iter().any(|d| &d.target == t))
 }
 
 /// Flatten grouped timeline items into display lines, honoring expansion.
@@ -117,7 +135,9 @@ fn build_lines(model: &SyncModel, now: u64, expanded: &HashSet<u64>) -> Vec<Line
     let mut lines = Vec::new();
     for item in group_timeline(&model.timeline) {
         match item {
-            TimelineItem::Row(row) => lines.push(Line::event(&row, now, false)),
+            TimelineItem::Row(row) => {
+                lines.push(Line::event(&row, now, false, is_drifted(model, &row)))
+            }
             TimelineItem::ScanGroup {
                 count,
                 newest_ts,
@@ -132,7 +152,7 @@ fn build_lines(model: &SyncModel, now: u64, expanded: &HashSet<u64>) -> Vec<Line
                 });
                 if is_open {
                     for row in &rows {
-                        lines.push(Line::event(row, now, true));
+                        lines.push(Line::event(row, now, true, is_drifted(model, row)));
                     }
                 }
             }
@@ -147,6 +167,9 @@ pub struct DashboardView {
     /// Cloned from `Shell::expanded_scans` by the caller — reading the Shell
     /// entity from inside its own render panics ("already being updated").
     pub expanded_scans: HashSet<u64>,
+    /// Copied from `Shell::dashboard_action_in_flight`: a quick action is
+    /// running, so the inline row buttons yield to a "working…" marker.
+    pub action_in_flight: bool,
 }
 
 impl DashboardView {
@@ -172,6 +195,12 @@ impl DashboardView {
 
         let lines: Rc<Vec<Line>> = Rc::new(build_lines(model, now, &expanded));
         let shell = cx.weak_entity();
+        // Resolve engine for the inline quick actions: None (disconnected /
+        // not yet built) renders them disabled.
+        let engine = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone());
+        let busy = self.action_in_flight;
 
         div()
             .flex()
@@ -283,7 +312,16 @@ impl DashboardView {
                     lines.len(),
                     move |range, _window, _cx| {
                         range
-                            .map(|ix| render_line(ix, &lines[ix], theme, shell.clone()))
+                            .map(|ix| {
+                                render_line(
+                                    ix,
+                                    &lines[ix],
+                                    theme,
+                                    shell.clone(),
+                                    engine.clone(),
+                                    busy,
+                                )
+                            })
                             .collect()
                     },
                 )
@@ -350,7 +388,14 @@ fn review_link(theme: Theme, drifted: usize, shell: WeakEntity<Shell>) -> gpui::
         .into_any_element()
 }
 
-fn render_line(ix: usize, line: &Line, theme: Theme, shell: WeakEntity<Shell>) -> gpui::AnyElement {
+fn render_line(
+    ix: usize,
+    line: &Line,
+    theme: Theme,
+    shell: WeakEntity<Shell>,
+    engine: Option<Arc<ResolveEngine>>,
+    busy: bool,
+) -> gpui::AnyElement {
     match line {
         Line::Group {
             count,
@@ -413,7 +458,14 @@ fn render_line(ix: usize, line: &Line, theme: Theme, shell: WeakEntity<Shell>) -
             class,
             target,
             indented,
+            drifted,
         } => {
+            // Inline quick actions on currently-drifted rows (right-aligned,
+            // before the class chip). `drifted` implies a target.
+            let quick = (*drifted)
+                .then_some(target.as_ref())
+                .flatten()
+                .map(|target| quick_actions(ix, target, theme, engine, busy, shell.clone()));
             let base = div()
                 .h_7()
                 .w_full()
@@ -473,6 +525,7 @@ fn render_line(ix: usize, line: &Line, theme: Theme, shell: WeakEntity<Shell>) -
                             )
                         }),
                 )
+                .when_some(quick, |el, actions| el.child(actions))
                 .when_some(chip.clone(), |el, label| {
                     let color = class
                         .as_deref()
@@ -505,5 +558,192 @@ fn render_line(ix: usize, line: &Line, theme: Theme, shell: WeakEntity<Shell>) -
                 None => base.into_any_element(),
             }
         }
+    }
+}
+
+/// The inline quick-action cluster for one drifted row: keep-disk /
+/// keep-source buttons, or a "working…" marker while any dashboard action
+/// runs. Outcomes surface as an osascript notification (the dashboard is
+/// transient — no banner).
+fn quick_actions(
+    ix: usize,
+    target: &Path,
+    theme: Theme,
+    engine: Option<Arc<ResolveEngine>>,
+    busy: bool,
+    shell: WeakEntity<Shell>,
+) -> Div {
+    if busy {
+        return div()
+            .flex_none()
+            .text_xs()
+            .text_color(theme.text_muted)
+            .child("working…");
+    }
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(quick_action_button(
+            ix,
+            ResolveAction::KeepDisk,
+            target,
+            theme,
+            engine.clone(),
+            shell.clone(),
+        ))
+        .child(quick_action_button(
+            ix,
+            ResolveAction::KeepSource,
+            target,
+            theme,
+            engine,
+            shell,
+        ))
+}
+
+fn quick_action_button(
+    ix: usize,
+    action: ResolveAction,
+    target: &Path,
+    theme: Theme,
+    engine: Option<Arc<ResolveEngine>>,
+    shell: WeakEntity<Shell>,
+) -> Stateful<Div> {
+    let id = match action {
+        ResolveAction::KeepDisk => "row-keep-disk",
+        ResolveAction::KeepSource => "row-keep-source",
+    };
+    let base = div()
+        .id(ElementId::named_usize(id, ix))
+        .flex_none()
+        .px_1p5()
+        .rounded_sm()
+        .border_1()
+        .text_xs()
+        .child(SharedString::from(action.label()));
+    let Some(engine) = engine else {
+        return base
+            .border_color(theme.border)
+            .text_color(theme.text_muted)
+            .tooltip(|_window, cx| {
+                cx.new(|_| TextTooltip {
+                    text: "daemon not connected".into(),
+                })
+                .into()
+            });
+    };
+    let target = target.to_path_buf();
+    base.border_color(theme.accent)
+        .text_color(theme.accent)
+        .cursor_pointer()
+        .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
+        .on_click(move |_event, _window, cx| {
+            // The row underneath opens Review on click — quick actions must
+            // not also navigate.
+            cx.stop_propagation();
+            run_quick_action(action, engine.clone(), target.clone(), shell.clone(), cx);
+        })
+}
+
+/// Run one quick action: flag the shell busy, do the blocking engine call +
+/// notification on the background executor, then clear the flag. No call
+/// ever runs on the main thread.
+fn run_quick_action(
+    action: ResolveAction,
+    engine: Arc<ResolveEngine>,
+    target: PathBuf,
+    shell: WeakEntity<Shell>,
+    cx: &mut App,
+) {
+    let flag = |cx: &mut App, shell: &WeakEntity<Shell>, value: bool| {
+        let _ = shell.update(cx, |shell, cx| {
+            shell.dashboard_action_in_flight = value;
+            cx.notify();
+        });
+    };
+    flag(cx, &shell, true);
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .spawn(async move {
+                let result = action.run(&engine, &target);
+                let body = quick_action_body(action, &target, &result);
+                notify(&SystemRunner, "chezmoi-ui", &body);
+            })
+            .await;
+        let _ = cx.update(|cx| flag(cx, &shell, false));
+    })
+    .detach();
+}
+
+/// Notification body for a quick action's outcome — same honesty rules as
+/// the review banner (`note` = degraded commit/push, spelled out).
+fn quick_action_body(
+    action: ResolveAction,
+    target: &Path,
+    result: &Result<ResolveOutcome, ResolveError>,
+) -> String {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| target.display().to_string());
+    match result {
+        Ok(ResolveOutcome::Done { note: None, .. }) => format!("{}: {name}", action.verb()),
+        Ok(ResolveOutcome::Done {
+            note: Some(note), ..
+        }) => format!("{}: {name} — {note}", action.verb()),
+        Ok(ResolveOutcome::NeedsMergeEditor) => {
+            format!("{name} is templated — needs the merge editor, arriving next milestone")
+        }
+        Err(e) => format!("{} {name} failed: {e}", action.label()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use czui_app::resolve::{ResolveError, ResolveOutcome};
+
+    use super::super::review::ResolveAction;
+    use super::quick_action_body;
+
+    fn done(note: Option<&str>) -> ResolveOutcome {
+        ResolveOutcome::Done {
+            session: 1,
+            committed: true,
+            pushed: note.is_none(),
+            note: note.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn quick_action_body_reports_success_degraded_templated_and_error() {
+        let t = Path::new("/Users/x/.zshrc");
+        assert_eq!(
+            quick_action_body(ResolveAction::KeepDisk, t, &Ok(done(None))),
+            "kept disk version: .zshrc"
+        );
+        assert_eq!(
+            quick_action_body(ResolveAction::KeepSource, t, &Ok(done(Some("push failed")))),
+            "restored chezmoi's version: .zshrc — push failed"
+        );
+        assert_eq!(
+            quick_action_body(
+                ResolveAction::KeepDisk,
+                t,
+                &Ok(ResolveOutcome::NeedsMergeEditor)
+            ),
+            ".zshrc is templated — needs the merge editor, arriving next milestone"
+        );
+        assert_eq!(
+            quick_action_body(
+                ResolveAction::KeepDisk,
+                t,
+                &Err(ResolveError::Failed("daemon gone".into()))
+            ),
+            "keep disk .zshrc failed: daemon gone"
+        );
     }
 }

@@ -126,7 +126,7 @@ TDD: unit-test the pure helpers (template detection from a source path, commit-m
 
 Gate + render smoke tests still pass (buttons render in the existing smoke windows; no new test API needed, but extend the smoke model with a non-templated drifted target so the live buttons render). Commit: `feat(app): live resolve actions in review/dashboard, sync-all in menubar`.
 
-- [ ] Implement per contract → extend render smoke → gate → commit.
+- [x] Implement per contract → extend render smoke → gate → commit.
 
 ---
 

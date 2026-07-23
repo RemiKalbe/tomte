@@ -46,6 +46,11 @@ pub struct Shell {
     /// Expanded scan-groups in the dashboard timeline, keyed by the group's
     /// newest event timestamp (stable across refreshes).
     pub expanded_scans: std::collections::HashSet<u64>,
+    /// A dashboard quick action (keep disk / keep source) is running on the
+    /// background executor. Lives here because the dashboard body is rebuilt
+    /// from Shell state on every render (unlike the long-lived ReviewView,
+    /// which tracks its own in-flight flag).
+    pub dashboard_action_in_flight: bool,
 }
 
 impl Shell {
@@ -208,6 +213,7 @@ impl Render for Shell {
                             state: self.state.clone(),
                             now_ts: dashboard::system_now,
                             expanded_scans: self.expanded_scans.clone(),
+                            action_in_flight: self.dashboard_action_in_flight,
                         }
                         .render(theme, cx)
                         .into_any_element(),
@@ -283,6 +289,14 @@ mod render_smoke {
         m
     }
 
+    fn smoke_paths() -> SettingsPaths {
+        SettingsPaths {
+            socket: PathBuf::from("/tmp/smoke.sock"),
+            journal: PathBuf::from("/tmp/smoke-journal.db"),
+            settings: PathBuf::from("/tmp/smoke-settings.toml"),
+        }
+    }
+
     #[gpui::test]
     fn shell_renders_every_route_without_panicking(cx: &mut TestAppContext) {
         for route in [Route::Dashboard, Route::Review, Route::Settings] {
@@ -296,16 +310,82 @@ mod render_smoke {
                     state,
                     review: None,
                     settings: None,
-                    paths: SettingsPaths {
-                        socket: PathBuf::from("/tmp/smoke.sock"),
-                        journal: PathBuf::from("/tmp/smoke-journal.db"),
-                        settings: PathBuf::from("/tmp/smoke-settings.toml"),
-                    },
+                    paths: smoke_paths(),
                     expanded_scans,
+                    dashboard_action_in_flight: false,
                 }
             });
             vis.run_until_parked();
         }
+    }
+
+    /// Plan 6 Task 3 surfaces: the model above already puts the drifted
+    /// `.zshrc` in the timeline, so the dashboard renders the inline quick
+    /// actions — and with no `EngineSlot` global set (this test app never
+    /// connects), they render through the DISABLED path. The review window
+    /// gets a posed selection so the header action buttons and the outcome
+    /// banner (with its Undo button) render too, plus one in-flight pass for
+    /// the "working…" marker.
+    #[gpui::test]
+    fn resolve_action_ui_renders_without_engine_or_panic(cx: &mut TestAppContext) {
+        use review::{BannerTint, OutcomeBanner, ReviewView};
+        for (in_flight, banner) in [
+            (
+                false,
+                Some(OutcomeBanner {
+                    text: "kept disk version — committed & pushed".into(),
+                    tint: BannerTint::Ok,
+                    undoable: true,
+                }),
+            ),
+            (
+                false,
+                Some(OutcomeBanner {
+                    text: "keep disk failed: daemon gone".into(),
+                    tint: BannerTint::Conflict,
+                    undoable: false,
+                }),
+            ),
+            (true, None),
+        ] {
+            let (_view, vis) = cx.add_window_view(|_window, cx| {
+                let state = cx.new(|_| model_with_data());
+                let review = cx.new(|cx| {
+                    let mut view = ReviewView::new(state.clone(), cx);
+                    view.selected = Some(PathBuf::from("/tmp/smoke/.zshrc"));
+                    view.last_outcome = banner.clone();
+                    view.action_in_flight = in_flight;
+                    view
+                });
+                Shell {
+                    route: Route::Review,
+                    state,
+                    review: Some(review),
+                    settings: None,
+                    paths: smoke_paths(),
+                    expanded_scans: HashSet::new(),
+                    // also exercises the dashboard's "working…" swap when the
+                    // shell flag is up (the drifted row is in the timeline)
+                    dashboard_action_in_flight: in_flight,
+                }
+            });
+            vis.run_until_parked();
+        }
+        // Dashboard route with the busy flag: quick actions yield to the
+        // "working…" marker.
+        let (_view, vis) = cx.add_window_view(|_window, cx| {
+            let state = cx.new(|_| model_with_data());
+            Shell {
+                route: Route::Dashboard,
+                state,
+                review: None,
+                settings: None,
+                paths: smoke_paths(),
+                expanded_scans: HashSet::new(),
+                dashboard_action_in_flight: true,
+            }
+        });
+        vis.run_until_parked();
     }
 
     #[gpui::test]
@@ -322,12 +402,9 @@ mod render_smoke {
                     state,
                     review: None,
                     settings: None,
-                    paths: SettingsPaths {
-                        socket: PathBuf::from("/tmp/smoke.sock"),
-                        journal: PathBuf::from("/tmp/smoke-journal.db"),
-                        settings: PathBuf::from("/tmp/smoke-settings.toml"),
-                    },
+                    paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
+                    dashboard_action_in_flight: false,
                 }
             });
             vis.run_until_parked();

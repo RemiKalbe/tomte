@@ -9,12 +9,16 @@ mod views;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use czui_app::ipc::{IpcClient, IpcError};
 use czui_app::model::{SyncModel, TIMELINE_CAP};
-use czui_core::cmd::SystemRunner;
+use czui_app::resolve::ResolveEngine;
+use czui_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
+use czui_core::cmd::{CommandRunner, SystemRunner};
+use czui_core::git::GitClient;
 use czui_journal::Journal;
 use czui_proto::{Event, Request, Response};
 use gpui::{
@@ -32,6 +36,34 @@ fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// gpui global holding the resolve engine for the CURRENT daemon connection
+/// (plan 6 Task 3). Absent or `None` while disconnected — views read it
+/// lazily each render (`cx.try_global`) and disable their action buttons.
+/// Rebuilt on every successful (re)connect because the engine's
+/// `Arc<IpcClient>` dies with the connection; an action racing a reconnect
+/// fails with an IpcError outcome, which the UI reports honestly.
+pub struct EngineSlot(pub Option<Arc<ResolveEngine>>);
+
+impl gpui::Global for EngineSlot {}
+
+/// Build the resolve engine for one daemon connection. Blocking — the
+/// `chezmoi source-path`-style `source_dir` lookup is a subprocess — so
+/// callers run it on the background executor. The app builds its own
+/// chezmoi/git clients (options default; the app reads no settings today),
+/// mirroring czui-daemon's `build_core` shape.
+fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEngine, ChezmoiError> {
+    let runner: Arc<dyn CommandRunner> = Arc::new(SystemRunner);
+    let chezmoi = ChezmoiClient::new(runner.clone(), ChezmoiOptions::default());
+    let source_dir = chezmoi.source_dir()?;
+    let git = GitClient::new(runner, source_dir);
+    Ok(ResolveEngine {
+        chezmoi,
+        git,
+        ipc,
+        journal_path,
+    })
 }
 
 /// Resolved daemon-facing paths. Env overrides and defaults must match
@@ -245,6 +277,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     settings: None,
                     paths,
                     expanded_scans: Default::default(),
+                    dashboard_action_in_flight: false,
                 }
             })
         },
@@ -293,7 +326,9 @@ fn spawn_menu_command_loop(
                     let _ = cx
                         .update(|cx| open_shell(cx, Route::Settings, state.clone(), paths.clone()));
                 }
-                Ok(MenuCommand::SyncAll) => { /* Plan 6 */ }
+                Ok(MenuCommand::SyncAll) => {
+                    let _ = cx.update(|cx| run_sync_all(cx, &state));
+                }
                 Ok(MenuCommand::Quit) => {
                     let _ = cx.update(|cx| cx.quit());
                     break;
@@ -308,6 +343,35 @@ fn spawn_menu_command_loop(
         }
     })
     .detach();
+}
+
+/// Menubar "Sync all" (spec §7.4, plan 6 Task 3): pull + apply when zero
+/// decisions are pending. `menu_spec` already disables the item unless the
+/// tree is clean, but menus can go stale — re-check the model here and drop
+/// the command silently when the gate no longer holds. The engine call runs
+/// on the background executor; the result surfaces as a notification.
+fn run_sync_all(cx: &mut App, state: &Entity<SyncModel>) {
+    let model = state.read(cx);
+    let gate_open =
+        model.connected && !model.scanning && model.degraded.is_none() && model.drifted.is_empty();
+    if !gate_open {
+        return;
+    }
+    let Some(engine) = cx
+        .try_global::<EngineSlot>()
+        .and_then(|slot| slot.0.clone())
+    else {
+        return;
+    };
+    cx.background_executor()
+        .spawn(async move {
+            let body = match engine.sync_all() {
+                Ok(_) => "synced with origin".to_string(),
+                Err(e) => format!("sync all failed: {e}"),
+            };
+            notify(&SystemRunner, "chezmoi-ui", &body);
+        })
+        .detach();
 }
 
 /// Coalescing window for drift notifications (spec §7.6, plan Task 7): every
@@ -454,6 +518,28 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                 cx.notify();
             });
             if hydrated.is_err() {
+                return; // app released
+            }
+
+            // Resolve engine for THIS connection (plan 6 Task 3): the
+            // source_dir lookup is a subprocess, so build off the main
+            // thread, then publish through the EngineSlot global. A failure
+            // leaves the slot None — action buttons stay disabled, honestly.
+            let engine = {
+                let ipc = client.clone();
+                let journal = paths.journal.clone();
+                cx.background_executor()
+                    .spawn(async move { build_engine(ipc, journal) })
+                    .await
+            };
+            let slot = match engine {
+                Ok(engine) => EngineSlot(Some(Arc::new(engine))),
+                Err(e) => {
+                    eprintln!("chezmoi-ui: resolve actions unavailable (source dir lookup failed): {e}");
+                    EngineSlot(None)
+                }
+            };
+            if cx.update(|cx| cx.set_global(slot)).is_err() {
                 return; // app released
             }
 
