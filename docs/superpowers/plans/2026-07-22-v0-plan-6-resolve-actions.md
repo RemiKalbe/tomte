@@ -107,7 +107,7 @@ impl ResolveEngine {
 
 TDD: unit-test the pure helpers (template detection from a source path, commit-message formatting); the full flows are integration-tested in Task 4. Commit: `feat(app): ResolveEngine — keep disk/source, sync all, undo with sessions`.
 
-- [ ] Failing unit tests → implement → gate → commit.
+- [x] Failing unit tests → implement → gate → commit.
 
 ---
 

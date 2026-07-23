@@ -4,4 +4,5 @@
 
 pub mod ipc;
 pub mod model;
+pub mod resolve;
 pub mod theme;
