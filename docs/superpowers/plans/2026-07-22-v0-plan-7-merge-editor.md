@@ -148,8 +148,8 @@ Commit: `test(app): merge-resolution e2e stories incl. template write-back`.
 
 ### Task 6: Close-out (user-attended)
 
-- [ ] Full gate; tick plan checkboxes; update project-state memory.
-- [ ] Hand off to Remi: (1) relaunch dev app → Review → pick the remaining conflict-y file → Open merge editor → resolve region-by-region → Save → verify convergence + Undo; (2) optionally `./scripts/bundle.sh` + open the .app + `./scripts/install-launchagent.sh` for the daemon-at-login experience. This is v0's acceptance.
+- [x] Full gate; tick plan checkboxes; update project-state memory.
+- [x] Hand off to Remi: (1) relaunch dev app → Review → pick the remaining conflict-y file → Open merge editor → resolve region-by-region → Save → verify convergence + Undo; (2) optionally `./scripts/bundle.sh` + open the .app + `./scripts/install-launchagent.sh` for the daemon-at-login experience. This is v0's acceptance.
 
 ---
 
