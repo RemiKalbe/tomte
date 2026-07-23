@@ -271,6 +271,13 @@ fn outcome_banner(
             tint: BannerTint::Drift,
             undoable: false,
         },
+        // Defensive: only `resolve_merged` produces this, and the merge
+        // editor (Plan 7 Task 3) reports it through its own flow.
+        Ok(ResolveOutcome::ProtectedSpan { .. }) => OutcomeBanner {
+            text: "this change touches a templated value — open in editor".into(),
+            tint: BannerTint::Drift,
+            undoable: false,
+        },
         Err(e) => OutcomeBanner {
             text: format!("{} failed: {e}", action.label()).into(),
             tint: BannerTint::Conflict,
@@ -1380,6 +1387,22 @@ mod tests {
         assert_eq!(b.text.as_ref(), "keep source failed: daemon gone");
         assert_eq!(b.tint, BannerTint::Conflict);
         assert!(!b.undoable);
+    }
+
+    #[test]
+    fn outcome_banner_protected_span_uses_the_plan_copy() {
+        let b = outcome_banner(
+            ResolveAction::KeepDisk,
+            &Ok(ResolveOutcome::ProtectedSpan {
+                detail: "edit at rendered bytes 8..13 touches a protected template span".into(),
+            }),
+        );
+        assert_eq!(
+            b.text.as_ref(),
+            "this change touches a templated value — open in editor"
+        );
+        assert_eq!(b.tint, BannerTint::Drift);
+        assert!(!b.undoable, "nothing was mutated — nothing to undo");
     }
 
     #[test]

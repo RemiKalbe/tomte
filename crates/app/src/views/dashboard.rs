@@ -696,6 +696,11 @@ fn quick_action_body(
         Ok(ResolveOutcome::NeedsMergeEditor) => {
             format!("{name} is templated — needs the merge editor, arriving next milestone")
         }
+        // Defensive: quick actions never run `resolve_merged`, the only
+        // producer of this outcome.
+        Ok(ResolveOutcome::ProtectedSpan { .. }) => {
+            format!("{name}: this change touches a templated value — open in editor")
+        }
         Err(e) => format!("{} {name} failed: {e}", action.label()),
     }
 }
@@ -744,6 +749,16 @@ mod tests {
                 &Err(ResolveError::Failed("daemon gone".into()))
             ),
             "keep disk .zshrc failed: daemon gone"
+        );
+        assert_eq!(
+            quick_action_body(
+                ResolveAction::KeepDisk,
+                t,
+                &Ok(ResolveOutcome::ProtectedSpan {
+                    detail: "touches a protected template span".into()
+                })
+            ),
+            ".zshrc: this change touches a templated value — open in editor"
         );
     }
 }

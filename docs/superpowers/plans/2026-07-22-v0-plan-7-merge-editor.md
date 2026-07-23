@@ -73,7 +73,7 @@ Behavior: SessionStart → SnapshotBlobs([target, source_path]) → decision `{a
 
 TDD: unit tests for the templated/plain branching with FakeRunner where cheap; full coverage in Task 4 stories. Commit: `feat(app): merge inputs loader and resolve_merged engine path`.
 
-- [ ] Failing tests → implement → gate → commit.
+- [x] Failing tests → implement → gate → commit.
 
 ---
 

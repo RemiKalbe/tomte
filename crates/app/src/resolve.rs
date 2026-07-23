@@ -15,10 +15,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use czui_core::chezmoi::{ChezmoiClient, ChezmoiError};
 use czui_core::git::{GitClient, GitError};
+use czui_core::template::anchor::SpanMap;
+use czui_core::template::verify::{VerifyError, verify_write_back};
+use czui_core::template::writeback::write_back;
 use czui_journal::{Journal, JournalError};
 use czui_proto::{Request, Response};
 
 use crate::ipc::{IpcClient, IpcError};
+use crate::merge_inputs::MergeInputs;
 
 /// TTL for ExpectChanges pre-announcements: generously covers a slow chezmoi
 /// invocation without leaving stale suppressions around for long.
@@ -26,7 +30,7 @@ const EXPECT_TTL_SECS: u32 = 60;
 
 /// Machine label for the app's read-only journal handle. Only stamped on
 /// writes, which a read-only handle rejects — it never reaches the database.
-const RO_MACHINE: &str = "czui-app";
+pub(crate) const RO_MACHINE: &str = "czui-app";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -57,6 +61,12 @@ pub enum ResolveOutcome {
     /// Templated source: one-click is unsafe (chezmoi re-add silently ignores
     /// templates); the merge editor (Plan 7) is required.
     NeedsMergeEditor,
+    /// Merge-editor write-back rejected: the resolved text touches a
+    /// protected template span (or the new template failed re-render
+    /// verification). Nothing was mutated — the rejection itself is
+    /// journaled. UI copy: "this change touches a templated value — open in
+    /// editor".
+    ProtectedSpan { detail: String },
 }
 
 #[derive(Clone)]
@@ -125,6 +135,82 @@ impl ResolveEngine {
             committed: false,
             pushed: false,
             note: None,
+        })
+    }
+
+    /// Persist a merge-editor resolution: write the resolved text into the
+    /// source (plain file: verbatim; templated: write_back + verify), then
+    /// apply the target so all states converge. Full session/undo plumbing.
+    ///
+    /// Templated sources are WRITE-AFTER-VERIFY (spec §6.2): the new template
+    /// text is computed in memory and re-rendered via `chezmoi
+    /// execute-template` first; the source file is written only once the
+    /// render matches `resolved`. A protected-span touch or a verification
+    /// mismatch ends the session with a rejection decision (journal truth:
+    /// the attempt happened; nothing mutated) and returns
+    /// `Ok(ProtectedSpan { detail })` with the source file untouched.
+    pub fn resolve_merged(
+        &self,
+        inputs: &MergeInputs,
+        resolved: &str,
+    ) -> Result<ResolveOutcome, ResolveError> {
+        let target = inputs.target.as_path();
+        let session = self.session_start()?;
+        let hashes =
+            self.snapshot_blobs(vec![inputs.target.clone(), inputs.source_path.clone()])?;
+        let [dest_blob, source_blob] = hashes.as_slice() else {
+            return Err(ResolveError::Failed(format!(
+                "snapshot returned {} blobs for 2 paths",
+                hashes.len()
+            )));
+        };
+        let decision = build_decision("merge", target, dest_blob, Some(source_blob));
+        self.session_decision(session, decision)?;
+        self.expect_changes(vec![inputs.target.clone(), inputs.source_path.clone()])?;
+
+        if inputs.templated {
+            let Some(span_map) = &inputs.span_map else {
+                return Err(ResolveError::Failed(format!(
+                    "templated merge inputs for {} carry no span map",
+                    display_name(target)
+                )));
+            };
+            let template = std::fs::read_to_string(&inputs.source_path)?;
+            let attempt =
+                write_back_verified(&self.chezmoi, &template, span_map, &inputs.theirs, resolved)?;
+            match attempt {
+                WriteBackAttempt::Verified(new_template) => {
+                    std::fs::write(&inputs.source_path, new_template)?;
+                }
+                WriteBackAttempt::Rejected(detail) => {
+                    self.session_decision(
+                        session,
+                        serde_json::json!({
+                            "action": "merge_rejected",
+                            "target": target.to_string_lossy(),
+                            "detail": detail,
+                        }),
+                    )?;
+                    self.session_end(
+                        session,
+                        &format!("merge rejected (protected span) {}", display_name(target)),
+                    )?;
+                    return Ok(ResolveOutcome::ProtectedSpan { detail });
+                }
+            }
+        } else {
+            std::fs::write(&inputs.source_path, resolved)?;
+        }
+
+        self.chezmoi.apply(Some(target))?;
+        let (committed, pushed, note) = self.commit_phase("merge", target);
+        self.session_end(session, &format!("merge {}", display_name(target)))?;
+        self.rescan()?;
+        Ok(ResolveOutcome::Done {
+            session,
+            committed,
+            pushed,
+            note,
         })
     }
 
@@ -289,6 +375,39 @@ fn unexpected(what: &str, response: Response) -> ResolveError {
     }
 }
 
+/// Outcome of the in-memory templated write-back attempt: the verified new
+/// template text, or the human-readable detail of a semantic rejection.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteBackAttempt {
+    Verified(String),
+    Rejected(String),
+}
+
+/// WRITE-AFTER-VERIFY core: map the resolved text back into the template via
+/// `write_back` (in memory), then prove the new template re-renders to
+/// exactly `resolved` via `chezmoi execute-template`. Only a `Verified`
+/// template may be persisted. Every write-back placement failure
+/// (protected span, repeated literal, unplaceable edit) and a render
+/// mismatch are semantic rejections; a chezmoi failure during verification
+/// is a real error.
+fn write_back_verified(
+    chezmoi: &ChezmoiClient,
+    template: &str,
+    span_map: &SpanMap,
+    theirs: &str,
+    resolved: &str,
+) -> Result<WriteBackAttempt, ResolveError> {
+    let new_template = match write_back(template, span_map, theirs, resolved) {
+        Ok(t) => t,
+        Err(e) => return Ok(WriteBackAttempt::Rejected(e.to_string())),
+    };
+    match verify_write_back(chezmoi, &new_template, resolved) {
+        Ok(()) => Ok(WriteBackAttempt::Verified(new_template)),
+        Err(e @ VerifyError::Mismatch { .. }) => Ok(WriteBackAttempt::Rejected(e.to_string())),
+        Err(VerifyError::Chezmoi(e)) => Err(ResolveError::Chezmoi(e)),
+    }
+}
+
 /// Whether a source path is a chezmoi template (`.tmpl` extension). Templated
 /// sources must never be one-click re-added: `chezmoi re-add` silently
 /// ignores them.
@@ -368,7 +487,100 @@ fn append_note(note: &mut Option<String>, message: String) {
 
 #[cfg(test)]
 mod tests {
+    use czui_core::chezmoi::ChezmoiOptions;
+    use czui_core::cmd::fake::FakeRunner;
+    use czui_core::template::{anchor::anchor, lexer::lex};
+
     use super::*;
+
+    /// A templated line plus a literal line: edits to `editor` are legal,
+    /// edits to the rendered `email` value touch a protected span.
+    const TMPL: &str = "email = {{ .email }}\neditor = hx\n";
+    const RENDERED: &str = "email = a@b.c\neditor = hx\n";
+
+    fn span_map() -> SpanMap {
+        anchor(TMPL, &lex(TMPL).unwrap(), RENDERED)
+    }
+
+    fn fake_chezmoi() -> (Arc<FakeRunner>, ChezmoiClient) {
+        let fake = Arc::new(FakeRunner::new());
+        let client = ChezmoiClient::new(fake.clone(), ChezmoiOptions::default());
+        (fake, client)
+    }
+
+    #[test]
+    fn write_back_verified_literal_edit_verifies_and_returns_new_template() {
+        let resolved = "email = a@b.c\neditor = nvim\n";
+        let (fake, chezmoi) = fake_chezmoi();
+        // execute-template renders the NEW template to exactly `resolved`.
+        fake.push_ok(0, resolved, "");
+        let attempt = write_back_verified(&chezmoi, TMPL, &span_map(), RENDERED, resolved).unwrap();
+        assert_eq!(
+            attempt,
+            WriteBackAttempt::Verified("email = {{ .email }}\neditor = nvim\n".into())
+        );
+        // The verification ran execute-template with the new template on stdin.
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].args.contains(&"execute-template".to_string()));
+        assert_eq!(
+            calls[0].stdin.as_deref(),
+            Some("email = {{ .email }}\neditor = nvim\n".as_bytes())
+        );
+    }
+
+    #[test]
+    fn write_back_verified_protected_touch_rejects_before_any_subprocess() {
+        // Editing the rendered value of {{ .email }} touches a protected span.
+        let resolved = "email = x@y.z\neditor = hx\n";
+        let (fake, chezmoi) = fake_chezmoi();
+        let attempt = write_back_verified(&chezmoi, TMPL, &span_map(), RENDERED, resolved).unwrap();
+        let WriteBackAttempt::Rejected(detail) = attempt else {
+            panic!("expected Rejected, got {attempt:?}");
+        };
+        assert!(detail.contains("protected"), "detail: {detail}");
+        assert!(
+            fake.calls().is_empty(),
+            "a placement rejection must not spawn chezmoi"
+        );
+    }
+
+    #[test]
+    fn write_back_verified_repeated_literal_rejects() {
+        let tmpl = "{{ range .shells }}alias {{ . }}\n{{ end }}";
+        let rendered = "alias zsh\nalias nu\n";
+        let resolved = "alia zsh\nalias nu\n";
+        let map = anchor(tmpl, &lex(tmpl).unwrap(), rendered);
+        let (fake, chezmoi) = fake_chezmoi();
+        let attempt = write_back_verified(&chezmoi, tmpl, &map, rendered, resolved).unwrap();
+        assert!(
+            matches!(attempt, WriteBackAttempt::Rejected(_)),
+            "got {attempt:?}"
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn write_back_verified_render_mismatch_rejects() {
+        let resolved = "email = a@b.c\neditor = nvim\n";
+        let (fake, chezmoi) = fake_chezmoi();
+        // The re-render disagrees with the resolved text → semantic rejection.
+        fake.push_ok(0, "email = SOMETHING ELSE\neditor = nvim\n", "");
+        let attempt = write_back_verified(&chezmoi, TMPL, &span_map(), RENDERED, resolved).unwrap();
+        let WriteBackAttempt::Rejected(detail) = attempt else {
+            panic!("expected Rejected, got {attempt:?}");
+        };
+        assert!(detail.contains("does not match"), "detail: {detail}");
+    }
+
+    #[test]
+    fn write_back_verified_chezmoi_failure_is_an_error_not_a_rejection() {
+        let resolved = "email = a@b.c\neditor = nvim\n";
+        let (fake, chezmoi) = fake_chezmoi();
+        fake.push_ok(1, "", "boom");
+        let err = write_back_verified(&chezmoi, TMPL, &span_map(), RENDERED, resolved).unwrap_err();
+        assert!(matches!(err, ResolveError::Chezmoi(_)), "got {err:?}");
+    }
 
     #[test]
     fn is_templated_detects_tmpl_extension_only() {

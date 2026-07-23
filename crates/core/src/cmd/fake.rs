@@ -16,10 +16,15 @@ impl FakeRunner {
         Self::default()
     }
     pub fn push_ok(&self, exit_code: i32, stdout: &str, stderr: &str) {
+        self.push_ok_bytes(exit_code, stdout.as_bytes(), stderr.as_bytes());
+    }
+    /// Raw-bytes variant for faking non-UTF-8 output (e.g. a binary
+    /// `chezmoi cat`).
+    pub fn push_ok_bytes(&self, exit_code: i32, stdout: &[u8], stderr: &[u8]) {
         self.queue.lock().unwrap().push_back(Ok(CommandOutput {
             exit_code,
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
         }));
     }
     pub fn push_err(&self, err: CommandError) {

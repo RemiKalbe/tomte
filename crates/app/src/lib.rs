@@ -3,6 +3,7 @@
 //! integration tests. Views and the AppKit platform layer stay bin-only.
 
 pub mod ipc;
+pub mod merge_inputs;
 pub mod model;
 pub mod resolve;
 pub mod theme;
