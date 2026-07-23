@@ -137,11 +137,13 @@ Gate + render smoke tests still pass (buttons render in the existing smoke windo
 
 Using the established pattern (scratch home + bare origin + in-process `serve()` daemon + real chezmoi/git via `czui_core::testsupport::Scratch`), one test per story, asserting BOTH filesystem truth and journal truth:
 
-- [ ] **Story A — keep disk**: drift `.testrc` on disk → `keep_disk` → source file content == disk content; a new git commit exists (scratch has no autoCommit → engine's fallback commit fired, `committed: true`); journal has session with `keep_disk` decision + blobs exist; daemon probe reports InSync after.
-- [ ] **Story B — keep source**: drift on disk → `keep_source` → disk content restored to rendered; journal session recorded; InSync after.
-- [ ] **Story C — sync all**: second clone pushes a change; local `fetch` shows behind → `sync_all` → destination file contains the remote change; InSync.
-- [ ] **Story D — undo**: after Story-B-style `keep_source`, `undo_last` → disk content back to the drifted version; journal has the undo session; daemon reports the drift again after rescan.
-- [ ] **Story E — templated file**: make the source a `.tmpl` → `keep_disk` returns `NeedsMergeEditor` and NOTHING changed (no session mutation beyond none, source untouched).
+- [x] **Story A — keep disk**: drift `.testrc` on disk → `keep_disk` → source file content == disk content; a new git commit exists (scratch has no autoCommit → engine's fallback commit fired, `committed: true`); journal has session with `keep_disk` decision + blobs exist; daemon probe reports InSync after.
+- [x] **Story B — keep source**: drift on disk → `keep_source` → disk content restored to rendered; journal session recorded; InSync after.
+- [x] **Story C — sync all**: second clone pushes a change; local `fetch` shows behind → `sync_all` → destination file contains the remote change; InSync.
+- [x] **Story D — undo**: after Story-B-style `keep_source`, `undo_last` → disk content back to the drifted version; journal has the undo session; daemon reports the drift again after rescan.
+- [x] **Story E — templated file**: make the source a `.tmpl` → `keep_disk` returns `NeedsMergeEditor` and NOTHING changed (no session mutation beyond none, source untouched).
+
+> Task 4 finding: stories B/D exposed that `chezmoi apply` on an externally modified destination prompts `(diff/overwrite/…)?` and dies with `EOF` under `--no-tty` — `keep_source` could never restore a drifted file. Fixed in `ChezmoiClient::apply` by passing `--force` (callers apply only on an explicit user decision), with a unit test pinning the args.
 
 Commit: `test(app): e2e drift stories for resolve actions`.
 

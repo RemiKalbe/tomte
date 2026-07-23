@@ -279,10 +279,15 @@ impl ChezmoiClient {
         self.run_ok(&["execute-template"], Some(input.to_vec()))
     }
 
+    /// Apply the target (or everything). Passes `--force`: a drifted
+    /// destination is by definition "modified since chezmoi last wrote it",
+    /// and chezmoi would otherwise prompt `(diff/overwrite/…)?` — which under
+    /// `--no-tty` dies with `EOF`. Callers apply only on an explicit user
+    /// decision, so overwriting is exactly the contract.
     pub fn apply(&self, target: Option<&Path>) -> Result<(), ChezmoiError> {
         match target {
-            Some(t) => self.run_ok(&["apply", &t.to_string_lossy()], None)?,
-            None => self.run_ok(&["apply"], None)?,
+            Some(t) => self.run_ok(&["apply", "--force", &t.to_string_lossy()], None)?,
+            None => self.run_ok(&["apply", "--force"], None)?,
         };
         Ok(())
     }
@@ -383,6 +388,34 @@ mod tests {
         assert!(
             call.env
                 .contains(&("OP_ACCOUNT".to_string(), "acct".to_string()))
+        );
+    }
+
+    #[test]
+    fn apply_passes_force_to_survive_modified_destinations() {
+        // Without --force, applying over an externally modified destination
+        // prompts "(diff/overwrite/…)?" and dies with EOF under --no-tty.
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "", "");
+        fake.push_ok(0, "", "");
+        let c = client(fake.clone());
+        c.apply(Some(std::path::Path::new("/Users/x/.zshrc")))
+            .unwrap();
+        c.apply(None).unwrap();
+        let calls = fake.calls();
+        assert_eq!(
+            calls[0].args,
+            vec![
+                "--no-tty",
+                "--no-pager",
+                "apply",
+                "--force",
+                "/Users/x/.zshrc"
+            ]
+        );
+        assert_eq!(
+            calls[1].args,
+            vec!["--no-tty", "--no-pager", "apply", "--force"]
         );
     }
 
