@@ -100,7 +100,7 @@ impl MergeState {
 ```
 Unit tests: conflict bookkeeping, pick/override, next_unresolved wrap-around, assembled None-until-done then equals `doc.assemble`. Commit: `feat(app): pure MergeState for the merge editor`.
 
-- [ ] TDD → gate → commit.
+- [x] TDD → gate → commit.
 
 ---
 

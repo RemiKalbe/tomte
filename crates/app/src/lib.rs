@@ -4,6 +4,7 @@
 
 pub mod ipc;
 pub mod merge_inputs;
+pub mod merge_state;
 pub mod model;
 pub mod resolve;
 pub mod theme;
