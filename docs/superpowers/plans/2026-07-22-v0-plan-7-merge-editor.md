@@ -126,9 +126,9 @@ Commit: `feat(app): three-pane merge editor with per-region choices`.
 
 **Files:** modify `crates/app/tests/resolve_e2e.rs` (reuse `DriftLab`).
 
-- [ ] **F merged save (plain)**: drift `.testrc` so dest and source BOTH changed (edit source file + dest differently → Conflict class); `merge_inputs::load` → MergeState → pick ours for the conflict → `resolve_merged` → source == resolved == dest after apply; committed; session journaled; in-sync after.
-- [ ] **G templated write-back**: `dot_testrc.tmpl` with a `{{ .hostname }}`-style value (scratch config data provides it); drift dest in a LITERAL region; resolved keeps the templated value → `resolve_merged` → the `.tmpl` gains the literal edit, `{{ }}` survives verbatim, verify passed, dest applied; in-sync.
-- [ ] **H protected rejection**: same template, resolved text alters the templated VALUE region → outcome `ProtectedSpan`, `.tmpl` byte-identical, dest untouched, no partial state.
+- [x] **F merged save (plain)**: drift `.testrc` so dest and source BOTH changed (edit source file + dest differently → Conflict class); `merge_inputs::load` → MergeState → pick ours for the conflict → `resolve_merged` → source == resolved == dest after apply; committed; session journaled; in-sync after.
+- [x] **G templated write-back**: `dot_testrc.tmpl` with a `{{ .hostname }}`-style value (scratch config data provides it); drift dest in a LITERAL region; resolved keeps the templated value → `resolve_merged` → the `.tmpl` gains the literal edit, `{{ }}` survives verbatim, verify passed, dest applied; in-sync.
+- [x] **H protected rejection**: same template, resolved text alters the templated VALUE region → outcome `ProtectedSpan`, `.tmpl` byte-identical, dest untouched, no partial state.
 
 Commit: `test(app): merge-resolution e2e stories incl. template write-back`.
 

@@ -12,10 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use czui_app::ipc::IpcClient;
+use czui_app::merge_inputs;
+use czui_app::merge_state::MergeState;
 use czui_app::resolve::{ResolveEngine, ResolveOutcome};
 use czui_core::cmd::SystemRunner;
 use czui_core::drift::{ContentHash, DriftClass};
 use czui_core::git::GitClient;
+use czui_core::merge::Choice;
 use czui_core::scanner::FileDrift;
 use czui_core::testsupport::{Scratch, git, sh};
 use czui_daemon::core::DaemonCore;
@@ -170,6 +173,32 @@ impl DriftLab {
         assert_eq!(drifted.len(), 1, "daemon must report the seeded drift");
         assert_eq!(drifted[0].target, self.target);
     }
+
+    /// Make the daemon observe the current filesystem state and return its
+    /// settled drift list (rescan is async-acked: request → ScanDone → poll).
+    fn rescan_and_settle(&self) -> Vec<DriftSummary> {
+        self.request_rescan();
+        self.wait_scan_done();
+        self.settled_status()
+    }
+
+    /// `merge_inputs::load` with the lab's own stack, ready for `MergeState`.
+    fn load_merge_inputs(&self) -> merge_inputs::MergeInputs {
+        merge_inputs::load(&self.engine.chezmoi, &self.journal_path, &self.target).unwrap()
+    }
+}
+
+/// Pick `Choice::Ours` for every conflict and assemble. Works 3-way (real
+/// conflicts to decide) and degraded 2-way (no conflicts: assembly is the
+/// default choices) alike — base presence is a daemon-history detail the
+/// stories must not depend on.
+fn resolve_all_ours(state: &mut MergeState) -> String {
+    for region in state.conflicts() {
+        state.pick(region, Choice::Ours);
+    }
+    state
+        .assembled()
+        .expect("fully resolved document must assemble")
 }
 
 #[test]
@@ -461,4 +490,271 @@ fn story_e_templated_source_needs_merge_editor_and_touches_nothing() {
         timeline.iter().all(|e| e.kind != "session_start"),
         "keep_disk on a template must not open a session"
     );
+}
+
+/// The source edit committed in story F, distinct from both the last-applied
+/// content and the destination edit — the classic both-sides Conflict.
+const SOURCE_EDITED: &[u8] = b"a=source\n";
+
+#[test]
+fn story_f_merged_save_converges_source_and_dest_on_the_chosen_text() {
+    let lab = DriftLab::new();
+
+    // The source side changes (committed)…
+    std::fs::write(lab.s.source.join("dot_testrc"), SOURCE_EDITED).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "source edit"]);
+    // …and the daemon sees the source-ahead state FIRST: journaling that
+    // probe snapshots the still-last-written destination ("a=1\n"), which is
+    // exactly the blob merge_inputs later resolves as the 3-way base.
+    let drifted = lab.rescan_and_settle();
+    assert_eq!(drifted.len(), 1);
+    assert_eq!(drifted[0].class, "source_ahead");
+
+    // …then the destination changes DIFFERENTLY → both sides moved.
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+    assert_eq!(
+        lab.probe().expect("both-sides drift must probe").class,
+        DriftClass::Conflict
+    );
+    let drifted = lab.rescan_and_settle();
+    assert_eq!(drifted.len(), 1);
+    assert_eq!(drifted[0].target, lab.target);
+    assert_eq!(drifted[0].class, "conflict");
+
+    let head_before = lab.source_git().head_sha().unwrap();
+
+    // Load → model → decide: the conflict is real and "ours" (disk) wins.
+    let inputs = lab.load_merge_inputs();
+    assert!(!inputs.templated);
+    assert!(inputs.span_map.is_none());
+    let mut state = MergeState::new(&inputs);
+    assert!(
+        !state.conflicts().is_empty(),
+        "both sides changed the same line — the editor must demand a decision"
+    );
+    let resolved = resolve_all_ours(&mut state);
+    assert_eq!(resolved.as_bytes(), DRIFTED);
+
+    let outcome = lab.engine.resolve_merged(&inputs, &resolved).unwrap();
+    let ResolveOutcome::Done {
+        session,
+        committed,
+        pushed,
+        note,
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(
+        committed,
+        "the merged source write leaves the repo dirty — fallback commit must fire"
+    );
+    assert!(pushed, "origin exists in the scratch — push must succeed");
+    assert_eq!(note, None);
+
+    // Filesystem truth: source and destination both carry the resolved text.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        DRIFTED
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), DRIFTED);
+
+    // Git truth: exactly one new commit on top of the source edit, pushed.
+    let head_after = lab.source_git().head_sha().unwrap();
+    assert_ne!(head_after, head_before, "fallback commit must move HEAD");
+    assert_eq!(lab.source_git().rev_parse("HEAD~1").unwrap(), head_before);
+    assert_eq!(lab.bare_git().rev_parse("HEAD").unwrap(), head_after);
+
+    // Journal truth: a finished session holding the merge decision with both
+    // pre-mutation snapshot blobs.
+    let journal = lab.journal();
+    let (id, decisions) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(id, session);
+    let arr = decisions.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["action"], "merge");
+    assert_eq!(
+        arr[0]["target"].as_str().unwrap(),
+        lab.target.to_str().unwrap()
+    );
+    let dest_blob = arr[0]["dest_blob"].as_str().unwrap();
+    let source_blob = arr[0]["source_blob"].as_str().unwrap();
+    assert_eq!(dest_blob, ContentHash::of(DRIFTED).to_hex());
+    assert_eq!(journal.get_blob(dest_blob).unwrap().unwrap(), DRIFTED);
+    assert_eq!(
+        journal.get_blob(source_blob).unwrap().unwrap(),
+        SOURCE_EDITED,
+        "source snapshot must hold the pre-merge source content"
+    );
+
+    // Daemon truth: the requested rescan settles to in-sync.
+    assert!(
+        lab.probe().is_none(),
+        "probe must be in-sync after the merge"
+    );
+    lab.wait_scan_done();
+    assert!(lab.settled_status().is_empty());
+}
+
+/// Stories G/H: the managed file as a template — one LITERAL line plus one
+/// line rendered from config `[data]` (testvalue = "tpl").
+const TPL_SOURCE: &[u8] = b"a=1\nvalue={{ .testvalue }}\n";
+const TPL_RENDERED: &[u8] = b"a=1\nvalue=tpl\n";
+/// Story G: the destination edited on the LITERAL line only.
+const TPL_LITERAL_DRIFT: &[u8] = b"a=local\nvalue=tpl\n";
+/// Story H: the destination edited on the RENDERED VALUE of {{ .testvalue }}.
+const TPL_VALUE_DRIFT: &[u8] = b"a=1\nvalue=changed\n";
+
+/// Convert the managed file into a `[data]`-driven template, level all
+/// states with it, then drift the destination to `drift` and make the daemon
+/// see it.
+fn templatize_and_drift(lab: &DriftLab, drift: &[u8]) {
+    // The scratch config exists (empty) since Scratch::new — give the
+    // template its variable, template_roundtrip's scratch_chezmoi pattern.
+    std::fs::write(lab.s.config_path(), "[data]\ntestvalue = \"tpl\"\n").unwrap();
+    git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
+    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TPL_SOURCE).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "templatize"]);
+    lab.s.chezmoi().apply(None).unwrap();
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_RENDERED);
+
+    std::fs::write(&lab.target, drift).unwrap();
+    assert_eq!(
+        lab.probe().expect("seeded drift must probe as drift").class,
+        DriftClass::DestinationDrift
+    );
+    let drifted = lab.rescan_and_settle();
+    assert_eq!(drifted.len(), 1, "daemon must report the seeded drift");
+    assert_eq!(drifted[0].target, lab.target);
+    assert_eq!(drifted[0].class, "destination_drift");
+}
+
+#[test]
+fn story_g_templated_literal_edit_writes_back_and_keeps_the_expression() {
+    let lab = DriftLab::new();
+    templatize_and_drift(&lab, TPL_LITERAL_DRIFT);
+
+    let inputs = lab.load_merge_inputs();
+    assert!(inputs.templated);
+    assert!(
+        inputs.span_map.is_some(),
+        "templated load must anchor protected spans"
+    );
+    assert_eq!(inputs.theirs.as_bytes(), TPL_RENDERED);
+    let mut state = MergeState::new(&inputs);
+    let resolved = resolve_all_ours(&mut state);
+    assert_eq!(resolved.as_bytes(), TPL_LITERAL_DRIFT);
+
+    let outcome = lab.engine.resolve_merged(&inputs, &resolved).unwrap();
+    let ResolveOutcome::Done {
+        session,
+        committed,
+        pushed,
+        note,
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(committed, "the template write leaves the repo dirty");
+    assert!(pushed);
+    assert_eq!(note, None);
+
+    // Filesystem truth: the template gained EXACTLY the literal edit and the
+    // {{ .testvalue }} expression survives verbatim; the destination carries
+    // the resolved (re-rendered) text.
+    let new_template = std::fs::read_to_string(lab.s.source.join("dot_testrc.tmpl")).unwrap();
+    assert_eq!(new_template, "a=local\nvalue={{ .testvalue }}\n");
+    assert!(
+        new_template.contains("{{ .testvalue }}"),
+        "template expressions must survive write-back"
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_LITERAL_DRIFT);
+
+    // Journal truth: the merge decision snapshots the drifted destination and
+    // the pre-mutation template.
+    let journal = lab.journal();
+    let (id, decisions) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(id, session);
+    let arr = decisions.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["action"], "merge");
+    let dest_blob = arr[0]["dest_blob"].as_str().unwrap();
+    let source_blob = arr[0]["source_blob"].as_str().unwrap();
+    assert_eq!(
+        journal.get_blob(dest_blob).unwrap().unwrap(),
+        TPL_LITERAL_DRIFT
+    );
+    assert_eq!(
+        journal.get_blob(source_blob).unwrap().unwrap(),
+        TPL_SOURCE,
+        "source snapshot must hold the pre-merge template"
+    );
+
+    // Daemon truth: in-sync after the merge's rescan.
+    assert!(
+        lab.probe().is_none(),
+        "probe must be in-sync after the merge"
+    );
+    lab.wait_scan_done();
+    assert!(lab.settled_status().is_empty());
+}
+
+#[test]
+fn story_h_templated_value_edit_is_rejected_and_touches_nothing() {
+    let lab = DriftLab::new();
+    templatize_and_drift(&lab, TPL_VALUE_DRIFT);
+    let head_before = lab.source_git().head_sha().unwrap();
+
+    let inputs = lab.load_merge_inputs();
+    assert!(inputs.templated);
+    let mut state = MergeState::new(&inputs);
+    let resolved = resolve_all_ours(&mut state);
+    assert_eq!(resolved.as_bytes(), TPL_VALUE_DRIFT);
+
+    // Keeping "ours" here means keeping an edit to the rendered value of
+    // {{ .testvalue }} — a protected span: write-back must refuse.
+    let outcome = lab.engine.resolve_merged(&inputs, &resolved).unwrap();
+    let ResolveOutcome::ProtectedSpan { detail } = outcome else {
+        panic!("expected ProtectedSpan, got {outcome:?}");
+    };
+    assert!(detail.contains("protected"), "detail: {detail}");
+
+    // NOTHING mutated: template byte-identical, destination still drifted,
+    // repo clean, HEAD unmoved.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        TPL_SOURCE
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_VALUE_DRIFT);
+    assert!(lab.source_git().dirty_files().unwrap().is_empty());
+    assert_eq!(lab.source_git().head_sha().unwrap(), head_before);
+
+    // Journal truth: the finished session records the attempt AND the
+    // rejection — the merge decision followed by merge_rejected.
+    let journal = lab.journal();
+    let (_, decisions) = journal.last_finished_session().unwrap().unwrap();
+    let arr = decisions.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["action"], "merge");
+    assert_eq!(arr[1]["action"], "merge_rejected");
+    assert_eq!(
+        arr[1]["target"].as_str().unwrap(),
+        lab.target.to_str().unwrap()
+    );
+    assert!(
+        arr[1]["detail"].as_str().unwrap().contains("protected"),
+        "rejection detail must be journaled"
+    );
+
+    // Daemon truth: no rescan was requested (nothing changed) — the drift is
+    // still reported, and the filesystem still probes as drifted.
+    assert_eq!(
+        lab.probe().expect("drift must survive the rejection").class,
+        DriftClass::DestinationDrift
+    );
+    let drifted = lab.settled_status();
+    assert_eq!(drifted.len(), 1);
+    assert_eq!(drifted[0].target, lab.target);
 }
