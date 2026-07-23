@@ -151,8 +151,8 @@ Commit: `test(app): e2e drift stories for resolve actions`.
 
 ### Task 5: Real-machine smoke (user-attended) + docs
 
-- [ ] Full gate; update the plan checkboxes; brief README section in `docs/` if absent — skip if time-boxed.
-- [ ] Hand off to Remi: relaunch app → click "keep disk" on `~/.claude/settings.json` (a real, non-templated drifted file) → expect: banner success, a signed commit in `~/.local/share/chezmoi` (1Password prompt may appear — that's chezmoi autoCommit doing its job), drift count drops to 3, and Undo restores it. This step is the acceptance test for the whole plan.
+- [x] Full gate; update the plan checkboxes; brief README section in `docs/` if absent — skip if time-boxed.
+- [x] Hand off to Remi: relaunch app → click "keep disk" on `~/.claude/settings.json` (a real, non-templated drifted file) → expect: banner success, a signed commit in `~/.local/share/chezmoi` (1Password prompt may appear — that's chezmoi autoCommit doing its job), drift count drops to 3, and Undo restores it. This step is the acceptance test for the whole plan.
 
 ---
 
