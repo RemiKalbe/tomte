@@ -400,7 +400,7 @@ mod render_smoke {
             (
                 false,
                 Some(OutcomeBanner {
-                    text: "kept disk version — committed & pushed".into(),
+                    text: "Kept disk version · committed & pushed".into(),
                     tint: BannerTint::Ok,
                     undoable: true,
                 }),
@@ -408,7 +408,7 @@ mod render_smoke {
             (
                 false,
                 Some(OutcomeBanner {
-                    text: "keep disk failed: daemon gone".into(),
+                    text: "Keep disk failed: daemon gone".into(),
                     tint: BannerTint::Conflict,
                     undoable: false,
                 }),

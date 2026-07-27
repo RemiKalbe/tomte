@@ -293,7 +293,7 @@ impl DashboardView {
                 let (text, color) = if scanning {
                     ("scanning your dotfiles…", theme.text_muted)
                 } else if !connected {
-                    ("waiting for chezmoid…", theme.text_muted)
+                    ("connecting to the sync daemon…", theme.text_muted)
                 } else {
                     ("everything in sync", theme.ok)
                 };
@@ -692,14 +692,14 @@ fn quick_action_body(
         Ok(ResolveOutcome::Done { note: None, .. }) => format!("{}: {name}", action.verb()),
         Ok(ResolveOutcome::Done {
             note: Some(note), ..
-        }) => format!("{}: {name} — {note}", action.verb()),
+        }) => format!("{}: {name} · {note}", action.verb()),
         Ok(ResolveOutcome::NeedsMergeEditor) => {
-            format!("{name} is templated — needs the merge editor, arriving next milestone")
+            format!("{name} is templated · use the merge editor")
         }
         // Defensive: quick actions never run `resolve_merged`, the only
         // producer of this outcome.
         Ok(ResolveOutcome::ProtectedSpan { .. }) => {
-            format!("{name}: this change touches a templated value — open in editor")
+            format!("{name}: this change touches a templated value · open the merge editor")
         }
         Err(e) => format!("{} {name} failed: {e}", action.label()),
     }
@@ -728,11 +728,11 @@ mod tests {
         let t = Path::new("/Users/x/.zshrc");
         assert_eq!(
             quick_action_body(ResolveAction::KeepDisk, t, &Ok(done(None))),
-            "kept disk version: .zshrc"
+            "Kept disk version: .zshrc"
         );
         assert_eq!(
             quick_action_body(ResolveAction::KeepSource, t, &Ok(done(Some("push failed")))),
-            "restored chezmoi's version: .zshrc — push failed"
+            "Restored chezmoi's version: .zshrc · push failed"
         );
         assert_eq!(
             quick_action_body(
@@ -740,7 +740,7 @@ mod tests {
                 t,
                 &Ok(ResolveOutcome::NeedsMergeEditor)
             ),
-            ".zshrc is templated — needs the merge editor, arriving next milestone"
+            ".zshrc is templated · use the merge editor"
         );
         assert_eq!(
             quick_action_body(
@@ -748,7 +748,7 @@ mod tests {
                 t,
                 &Err(ResolveError::Failed("daemon gone".into()))
             ),
-            "keep disk .zshrc failed: daemon gone"
+            "Keep disk .zshrc failed: daemon gone"
         );
         assert_eq!(
             quick_action_body(
@@ -758,7 +758,7 @@ mod tests {
                     detail: "touches a protected template span".into()
                 })
             ),
-            ".zshrc: this change touches a templated value — open in editor"
+            ".zshrc: this change touches a templated value · open the merge editor"
         );
     }
 }

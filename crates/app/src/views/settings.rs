@@ -318,7 +318,7 @@ impl SettingsView {
                 div()
                     .text_xs()
                     .text_color(theme.text_muted)
-                    .child("how often chezmoid fetches origin (5–120 minutes, 5-minute steps)"),
+                    .child("How often to check origin for changes (5–120 min, steps of 5)"),
             )
     }
 
@@ -445,7 +445,7 @@ impl SettingsView {
                 div()
                     .text_sm()
                     .text_color(theme.drift)
-                    .child("Saved — chezmoid restarting with new settings"),
+                    .child("Saved · the sync daemon is restarting with the new settings"),
             ),
             SaveState::Error(e) => row.child(
                 div()

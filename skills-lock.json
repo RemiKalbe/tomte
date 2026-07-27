@@ -1,11 +1,29 @@
 {
   "version": 1,
   "skills": {
+    "Desktop App Design": {
+      "source": "phazurlabs/ux-ui-mastery",
+      "sourceType": "github",
+      "skillPath": "skills/desktop-app-design/SKILL.md",
+      "computedHash": "9aee65a84ccab738ba1c6c649ef858db75ce8688e731b4a2b5c48427fb108fb0"
+    },
+    "apple-human-interface-guidelines": {
+      "source": "milistu/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/apple-human-interface-guidelines/SKILL.md",
+      "computedHash": "210c707531a128c2c5ff1d1b7fe701800bbfd9a4f6369baa3a0c1aa8ffe1dc7f"
+    },
     "brainstorming": {
       "source": "obra/superpowers",
       "sourceType": "github",
       "skillPath": "skills/brainstorming/SKILL.md",
       "computedHash": "253570c46990ea018dd4520dba80cd77c35f9e5a8654057da1812face7be30cd"
+    },
+    "design-taste-frontend": {
+      "source": "Leonxlnx/taste-skill",
+      "sourceType": "github",
+      "skillPath": "skills/taste-skill/SKILL.md",
+      "computedHash": "6d838b246d0e35d0b53f4f23f98ba7a1dd561937e64f7d0c7553b0928e376c3e"
     },
     "executing-plans": {
       "source": "obra/superpowers",

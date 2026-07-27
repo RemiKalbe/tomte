@@ -304,7 +304,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 "review-empty" => (None, false, false),
                 "review-banner" => (
                     Some(OutcomeBanner {
-                        text: "kept disk version — committed & pushed".into(),
+                        text: "Kept disk version · committed & pushed".into(),
                         tint: BannerTint::Ok,
                         undoable: true,
                     }),

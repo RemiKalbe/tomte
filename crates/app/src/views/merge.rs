@@ -212,7 +212,7 @@ fn merge_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBanner 
             ..
         }) => OutcomeBanner {
             text: if *committed && *pushed {
-                "merged — committed & pushed".into()
+                "Merged · committed & pushed".into()
             } else {
                 "merged".into()
             },
@@ -222,18 +222,18 @@ fn merge_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBanner 
         Ok(ResolveOutcome::Done {
             note: Some(note), ..
         }) => OutcomeBanner {
-            text: format!("merged — {note}").into(),
+            text: format!("Merged · {note}").into(),
             tint: BannerTint::Drift,
             undoable: true,
         },
         Ok(ResolveOutcome::ProtectedSpan { detail }) => OutcomeBanner {
-            text: format!("this change touches a templated value — {detail}").into(),
+            text: format!("This change touches a templated value · {detail}").into(),
             tint: BannerTint::Drift,
             undoable: false,
         },
         // Defensive: resolve_merged never reports this outcome.
         Ok(ResolveOutcome::NeedsMergeEditor) => OutcomeBanner {
-            text: "unexpected engine outcome — nothing was changed".into(),
+            text: "Unexpected engine outcome · nothing was changed".into(),
             tint: BannerTint::Drift,
             undoable: false,
         },
@@ -405,7 +405,7 @@ impl MergeView {
             // The button was enabled before a disconnect — report, don't
             // no-op silently (spec §10).
             self.banner = Some(OutcomeBanner {
-                text: "daemon not connected — cannot save".into(),
+                text: "Daemon not connected · cannot save".into(),
                 tint: BannerTint::Conflict,
                 undoable: false,
             });
@@ -501,7 +501,12 @@ impl MergeView {
                         .text_xs()
                         .whitespace_nowrap()
                         .text_color(if open == 0 { theme.ok } else { theme.conflict })
-                        .child(format!("{open} of {total} regions need you")),
+                        .child(if total == 0 {
+                            "No conflicts to resolve".to_string()
+                        } else {
+                            let s = if total == 1 { "" } else { "s" };
+                            format!("{total} conflict{s}, {} resolved", total - open)
+                        }),
                 );
             if open > 0 {
                 bar = bar.child(
@@ -516,7 +521,7 @@ impl MergeView {
                         .text_color(theme.conflict)
                         .cursor_pointer()
                         .hover(|el| el.bg(Theme::wash(theme.conflict, 0.12)))
-                        .child("next ↓")
+                        .child("Next ↓")
                         .on_click(cx.listener(|view, _ev, _window, cx| view.next(cx))),
                 );
             }
@@ -1078,7 +1083,7 @@ mod tests {
     #[test]
     fn merge_banner_full_success_is_ok_and_undoable() {
         let b = merge_banner(&Ok(done(true, true, None)));
-        assert_eq!(b.text.as_ref(), "merged — committed & pushed");
+        assert_eq!(b.text.as_ref(), "Merged · committed & pushed");
         assert_eq!(b.tint, BannerTint::Ok);
         assert!(b.undoable);
 
@@ -1091,7 +1096,7 @@ mod tests {
     #[test]
     fn merge_banner_degraded_commit_carries_the_note_in_drift_tint() {
         let b = merge_banner(&Ok(done(true, false, Some("push failed: locked"))));
-        assert_eq!(b.text.as_ref(), "merged — push failed: locked");
+        assert_eq!(b.text.as_ref(), "Merged · push failed: locked");
         assert_eq!(b.tint, BannerTint::Drift);
         assert!(b.undoable, "the merge itself succeeded");
     }
@@ -1104,7 +1109,7 @@ mod tests {
         assert!(
             b.text
                 .as_ref()
-                .starts_with("this change touches a templated value — "),
+                .starts_with("This change touches a templated value · "),
             "text: {}",
             b.text
         );

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use czui_app::model::{SyncModel, kind_glyph, time_ago};
+use czui_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
 use czui_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use czui_app::theme::Theme;
 use czui_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
@@ -182,16 +182,16 @@ impl ResolveAction {
     /// Short imperative label for buttons and failure messages.
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::KeepDisk => "keep disk",
-            Self::KeepSource => "keep source",
+            Self::KeepDisk => "Keep disk",
+            Self::KeepSource => "Keep source",
         }
     }
 
     /// Past-tense verb for success messages.
     pub(super) fn verb(self) -> &'static str {
         match self {
-            Self::KeepDisk => "kept disk version",
-            Self::KeepSource => "restored chezmoi's version",
+            Self::KeepDisk => "Kept disk version",
+            Self::KeepSource => "Restored chezmoi's version",
         }
     }
 
@@ -256,7 +256,7 @@ fn outcome_banner(
             // keep_source runs no commit phase, so only advertise the
             // commit/push when they actually happened.
             text: if *committed && *pushed {
-                format!("{} — committed & pushed", action.verb()).into()
+                format!("{} · committed & pushed", action.verb()).into()
             } else {
                 action.verb().into()
             },
@@ -266,19 +266,19 @@ fn outcome_banner(
         Ok(ResolveOutcome::Done {
             note: Some(note), ..
         }) => OutcomeBanner {
-            text: format!("{} — {note}", action.verb()).into(),
+            text: format!("{} · {note}", action.verb()).into(),
             tint: BannerTint::Drift,
             undoable: true,
         },
         Ok(ResolveOutcome::NeedsMergeEditor) => OutcomeBanner {
-            text: "templated file — needs the merge editor, arriving next milestone".into(),
+            text: "Templated file · use the merge editor".into(),
             tint: BannerTint::Drift,
             undoable: false,
         },
         // Defensive: only `resolve_merged` produces this, and the merge
         // editor (Plan 7 Task 3) reports it through its own flow.
         Ok(ResolveOutcome::ProtectedSpan { .. }) => OutcomeBanner {
-            text: "this change touches a templated value — open in editor".into(),
+            text: "This change touches a templated value · open the merge editor".into(),
             tint: BannerTint::Drift,
             undoable: false,
         },
@@ -1095,25 +1095,33 @@ fn provenance_row(row: &ProvRow, now: u64, theme: Theme) -> Div {
         .child(
             div()
                 .text_color(theme.text)
-                .child(SharedString::from(row.kind.clone())),
+                .child(kind_label(&row.kind)),
         )
         .child(
             div()
                 .text_color(theme.text_muted)
                 .child(SharedString::from(row.machine.clone())),
         )
-        .when_some(row.class.clone(), |el, class| {
-            let color = theme.class_color(&class);
-            el.child(
-                div()
-                    .px_1p5()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color)
-                    .text_color(color)
-                    .child(SharedString::from(class)),
-            )
-        })
+        .when_some(
+            // The chip earns its place only when it says something the event
+            // label doesn't (e.g. "applied" + a drift class); otherwise the
+            // row would repeat itself ("modified on disk" twice).
+            row.class
+                .clone()
+                .filter(|class| class_label(class) != kind_label(&row.kind)),
+            |el, class| {
+                let color = theme.class_color(&class);
+                el.child(
+                    div()
+                        .px_1p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(color)
+                        .text_color(color)
+                        .child(class_label(&class)),
+                )
+            },
+        )
 }
 
 fn diff_preview(doc: &MergeDocument, theme: Theme) -> AnyElement {
@@ -1382,13 +1390,13 @@ mod tests {
     fn outcome_banner_full_success_is_ok_tinted_and_undoable() {
         // keep_disk: commit phase ran and fully succeeded
         let b = outcome_banner(ResolveAction::KeepDisk, &Ok(done(true, true, None)));
-        assert_eq!(b.text.as_ref(), "kept disk version — committed & pushed");
+        assert_eq!(b.text.as_ref(), "Kept disk version · committed & pushed");
         assert_eq!(b.tint, BannerTint::Ok);
         assert!(b.undoable);
 
         // keep_source: no commit phase — the banner must not claim one
         let b = outcome_banner(ResolveAction::KeepSource, &Ok(done(false, false, None)));
-        assert_eq!(b.text.as_ref(), "restored chezmoi's version");
+        assert_eq!(b.text.as_ref(), "Restored chezmoi's version");
         assert_eq!(b.tint, BannerTint::Ok);
         assert!(b.undoable);
     }
@@ -1399,7 +1407,7 @@ mod tests {
             ResolveAction::KeepDisk,
             &Ok(done(true, false, Some("push failed: locked"))),
         );
-        assert_eq!(b.text.as_ref(), "kept disk version — push failed: locked");
+        assert_eq!(b.text.as_ref(), "Kept disk version · push failed: locked");
         assert_eq!(b.tint, BannerTint::Drift);
         assert!(b.undoable, "the resolution itself succeeded");
     }
@@ -1412,7 +1420,7 @@ mod tests {
         );
         assert_eq!(
             b.text.as_ref(),
-            "templated file — needs the merge editor, arriving next milestone"
+            "Templated file · use the merge editor"
         );
         assert_eq!(b.tint, BannerTint::Drift);
         assert!(!b.undoable);
@@ -1421,7 +1429,7 @@ mod tests {
             ResolveAction::KeepSource,
             &Err(ResolveError::Failed("daemon gone".into())),
         );
-        assert_eq!(b.text.as_ref(), "keep source failed: daemon gone");
+        assert_eq!(b.text.as_ref(), "Keep source failed: daemon gone");
         assert_eq!(b.tint, BannerTint::Conflict);
         assert!(!b.undoable);
     }
@@ -1436,7 +1444,7 @@ mod tests {
         );
         assert_eq!(
             b.text.as_ref(),
-            "this change touches a templated value — open in editor"
+            "This change touches a templated value · open the merge editor"
         );
         assert_eq!(b.tint, BannerTint::Drift);
         assert!(!b.undoable, "nothing was mutated — nothing to undo");
