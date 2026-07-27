@@ -2,6 +2,7 @@
 //! panel, bordered, compact nav rows) over a routed content pane.
 
 pub mod dashboard;
+pub mod fixtures;
 pub mod merge;
 pub mod review;
 pub mod settings;
@@ -338,6 +339,20 @@ mod render_smoke {
             socket: PathBuf::from("/tmp/smoke.sock"),
             journal: PathBuf::from("/tmp/smoke-journal.db"),
             settings: PathBuf::from("/tmp/smoke-settings.toml"),
+        }
+    }
+
+    /// Every gallery state must build and render headlessly — otherwise
+    /// `--gallery` (and scripts/shoot.sh) breaks silently the next time a
+    /// view struct changes shape.
+    #[gpui::test]
+    fn every_gallery_state_builds_and_renders(cx: &mut TestAppContext) {
+        for (name, _) in fixtures::STATES {
+            let (_view, vis) = cx.add_window_view(|_window, cx| {
+                fixtures::build(name, smoke_paths(), cx)
+                    .unwrap_or_else(|| panic!("fixture missing for listed state {name}"))
+            });
+            vis.run_until_parked();
         }
     }
 

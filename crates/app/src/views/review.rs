@@ -87,11 +87,11 @@ pub enum PreviewState {
 /// [`EventRow`] the same way `SyncModel::hydrate_timeline` maps timeline rows
 /// (`meta.class` extraction included).
 #[derive(Debug, Clone)]
-struct ProvRow {
-    ts: u64,
-    kind: String,
-    machine: String,
-    class: Option<String>,
+pub(super) struct ProvRow {
+    pub(super) ts: u64,
+    pub(super) kind: String,
+    pub(super) machine: String,
+    pub(super) class: Option<String>,
 }
 
 impl From<EventRow> for ProvRow {
@@ -128,8 +128,8 @@ pub(super) fn journal_path() -> PathBuf {
 /// Everything the detail pane needs for one target, computed entirely on the
 /// background executor.
 struct LoadedDetail {
-    provenance: Vec<ProvRow>,
-    preview: PreviewState,
+    pub(super) provenance: Vec<ProvRow>,
+    pub(super) preview: PreviewState,
 }
 
 fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
@@ -460,10 +460,10 @@ pub struct ReviewView {
     /// `pub(super)` so the render-smoke tests can pose a selected target
     /// without spawning the background detail load.
     pub(super) selected: Option<PathBuf>,
-    preview: PreviewState,
+    pub(super) preview: PreviewState,
     /// Provenance for the selected target, newest first (background-loaded
     /// together with the preview).
-    provenance: Vec<ProvRow>,
+    pub(super) provenance: Vec<ProvRow>,
     /// Outcome of the last resolve/undo action, rendered as a banner above
     /// the diff. `pub(super)` for the render-smoke tests.
     pub(super) last_outcome: Option<OutcomeBanner>,

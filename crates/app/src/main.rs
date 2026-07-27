@@ -250,6 +250,82 @@ fn print_status(socket: &Path) -> ExitCode {
     }
 }
 
+/// Value following a `--flag` argument, if present.
+fn arg_value(flag: &str) -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+    }
+    None
+}
+
+/// Gallery mode: open a normal window posed to a named synthetic state so a
+/// screenshot tool (scripts/shoot.sh) can capture any UI state on demand —
+/// no daemon, no real data. Prints `GALLERY_WINDOW_ID: <n>` for
+/// `screencapture -l`. `dark`: force appearance; None follows the system.
+fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> ExitCode {
+    use objc2_app_kit::{
+        NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    };
+
+    if !views::fixtures::STATES.iter().any(|(n, _)| *n == state_name) {
+        eprintln!("unknown gallery state: {state_name} (try --gallery-list)");
+        return ExitCode::FAILURE;
+    }
+
+    Application::new().run(move |cx: &mut App| {
+        let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(dark) = dark {
+            let name = if dark {
+                unsafe { NSAppearanceNameDarkAqua }
+            } else {
+                unsafe { NSAppearanceNameAqua }
+            };
+            let appearance = NSAppearance::appearanceNamed(name);
+            app.setAppearance(appearance.as_deref());
+        }
+
+        cx.activate(true);
+        let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("chezmoi ui — gallery".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(gpui::point(px(12.), px(12.))),
+                }),
+                ..Default::default()
+            },
+            |_, cx| {
+                cx.new(|cx| {
+                    views::fixtures::build(&state_name, paths.clone(), cx)
+                        .expect("state name validated before run()")
+                })
+            },
+        );
+        if opened.is_err() {
+            eprintln!("gallery: failed to open window");
+            std::process::exit(1);
+        }
+
+        // The capture script waits for this line, then shoots the window.
+        let windows = app.windows();
+        if let Some(win) = windows.iter().last() {
+            println!("GALLERY_WINDOW_ID: {}", win.windowNumber());
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+        } else {
+            eprintln!("gallery: no NSWindow found after open");
+            std::process::exit(1);
+        }
+    });
+    ExitCode::SUCCESS
+}
+
 fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: SettingsPaths) {
     cx.activate(true);
     let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
@@ -688,6 +764,23 @@ fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "--print-status") {
         return print_status(&paths.socket);
+    }
+    if std::env::args().any(|a| a == "--gallery-list") {
+        for (name, desc) in views::fixtures::STATES {
+            println!("{name}\t{desc}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Some(state) = arg_value("--gallery") {
+        let dark = match (
+            std::env::args().any(|a| a == "--dark"),
+            std::env::args().any(|a| a == "--light"),
+        ) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        };
+        return run_gallery(state, dark, paths.view_paths());
     }
 
     Application::new().run(move |cx: &mut App| {
