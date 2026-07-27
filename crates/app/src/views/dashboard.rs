@@ -37,7 +37,7 @@ pub fn system_now() -> u64 {
 }
 
 /// `$HOME/...` → `~/...` — paths read better and truncate less.
-fn shorten_home(path: &str) -> String {
+pub(super) fn shorten_home(path: &str) -> String {
     match std::env::var("HOME") {
         Ok(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
         _ => path.to_string(),

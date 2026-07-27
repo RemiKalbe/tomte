@@ -638,6 +638,7 @@ impl ReviewView {
     fn merge_editor_button(
         &self,
         enabled: bool,
+        is_conflict: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -650,11 +651,18 @@ impl ReviewView {
             .text_xs()
             .child("Open merge editor");
         if enabled {
-            base.border_color(theme.accent)
-                .text_color(theme.accent)
-                .cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
-                .on_click(cx.listener(|view, _ev, _window, cx| view.open_merge_editor(cx)))
+            // Accent only when merging is this file's real resolution path
+            // (a conflict); for one-click drifts it's a secondary option.
+            let color = if is_conflict { theme.accent } else { theme.text };
+            base.border_color(if is_conflict {
+                theme.accent
+            } else {
+                theme.border
+            })
+            .text_color(color)
+            .cursor_pointer()
+            .hover(|el| el.bg(Theme::wash(color, 0.12)))
+            .on_click(cx.listener(|view, _ev, _window, cx| view.open_merge_editor(cx)))
         } else {
             base.border_color(theme.border)
                 .text_color(theme.text_muted)
@@ -753,7 +761,7 @@ impl ReviewView {
     ) -> impl IntoElement + use<> {
         let mut ix = 0usize;
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (label, group) in [("NEEDS YOU", needs_you), ("ONE CLICK", one_click)] {
+        for (label, group) in [("NEEDS A DECISION", needs_you), ("SAFE TO RESOLVE", one_click)] {
             if group.is_empty() {
                 continue;
             }
@@ -864,11 +872,18 @@ impl ReviewView {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| selected.display().to_string())
             .into();
-        let path: SharedString = selected.display().to_string().into();
+        let path: SharedString = super::dashboard::shorten_home(&selected.display().to_string()).into();
 
         let engine_ready = cx
             .try_global::<crate::EngineSlot>()
             .is_some_and(|slot| slot.0.is_some());
+        let is_conflict = self
+            .state
+            .read(cx)
+            .drifted
+            .iter()
+            .find(|d| d.target == *selected)
+            .is_some_and(|d| matches!(d.class.as_str(), "conflict" | "local_source_diverged"));
 
         let body = match &self.preview {
             PreviewState::Empty | PreviewState::Loading => {
@@ -902,8 +917,7 @@ impl ReviewView {
                             .flex_1()
                             .min_w_0()
                             .flex()
-                            .items_baseline()
-                            .gap_2()
+                            .flex_col()
                             .child(
                                 div()
                                     .text_sm()
@@ -912,11 +926,16 @@ impl ReviewView {
                                     .child(name),
                             )
                             .child(
+                                // ~-shortened so it fits in practice; gpui's
+                                // ellipsis is unreliable inside flex columns
+                                // (see the footer fix in mod.rs), so rare
+                                // overlong paths clip at the pane edge.
                                 div()
                                     .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
                                     .text_xs()
                                     .text_color(theme.text_muted)
-                                    .truncate()
                                     .child(path),
                             ),
                     )
@@ -947,19 +966,26 @@ impl ReviewView {
                             ))
                             .into_any_element()
                     })
-                    .child(self.merge_editor_button(engine_ready, theme, cx))
+                    .child(self.merge_editor_button(engine_ready, is_conflict, theme, cx))
                     .child(
+                        // External editor: real but rare — an icon, not a
+                        // fourth competing button.
                         div()
                             .id("open-in-editor")
-                            .px_2()
+                            .px_1p5()
                             .py_0p5()
                             .rounded_md()
-                            .border_1()
-                            .border_color(theme.accent)
-                            .text_xs()
-                            .text_color(theme.accent)
+                            .text_sm()
+                            .text_color(theme.text_muted)
                             .cursor_pointer()
-                            .child("Open in editor")
+                            .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                            .child("↗")
+                            .tooltip(|_window, cx| {
+                                cx.new(|_| TextTooltip {
+                                    text: "Open in external editor".into(),
+                                })
+                                .into()
+                            })
                             .on_click(
                                 cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)),
                             ),
@@ -1082,6 +1108,7 @@ fn provenance_row(row: &ProvRow, now: u64, theme: Theme) -> Div {
             div()
                 .w_16()
                 .flex_shrink_0()
+                .text_right()
                 .text_color(theme.text_muted)
                 .child(SharedString::from(time_ago(now, row.ts))),
         )
