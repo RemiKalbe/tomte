@@ -447,7 +447,7 @@ impl MergeView {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| target.display().to_string())
                     .into(),
-                target.display().to_string().into(),
+                super::dashboard::shorten_home(&target.display().to_string()).into(),
             ),
             None => ("merge editor".into(), "".into()),
         };
@@ -486,16 +486,6 @@ impl MergeView {
             let (decided, total) = loaded.state.progress();
             let open = total - decided;
             bar = bar
-                .child(chip("source (rendered)", theme.accent))
-                .child(chip(
-                    if degraded {
-                        "(no snapshot)"
-                    } else {
-                        "last written"
-                    },
-                    theme.text_muted,
-                ))
-                .child(chip("on disk", theme.drift))
                 .child(
                     div()
                         .text_xs()
@@ -542,6 +532,10 @@ impl MergeView {
                 .on_click(cx.listener(|view, _ev, _window, cx| view.cancel(cx))),
         );
         if let Some(loaded) = &self.loaded {
+            let unresolved = {
+                let (decided, total) = loaded.state.progress();
+                total - decided
+            };
             bar = bar.child(if self.saving {
                 div()
                     .text_xs()
@@ -549,7 +543,7 @@ impl MergeView {
                     .child("saving…")
                     .into_any_element()
             } else {
-                self.save_button(loaded.state.assembled().is_some(), theme, cx)
+                self.save_button(loaded.state.assembled().is_some(), unresolved, theme, cx)
                     .into_any_element()
             });
         }
@@ -558,7 +552,13 @@ impl MergeView {
 
     /// Save is enabled exactly when the document is fully resolved and no
     /// save is in flight (the plan's contract).
-    fn save_button(&self, enabled: bool, theme: Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn save_button(
+        &self,
+        enabled: bool,
+        unresolved: usize,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let base = div()
             .id("merge-save")
             .px_2()
@@ -576,11 +576,10 @@ impl MergeView {
         } else {
             base.border_color(theme.border)
                 .text_color(theme.text_muted)
-                .tooltip(|_window, cx| {
-                    cx.new(|_| TextTooltip {
-                        text: "resolve every region first".into(),
-                    })
-                    .into()
+                .tooltip(move |_window, cx| {
+                    let s = if unresolved == 1 { "" } else { "s" };
+                    let text = format!("{unresolved} conflict{s} left").into();
+                    cx.new(|_| TextTooltip { text }).into()
                 })
         }
     }
@@ -625,6 +624,8 @@ impl MergeView {
                     .gap_2()
                     .child(pane_col(
                         "merge-pane-theirs",
+                        "source (rendered)",
+                        theme.accent,
                         &loaded.theirs_rows,
                         PaneSide::Theirs,
                         theme,
@@ -632,10 +633,19 @@ impl MergeView {
                     .child(if degraded {
                         degraded_base_col(theme)
                     } else {
-                        pane_col("merge-pane-base", &loaded.base_rows, PaneSide::Base, theme)
+                        pane_col(
+                            "merge-pane-base",
+                            "last written",
+                            theme.text_muted,
+                            &loaded.base_rows,
+                            PaneSide::Base,
+                            theme,
+                        )
                     })
                     .child(pane_col(
                         "merge-pane-ours",
+                        "on disk",
+                        theme.drift,
                         &loaded.ours_rows,
                         PaneSide::Ours,
                         theme,
@@ -680,18 +690,6 @@ impl Render for MergeView {
     }
 }
 
-/// Provenance chip: translucent wash of its pane's tint (nav-badge idiom).
-fn chip(label: &'static str, color: Rgba) -> Div {
-    div()
-        .px_1p5()
-        .rounded_sm()
-        .bg(Theme::wash(color, 0.15))
-        .text_xs()
-        .whitespace_nowrap()
-        .text_color(color)
-        .child(label)
-}
-
 /// Merge-local banner: same shape as Review's, minus the Undo button (the
 /// banners that stay here — protected span, errors — are never undoable).
 fn banner_el(banner: &OutcomeBanner, theme: Theme) -> Div {
@@ -708,9 +706,13 @@ fn banner_el(banner: &OutcomeBanner, theme: Theme) -> Div {
         .child(div().min_w_0().truncate().child(banner.text.clone()))
 }
 
-/// One read-only pane column: a bordered `uniform_list` over its lines.
+/// One read-only pane column: an attached label header (the user should
+/// never have to map floating toolbar chips onto panes by position) over a
+/// bordered `uniform_list` of its lines.
 fn pane_col(
     id: &'static str,
+    label: &'static str,
+    tint: Rgba,
     rows: &Rc<Vec<PaneLine>>,
     side: PaneSide,
     theme: Theme,
@@ -725,6 +727,7 @@ fn pane_col(
         .rounded_md()
         .border_1()
         .border_color(theme.border)
+        .child(pane_label(label, tint, theme))
         .child(
             uniform_list(id, rows.len(), move |range, _window, _cx| {
                 range.map(|ix| pane_row(&rows[ix], side, theme)).collect()
@@ -732,6 +735,20 @@ fn pane_col(
             .flex_1(),
         )
         .into_any_element()
+}
+
+/// The header strip inside a pane: tint dot + muted label.
+fn pane_label(label: &'static str, tint: Rgba, theme: Theme) -> Div {
+    div()
+        .px_2()
+        .py_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .child(div().w_1p5().h_1p5().rounded_full().bg(tint))
+        .child(div().text_xs().text_color(theme.text_muted).child(label))
 }
 
 /// The base column when no last-written snapshot exists: the merge degraded
@@ -745,12 +762,19 @@ fn degraded_base_col(theme: Theme) -> AnyElement {
         .border_1()
         .border_color(theme.border)
         .flex()
-        .items_center()
-        .justify_center()
-        .px_2()
-        .text_xs()
-        .text_color(theme.text_muted)
-        .child("(no snapshot of last-written state)")
+        .flex_col()
+        .child(pane_label("last written", theme.text_muted, theme))
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_2()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child("no snapshot · merging 2-way"),
+        )
         .into_any_element()
 }
 
@@ -782,7 +806,7 @@ fn pane_row(line: &PaneLine, side: PaneSide, theme: Theme) -> Div {
                 .w_4()
                 .flex_shrink_0()
                 .text_color(theme.drift)
-                .child(if line.protected { "🔒" } else { "" }),
+                .child(if line.protected { "⚿" } else { "" }),
         )
         .child(
             div()
