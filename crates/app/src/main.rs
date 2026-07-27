@@ -326,6 +326,51 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
     ExitCode::SUCCESS
 }
 
+/// Live mode: the REAL boot path — connect to (or spawn) the actual daemon,
+/// hydrate from the real journal and chezmoi state — but open the window
+/// immediately on `route` and print `GALLERY_WINDOW_ID:` for the capture
+/// script. No status item (a second transient menubar icon would flicker);
+/// this instance is a read-only observer that shoot.sh kills after the shot.
+/// Prints `LIVE_CONNECTED` once the daemon hello lands so the script can
+/// wait for real data instead of guessing with a sleep.
+fn run_live(route: Route, paths: Paths) -> ExitCode {
+    use objc2_app_kit::NSApplication;
+
+    Application::new().run(move |cx: &mut App| {
+        let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
+        set_accessory_policy(mtm);
+
+        let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
+        cx.observe(&state, {
+            let mut announced = false;
+            move |state, cx| {
+                if !announced && state.read(cx).connected {
+                    announced = true;
+                    println!("LIVE_CONNECTED");
+                    use std::io::Write as _;
+                    std::io::stdout().flush().ok();
+                }
+            }
+        })
+        .detach();
+
+        let view_paths = paths.view_paths();
+        spawn_boot_and_event_loop(cx, state.clone(), paths);
+        open_shell(cx, route, state, view_paths);
+
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(win) = app.windows().iter().last() {
+            println!("GALLERY_WINDOW_ID: {}", win.windowNumber());
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+        } else {
+            eprintln!("live: no NSWindow found after open");
+            std::process::exit(1);
+        }
+    });
+    ExitCode::SUCCESS
+}
+
 fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: SettingsPaths) {
     cx.activate(true);
     let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
@@ -770,6 +815,18 @@ fn main() -> ExitCode {
             println!("{name}\t{desc}");
         }
         return ExitCode::SUCCESS;
+    }
+    if let Some(route) = arg_value("--live") {
+        let route = match route.as_str() {
+            "dashboard" => Route::Dashboard,
+            "review" => Route::Review,
+            "settings" => Route::Settings,
+            other => {
+                eprintln!("unknown live route: {other} (dashboard|review|settings)");
+                return ExitCode::FAILURE;
+            }
+        };
+        return run_live(route, paths);
     }
     if let Some(state) = arg_value("--gallery") {
         let dark = match (

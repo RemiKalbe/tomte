@@ -5,6 +5,8 @@
 #   scripts/shoot.sh dashboard           # one state, dark + light
 #   scripts/shoot.sh dashboard dark      # one state, one theme
 #   scripts/shoot.sh all light           # every state, light only
+#   scripts/shoot.sh live dashboard      # REAL app, real daemon + live data
+#                                        # (routes: dashboard|review|settings)
 #
 # PNGs land in shots/<state>-<theme>.png (gitignored). Requires the terminal
 # (or whoever spawns this) to have Screen Recording permission — first run
@@ -24,6 +26,67 @@ if [[ "$STATE" == "all" ]]; then
   STATES=$("$BIN" --gallery-list | cut -f1)
 else
   STATES="$STATE"
+fi
+
+# Live mode: launch the real boot path (`--live <route>`), wait for both the
+# window id AND the daemon hello (LIVE_CONNECTED), give the status hydrate a
+# beat, then shoot. Follows the system theme — no forcing.
+shoot_live() {
+  local route="${1:-dashboard}"
+  local log png pid win
+  log=$(mktemp)
+  png="$OUT/live-$route.png"
+
+  "$BIN" --live "$route" >"$log" 2>&1 &
+  pid=$!
+
+  win=""
+  for _ in $(seq 1 100); do
+    win=$(sed -n 's/^GALLERY_WINDOW_ID: //p' "$log" | head -1)
+    [[ -n "$win" ]] && break
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "FAIL  live-$route: app exited early:" >&2
+      cat "$log" >&2
+      rm -f "$log"
+      return 1
+    fi
+    sleep 0.1
+  done
+  if [[ -z "$win" ]]; then
+    echo "FAIL  live-$route: no window id after 10s" >&2
+    kill "$pid" 2>/dev/null || true
+    rm -f "$log"
+    return 1
+  fi
+
+  connected=""
+  for _ in $(seq 1 150); do
+    if grep -q '^LIVE_CONNECTED$' "$log"; then
+      connected=yes
+      break
+    fi
+    sleep 0.1
+  done
+  [[ -z "$connected" ]] && echo "WARN  live-$route: no daemon hello after 15s — shooting anyway" >&2
+
+  # hello landed; let the status reply + render settle
+  sleep 1.5
+  screencapture -o -x -l "$win" "$png"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$log"
+
+  if [[ -s "$png" ]]; then
+    echo "OK    $png"
+  else
+    echo "FAIL  live-$route: empty capture (Screen Recording permission?)" >&2
+    return 1
+  fi
+}
+
+if [[ "$STATE" == "live" ]]; then
+  shoot_live "${2:-dashboard}"
+  exit $?
 fi
 
 shoot_one() {
