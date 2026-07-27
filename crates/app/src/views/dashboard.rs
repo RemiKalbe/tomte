@@ -188,9 +188,19 @@ impl DashboardView {
         let degraded = model.degraded.clone();
         let have_data = drifted_count > 0 || in_sync > 0;
         let counts_known = connected && (have_data || !scanning);
-        let freshness: SharedString = match model.last_fetch_ts {
-            Some(ts) => format!("fetched {}", time_ago(now, ts)).into(),
-            None => "never fetched".into(),
+        // Freshness carries its own severity: recent is plain fact, stale is
+        // drift-tinted, unknown is muted (never a bold alarm headline).
+        let (freshness, freshness_color): (SharedString, Rgba) = match model.last_fetch_ts {
+            Some(ts) => (
+                format!("fetched {}", time_ago(now, ts)).into(),
+                // 2x the default 15-min fetch interval before it reads stale.
+                if now.saturating_sub(ts) > 30 * 60 {
+                    theme.drift
+                } else {
+                    theme.text
+                },
+            ),
+            None => ("never fetched".into(), theme.text_muted),
         };
 
         let lines: Rc<Vec<Line>> = Rc::new(build_lines(model, now, &expanded));
@@ -224,7 +234,7 @@ impl DashboardView {
                         } else {
                             "–".into()
                         },
-                        "need attention",
+                        "need a decision",
                         if needs_attention > 0 {
                             theme.conflict
                         } else {
@@ -237,7 +247,7 @@ impl DashboardView {
                         theme,
                         freshness.to_string(),
                         "origin",
-                        theme.text,
+                        freshness_color,
                         None,
                     ))
                     .child(tile(
@@ -248,7 +258,11 @@ impl DashboardView {
                             "–".into()
                         },
                         "in sync",
-                        theme.ok,
+                        if counts_known {
+                            theme.ok
+                        } else {
+                            theme.text_muted
+                        },
                         None,
                     )),
             )
