@@ -223,14 +223,35 @@ impl Shell {
                     .gap_1()
                     .text_xs()
                     .text_color(theme.text_muted)
-                    .child(
+                    .child({
+                        // Long degraded hints get one truncated line here and
+                        // their full text in a tooltip — never a hard clip.
+                        let full: SharedString = status_line.clone().into();
                         div()
+                            .id("footer-status")
                             .flex()
                             .items_center()
                             .gap_1p5()
                             .child(div().text_color(dot_color).child("●"))
-                            .child(div().flex_1().min_w_0().truncate().child(status_line)),
-                    )
+                            // NOT `.truncate()`: its whitespace_nowrap makes
+                            // gpui memoize the first (unconstrained) measure
+                            // and the ellipsis pass never re-runs (text.rs
+                            // measure cache keys on wrap_width, None when
+                            // nowrap). line_clamp(1) keeps a definite wrap
+                            // width, so truncation actually applies.
+                            .child(
+                                div()
+                                    .w(px(150.))
+                                    .flex_none()
+                                    .text_ellipsis()
+                                    .line_clamp(1)
+                                    .child(status_line),
+                            )
+                            .tooltip(move |_window, cx| {
+                                let text = full.clone();
+                                cx.new(|_| dashboard::TextTooltip { text }).into()
+                            })
+                    })
                     .child(div().truncate().child(freshness)),
             )
     }

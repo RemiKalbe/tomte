@@ -267,6 +267,11 @@ impl DashboardView {
                     )),
             )
             .when_some(degraded, |el, hint| {
+                let settings_remedy = {
+                    let h = hint.to_lowercase();
+                    h.contains("1password") || h.contains("op_account")
+                };
+                let shell = shell.clone();
                 el.child(
                     div()
                         .mx_4()
@@ -275,51 +280,80 @@ impl DashboardView {
                         .py_1()
                         .rounded_sm()
                         .bg(Theme::wash(theme.drift, 0.12))
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .text_xs()
                         .text_color(theme.drift)
-                        .child(hint),
+                        .child(div().flex_1().min_w_0().line_clamp(2).child(hint))
+                        .when(settings_remedy, |el| {
+                            el.child(
+                                div()
+                                    .id("degraded-open-settings")
+                                    .flex_none()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(Theme::wash(theme.drift, 0.5))
+                                    .cursor_pointer()
+                                    .hover(|el| el.bg(Theme::wash(theme.drift, 0.15)))
+                                    .child("Open Settings")
+                                    .on_click(move |_event, _window, cx| {
+                                        let _ = shell.update(cx, |shell, cx| {
+                                            shell.route = super::Route::Settings;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                        }),
                 )
             })
-            .child(
-                div()
-                    .px_4()
-                    .pb_1()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_muted)
-                            .child("ACTIVITY"),
-                    )
-                    .when(scanning && have_data, |el| {
-                        el.child(
+            .when(!lines.is_empty() || scanning, |el| {
+                el.child(
+                    div()
+                        .px_4()
+                        .pb_1()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
                             div()
                                 .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme.text_muted)
-                                .child("rescanning…"),
+                                .child("ACTIVITY"),
                         )
-                    }),
-            )
+                        .when(scanning && have_data, |el| {
+                            el.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .child("rescanning…"),
+                            )
+                        }),
+                )
+            })
             .child(if lines.is_empty() {
-                let (text, color) = if scanning {
-                    ("scanning your dotfiles…", theme.text_muted)
+                if scanning {
+                    skeleton_rows(theme)
                 } else if !connected {
-                    ("connecting to the sync daemon…", theme.text_muted)
+                    empty_state(
+                        theme,
+                        "●",
+                        theme.conflict,
+                        "Sync daemon not connected",
+                        "reconnecting automatically…".into(),
+                    )
                 } else {
-                    ("everything in sync", theme.ok)
-                };
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(color)
-                    .child(text)
-                    .into_any_element()
+                    empty_state(
+                        theme,
+                        "✓",
+                        theme.ok,
+                        "Everything in sync",
+                        format!("{in_sync} files tracked"),
+                    )
+                }
             } else {
                 uniform_list(
                     "dashboard-timeline",
@@ -344,6 +378,68 @@ impl DashboardView {
                 .into_any_element()
             })
     }
+}
+
+/// Structured empty-state block: glyph + fact + muted context, top-aligned
+/// where the list would start — never a lone sentence floating in a void.
+fn empty_state(
+    theme: Theme,
+    glyph: &'static str,
+    color: Rgba,
+    primary: &'static str,
+    secondary: String,
+) -> gpui::AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .pt_16()
+        .child(div().text_xl().text_color(color).child(glyph))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(primary),
+        )
+        .child(div().text_xs().text_color(theme.text_muted).child(secondary))
+        .into_any_element()
+}
+
+/// Skeleton rows while the first scan runs: the shape of the activity list,
+/// not a sentence about it.
+fn skeleton_rows(theme: Theme) -> gpui::AnyElement {
+    div()
+        .px_4()
+        .pt_1()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .children([0.40_f32, 0.65, 0.52].into_iter().map(|w| {
+            div()
+                .h_5()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w_12()
+                        .h_2()
+                        .flex_none()
+                        .rounded_sm()
+                        .bg(Theme::wash(theme.text, 0.06)),
+                )
+                .child(
+                    div()
+                        .h_2()
+                        .w(gpui::relative(w))
+                        .rounded_sm()
+                        .bg(Theme::wash(theme.text, 0.09)),
+                )
+        }))
+        .into_any_element()
 }
 
 /// One mockup-B health tile: big value, muted label, optional action slot.
