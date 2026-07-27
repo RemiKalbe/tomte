@@ -435,6 +435,7 @@ fn render_line(
                         .w_12()
                         .flex_none()
                         .text_xs()
+                        .text_right()
                         .text_color(theme.text_muted)
                         .child(time.clone()),
                 )
@@ -489,11 +490,13 @@ fn render_line(
                 .flex()
                 .items_center()
                 .gap_2()
+                .group("activity-row")
                 .child(
                     div()
                         .w_12()
                         .flex_none()
                         .text_xs()
+                        .text_right()
                         .text_color(theme.text_muted)
                         .child(time.clone()),
                 )
@@ -537,25 +540,25 @@ fn render_line(
                                     .truncate()
                                     .child(dir),
                             )
+                        })
+                        .when_some(chip.clone(), |el, label| {
+                            let color = class
+                                .as_deref()
+                                .map(|c| theme.class_color(c))
+                                .unwrap_or(theme.text_muted);
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .px_1p5()
+                                    .rounded_sm()
+                                    .bg(Theme::wash(color, 0.12))
+                                    .text_xs()
+                                    .text_color(color)
+                                    .child(label),
+                            )
                         }),
                 )
-                .when_some(quick, |el, actions| el.child(actions))
-                .when_some(chip.clone(), |el, label| {
-                    let color = class
-                        .as_deref()
-                        .map(|c| theme.class_color(c))
-                        .unwrap_or(theme.text_muted);
-                    el.child(
-                        div()
-                            .flex_none()
-                            .px_1p5()
-                            .rounded_sm()
-                            .bg(Theme::wash(color, 0.12))
-                            .text_xs()
-                            .text_color(color)
-                            .child(label),
-                    )
-                });
+                .when_some(quick, |el, actions| el.child(actions));
 
             match target.clone() {
                 Some(target) => base
@@ -594,11 +597,15 @@ fn quick_actions(
             .text_color(theme.text_muted)
             .child("working…");
     }
+    // Ghost until the row is hovered (Zed idiom): the chip carries the
+    // information at rest; the response appears when the user reaches for it.
     div()
         .flex_none()
         .flex()
         .items_center()
         .gap_1()
+        .opacity(0.)
+        .group_hover("activity-row", |el| el.opacity(1.))
         .child(quick_action_button(
             ix,
             ResolveAction::KeepDisk,

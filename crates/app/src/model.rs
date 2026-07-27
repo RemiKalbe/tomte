@@ -352,7 +352,7 @@ pub fn kind_glyph(kind: &str) -> &'static str {
         "dest_changed" => "Δ",
         "remote_advanced" => "↓",
         "applied" | "resolved" => "✓",
-        "eval_failed" => "⛔",
+        "eval_failed" => "⊘",
         "left_management" => "−",
         _ => "·",
     }
@@ -727,7 +727,7 @@ mod tests {
             ("remote_advanced", "↓"),
             ("applied", "✓"),
             ("resolved", "✓"),
-            ("eval_failed", "⛔"),
+            ("eval_failed", "⊘"),
             ("left_management", "−"),
             // informational rows fall back to a neutral dot
             ("fetch", "·"),
