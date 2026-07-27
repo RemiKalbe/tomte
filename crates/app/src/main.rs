@@ -298,6 +298,7 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
                     appears_transparent: true,
                     traffic_light_position: Some(gpui::point(px(12.), px(12.))),
                 }),
+                window_min_size: Some(size(px(840.), px(540.))),
                 ..Default::default()
             },
             |_, cx| {
@@ -384,6 +385,8 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                 appears_transparent: true,
                 traffic_light_position: Some(gpui::point(px(12.), px(12.))),
             }),
+            // Below this the panes collapse into overlap.
+            window_min_size: Some(size(px(840.), px(540.))),
             ..Default::default()
         },
         |_, cx| {

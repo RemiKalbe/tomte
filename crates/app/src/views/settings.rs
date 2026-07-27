@@ -186,6 +186,10 @@ pub struct SettingsView {
     /// The `onepassword_account` value to save; `None` = single account.
     selected: Option<String>,
     save: SaveState,
+    /// What's on disk: `(interval, account)` as of load / last save. Save is
+    /// inert until edits diverge from this (it restarts the daemon — don't
+    /// invite no-op restarts).
+    baseline: Option<(u64, Option<String>)>,
 }
 
 impl SettingsView {
@@ -200,6 +204,7 @@ impl SettingsView {
             this.update(cx, |view, cx| {
                 view.interval = doc.fetch_interval_minutes;
                 view.selected = doc.onepassword_account;
+                view.baseline = Some((view.interval, view.selected.clone()));
                 view.loaded = true;
                 cx.notify();
             })
@@ -228,6 +233,7 @@ impl SettingsView {
             accounts: AccountsState::Loading,
             selected: None,
             save: SaveState::Idle,
+            baseline: None,
         }
     }
 
@@ -276,7 +282,10 @@ impl SettingsView {
                 .await;
             this.update(cx, |view, cx| {
                 view.save = match result {
-                    Ok(()) => SaveState::Saved,
+                    Ok(()) => {
+                        view.baseline = Some((view.interval, view.selected.clone()));
+                        SaveState::Saved
+                    }
                     Err(e) => SaveState::Error(e.to_string()),
                 };
                 cx.notify();
@@ -292,7 +301,10 @@ impl SettingsView {
         } else {
             "…".into()
         };
-        section(theme, "Fetch interval")
+        titled(
+            theme,
+            "FETCH INTERVAL",
+            section(theme)
             .child(
                 div()
                     .flex()
@@ -319,7 +331,8 @@ impl SettingsView {
                     .text_xs()
                     .text_color(theme.text_muted)
                     .child("How often to check origin for changes (5–120 min, steps of 5)"),
-            )
+                ),
+        )
     }
 
     fn accounts_section(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
@@ -375,14 +388,18 @@ impl SettingsView {
                 }
             }
         }
-        section(theme, "1Password account")
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.text_muted)
-                    .child("injected as OP_ACCOUNT into every chezmoi/op subprocess"),
-            )
-            .children(rows)
+        titled(
+            theme,
+            "1PASSWORD ACCOUNT",
+            section(theme)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child("injected as OP_ACCOUNT into every chezmoi/op subprocess"),
+                )
+                .children(rows),
+        )
     }
 
     /// One selectable picker row; selection shows as an accent border.
@@ -398,14 +415,23 @@ impl SettingsView {
         let selected = self.selected.as_deref() == value.as_deref();
         div()
             .id(ElementId::named_usize("op-account", ix))
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .border_1()
-            .border_color(if selected { theme.accent } else { theme.border })
+            .h_7()
+            .px_2()
+            .rounded_sm()
             .flex()
-            .items_baseline()
+            .items_center()
             .gap_2()
+            .hover(|el| el.bg(Theme::wash(theme.text, 0.05)))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(if selected {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(if selected { "◉" } else { "○" }),
+            )
             .child(div().text_sm().text_color(theme.text).child(label))
             .when_some(sublabel, |el, s| {
                 el.child(div().text_xs().text_color(theme.text_muted).child(s))
@@ -420,7 +446,11 @@ impl SettingsView {
 
     fn save_section(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let saving = matches!(self.save, SaveState::Saving);
-        let ready = self.loaded && !saving;
+        let dirty = self
+            .baseline
+            .as_ref()
+            .is_some_and(|b| *b != (self.interval, self.selected.clone()));
+        let ready = self.loaded && !saving && dirty;
         let button = div()
             .id("save-settings")
             .px_3()
@@ -440,6 +470,14 @@ impl SettingsView {
                     .on_click(cx.listener(|view, _ev, _window, cx| view.write_settings(cx)))
             });
         let row = div().flex().items_center().gap_3().child(button);
+        let row = row.when(dirty && matches!(self.save, SaveState::Idle), |el| {
+            el.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child("unsaved changes · saving restarts the sync daemon"),
+            )
+        });
         match &self.save {
             SaveState::Saved => row.child(
                 div()
@@ -458,10 +496,14 @@ impl SettingsView {
     }
 
     fn paths_section(&self, theme: Theme) -> Div {
-        section(theme, "Paths")
-            .child(path_row(theme, "socket", &self.paths.socket))
-            .child(path_row(theme, "journal", &self.paths.journal))
-            .child(path_row(theme, "settings", &self.paths.settings))
+        titled(
+            theme,
+            "PATHS",
+            section(theme)
+                .child(path_row(theme, "socket", &self.paths.socket))
+                .child(path_row(theme, "journal", &self.paths.journal))
+                .child(path_row(theme, "settings", &self.paths.settings)),
+        )
     }
 }
 
@@ -484,8 +526,9 @@ impl Render for SettingsView {
     }
 }
 
-/// One settings card: surface background, bordered, titled.
-fn section(theme: Theme, title: &'static str) -> Div {
+/// The bordered surface box of a settings section; its caps header renders
+/// OUTSIDE via [`titled`] (Zed settings shape).
+fn section(theme: Theme) -> Div {
     div()
         .flex()
         .flex_col()
@@ -495,12 +538,22 @@ fn section(theme: Theme, title: &'static str) -> Div {
         .bg(theme.surface)
         .border_1()
         .border_color(theme.border)
+}
+
+/// Wrap a finished section box under its outside header.
+fn titled(theme: Theme, title: &'static str, body: Div) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
         .child(
             div()
-                .text_sm()
+                .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_muted)
                 .child(title),
         )
+        .child(body)
 }
 
 /// Square − / + button; disabled renders muted with no click handler.
