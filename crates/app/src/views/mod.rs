@@ -15,6 +15,7 @@ use gpui::{
 
 use czui_app::model::{SyncModel, time_ago};
 use czui_app::theme::Theme;
+use czui_ui::components as ui;
 
 use dashboard::DashboardView;
 use merge::MergeView;
@@ -144,15 +145,7 @@ impl Shell {
                     .child(SharedString::from(label)),
             )
             .when_some(badge, |el, (text, color)| {
-                el.child(
-                    div()
-                        .px_1p5()
-                        .rounded_sm()
-                        .bg(Theme::wash(color, 0.15))
-                        .text_xs()
-                        .text_color(color)
-                        .child(text),
-                )
+                el.child(ui::chip(*theme, text, ui::ChipVariant::Wash(color)))
             })
             .on_click(cx.listener(move |shell, _ev, _window, cx| {
                 if route == Route::Review {
@@ -177,16 +170,16 @@ impl Shell {
         };
 
         // Footer facts: connection dot + freshness, always honest (spec §10).
-        let (dot_color, status_line): (gpui::Rgba, String) = if !model.connected {
-            (theme.conflict, "daemon not connected".into())
+        let (dot_tone, status_line): (ui::StatusTone, String) = if !model.connected {
+            (ui::StatusTone::Conflict, "daemon not connected".into())
         } else if model.scanning {
-            (theme.drift, "scanning…".into())
+            (ui::StatusTone::Drift, "scanning…".into())
         } else if let Some(hint) = &model.degraded {
-            (theme.drift, hint.clone())
+            (ui::StatusTone::Drift, hint.clone())
         } else if drifted > 0 {
-            (theme.drift, format!("{drifted} drifted"))
+            (ui::StatusTone::Drift, format!("{drifted} drifted"))
         } else {
-            (theme.ok, format!("in sync · {} files", model.in_sync))
+            (ui::StatusTone::Ok, format!("in sync · {} files", model.in_sync))
         };
         let freshness = match model.last_fetch_ts {
             Some(ts) => format!("origin: fetched {}", time_ago(dashboard::system_now(), ts)),
@@ -227,35 +220,12 @@ impl Shell {
                     .gap_1()
                     .text_xs()
                     .text_color(theme.text_muted)
-                    .child({
-                        // Long degraded hints get one truncated line here and
-                        // their full text in a tooltip — never a hard clip.
-                        let full: SharedString = status_line.clone().into();
-                        div()
-                            .id("footer-status")
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(div().text_color(dot_color).child("●"))
-                            // NOT `.truncate()`: its whitespace_nowrap makes
-                            // gpui memoize the first (unconstrained) measure
-                            // and the ellipsis pass never re-runs (text.rs
-                            // measure cache keys on wrap_width, None when
-                            // nowrap). line_clamp(1) keeps a definite wrap
-                            // width, so truncation actually applies.
-                            .child(
-                                div()
-                                    .w(px(150.))
-                                    .flex_none()
-                                    .text_ellipsis()
-                                    .line_clamp(1)
-                                    .child(status_line),
-                            )
-                            .tooltip(move |_window, cx| {
-                                let text = full.clone();
-                                cx.new(|_| dashboard::TextTooltip { text }).into()
-                            })
-                    })
+                    .child(ui::status_dot_line(
+                        *theme,
+                        dot_tone,
+                        status_line.into(),
+                        px(170.),
+                    ))
                     .child(div().truncate().child(freshness)),
             )
     }

@@ -14,4 +14,5 @@ pub mod preview;
 pub mod theme;
 
 pub use assets::Assets;
+pub use components::banner::BannerTint;
 pub use theme::Theme;

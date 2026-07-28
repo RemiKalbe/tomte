@@ -380,36 +380,24 @@ impl SettingsView {
         };
 
         let revert = (dirty && !saving).then(|| {
-            div()
-                .id("revert-settings")
-                .h_6()
-                .px_2p5()
-                .rounded_md()
-                .flex()
-                .items_center()
-                .text_sm()
-                .text_color(theme.text_muted)
-                .cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                .child("Revert")
-                .on_click(cx.listener(|view, _ev, _window, cx| view.revert(cx)))
+            ui::button(
+                theme,
+                "revert-settings",
+                "Revert".into(),
+                ui::ButtonVariant::Ghost,
+                ui::ButtonSize::Md,
+                cx.listener(|view, _ev, _window, cx| view.revert(cx)),
+            )
         });
         let save = (dirty && !saving).then(|| {
-            div()
-                .id("save-settings")
-                .h_6()
-                .px_2p5()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.accent)
-                .flex()
-                .items_center()
-                .text_sm()
-                .text_color(theme.accent)
-                .cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
-                .child("Save")
-                .on_click(cx.listener(|view, _ev, _window, cx| view.write_settings(cx)))
+            ui::button(
+                theme,
+                "save-settings",
+                "Save".into(),
+                ui::ButtonVariant::Outline(theme.accent),
+                ui::ButtonSize::Md,
+                cx.listener(|view, _ev, _window, cx| view.write_settings(cx)),
+            )
         });
 
         Some(
@@ -620,40 +608,32 @@ impl Render for SettingsView {
                             .py_5()
                             .flex()
                             .flex_col()
-                            .child(section_header(theme, "Sync", false))
+                            .child(ui::section_header(
+                                theme,
+                                "Sync",
+                                ui::SectionHeaderStyle::MonoRuled { spaced: false },
+                                None,
+                            ))
                             .child(self.interval_row(theme, cx))
-                            .child(section_header(theme, "1Password", true))
+                            .child(ui::section_header(
+                                theme,
+                                "1Password",
+                                ui::SectionHeaderStyle::MonoRuled { spaced: true },
+                                None,
+                            ))
                             .child(self.account_row(theme, cx))
-                            .child(section_header(theme, "Paths", true))
+                            .child(ui::section_header(
+                                theme,
+                                "Paths",
+                                ui::SectionHeaderStyle::MonoRuled { spaced: true },
+                                None,
+                            ))
                             .child(path_row(theme, "Socket", &self.paths.socket, true))
                             .child(path_row(theme, "Journal", &self.paths.journal, true))
                             .child(path_row(theme, "Settings file", &self.paths.settings, false)),
                     ),
             )
     }
-}
-
-/// Zed's settings section header: small monospaced muted label over a faded
-/// hairline (see zed/crates/settings_ui components/section_items.rs).
-fn section_header(theme: Theme, label: &'static str, spaced: bool) -> Div {
-    div()
-        .when(spaced, |el| el.mt_8())
-        .mb_1()
-        .flex()
-        .flex_col()
-        .gap_1p5()
-        .child(
-            div()
-                .font_family("Menlo")
-                .text_xs()
-                .text_color(theme.text_muted)
-                .child(label),
-        )
-        .child(hairline(theme))
-}
-
-fn hairline(theme: Theme) -> Div {
-    div().h_px().w_full().bg(theme.border)
 }
 
 /// One setting row (Zed's settings-item layout): title + optional muted

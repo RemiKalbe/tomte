@@ -16,6 +16,7 @@ use czui_app::model::{
 };
 use czui_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use czui_app::theme::Theme;
+use czui_ui::components as ui;
 use czui_core::cmd::SystemRunner;
 use gpui::{
     App, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful, WeakEntity,
@@ -36,34 +37,8 @@ pub fn system_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `$HOME/...` → `~/...` — paths read better and truncate less.
-pub(super) fn shorten_home(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
-        _ => path.to_string(),
-    }
-}
-
-/// Hover tooltip (shared with review/settings): the minimal themed bubble.
-pub(super) struct TextTooltip {
-    pub(super) text: SharedString,
-}
-
-impl Render for TextTooltip {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_appearance(window.appearance());
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(theme.surface)
-            .border_1()
-            .border_color(theme.border)
-            .text_xs()
-            .text_color(theme.text_muted)
-            .child(self.text.clone())
-    }
-}
+/// Moved to czui-ui; re-exported so sibling views keep their import paths.
+pub(super) use czui_ui::components::{TextTooltip, shorten_home};
 
 /// One flattened display line for the uniform list.
 enum Line {
@@ -272,41 +247,27 @@ impl DashboardView {
                     h.contains("1password") || h.contains("op_account")
                 };
                 let shell = shell.clone();
+                let action = settings_remedy.then(|| {
+                    ui::button(
+                        theme,
+                        "degraded-open-settings",
+                        "Open Settings".into(),
+                        ui::ButtonVariant::Outline(theme.drift),
+                        ui::ButtonSize::Micro,
+                        move |_event, _window, cx| {
+                            let _ = shell.update(cx, |shell, cx| {
+                                shell.route = super::Route::Settings;
+                                cx.notify();
+                            });
+                        },
+                    )
+                    .into_any_element()
+                });
                 el.child(
-                    div()
+                    ui::banner(theme, ui::BannerTint::Drift, hint.into(), action)
                         .mx_4()
                         .mb_2()
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(Theme::wash(theme.drift, 0.12))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(theme.drift)
-                        .child(div().flex_1().min_w_0().line_clamp(2).child(hint))
-                        .when(settings_remedy, |el| {
-                            el.child(
-                                div()
-                                    .id("degraded-open-settings")
-                                    .flex_none()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(Theme::wash(theme.drift, 0.5))
-                                    .cursor_pointer()
-                                    .hover(|el| el.bg(Theme::wash(theme.drift, 0.15)))
-                                    .child("Open Settings")
-                                    .on_click(move |_event, _window, cx| {
-                                        let _ = shell.update(cx, |shell, cx| {
-                                            shell.route = super::Route::Settings;
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                        }),
+                        .mt_0(),
                 )
             })
             .when(!lines.is_empty() || scanning, |el| {
@@ -338,21 +299,23 @@ impl DashboardView {
                 if scanning {
                     skeleton_rows(theme)
                 } else if !connected {
-                    empty_state(
+                    ui::empty_state(
                         theme,
                         "●",
                         theme.conflict,
                         "Sync daemon not connected",
-                        "reconnecting automatically…".into(),
+                        "reconnecting automatically…",
                     )
+                    .into_any_element()
                 } else {
-                    empty_state(
+                    ui::empty_state(
                         theme,
                         "✓",
                         theme.ok,
                         "Everything in sync",
                         format!("{in_sync} files tracked"),
                     )
+                    .into_any_element()
                 }
             } else {
                 uniform_list(
@@ -380,33 +343,7 @@ impl DashboardView {
     }
 }
 
-/// Structured empty-state block: glyph + fact + muted context, top-aligned
-/// where the list would start — never a lone sentence floating in a void.
-fn empty_state(
-    theme: Theme,
-    glyph: &'static str,
-    color: Rgba,
-    primary: &'static str,
-    secondary: String,
-) -> gpui::AnyElement {
-    div()
-        .flex_1()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap_1()
-        .pt_16()
-        .child(div().text_xl().text_color(color).child(glyph))
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .child(primary),
-        )
-        .child(div().text_xs().text_color(theme.text_muted).child(secondary))
-        .into_any_element()
-}
+
 
 /// Skeleton rows while the first scan runs: the shape of the activity list,
 /// not a sentence about it.
@@ -479,23 +416,19 @@ fn tile(
 
 /// The "Review →" shortcut inside the attention tile (mockup B).
 fn review_link(theme: Theme, drifted: usize, shell: WeakEntity<Shell>) -> gpui::AnyElement {
-    div()
-        .id("tile-review")
-        .px_2()
-        .py_0p5()
-        .rounded_sm()
-        .bg(Theme::wash(theme.accent, 0.15))
-        .text_xs()
-        .text_color(theme.accent)
-        .cursor_pointer()
-        .hover(|el| el.bg(Theme::wash(theme.accent, 0.25)))
-        .child(format!("Review {drifted} →"))
-        .on_click(move |_event, _window, cx| {
+    ui::button(
+        theme,
+        "tile-review",
+        format!("Review {drifted} →").into(),
+        ui::ButtonVariant::Wash(theme.accent),
+        ui::ButtonSize::Sm,
+        move |_event, _window, cx| {
             let _ = shell.update(cx, |shell, cx| {
                 shell.open_review(None, cx);
             });
-        })
-        .into_any_element()
+        },
+    )
+    .into_any_element()
 }
 
 fn render_line(
@@ -642,16 +575,7 @@ fn render_line(
                                 .as_deref()
                                 .map(|c| theme.class_color(c))
                                 .unwrap_or(theme.text_muted);
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .px_1p5()
-                                    .rounded_sm()
-                                    .bg(Theme::wash(color, 0.12))
-                                    .text_xs()
-                                    .text_color(color)
-                                    .child(label),
-                            )
+                            el.child(ui::chip(theme, label, ui::ChipVariant::Wash(color)).flex_none())
                         }),
                 )
                 .when_some(quick, |el, actions| el.child(actions));
@@ -732,36 +656,32 @@ fn quick_action_button(
         ResolveAction::KeepDisk => "row-keep-disk",
         ResolveAction::KeepSource => "row-keep-source",
     };
-    let base = div()
-        .id(ElementId::named_usize(id, ix))
-        .flex_none()
-        .px_1p5()
-        .rounded_sm()
-        .border_1()
-        .text_xs()
-        .child(SharedString::from(action.label()));
+    let id = ElementId::named_usize(id, ix);
     let Some(engine) = engine else {
-        return base
-            .border_color(theme.border)
-            .text_color(theme.text_muted)
-            .tooltip(|_window, cx| {
-                cx.new(|_| TextTooltip {
-                    text: "daemon not connected".into(),
-                })
-                .into()
-            });
+        return ui::disabled_button(
+            theme,
+            id,
+            action.label().into(),
+            ui::ButtonSize::Micro,
+            Some("daemon not connected".into()),
+        )
+        .flex_none();
     };
     let target = target.to_path_buf();
-    base.border_color(theme.accent)
-        .text_color(theme.accent)
-        .cursor_pointer()
-        .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
-        .on_click(move |_event, _window, cx| {
+    ui::button(
+        theme,
+        id,
+        action.label().into(),
+        ui::ButtonVariant::Outline(theme.accent),
+        ui::ButtonSize::Micro,
+        move |_event, _window, cx| {
             // The row underneath opens Review on click — quick actions must
             // not also navigate.
             cx.stop_propagation();
             run_quick_action(action, engine.clone(), target.clone(), shell.clone(), cx);
-        })
+        },
+    )
+    .flex_none()
 }
 
 /// Run one quick action: flag the shell busy, do the blocking engine call +

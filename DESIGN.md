@@ -33,6 +33,10 @@ Rules:
 - Master-detail on Review (list left, provenance + diff right). Three inputs + result pane on Merge.
 - Density: rows ~28-32px, 1px borders, radius 4-6px small elements, 8px panes.
 
+## Where the system lives
+
+`crates/ui` (czui-ui) owns the theme, embedded SVG assets, and every reusable component — one file per component under `src/components/`, pure builders (Theme + data + plain click handlers, no Entity coupling). `src/preview.rs` registers component-isolation previews; the gallery derives `comp:<name>` states from it (`scripts/shoot.sh comp:dropdown dark`). Views import via `use czui_ui::components as ui;`. New reusable styling goes in czui-ui first, never inline in a view.
+
 ## Components (established vocabulary)
 
 - Tiles: dashboard summary cards (mockup B), number + label + optional action button.
