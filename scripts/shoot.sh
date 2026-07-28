@@ -93,7 +93,7 @@ shoot_one() {
   local state="$1" theme="$2"
   local log png pid win
   log=$(mktemp)
-  png="$OUT/$state-$theme.png"
+  png="$OUT/${state//:/-}-$theme.png"
 
   "$BIN" --gallery "$state" "--$theme" >"$log" 2>&1 &
   pid=$!

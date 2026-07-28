@@ -39,7 +39,22 @@ pub const STATES: &[(&str, &str)] = &[
     ("settings", "live settings view (reads real settings/op)"),
     ("settings-menu", "settings with the account dropdown open"),
     ("settings-dirty", "unsaved edits: floating Save/Revert toolbar"),
+    ("comp:dropdown", "isolated: dropdown button, disabled, open menu"),
+    ("comp:stepper", "isolated: stepper enabled / at-min / loading"),
+    ("comp:code-chip", "isolated: inline + standalone code chips"),
+    ("comp:toolbar", "isolated: floating Save/Revert toolbar"),
 ];
+
+/// Window size for a gallery state: component previews get a compact window
+/// so the screenshot is mostly component.
+pub fn window_size(name: &str) -> gpui::Size<gpui::Pixels> {
+    use gpui::{px, size};
+    if name.starts_with("comp:") {
+        size(px(520.), px(420.))
+    } else {
+        size(px(980.), px(640.))
+    }
+}
 
 fn home(sub: &str) -> PathBuf {
     let home = std::env::var_os("HOME")
@@ -265,6 +280,13 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         expanded_scans: HashSet::new(),
         dashboard_action_in_flight: false,
     };
+
+    // Component previews: bare Shell routed at the preview (no posed data).
+    if name.starts_with("comp:") {
+        let static_name = STATES.iter().find(|(n, _)| *n == name)?.0;
+        let comp = static_name.strip_prefix("comp:").expect("checked above");
+        return Some(shell(Route::Component(comp), SyncModel::default()));
+    }
 
     Some(match name {
         "dashboard" => shell(Route::Dashboard, rich_model()),

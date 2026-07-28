@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use czui_app::theme::Theme;
 use czui_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Corner, Div, ElementId, FontWeight, SharedString,
-    Stateful, Window, anchored, deferred, div, point, prelude::*, px,
+    AnyElement, Context, Corner, Div, ElementId, SharedString, Stateful, Window, anchored,
+    deferred, div, point, prelude::*, px,
 };
+
+use super::ui;
 use serde::{Deserialize, Serialize};
 
 /// Fetch-interval bounds and step (spec §9): 5..=120 minutes, 5-minute steps.
@@ -411,17 +413,7 @@ impl SettingsView {
         });
 
         Some(
-            div()
-                .px_3()
-                .py_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.surface)
-                .shadow_md()
-                .flex()
-                .items_center()
-                .gap_3()
+            ui::toolbar_pill(theme)
                 .when_some(status, |el, (text, color)| {
                     el.child(div().text_xs().text_color(color).child(text))
                 })
@@ -438,41 +430,16 @@ impl SettingsView {
         } else {
             "…".into()
         };
-        let stepper = div()
-            .flex()
-            .h_6()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .overflow_hidden()
-            .child(seg_button(
-                "interval-minus",
-                "−",
-                self.loaded && self.interval > INTERVAL_MIN,
-                theme,
-                cx.listener(|view, _ev, _window, cx| view.bump_interval(false, cx)),
-            ))
-            .child(
-                div()
-                    .w_16()
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .child(value),
-            )
-            .child(seg_button(
-                "interval-plus",
-                "+",
-                self.loaded && self.interval < INTERVAL_MAX,
-                theme,
-                cx.listener(|view, _ev, _window, cx| view.bump_interval(true, cx)),
-            ));
+        let stepper = ui::stepper(
+            theme,
+            "interval-minus",
+            "interval-plus",
+            value,
+            self.loaded && self.interval > INTERVAL_MIN,
+            self.loaded && self.interval < INTERVAL_MAX,
+            cx.listener(|view, _ev, _window, cx| view.bump_interval(false, cx)),
+            cx.listener(|view, _ev, _window, cx| view.bump_interval(true, cx)),
+        );
         setting_row(
             theme,
             "Fetch interval",
@@ -501,40 +468,16 @@ impl SettingsView {
     /// "Account" row: dropdown button right; the popover menu anchors under
     /// its right edge.
     fn account_row(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
-        let button = div()
-            .id("account-dropdown")
-            .h_6()
-            .px_2p5()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.surface)
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .text_sm()
-            .map(|el| {
-                if self.loaded {
-                    el.text_color(theme.text)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                        .on_click(cx.listener(|view, _ev, _window, cx| {
-                            view.menu_open = !view.menu_open;
-                            cx.notify();
-                        }))
-                } else {
-                    el.text_color(theme.text_muted)
-                }
-            })
-            .child(self.selected_label())
-            .child(
-                // U+2304's ink sits below the line-box center; lift it.
-                div()
-                    .mt(px(-2.))
-                    .text_xs()
-                    .text_color(theme.text_muted)
-                    .child("⌄"),
-            );
+        let button = ui::dropdown_button(
+            theme,
+            "account-dropdown",
+            self.selected_label(),
+            self.loaded,
+            cx.listener(|view, _ev, _window, cx| {
+                view.menu_open = !view.menu_open;
+                cx.notify();
+            }),
+        );
 
         let control = div()
             .flex()
@@ -562,11 +505,11 @@ impl SettingsView {
             .text_xs()
             .text_color(theme.text_muted)
             .child("Injected as")
-            .child(code_chip(theme, "OP_ACCOUNT").py_0())
+            .child(ui::code_chip(theme, "OP_ACCOUNT").py_0())
             .child("into every")
-            .child(code_chip(theme, "chezmoi").py_0())
+            .child(ui::code_chip(theme, "chezmoi").py_0())
             .child("and")
-            .child(code_chip(theme, "op").py_0())
+            .child(ui::code_chip(theme, "op").py_0())
             .child("subprocess.")
             .into_any_element();
         setting_row(theme, "Account", Some(description), control.into_any_element(), false)
@@ -576,29 +519,19 @@ impl SettingsView {
     /// accounts `op` reported — or the loading/unavailable state as an inert
     /// line, so the menu never lies about why the list is short.
     fn account_menu(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut menu = div()
+        let mut menu = ui::menu(theme)
             .id("account-menu")
             .on_mouse_down_out(cx.listener(|view, _ev, _window, cx| {
                 view.menu_open = false;
                 cx.notify();
             }))
-            .min_w(px(260.))
-            .max_w(px(380.))
-            .p_1()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.surface)
-            .shadow_md()
-            .flex()
-            .flex_col()
             .child(self.menu_item(0, None, "None (single account)".into(), None, theme, cx));
         match &self.accounts {
             AccountsState::Loading => {
-                menu = menu.child(inert_menu_line(theme, "loading accounts…", theme.text_muted));
+                menu = menu.child(ui::inert_menu_line(theme, "loading accounts…", theme.text_muted));
             }
             AccountsState::Unavailable => {
-                menu = menu.child(inert_menu_line(
+                menu = menu.child(ui::inert_menu_line(
                     theme,
                     "1Password CLI not found or errored",
                     theme.drift,
@@ -636,33 +569,18 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let selected = self.selected.as_deref() == value.as_deref();
-        div()
-            .id(ElementId::named_usize("op-account", ix))
-            .h_7()
-            .px_2()
-            .rounded_sm()
-            .flex()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .hover(|el| el.bg(Theme::wash(theme.text, 0.06)))
-            .child(
-                div()
-                    .w_4()
-                    .flex_none()
-                    .text_sm()
-                    .text_color(theme.accent)
-                    .child(if selected { "✓" } else { "" }),
-            )
-            .child(div().text_sm().text_color(theme.text).child(label))
-            .when_some(sublabel, |el, s| {
-                el.child(div().text_xs().text_color(theme.text_muted).child(s))
-            })
-            .on_click(cx.listener(move |view, _ev, _window, cx| {
+        ui::menu_row(
+            theme,
+            ElementId::named_usize("op-account", ix),
+            label,
+            sublabel,
+            selected,
+            cx.listener(move |view, _ev, _window, cx| {
                 view.select_account(value.clone(), cx);
                 view.menu_open = false;
                 cx.notify();
-            }))
+            }),
+        )
     }
 }
 
@@ -773,48 +691,6 @@ fn setting_row(
         .child(div().flex_none().child(control))
 }
 
-/// − / + segment of the stepper; disabled renders muted with no handler.
-fn seg_button(
-    id: &'static str,
-    label: &'static str,
-    enabled: bool,
-    theme: Theme,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .w_6()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_sm()
-        .text_color(if enabled {
-            theme.text
-        } else {
-            theme.text_muted
-        })
-        .child(label)
-        .when(enabled, |el| {
-            el.cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                .on_click(on_click)
-        })
-}
-
-/// An unselectable status line inside the dropdown (loading / unavailable).
-fn inert_menu_line(theme: Theme, text: &'static str, color: gpui::Rgba) -> Div {
-    let _ = theme;
-    div()
-        .h_7()
-        .px_2()
-        .pl_8()
-        .flex()
-        .items_center()
-        .text_xs()
-        .text_color(color)
-        .child(text)
-}
-
 /// Plain one-line description under a setting title.
 fn desc_text(theme: Theme, text: &'static str) -> AnyElement {
     div()
@@ -822,20 +698,6 @@ fn desc_text(theme: Theme, text: &'static str) -> AnyElement {
         .text_color(theme.text_muted)
         .child(text)
         .into_any_element()
-}
-
-/// Inline mono code chip (markdown `code` look): washed pill, Menlo.
-fn code_chip(theme: Theme, text: impl Into<SharedString>) -> Div {
-    div()
-        .px_1()
-        .py_0p5()
-        .rounded_sm()
-        .bg(Theme::wash(theme.text_muted, 0.15))
-        .font_family("Menlo")
-        .text_size(px(11.))
-        .text_color(theme.text)
-        .whitespace_nowrap()
-        .child(text.into())
 }
 
 /// Read-only path row: title left, the value as an inline code chip right.
@@ -847,7 +709,7 @@ fn path_row(theme: Theme, label: &'static str, path: &Path, divider: bool) -> Di
         div()
             .max_w(px(520.))
             .overflow_hidden()
-            .child(code_chip(
+            .child(ui::code_chip(
                 theme,
                 super::dashboard::shorten_home(&path.display().to_string()),
             ))

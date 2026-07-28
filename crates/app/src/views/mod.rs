@@ -6,6 +6,7 @@ pub mod fixtures;
 pub mod merge;
 pub mod review;
 pub mod settings;
+pub mod ui;
 
 use std::path::PathBuf;
 
@@ -32,6 +33,10 @@ pub enum Route {
     /// Full-window merge editor (plan 7 Task 3). Not a sidebar item — entered
     /// via Review's "Open merge editor", left via Cancel/Save.
     Merge,
+    /// Gallery-only: one isolated component preview (`--gallery comp:<name>`),
+    /// rendered without the sidebar in a small window. Never reachable from
+    /// the app's own navigation.
+    Component(&'static str),
 }
 
 pub struct Shell {
@@ -260,6 +265,21 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        if let Route::Component(name) = self.route {
+            return div()
+                .size_full()
+                .bg(theme.bg)
+                .text_color(theme.text)
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_8()
+                .child(
+                    ui::render_component(name, theme)
+                        .unwrap_or_else(|| div().child("unknown component").into_any_element()),
+                )
+                .into_any_element();
+        }
         div()
             .flex()
             .size_full()
@@ -297,8 +317,11 @@ impl Render for Shell {
                                 .clone()
                                 .into_any_element()
                         }
+                        // Handled by the early return above.
+                        Route::Component(_) => div().into_any_element(),
                     }),
             )
+            .into_any_element()
     }
 }
 

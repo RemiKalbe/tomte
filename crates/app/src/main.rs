@@ -2,6 +2,7 @@
 
 // Shared modules (ipc, model, theme) live in the czui_app lib target;
 // views and the AppKit platform layer stay bin-only.
+mod assets;
 mod notify_osa;
 mod platform_mac;
 mod views;
@@ -275,7 +276,7 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
         return ExitCode::FAILURE;
     }
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         let app = NSApplication::sharedApplication(mtm);
         if let Some(dark) = dark {
@@ -289,7 +290,9 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
         }
 
         cx.activate(true);
-        let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
+        let win_size = views::fixtures::window_size(&state_name);
+        let is_component = state_name.starts_with("comp:");
+        let bounds = Bounds::centered(None, win_size, cx);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -298,7 +301,9 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
                     appears_transparent: true,
                     traffic_light_position: Some(gpui::point(px(12.), px(12.))),
                 }),
-                window_min_size: Some(size(px(840.), px(540.))),
+                // Screens keep the app's floor; component previews are small
+                // on purpose.
+                window_min_size: (!is_component).then(|| size(px(840.), px(540.))),
                 ..Default::default()
             },
             |_, cx| {
@@ -337,7 +342,7 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
 fn run_live(route: Route, paths: Paths) -> ExitCode {
     use objc2_app_kit::NSApplication;
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         set_accessory_policy(mtm);
 
@@ -843,7 +848,7 @@ fn main() -> ExitCode {
         return run_gallery(state, dark, paths.view_paths());
     }
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         set_accessory_policy(mtm);
         let (status, menu_rx) = StatusItem::install(mtm);
