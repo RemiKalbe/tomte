@@ -482,7 +482,6 @@ impl MergeView {
                     ),
             );
         if let Some(loaded) = &self.loaded {
-            let degraded = loaded.state.degraded_base;
             let (decided, total) = loaded.state.progress();
             let open = total - decided;
             bar = bar

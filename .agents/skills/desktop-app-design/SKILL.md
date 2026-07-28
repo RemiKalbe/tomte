@@ -1,5 +1,5 @@
 ---
-name: Desktop App Design
+name: desktop-app-design
 description: Desktop and enterprise application design patterns covering data-dense interfaces, dashboard design, complex workflow management, keyboard-first interaction, multi-window patterns, and professional tool design.
 triggers:
   - desktop app

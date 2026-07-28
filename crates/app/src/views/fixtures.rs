@@ -37,6 +37,7 @@ pub const STATES: &[(&str, &str)] = &[
     ("merge-resolved", "all regions decided, Save enabled"),
     ("merge-loading", "inputs loading"),
     ("settings", "live settings view (reads real settings/op)"),
+    ("settings-menu", "settings with the account dropdown open"),
 ];
 
 fn home(sub: &str) -> PathBuf {
@@ -338,6 +339,16 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             s
         }
         "settings" => shell(Route::Settings, rich_model()),
+        "settings-menu" => {
+            let mut s = shell(Route::Settings, rich_model());
+            let posed = cx.new(|cx| {
+                let mut view = super::settings::SettingsView::new(paths.clone(), cx);
+                view.menu_open = true;
+                view
+            });
+            s.settings = Some(posed);
+            s
+        }
         _ => return None,
     })
 }

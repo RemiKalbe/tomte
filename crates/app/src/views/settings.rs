@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use czui_app::theme::Theme;
 use czui_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, FontWeight, SharedString, Stateful,
-    Window, div, prelude::*,
+    AnyElement, App, ClickEvent, Context, Corner, Div, ElementId, FontWeight, SharedString,
+    Stateful, Window, anchored, deferred, div, point, prelude::*, px,
 };
 use serde::{Deserialize, Serialize};
 
@@ -190,6 +190,9 @@ pub struct SettingsView {
     /// inert until edits diverge from this (it restarts the daemon — don't
     /// invite no-op restarts).
     baseline: Option<(u64, Option<String>)>,
+    /// The account dropdown's popover is open. `pub(super)` so the gallery
+    /// can pose the open state for screenshots.
+    pub(super) menu_open: bool,
 }
 
 impl SettingsView {
@@ -234,6 +237,7 @@ impl SettingsView {
             selected: None,
             save: SaveState::Idle,
             baseline: None,
+            menu_open: false,
         }
     }
 
@@ -295,79 +299,228 @@ impl SettingsView {
         .detach();
     }
 
-    fn interval_section(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+    /// Header bar (same idiom as Review/Merge): title left, save state and
+    /// the Save button right. Save lives here, always visible — not floating
+    /// mid-scroll between sections.
+    fn header_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let saving = matches!(self.save, SaveState::Saving);
+        let dirty = self
+            .baseline
+            .as_ref()
+            .is_some_and(|b| *b != (self.interval, self.selected.clone()));
+        let ready = self.loaded && !saving && dirty;
+
+        let status: Option<(SharedString, gpui::Rgba)> = match &self.save {
+            SaveState::Saved => Some(("Saved · sync daemon restarting".into(), theme.ok)),
+            SaveState::Error(e) => Some((format!("save failed: {e}").into(), theme.conflict)),
+            SaveState::Saving => None,
+            SaveState::Idle if dirty => Some((
+                "unsaved changes · saving restarts the sync daemon".into(),
+                theme.text_muted,
+            )),
+            SaveState::Idle => None,
+        };
+
+        let save = div()
+            .id("save-settings")
+            .h_6()
+            .px_2p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .flex()
+            .items_center()
+            .text_sm()
+            .child(if saving { "Saving…" } else { "Save" })
+            .map(|el| {
+                if ready {
+                    el.text_color(theme.text)
+                        .cursor_pointer()
+                        .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                        .on_click(cx.listener(|view, _ev, _window, cx| view.write_settings(cx)))
+                } else {
+                    el.text_color(theme.text_muted)
+                }
+            });
+
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .p_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Settings"),
+            )
+            .child(div().flex_1())
+            .when_some(status, |el, (text, color)| {
+                el.child(div().text_xs().text_color(color).child(text))
+            })
+            .child(save)
+    }
+
+    /// "Fetch interval" row: title + description left, segmented stepper
+    /// right (Zed's number-field shape: − │ value │ +).
+    fn interval_row(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let value: SharedString = if self.loaded {
             format!("{} min", self.interval).into()
         } else {
             "…".into()
         };
-        titled(
-            theme,
-            "FETCH INTERVAL",
-            section(theme)
+        let stepper = div()
+            .flex()
+            .h_6()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .child(seg_button(
+                "interval-minus",
+                "−",
+                self.loaded && self.interval > INTERVAL_MIN,
+                theme,
+                cx.listener(|view, _ev, _window, cx| view.bump_interval(false, cx)),
+            ))
             .child(
                 div()
+                    .w_16()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(stepper_button(
-                        "interval-minus",
-                        "−",
-                        self.loaded && self.interval > INTERVAL_MIN,
-                        theme,
-                        cx.listener(|view, _ev, _window, cx| view.bump_interval(false, cx)),
-                    ))
-                    .child(div().w_20().text_sm().text_center().child(value))
-                    .child(stepper_button(
-                        "interval-plus",
-                        "+",
-                        self.loaded && self.interval < INTERVAL_MAX,
-                        theme,
-                        cx.listener(|view, _ev, _window, cx| view.bump_interval(true, cx)),
-                    )),
-            )
-            .child(
-                div()
-                    .text_xs()
+                    .justify_center()
+                    .text_sm()
                     .text_color(theme.text_muted)
-                    .child("How often to check origin for changes (5–120 min, steps of 5)"),
-                ),
+                    .child(value),
+            )
+            .child(seg_button(
+                "interval-plus",
+                "+",
+                self.loaded && self.interval < INTERVAL_MAX,
+                theme,
+                cx.listener(|view, _ev, _window, cx| view.bump_interval(true, cx)),
+            ));
+        setting_row(
+            theme,
+            "Fetch interval",
+            Some("How often to check origin for changes. 5–120 minutes."),
+            stepper.into_any_element(),
+            false,
         )
     }
 
-    fn accounts_section(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
-        // "None (single account)" always leads: it is a real choice even when
-        // `op` is unavailable.
-        let mut rows: Vec<AnyElement> = vec![
-            self.picker_row(0, None, "None (single account)".into(), None, theme, cx)
-                .into_any_element(),
-        ];
+    /// Display label for the current account selection.
+    fn selected_label(&self) -> SharedString {
+        let Some(value) = self.selected.as_deref() else {
+            return "None (single account)".into();
+        };
+        if let AccountsState::Ready(accounts) = &self.accounts
+            && let Some(a) = accounts.iter().find(|a| a.value() == Some(value))
+        {
+            return a.label().into();
+        }
+        value.to_string().into()
+    }
+
+    /// "Account" row: dropdown button right; the popover menu anchors under
+    /// its right edge.
+    fn account_row(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let button = div()
+            .id("account-dropdown")
+            .h_6()
+            .px_2p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .text_sm()
+            .map(|el| {
+                if self.loaded {
+                    el.text_color(theme.text)
+                        .cursor_pointer()
+                        .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                        .on_click(cx.listener(|view, _ev, _window, cx| {
+                            view.menu_open = !view.menu_open;
+                            cx.notify();
+                        }))
+                } else {
+                    el.text_color(theme.text_muted)
+                }
+            })
+            .child(self.selected_label())
+            .child(div().text_xs().text_color(theme.text_muted).child("⌄"));
+
+        let control = div()
+            .flex()
+            .flex_col()
+            .items_end()
+            .child(button)
+            .when(self.menu_open, |el| {
+                // Zero-size marker: the anchored element positions at its own
+                // layout origin, so give it a point (the button's bottom-right
+                // corner), not a box with the menu's size.
+                el.child(div().h_0().w_0().child(deferred(
+                    anchored()
+                        .anchor(Corner::TopRight)
+                        .offset(point(px(0.), px(4.)))
+                        .snap_to_window_with_margin(px(8.))
+                        .child(self.account_menu(theme, cx)),
+                )))
+            });
+
+        setting_row(
+            theme,
+            "Account",
+            Some("Injected as OP_ACCOUNT into every chezmoi and op subprocess."),
+            control.into_any_element(),
+            false,
+        )
+    }
+
+    /// The dropdown popover: "None" first (always a real choice), then the
+    /// accounts `op` reported — or the loading/unavailable state as an inert
+    /// line, so the menu never lies about why the list is short.
+    fn account_menu(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut menu = div()
+            .id("account-menu")
+            .on_mouse_down_out(cx.listener(|view, _ev, _window, cx| {
+                view.menu_open = false;
+                cx.notify();
+            }))
+            .min_w(px(260.))
+            .max_w(px(380.))
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .shadow_md()
+            .flex()
+            .flex_col()
+            .child(self.menu_item(0, None, "None (single account)".into(), None, theme, cx));
         match &self.accounts {
-            AccountsState::Loading => rows.push(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .child("loading accounts…")
-                    .into_any_element(),
-            ),
-            AccountsState::Unavailable => rows.push(
-                div()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.drift)
-                    .text_sm()
-                    .text_color(theme.drift)
-                    .child("1Password CLI not found or errored")
-                    .into_any_element(),
-            ),
+            AccountsState::Loading => {
+                menu = menu.child(inert_menu_line(theme, "loading accounts…", theme.text_muted));
+            }
+            AccountsState::Unavailable => {
+                menu = menu.child(inert_menu_line(
+                    theme,
+                    "1Password CLI not found or errored",
+                    theme.drift,
+                ));
+            }
             AccountsState::Ready(accounts) => {
-                // Entries with no usable identifier can't be selected (there
-                // is nothing to store), so they don't render as rows.
-                let data: Vec<(Option<String>, SharedString, Option<SharedString>)> = accounts
+                let rows: Vec<(Option<String>, SharedString, Option<SharedString>)> = accounts
                     .iter()
                     .filter(|a| a.value().is_some())
                     .map(|a| {
@@ -380,30 +533,15 @@ impl SettingsView {
                         (a.value().map(str::to_owned), label.into(), sublabel)
                     })
                     .collect();
-                for (i, (value, label, sublabel)) in data.into_iter().enumerate() {
-                    rows.push(
-                        self.picker_row(i + 1, value, label, sublabel, theme, cx)
-                            .into_any_element(),
-                    );
+                for (i, (value, label, sublabel)) in rows.into_iter().enumerate() {
+                    menu = menu.child(self.menu_item(i + 1, value, label, sublabel, theme, cx));
                 }
             }
         }
-        titled(
-            theme,
-            "1PASSWORD ACCOUNT",
-            section(theme)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.text_muted)
-                        .child("injected as OP_ACCOUNT into every chezmoi/op subprocess"),
-                )
-                .children(rows),
-        )
+        menu.into_any_element()
     }
 
-    /// One selectable picker row; selection shows as an accent border.
-    fn picker_row(
+    fn menu_item(
         &self,
         ix: usize,
         value: Option<String>,
@@ -421,89 +559,25 @@ impl SettingsView {
             .flex()
             .items_center()
             .gap_2()
-            .hover(|el| el.bg(Theme::wash(theme.text, 0.05)))
+            .cursor_pointer()
+            .hover(|el| el.bg(Theme::wash(theme.text, 0.06)))
             .child(
                 div()
+                    .w_4()
+                    .flex_none()
                     .text_sm()
-                    .text_color(if selected {
-                        theme.accent
-                    } else {
-                        theme.text_muted
-                    })
-                    .child(if selected { "◉" } else { "○" }),
+                    .text_color(theme.accent)
+                    .child(if selected { "✓" } else { "" }),
             )
             .child(div().text_sm().text_color(theme.text).child(label))
             .when_some(sublabel, |el, s| {
                 el.child(div().text_xs().text_color(theme.text_muted).child(s))
             })
-            .when(self.loaded, |el| {
-                el.cursor_pointer()
-                    .on_click(cx.listener(move |view, _ev, _window, cx| {
-                        view.select_account(value.clone(), cx);
-                    }))
-            })
-    }
-
-    fn save_section(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
-        let saving = matches!(self.save, SaveState::Saving);
-        let dirty = self
-            .baseline
-            .as_ref()
-            .is_some_and(|b| *b != (self.interval, self.selected.clone()));
-        let ready = self.loaded && !saving && dirty;
-        let button = div()
-            .id("save-settings")
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(if ready { theme.accent } else { theme.border })
-            .text_sm()
-            .text_color(if ready {
-                theme.accent
-            } else {
-                theme.text_muted
-            })
-            .child(if saving { "Saving…" } else { "Save" })
-            .when(ready, |el| {
-                el.cursor_pointer()
-                    .on_click(cx.listener(|view, _ev, _window, cx| view.write_settings(cx)))
-            });
-        let row = div().flex().items_center().gap_3().child(button);
-        let row = row.when(dirty && matches!(self.save, SaveState::Idle), |el| {
-            el.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.text_muted)
-                    .child("unsaved changes · saving restarts the sync daemon"),
-            )
-        });
-        match &self.save {
-            SaveState::Saved => row.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.drift)
-                    .child("Saved · the sync daemon is restarting with the new settings"),
-            ),
-            SaveState::Error(e) => row.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.conflict)
-                    .child(format!("save failed: {e}")),
-            ),
-            SaveState::Idle | SaveState::Saving => row,
-        }
-    }
-
-    fn paths_section(&self, theme: Theme) -> Div {
-        titled(
-            theme,
-            "PATHS",
-            section(theme)
-                .child(path_row(theme, "socket", &self.paths.socket))
-                .child(path_row(theme, "journal", &self.paths.journal))
-                .child(path_row(theme, "settings", &self.paths.settings)),
-        )
+            .on_click(cx.listener(move |view, _ev, _window, cx| {
+                view.select_account(value.clone(), cx);
+                view.menu_open = false;
+                cx.notify();
+            }))
     }
 }
 
@@ -511,53 +585,96 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         div()
-            .id("settings-scroll")
             .flex_1()
+            .min_w_0()
             .min_h_0()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap_3()
-            .p_4()
-            .child(self.interval_section(theme, cx))
-            .child(self.accounts_section(theme, cx))
-            .child(self.save_section(theme, cx))
-            .child(self.paths_section(theme))
+            .child(self.header_bar(theme, cx))
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .max_w(px(760.))
+                            .px_8()
+                            .py_5()
+                            .flex()
+                            .flex_col()
+                            .child(section_header(theme, "Sync", false))
+                            .child(self.interval_row(theme, cx))
+                            .child(section_header(theme, "1Password", true))
+                            .child(self.account_row(theme, cx))
+                            .child(section_header(theme, "Paths", true))
+                            .child(path_row(theme, "Socket", &self.paths.socket, true))
+                            .child(path_row(theme, "Journal", &self.paths.journal, true))
+                            .child(path_row(theme, "Settings file", &self.paths.settings, false)),
+                    ),
+            )
     }
 }
 
-/// The bordered surface box of a settings section; its caps header renders
-/// OUTSIDE via [`titled`] (Zed settings shape).
-fn section(theme: Theme) -> Div {
+/// Zed's settings section header: small monospaced muted label over a faded
+/// hairline (see zed/crates/settings_ui components/section_items.rs).
+fn section_header(theme: Theme, label: &'static str, spaced: bool) -> Div {
     div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p_3()
-        .rounded_md()
-        .bg(theme.surface)
-        .border_1()
-        .border_color(theme.border)
-}
-
-/// Wrap a finished section box under its outside header.
-fn titled(theme: Theme, title: &'static str, body: Div) -> Div {
-    div()
+        .when(spaced, |el| el.mt_8())
+        .mb_1()
         .flex()
         .flex_col()
         .gap_1p5()
         .child(
             div()
+                .font_family("Menlo")
                 .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text_muted)
-                .child(title),
+                .child(label),
         )
-        .child(body)
+        .child(hairline(theme))
 }
 
-/// Square − / + button; disabled renders muted with no click handler.
-fn stepper_button(
+fn hairline(theme: Theme) -> Div {
+    div().h_px().w_full().bg(Theme::wash(theme.border, 0.6))
+}
+
+/// One setting row (Zed's settings-item layout): title + optional muted
+/// description left, the control right; optional faded divider below.
+fn setting_row(
+    theme: Theme,
+    title: &'static str,
+    description: Option<&'static str>,
+    control: AnyElement,
+    divider: bool,
+) -> Div {
+    div()
+        .py_3()
+        .when(divider, |el| {
+            el.border_b_1().border_color(Theme::wash(theme.border, 0.6))
+        })
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_6()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().text_sm().text_color(theme.text).child(title))
+                .when_some(description, |el, d| {
+                    el.child(div().text_xs().text_color(theme.text_muted).child(d))
+                }),
+        )
+        .child(div().flex_none().child(control))
+}
+
+/// − / + segment of the stepper; disabled renders muted with no handler.
+fn seg_button(
     id: &'static str,
     label: &'static str,
     enabled: bool,
@@ -566,47 +683,57 @@ fn stepper_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .w_7()
-        .h_7()
+        .w_6()
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
         .text_sm()
         .text_color(if enabled {
             theme.text
         } else {
             theme.text_muted
         })
-        .when(enabled, |el| el.cursor_pointer().on_click(on_click))
         .child(label)
+        .when(enabled, |el| {
+            el.cursor_pointer()
+                .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                .on_click(on_click)
+        })
 }
 
-/// Read-only path line: muted label + monospaced path.
-fn path_row(theme: Theme, label: &'static str, path: &Path) -> Div {
+/// An unselectable status line inside the dropdown (loading / unavailable).
+fn inert_menu_line(theme: Theme, text: &'static str, color: gpui::Rgba) -> Div {
+    let _ = theme;
     div()
+        .h_7()
+        .px_2()
+        .pl_8()
         .flex()
-        .items_baseline()
-        .gap_2()
-        .child(
-            div()
-                .w_16()
-                .flex_shrink_0()
-                .text_xs()
-                .text_color(theme.text_muted)
-                .child(label),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .text_xs()
-                .font_family("Menlo")
-                .text_color(theme.text)
-                .truncate()
-                .child(SharedString::from(path.display().to_string())),
-        )
+        .items_center()
+        .text_xs()
+        .text_color(color)
+        .child(text)
+}
+
+/// Read-only path row: title left, monospaced muted value right.
+fn path_row(theme: Theme, label: &'static str, path: &Path, divider: bool) -> Div {
+    setting_row(
+        theme,
+        label,
+        None,
+        div()
+            .max_w(px(480.))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_xs()
+            .font_family("Menlo")
+            .text_color(theme.text_muted)
+            .child(SharedString::from(super::dashboard::shorten_home(
+                &path.display().to_string(),
+            )))
+            .into_any_element(),
+        divider,
+    )
 }
 
 #[cfg(test)]
