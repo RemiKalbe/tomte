@@ -19,6 +19,7 @@ use std::sync::Arc;
 use czui_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
 use czui_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use czui_app::theme::Theme;
+use czui_ui::components as ui;
 use czui_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
 use czui_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
 use czui_core::merge::{MergeDocument, MergeOptions, RegionKind, worddiff::word_diff};
@@ -208,25 +209,8 @@ impl ResolveAction {
     }
 }
 
-/// Theme token the outcome banner is tinted with (kept symbolic so the
-/// mapping stays pure and testable; resolved to a color at render).
-/// `pub(crate)` because `Shell::merge_done` carries a banner in its signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BannerTint {
-    Ok,
-    Drift,
-    Conflict,
-}
-
-impl BannerTint {
-    pub(crate) fn color(self, theme: Theme) -> Rgba {
-        match self {
-            Self::Ok => theme.ok,
-            Self::Drift => theme.drift,
-            Self::Conflict => theme.conflict,
-        }
-    }
-}
+/// Moved to czui-ui; re-exported so sibling views keep their import paths.
+pub(crate) use czui_ui::BannerTint;
 
 /// The slim banner above the diff reporting the last action's outcome
 /// (spec §10: honest, including degraded commit/push results). Shared with
@@ -685,29 +669,23 @@ impl ReviewView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let base = div()
-            .id(id)
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .border_1()
-            .text_xs()
-            .child(SharedString::from(action.label()));
         if enabled {
-            base.border_color(theme.accent)
-                .text_color(theme.accent)
-                .cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
-                .on_click(cx.listener(move |view, _ev, _window, cx| view.run_action(action, cx)))
+            ui::button(
+                theme,
+                id,
+                action.label().into(),
+                ui::ButtonVariant::Outline(theme.accent),
+                ui::ButtonSize::Sm,
+                cx.listener(move |view, _ev, _window, cx| view.run_action(action, cx)),
+            )
         } else {
-            base.border_color(theme.border)
-                .text_color(theme.text_muted)
-                .tooltip(|_window, cx| {
-                    cx.new(|_| TextTooltip {
-                        text: "daemon not connected".into(),
-                    })
-                    .into()
-                })
+            ui::disabled_button(
+                theme,
+                id,
+                action.label().into(),
+                ui::ButtonSize::Sm,
+                Some("daemon not connected".into()),
+            )
         }
     }
 
@@ -715,39 +693,18 @@ impl ReviewView {
     /// successful resolutions.
     fn banner_el(&self, banner: &OutcomeBanner, theme: Theme, cx: &mut Context<Self>) -> Div {
         let color = banner.tint.color(theme);
-        div()
-            .mx_3()
-            .mt_2()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .bg(Theme::wash(color, 0.12))
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_xs()
-            .text_color(color)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(banner.text.clone()),
+        let undo = (banner.undoable && !self.action_in_flight).then(|| {
+            ui::button(
+                theme,
+                "outcome-undo",
+                "Undo".into(),
+                ui::ButtonVariant::Outline(color),
+                ui::ButtonSize::Micro,
+                cx.listener(|view, _ev, _window, cx| view.run_undo(cx)),
             )
-            .when(banner.undoable && !self.action_in_flight, |el| {
-                el.child(
-                    div()
-                        .id("outcome-undo")
-                        .flex_none()
-                        .px_1p5()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(color)
-                        .cursor_pointer()
-                        .child("Undo")
-                        .on_click(cx.listener(|view, _ev, _window, cx| view.run_undo(cx))),
-                )
-            })
+            .into_any_element()
+        });
+        ui::banner(theme, banner.tint, banner.text.clone(), undo)
     }
 
     fn sidebar(
@@ -1032,16 +989,7 @@ fn group_header(label: &'static str, theme: Theme) -> Div {
 }
 
 pub(super) fn centered_note(theme: Theme, text: SharedString, color: Rgba) -> AnyElement {
-    let _ = theme;
-    div()
-        .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_sm()
-        .text_color(color)
-        .child(text)
-        .into_any_element()
+    ui::centered_note(theme, text, color).into_any_element()
 }
 
 /// Error/eval-failure box: title + detail + optional muted remediation line
@@ -1052,27 +1000,7 @@ pub(super) fn message_box(
     detail: String,
     followup: Option<&'static str>,
 ) -> AnyElement {
-    div()
-        .m_3()
-        .p_3()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.conflict)
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.conflict)
-                .child(title),
-        )
-        .child(div().text_sm().text_color(theme.text).child(detail))
-        .when_some(followup, |el, f| {
-            el.child(div().text_xs().text_color(theme.text_muted).child(f))
-        })
-        .into_any_element()
+    ui::message_box(theme, title, detail.into(), followup).into_any_element()
 }
 
 fn provenance_section(rows: &[ProvRow], now: u64, theme: Theme) -> Div {
@@ -1099,56 +1027,31 @@ fn provenance_row(row: &ProvRow, now: u64, theme: Theme) -> Div {
         Some(class) => theme.class_color(class),
         None => theme.text_muted,
     };
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .text_xs()
-        .child(
-            div()
-                .w_16()
-                .flex_shrink_0()
-                .text_right()
-                .text_color(theme.text_muted)
-                .child(SharedString::from(time_ago(now, row.ts))),
-        )
-        .child(
-            div()
-                .w_4()
-                .flex_shrink_0()
-                .text_color(glyph_color)
-                .child(kind_glyph(&row.kind)),
-        )
-        .child(
-            div()
-                .text_color(theme.text)
-                .child(kind_label(&row.kind)),
-        )
-        .child(
-            div()
-                .text_color(theme.text_muted)
-                .child(SharedString::from(row.machine.clone())),
-        )
-        .when_some(
-            // The chip earns its place only when it says something the event
-            // label doesn't (e.g. "applied" + a drift class); otherwise the
-            // row would repeat itself ("modified on disk" twice).
-            row.class
-                .clone()
-                .filter(|class| class_label(class) != kind_label(&row.kind)),
-            |el, class| {
-                let color = theme.class_color(&class);
-                el.child(
-                    div()
-                        .px_1p5()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(color)
-                        .text_color(color)
-                        .child(class_label(&class)),
-                )
-            },
-        )
+    // The chip earns its place only when it says something the event label
+    // doesn't (e.g. "applied" + a drift class); otherwise the row would
+    // repeat itself ("modified on disk" twice).
+    let chip = row
+        .class
+        .clone()
+        .filter(|class| class_label(class) != kind_label(&row.kind))
+        .map(|class| {
+            let color = theme.class_color(&class);
+            (
+                SharedString::from(class_label(&class)),
+                ui::ChipVariant::Outline(color),
+            )
+        });
+    ui::inert_event_row(
+        theme,
+        ui::EventRowSpec {
+            time: time_ago(now, row.ts).into(),
+            glyph: (kind_glyph(&row.kind), glyph_color),
+            title: kind_label(&row.kind).into(),
+            title_color: theme.text,
+            detail: Some(row.machine.clone().into()),
+            chip,
+        },
+    )
 }
 
 fn diff_preview(doc: &MergeDocument, theme: Theme) -> AnyElement {

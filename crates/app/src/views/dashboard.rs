@@ -20,7 +20,7 @@ use czui_ui::components as ui;
 use czui_core::cmd::SystemRunner;
 use gpui::{
     App, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful, WeakEntity,
-    Window, div, prelude::*, uniform_list,
+    div, prelude::*, uniform_list,
 };
 
 use crate::notify_osa::notify;

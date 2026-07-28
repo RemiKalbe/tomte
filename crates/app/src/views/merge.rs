@@ -20,6 +20,7 @@ use czui_app::merge_inputs::{self, MergeInputs};
 use czui_app::merge_state::MergeState;
 use czui_app::resolve::{ResolveError, ResolveOutcome};
 use czui_app::theme::Theme;
+use czui_ui::components as ui;
 use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
 use czui_core::cmd::SystemRunner;
 use czui_core::merge::{Choice, MergeDocument, RegionKind};
@@ -29,7 +30,6 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, Window, div, prelude::*, uniform_list,
 };
 
-use super::dashboard::TextTooltip;
 use super::review::{
     BannerTint, OutcomeBanner, centered_note, display_text, journal_path, message_box,
 };
@@ -498,38 +498,24 @@ impl MergeView {
                         }),
                 );
             if open > 0 {
-                bar = bar.child(
-                    div()
-                        .id("merge-next")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme.conflict)
-                        .text_xs()
-                        .text_color(theme.conflict)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(Theme::wash(theme.conflict, 0.12)))
-                        .child("Next ↓")
-                        .on_click(cx.listener(|view, _ev, _window, cx| view.next(cx))),
-                );
+                bar = bar.child(ui::button(
+                    theme,
+                    "merge-next",
+                    "Next ↓".into(),
+                    ui::ButtonVariant::Outline(theme.conflict),
+                    ui::ButtonSize::Sm,
+                    cx.listener(|view, _ev, _window, cx| view.next(cx)),
+                ));
             }
         }
-        bar = bar.child(
-            div()
-                .id("merge-cancel")
-                .px_2()
-                .py_0p5()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .text_xs()
-                .text_color(theme.text)
-                .cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.text, 0.05)))
-                .child("Cancel")
-                .on_click(cx.listener(|view, _ev, _window, cx| view.cancel(cx))),
-        );
+        bar = bar.child(ui::button(
+            theme,
+            "merge-cancel",
+            "Cancel".into(),
+            ui::ButtonVariant::Outline(theme.text),
+            ui::ButtonSize::Sm,
+            cx.listener(|view, _ev, _window, cx| view.cancel(cx)),
+        ));
         if let Some(loaded) = &self.loaded {
             let unresolved = {
                 let (decided, total) = loaded.state.progress();
@@ -558,28 +544,24 @@ impl MergeView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let base = div()
-            .id("merge-save")
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .border_1()
-            .text_xs()
-            .child("Save");
         if enabled {
-            base.border_color(theme.accent)
-                .text_color(theme.accent)
-                .cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
-                .on_click(cx.listener(|view, _ev, _window, cx| view.save(cx)))
+            ui::button(
+                theme,
+                "merge-save",
+                "Save".into(),
+                ui::ButtonVariant::Outline(theme.accent),
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.save(cx)),
+            )
         } else {
-            base.border_color(theme.border)
-                .text_color(theme.text_muted)
-                .tooltip(move |_window, cx| {
-                    let s = if unresolved == 1 { "" } else { "s" };
-                    let text = format!("{unresolved} conflict{s} left").into();
-                    cx.new(|_| TextTooltip { text }).into()
-                })
+            let s = if unresolved == 1 { "" } else { "s" };
+            ui::disabled_button(
+                theme,
+                "merge-save",
+                "Save".into(),
+                ui::ButtonSize::Sm,
+                Some(format!("{unresolved} conflict{s} left").into()),
+            )
         }
     }
 
@@ -692,17 +674,7 @@ impl Render for MergeView {
 /// Merge-local banner: same shape as Review's, minus the Undo button (the
 /// banners that stay here — protected span, errors — are never undoable).
 fn banner_el(banner: &OutcomeBanner, theme: Theme) -> Div {
-    let color = banner.tint.color(theme);
-    div()
-        .mx_3()
-        .mt_2()
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .bg(Theme::wash(color, 0.12))
-        .text_xs()
-        .text_color(color)
-        .child(div().min_w_0().truncate().child(banner.text.clone()))
+    ui::banner(theme, banner.tint, banner.text.clone(), None)
 }
 
 /// One read-only pane column: an attached label header (the user should
@@ -717,16 +689,10 @@ fn pane_col(
     theme: Theme,
 ) -> AnyElement {
     let rows = rows.clone();
-    div()
+    ui::list_pane(theme, Some((label, tint)))
         .flex_1()
         .min_w_0()
         .h_full()
-        .flex()
-        .flex_col()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .child(pane_label(label, tint, theme))
         .child(
             uniform_list(id, rows.len(), move |range, _window, _cx| {
                 range.map(|ix| pane_row(&rows[ix], side, theme)).collect()
@@ -736,33 +702,13 @@ fn pane_col(
         .into_any_element()
 }
 
-/// The header strip inside a pane: tint dot + muted label.
-fn pane_label(label: &'static str, tint: Rgba, theme: Theme) -> Div {
-    div()
-        .px_2()
-        .py_1()
-        .border_b_1()
-        .border_color(theme.border)
-        .flex()
-        .items_center()
-        .gap_1p5()
-        .child(div().w_1p5().h_1p5().rounded_full().bg(tint))
-        .child(div().text_xs().text_color(theme.text_muted).child(label))
-}
-
 /// The base column when no last-written snapshot exists: the merge degraded
 /// to 2-way, and the pane says so instead of duplicating theirs (spec §10).
 fn degraded_base_col(theme: Theme) -> AnyElement {
-    div()
+    ui::list_pane(theme, Some(("last written", theme.text_muted)))
         .flex_1()
         .min_w_0()
         .h_full()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .flex()
-        .flex_col()
-        .child(pane_label("last written", theme.text_muted, theme))
         .child(
             div()
                 .flex_1()
