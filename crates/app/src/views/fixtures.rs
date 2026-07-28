@@ -38,6 +38,7 @@ pub const STATES: &[(&str, &str)] = &[
     ("merge-loading", "inputs loading"),
     ("settings", "live settings view (reads real settings/op)"),
     ("settings-menu", "settings with the account dropdown open"),
+    ("settings-dirty", "unsaved edits: floating Save/Revert toolbar"),
 ];
 
 fn home(sub: &str) -> PathBuf {
@@ -341,12 +342,20 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "settings" => shell(Route::Settings, rich_model()),
         "settings-menu" => {
             let mut s = shell(Route::Settings, rich_model());
-            let posed = cx.new(|cx| {
-                let mut view = super::settings::SettingsView::new(paths.clone(), cx);
+            let posed = cx.new(|_| {
+                let mut view =
+                    super::settings::SettingsView::posed_for_gallery(paths.clone(), false);
                 view.menu_open = true;
                 view
             });
             s.settings = Some(posed);
+            s
+        }
+        "settings-dirty" => {
+            let mut s = shell(Route::Settings, rich_model());
+            s.settings = Some(cx.new(|_| {
+                super::settings::SettingsView::posed_for_gallery(paths.clone(), true)
+            }));
             s
         }
         _ => return None,

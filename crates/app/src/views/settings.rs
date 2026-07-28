@@ -241,6 +241,45 @@ impl SettingsView {
         }
     }
 
+    /// Gallery-only: a fully-posed view with NO background loads, so the
+    /// screenshot is deterministic (synthetic accounts, optional dirty edit).
+    #[doc(hidden)]
+    pub fn posed_for_gallery(paths: SettingsPaths, dirty: bool) -> Self {
+        let accounts = AccountsState::Ready(vec![
+            OpAccount {
+                shorthand: Some("personal".into()),
+                email: Some("remi@example.com".into()),
+                account_uuid: Some("AAAA1111".into()),
+            },
+            OpAccount {
+                shorthand: None,
+                email: Some("work@example.com".into()),
+                account_uuid: Some("BBBB2222".into()),
+            },
+        ]);
+        Self {
+            paths,
+            interval: if dirty { 25 } else { 15 },
+            loaded: true,
+            accounts,
+            selected: Some("personal".into()),
+            save: SaveState::Idle,
+            baseline: Some((15, Some("personal".into()))),
+            menu_open: false,
+        }
+    }
+
+    /// Discard every unsaved edit: current state snaps back to the baseline
+    /// (what's on disk).
+    fn revert(&mut self, cx: &mut Context<Self>) {
+        if let Some((interval, selected)) = self.baseline.clone() {
+            self.interval = interval;
+            self.selected = selected;
+        }
+        self.save = SaveState::Idle;
+        cx.notify();
+    }
+
     fn bump_interval(&mut self, up: bool, cx: &mut Context<Self>) {
         let next = step_interval(self.interval, up);
         if next != self.interval {
@@ -288,6 +327,21 @@ impl SettingsView {
                 view.save = match result {
                     Ok(()) => {
                         view.baseline = Some((view.interval, view.selected.clone()));
+                        // The confirmation dismisses itself; edits also clear
+                        // it (see bump_interval/select_account).
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(4))
+                                .await;
+                            this.update(cx, |view, cx| {
+                                if matches!(view.save, SaveState::Saved) {
+                                    view.save = SaveState::Idle;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
                         SaveState::Saved
                     }
                     Err(e) => SaveState::Error(e.to_string()),
@@ -299,69 +353,81 @@ impl SettingsView {
         .detach();
     }
 
-    /// Header bar (same idiom as Review/Merge): title left, save state and
-    /// the Save button right. Save lives here, always visible — not floating
-    /// mid-scroll between sections.
-    fn header_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+    /// Floating toolbar, anchored at the bottom of the pane. Appears only
+    /// when there is something to act on (unsaved edits, a save in flight)
+    /// or report (saved / failed); Revert discards edits back to disk state.
+    fn floating_toolbar(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Div> {
         let saving = matches!(self.save, SaveState::Saving);
         let dirty = self
             .baseline
             .as_ref()
             .is_some_and(|b| *b != (self.interval, self.selected.clone()));
-        let ready = self.loaded && !saving && dirty;
+        let show = dirty || !matches!(self.save, SaveState::Idle);
+        if !show {
+            return None;
+        }
 
         let status: Option<(SharedString, gpui::Rgba)> = match &self.save {
             SaveState::Saved => Some(("Saved · sync daemon restarting".into(), theme.ok)),
             SaveState::Error(e) => Some((format!("save failed: {e}").into(), theme.conflict)),
-            SaveState::Saving => None,
-            SaveState::Idle if dirty => Some((
+            SaveState::Saving => Some(("saving…".into(), theme.text_muted)),
+            SaveState::Idle => Some((
                 "unsaved changes · saving restarts the sync daemon".into(),
                 theme.text_muted,
             )),
-            SaveState::Idle => None,
         };
 
-        let save = div()
-            .id("save-settings")
-            .h_6()
-            .px_2p5()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.surface)
-            .flex()
-            .items_center()
-            .text_sm()
-            .child(if saving { "Saving…" } else { "Save" })
-            .map(|el| {
-                if ready {
-                    el.text_color(theme.text)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                        .on_click(cx.listener(|view, _ev, _window, cx| view.write_settings(cx)))
-                } else {
-                    el.text_color(theme.text_muted)
-                }
-            });
+        let revert = (dirty && !saving).then(|| {
+            div()
+                .id("revert-settings")
+                .h_6()
+                .px_2p5()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .text_sm()
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                .child("Revert")
+                .on_click(cx.listener(|view, _ev, _window, cx| view.revert(cx)))
+        });
+        let save = (dirty && !saving).then(|| {
+            div()
+                .id("save-settings")
+                .h_6()
+                .px_2p5()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.accent)
+                .flex()
+                .items_center()
+                .text_sm()
+                .text_color(theme.accent)
+                .cursor_pointer()
+                .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
+                .child("Save")
+                .on_click(cx.listener(|view, _ev, _window, cx| view.write_settings(cx)))
+        });
 
-        div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .p_3()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Settings"),
-            )
-            .child(div().flex_1())
-            .when_some(status, |el, (text, color)| {
-                el.child(div().text_xs().text_color(color).child(text))
-            })
-            .child(save)
+        Some(
+            div()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface)
+                .shadow_md()
+                .flex()
+                .items_center()
+                .gap_3()
+                .when_some(status, |el, (text, color)| {
+                    el.child(div().text_xs().text_color(color).child(text))
+                })
+                .when_some(revert, |el, b| el.child(b))
+                .when_some(save, |el, b| el.child(b)),
+        )
     }
 
     /// "Fetch interval" row: title + description left, segmented stepper
@@ -410,7 +476,10 @@ impl SettingsView {
         setting_row(
             theme,
             "Fetch interval",
-            Some("How often to check origin for changes. 5–120 minutes."),
+            Some(desc_text(
+                theme,
+                "How often to check origin for changes. 5–120 minutes.",
+            )),
             stepper.into_any_element(),
             false,
         )
@@ -458,7 +527,14 @@ impl SettingsView {
                 }
             })
             .child(self.selected_label())
-            .child(div().text_xs().text_color(theme.text_muted).child("⌄"));
+            .child(
+                // U+2304's ink sits below the line-box center; lift it.
+                div()
+                    .mt(px(-2.))
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child("⌄"),
+            );
 
         let control = div()
             .flex()
@@ -478,13 +554,22 @@ impl SettingsView {
                 )))
             });
 
-        setting_row(
-            theme,
-            "Account",
-            Some("Injected as OP_ACCOUNT into every chezmoi and op subprocess."),
-            control.into_any_element(),
-            false,
-        )
+        let description = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .text_color(theme.text_muted)
+            .child("Injected as")
+            .child(code_chip(theme, "OP_ACCOUNT").py_0())
+            .child("into every")
+            .child(code_chip(theme, "chezmoi").py_0())
+            .child("and")
+            .child(code_chip(theme, "op").py_0())
+            .child("subprocess.")
+            .into_any_element();
+        setting_row(theme, "Account", Some(description), control.into_any_element(), false)
     }
 
     /// The dropdown popover: "None" first (always a real choice), then the
@@ -584,13 +669,26 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        let toolbar = self.floating_toolbar(theme, cx);
         div()
             .flex_1()
             .min_w_0()
             .min_h_0()
+            .relative()
             .flex()
             .flex_col()
-            .child(self.header_bar(theme, cx))
+            .when_some(toolbar, |el, toolbar| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_4()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(toolbar),
+                )
+            })
             .child(
                 div()
                     .id("settings-scroll")
@@ -637,7 +735,7 @@ fn section_header(theme: Theme, label: &'static str, spaced: bool) -> Div {
 }
 
 fn hairline(theme: Theme) -> Div {
-    div().h_px().w_full().bg(Theme::wash(theme.border, 0.6))
+    div().h_px().w_full().bg(theme.border)
 }
 
 /// One setting row (Zed's settings-item layout): title + optional muted
@@ -645,14 +743,18 @@ fn hairline(theme: Theme) -> Div {
 fn setting_row(
     theme: Theme,
     title: &'static str,
-    description: Option<&'static str>,
+    description: Option<AnyElement>,
     control: AnyElement,
     divider: bool,
 ) -> Div {
     div()
         .py_3()
         .when(divider, |el| {
-            el.border_b_1().border_color(Theme::wash(theme.border, 0.6))
+            // In-section separator: dashed and faded, one clear step below
+            // the solid section rule (Zed's sub-item treatment).
+            el.border_b_1()
+                .border_dashed()
+                .border_color(Theme::wash(theme.border, 0.7))
         })
         .flex()
         .items_center()
@@ -666,9 +768,7 @@ fn setting_row(
                 .flex_col()
                 .gap_0p5()
                 .child(div().text_sm().text_color(theme.text).child(title))
-                .when_some(description, |el, d| {
-                    el.child(div().text_xs().text_color(theme.text_muted).child(d))
-                }),
+                .when_some(description, |el, d| el.child(d)),
         )
         .child(div().flex_none().child(control))
 }
@@ -715,22 +815,42 @@ fn inert_menu_line(theme: Theme, text: &'static str, color: gpui::Rgba) -> Div {
         .child(text)
 }
 
-/// Read-only path row: title left, monospaced muted value right.
+/// Plain one-line description under a setting title.
+fn desc_text(theme: Theme, text: &'static str) -> AnyElement {
+    div()
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(text)
+        .into_any_element()
+}
+
+/// Inline mono code chip (markdown `code` look): washed pill, Menlo.
+fn code_chip(theme: Theme, text: impl Into<SharedString>) -> Div {
+    div()
+        .px_1()
+        .py_0p5()
+        .rounded_sm()
+        .bg(Theme::wash(theme.text_muted, 0.15))
+        .font_family("Menlo")
+        .text_size(px(11.))
+        .text_color(theme.text)
+        .whitespace_nowrap()
+        .child(text.into())
+}
+
+/// Read-only path row: title left, the value as an inline code chip right.
 fn path_row(theme: Theme, label: &'static str, path: &Path, divider: bool) -> Div {
     setting_row(
         theme,
         label,
         None,
         div()
-            .max_w(px(480.))
+            .max_w(px(520.))
             .overflow_hidden()
-            .whitespace_nowrap()
-            .text_xs()
-            .font_family("Menlo")
-            .text_color(theme.text_muted)
-            .child(SharedString::from(super::dashboard::shorten_home(
-                &path.display().to_string(),
-            )))
+            .child(code_chip(
+                theme,
+                super::dashboard::shorten_home(&path.display().to_string()),
+            ))
             .into_any_element(),
         divider,
     )
