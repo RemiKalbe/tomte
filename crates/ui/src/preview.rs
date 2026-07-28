@@ -146,40 +146,27 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
             toolbar_pill(theme)
                 .child(
                     div()
+                        .pl_1p5()
                         .text_xs()
                         .text_color(theme.text_muted)
                         .child("unsaved changes · saving restarts the sync daemon"),
                 )
-                .child(
-                    div()
-                        .id("prev-revert")
-                        .h_6()
-                        .px_2p5()
-                        .rounded_md()
-                        .flex()
-                        .items_center()
-                        .text_sm()
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                        .child("Revert"),
-                )
-                .child(
-                    div()
-                        .id("prev-save")
-                        .h_6()
-                        .px_2p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme.accent)
-                        .flex()
-                        .items_center()
-                        .text_sm()
-                        .text_color(theme.accent)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(Theme::wash(theme.accent, 0.12)))
-                        .child("Save"),
-                )
+                .child(button(
+                    theme,
+                    "prev-revert",
+                    "Revert".into(),
+                    ButtonVariant::Ghost,
+                    ButtonSize::Md,
+                    noop,
+                ))
+                .child(button(
+                    theme,
+                    "prev-save",
+                    "Save".into(),
+                    ButtonVariant::Outline(theme.accent),
+                    ButtonSize::Md,
+                    noop,
+                ))
                 .into_any_element(),
         )
         .into_any_element(),

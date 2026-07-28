@@ -403,7 +403,7 @@ impl SettingsView {
         Some(
             ui::toolbar_pill(theme)
                 .when_some(status, |el, (text, color)| {
-                    el.child(div().text_xs().text_color(color).child(text))
+                    el.child(div().pl_1p5().text_xs().text_color(color).child(text))
                 })
                 .when_some(revert, |el, b| el.child(b))
                 .when_some(save, |el, b| el.child(b)),
