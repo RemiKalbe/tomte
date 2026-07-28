@@ -17,7 +17,7 @@ use gpui::{
     deferred, div, point, prelude::*, px,
 };
 
-use super::ui;
+use czui_ui::components as ui;
 use serde::{Deserialize, Serialize};
 
 /// Fetch-interval bounds and step (spec §9): 5..=120 minutes, 5-minute steps.

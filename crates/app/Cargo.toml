@@ -16,6 +16,7 @@ path = "src/main.rs"
 czui-core = { path = "../core" }
 czui-journal = { path = "../journal" }
 czui-proto = { path = "../proto" }
+czui-ui = { path = "../ui" }
 gpui.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true

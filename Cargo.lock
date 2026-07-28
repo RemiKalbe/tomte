@@ -1278,6 +1278,7 @@ dependencies = [
  "czui-daemon",
  "czui-journal",
  "czui-proto",
+ "czui-ui",
  "gpui",
  "objc2",
  "objc2-app-kit",
@@ -1338,6 +1339,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "czui-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]

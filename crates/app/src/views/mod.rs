@@ -6,7 +6,6 @@ pub mod fixtures;
 pub mod merge;
 pub mod review;
 pub mod settings;
-pub mod ui;
 
 use std::path::PathBuf;
 
@@ -275,7 +274,7 @@ impl Render for Shell {
                 .justify_center()
                 .p_8()
                 .child(
-                    ui::render_component(name, theme)
+                    czui_ui::preview::render_component(name, theme)
                         .unwrap_or_else(|| div().child("unknown component").into_any_element()),
                 )
                 .into_any_element();

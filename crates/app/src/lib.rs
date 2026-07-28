@@ -7,4 +7,6 @@ pub mod merge_inputs;
 pub mod merge_state;
 pub mod model;
 pub mod resolve;
-pub mod theme;
+/// Re-export: the theme moved into the czui-ui design-system crate; every
+/// existing `czui_app::theme::Theme` import keeps working.
+pub use czui_ui::theme;

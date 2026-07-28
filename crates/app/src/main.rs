@@ -2,7 +2,6 @@
 
 // Shared modules (ipc, model, theme) live in the czui_app lib target;
 // views and the AppKit platform layer stay bin-only.
-mod assets;
 mod notify_osa;
 mod platform_mac;
 mod views;
@@ -271,12 +270,12 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
         NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     };
 
-    if !views::fixtures::STATES.iter().any(|(n, _)| *n == state_name) {
+    if !views::fixtures::states().iter().any(|(n, _)| *n == state_name) {
         eprintln!("unknown gallery state: {state_name} (try --gallery-list)");
         return ExitCode::FAILURE;
     }
 
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+    Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         let app = NSApplication::sharedApplication(mtm);
         if let Some(dark) = dark {
@@ -342,7 +341,7 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
 fn run_live(route: Route, paths: Paths) -> ExitCode {
     use objc2_app_kit::NSApplication;
 
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+    Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         set_accessory_policy(mtm);
 
@@ -819,7 +818,7 @@ fn main() -> ExitCode {
         return print_status(&paths.socket);
     }
     if std::env::args().any(|a| a == "--gallery-list") {
-        for (name, desc) in views::fixtures::STATES {
+        for (name, desc) in views::fixtures::states() {
             println!("{name}\t{desc}");
         }
         return ExitCode::SUCCESS;
@@ -848,7 +847,7 @@ fn main() -> ExitCode {
         return run_gallery(state, dark, paths.view_paths());
     }
 
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+    Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         set_accessory_policy(mtm);
         let (status, menu_rx) = StatusItem::install(mtm);

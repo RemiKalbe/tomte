@@ -39,11 +39,22 @@ pub const STATES: &[(&str, &str)] = &[
     ("settings", "live settings view (reads real settings/op)"),
     ("settings-menu", "settings with the account dropdown open"),
     ("settings-dirty", "unsaved edits: floating Save/Revert toolbar"),
-    ("comp:dropdown", "isolated: dropdown button, disabled, open menu"),
-    ("comp:stepper", "isolated: stepper enabled / at-min / loading"),
-    ("comp:code-chip", "isolated: inline + standalone code chips"),
-    ("comp:toolbar", "isolated: floating Save/Revert toolbar"),
 ];
+
+/// All gallery states: the screen poses above plus one `comp:<name>` state
+/// per czui-ui preview registry entry.
+pub fn states() -> Vec<(String, &'static str)> {
+    let mut all: Vec<(String, &'static str)> = STATES
+        .iter()
+        .map(|(n, d)| (n.to_string(), *d))
+        .collect();
+    all.extend(
+        czui_ui::preview::COMPONENTS
+            .iter()
+            .map(|(n, d)| (format!("comp:{n}"), *d)),
+    );
+    all
+}
 
 /// Window size for a gallery state: component previews get a compact window
 /// so the screenshot is mostly component.
@@ -282,9 +293,11 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
     };
 
     // Component previews: bare Shell routed at the preview (no posed data).
-    if name.starts_with("comp:") {
-        let static_name = STATES.iter().find(|(n, _)| *n == name)?.0;
-        let comp = static_name.strip_prefix("comp:").expect("checked above");
+    if let Some(comp) = name.strip_prefix("comp:") {
+        let comp = czui_ui::preview::COMPONENTS
+            .iter()
+            .find(|(n, _)| *n == comp)?
+            .0;
         return Some(shell(Route::Component(comp), SyncModel::default()));
     }
 
