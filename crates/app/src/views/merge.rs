@@ -26,7 +26,7 @@ use czui_core::cmd::SystemRunner;
 use czui_core::merge::{Choice, MergeDocument, RegionKind};
 use czui_core::template::anchor::{SpanMap, SpanOrigin};
 use gpui::{
-    AnyElement, Context, Div, ElementId, FontWeight, Rgba, ScrollStrategy, SharedString, Stateful,
+    AnyElement, Context, Div, ElementId, Rgba, ScrollStrategy, SharedString, Stateful,
     UniformListScrollHandle, WeakEntity, Window, div, prelude::*, uniform_list,
 };
 
@@ -451,36 +451,7 @@ impl MergeView {
             ),
             None => ("merge editor".into(), "".into()),
         };
-        let mut bar = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .p_3()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_baseline()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .whitespace_nowrap()
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .truncate()
-                            .child(path),
-                    ),
-            );
+        let mut bar = ui::detail_header(theme, name, path, Vec::new());
         if let Some(loaded) = &self.loaded {
             let (decided, total) = loaded.state.progress();
             let open = total - decided;
@@ -731,35 +702,18 @@ fn pane_row(line: &PaneLine, side: PaneSide, theme: Theme) -> Div {
     } else {
         row_bg(line.kind, side, &theme)
     };
-    div()
-        .h_5()
-        .flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .font_family("Menlo")
-        .text_xs()
+    ui::mono_line(theme)
         .text_color(if line.kind == RegionKind::Unchanged {
             theme.text_muted
         } else {
             theme.text
         })
-        .whitespace_nowrap()
         .when_some(bg, |el, bg| el.bg(bg))
-        .child(
-            div()
-                .w_4()
-                .flex_shrink_0()
-                .text_color(theme.drift)
-                .child(if line.protected { "⚿" } else { "" }),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .child(line.text.clone()),
-        )
+        .child(ui::line_gutter(
+            theme.drift,
+            if line.protected { "⚿" } else { "" },
+        ))
+        .child(ui::line_text(line.text.clone()))
 }
 
 fn result_row_el(
@@ -769,22 +723,9 @@ fn result_row_el(
     view: &WeakEntity<MergeView>,
 ) -> AnyElement {
     match row {
-        ResultRow::Line { text, muted } => div()
-            .h_5()
-            .flex()
-            .items_center()
-            .px_2()
-            .font_family("Menlo")
-            .text_xs()
-            .text_color(if *muted { theme.text_muted } else { theme.text })
-            .whitespace_nowrap()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(text.clone()),
-            )
+        ResultRow::Line { text, muted } => ui::mono_line(theme)
+            .when(*muted, |el| el.text_color(theme.text_muted))
+            .child(ui::line_text(text.clone()))
             .into_any_element(),
         ResultRow::Placeholder { region, focused } => {
             let region = *region;
@@ -806,6 +747,7 @@ fn result_row_el(
                     region,
                     Choice::Ours,
                     theme.drift,
+                    theme,
                     view,
                 ))
                 .child(pick_button(
@@ -814,6 +756,7 @@ fn result_row_el(
                     region,
                     Choice::Theirs,
                     theme.accent,
+                    theme,
                     view,
                 ))
                 .when(!degraded_base, |el| {
@@ -823,6 +766,7 @@ fn result_row_el(
                         region,
                         Choice::Base,
                         theme.text_muted,
+                        theme,
                         view,
                     ))
                 })
@@ -839,25 +783,23 @@ fn pick_button(
     region: usize,
     choice: Choice,
     color: Rgba,
+    theme: Theme,
     view: &WeakEntity<MergeView>,
 ) -> Stateful<Div> {
     let view = view.clone();
-    div()
-        .id(ElementId::named_usize(id, region))
-        .flex_none()
-        .px_1p5()
-        .rounded_sm()
-        .border_1()
-        .border_color(color)
-        .text_color(color)
-        .cursor_pointer()
-        .hover(move |el| el.bg(Theme::wash(color, 0.12)))
-        .child(label)
-        .on_click(move |_ev, _window, cx| {
+    ui::button(
+        theme,
+        ElementId::named_usize(id, region),
+        label.into(),
+        ui::ButtonVariant::Outline(color),
+        ui::ButtonSize::Micro,
+        move |_ev, _window, cx| {
             let choice = choice.clone();
             view.update(cx, |merge, cx| merge.pick(region, choice, cx))
                 .ok();
-        })
+        },
+    )
+    .flex_none()
 }
 
 #[cfg(test)]

@@ -861,93 +861,48 @@ impl ReviewView {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(
+            .child(ui::detail_header(theme, name, path, vec![
+                if self.action_in_flight {
+                    ui::status_text(theme, "working…", ui::StatusTone::Muted).into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(self.action_button(
+                            "keep-disk",
+                            ResolveAction::KeepDisk,
+                            engine_ready,
+                            theme,
+                            cx,
+                        ))
+                        .child(self.action_button(
+                            "keep-source",
+                            ResolveAction::KeepSource,
+                            engine_ready,
+                            theme,
+                            cx,
+                        ))
+                        .into_any_element()
+                },
+                self.merge_editor_button(engine_ready, is_conflict, theme, cx)
+                    .into_any_element(),
+                // External editor: real but rare — an icon, not a fourth
+                // competing button.
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .p_3()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .whitespace_nowrap()
-                                    .child(name),
-                            )
-                            .child(
-                                // ~-shortened so it fits in practice; gpui's
-                                // ellipsis is unreliable inside flex columns
-                                // (see the footer fix in mod.rs), so rare
-                                // overlong paths clip at the pane edge.
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_xs()
-                                    .text_color(theme.text_muted)
-                                    .child(path),
-                            ),
-                    )
-                    .child(if self.action_in_flight {
-                        div()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child("working…")
-                            .into_any_element()
-                    } else {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(self.action_button(
-                                "keep-disk",
-                                ResolveAction::KeepDisk,
-                                engine_ready,
-                                theme,
-                                cx,
-                            ))
-                            .child(self.action_button(
-                                "keep-source",
-                                ResolveAction::KeepSource,
-                                engine_ready,
-                                theme,
-                                cx,
-                            ))
-                            .into_any_element()
-                    })
-                    .child(self.merge_editor_button(engine_ready, is_conflict, theme, cx))
-                    .child(
-                        // External editor: real but rare — an icon, not a
-                        // fourth competing button.
-                        div()
-                            .id("open-in-editor")
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_md()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .cursor_pointer()
-                            .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                            .child("↗")
-                            .tooltip(|_window, cx| {
-                                cx.new(|_| TextTooltip {
-                                    text: "Open in external editor".into(),
-                                })
-                                .into()
-                            })
-                            .on_click(
-                                cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)),
-                            ),
-                    ),
-            )
+                    .id("open-in-editor")
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_sm()
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                    .child("↗")
+                    .tooltip(ui::text_tooltip("Open in external editor"))
+                    .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
+                    .into_any_element(),
+            ]))
             .when_some(self.last_outcome.clone(), |el, banner| {
                 el.child(self.banner_el(&banner, theme, cx))
             })
@@ -1109,18 +1064,10 @@ fn diff_row(line: &DiffLine, theme: Theme) -> Div {
             .with_highlights(line.highlights.iter().map(|r| (r.clone(), style)))
             .into_any_element()
     };
-    div()
-        .h_5()
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .font_family("Menlo")
-        .text_xs()
+    ui::mono_line(theme)
         .text_color(color)
-        .whitespace_nowrap()
-        .child(div().w_3().flex_shrink_0().child(line.marker))
-        .child(div().flex_1().min_w_0().overflow_hidden().child(text))
+        .child(ui::line_gutter(color, line.marker))
+        .child(ui::line_text(text))
 }
 
 #[cfg(test)]
