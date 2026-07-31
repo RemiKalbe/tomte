@@ -61,7 +61,7 @@ pub fn states() -> Vec<(String, &'static str)> {
 pub fn window_size(name: &str) -> gpui::Size<gpui::Pixels> {
     use gpui::{px, size};
     if name.starts_with("comp:") {
-        size(px(520.), px(420.))
+        size(px(560.), px(640.))
     } else {
         size(px(980.), px(640.))
     }

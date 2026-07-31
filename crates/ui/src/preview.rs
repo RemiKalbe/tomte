@@ -14,6 +14,7 @@ pub const COMPONENTS: &[(&str, &str)] = &[
     ("stepper", "stepper enabled / at-min / loading"),
     ("code-chip", "inline + standalone code chips"),
     ("toolbar", "floating Save/Revert toolbar"),
+    ("merge-region", "decision strip states + provenance rows"),
 ];
 
 fn noop(_: &ClickEvent, _: &mut Window, _: &mut App) {}
@@ -170,6 +171,88 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 .into_any_element(),
         )
         .into_any_element(),
+        "merge-region" => {
+            let noop_pick = |_: ChoiceKind, _: &ClickEvent, _: &mut Window, _: &mut App| {};
+            let lines: Vec<gpui::SharedString> = vec![
+                "    \"@xberg-io/opencode-xberg\",".into(),
+                "    \"@xberg-io/opencode-crawlberg\",".into(),
+            ];
+            let mut protected = std::collections::HashSet::new();
+            protected.insert(1usize);
+            div()
+                .flex()
+                .flex_col()
+                .gap_6()
+                .w(gpui::px(430.))
+                .child(variant(
+                    theme,
+                    "deciding (conflict, focused)",
+                    decision_strip(
+                        theme,
+                        0,
+                        StripState::Deciding {
+                            has_base: true,
+                            current: None,
+                            focused: true,
+                        },
+                        noop_pick,
+                        noop,
+                        noop,
+                    )
+                    .into_any_element(),
+                ))
+                .child(variant(
+                    theme,
+                    "deciding (auto-resolved, overridable)",
+                    decision_strip(
+                        theme,
+                        1,
+                        StripState::Deciding {
+                            has_base: false,
+                            current: Some(ChoiceKind::Theirs),
+                            focused: false,
+                        },
+                        noop_pick,
+                        noop,
+                        noop,
+                    )
+                    .into_any_element(),
+                ))
+                .child(variant(
+                    theme,
+                    "decided",
+                    decision_strip(
+                        theme,
+                        2,
+                        StripState::Decided {
+                            choice: ChoiceKind::Both,
+                        },
+                        noop_pick,
+                        noop,
+                        noop,
+                    )
+                    .into_any_element(),
+                ))
+                .child(variant(
+                    theme,
+                    "provenance: disk side",
+                    div()
+                        .w_full()
+                        .child(provenance_label(theme, Side::Ours))
+                        .child(provenance_rows(theme, Side::Ours, &lines, &protected))
+                        .into_any_element(),
+                ))
+                .child(variant(
+                    theme,
+                    "provenance: source side (protected line)",
+                    div()
+                        .w_full()
+                        .child(provenance_label(theme, Side::Theirs))
+                        .child(provenance_rows(theme, Side::Theirs, &lines, &protected))
+                        .into_any_element(),
+                ))
+                .into_any_element()
+        }
         _ => return None,
     };
     Some(el)
