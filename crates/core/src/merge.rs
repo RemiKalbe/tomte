@@ -247,6 +247,11 @@ pub enum Choice {
     Ours,
     Theirs,
     Base,
+    /// Keep both sides: ours (disk) first, then theirs (source) — the order
+    /// git and Zed's "Use Both" use. First-class rather than
+    /// `Edited(concat)` so provenance survives (each half keeps its tint and
+    /// the decision stays revisitable without loss).
+    Both,
     Edited(String),
 }
 
@@ -288,6 +293,10 @@ impl MergeDocument {
                 (Some(Choice::Base), _) => {
                     out.push_str(&self.base_lines[region.base.clone()].concat())
                 }
+                (Some(Choice::Both), _) => {
+                    out.push_str(&self.ours_lines[region.ours.clone()].concat());
+                    out.push_str(&self.theirs_lines[region.theirs.clone()].concat());
+                }
                 (Some(Choice::Edited(text)), _) => out.push_str(text),
                 (None, RegionKind::Unchanged) => {
                     out.push_str(&self.base_lines[region.base.clone()].concat())
@@ -310,6 +319,44 @@ impl MergeDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_choice_concatenates_ours_then_theirs() {
+        // base "x" -> ours "disk", theirs "src": a true conflict.
+        let doc = MergeDocument::compute("x\n", "disk\n", "src\n", MergeOptions::default());
+        let conflicts = doc.required_decisions();
+        assert_eq!(conflicts.len(), 1);
+        let mut res = Resolution::new();
+        res.set(conflicts[0], Choice::Both);
+        assert_eq!(doc.assemble(&res).unwrap(), "disk\nsrc\n");
+    }
+
+    #[test]
+    fn both_choice_on_one_sided_region_duplicates_nothing_missing() {
+        // theirs added a line; ours == base. Both on that region = ours part
+        // (empty side tolerated) + theirs part.
+        let doc = MergeDocument::compute("a\n", "a\n", "a\nb\n", MergeOptions::default());
+        let region_ix = doc
+            .regions
+            .iter()
+            .position(|r| r.kind == RegionKind::TheirsOnly)
+            .expect("theirs-only region");
+        let mut res = Resolution::new();
+        res.set(region_ix, Choice::Both);
+        let out = doc.assemble(&res).unwrap();
+        assert_eq!(out, "a\nb\n");
+    }
+
+    #[test]
+    fn both_choice_with_empty_ours_side_in_conflict() {
+        // ours deleted the line, theirs rewrote it: conflict with empty ours.
+        let doc = MergeDocument::compute("x\n", "", "y\n", MergeOptions::default());
+        let conflicts = doc.required_decisions();
+        assert_eq!(conflicts.len(), 1);
+        let mut res = Resolution::new();
+        res.set(conflicts[0], Choice::Both);
+        assert_eq!(doc.assemble(&res).unwrap(), "y\n");
+    }
 
     fn kinds(doc: &MergeDocument) -> Vec<RegionKind> {
         doc.regions.iter().map(|r| r.kind).collect()

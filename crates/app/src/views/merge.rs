@@ -164,6 +164,15 @@ fn result_rows(state: &MergeState) -> Vec<ResultRow> {
             (Some(Choice::Ours), _) => (&doc.ours_lines()[region.ours.clone()], false),
             (Some(Choice::Theirs), _) => (&doc.theirs_lines()[region.theirs.clone()], false),
             (Some(Choice::Base), _) => (&doc.base_lines()[region.base.clone()], false),
+            (Some(Choice::Both), _) => {
+                let ours = &doc.ours_lines()[region.ours.clone()];
+                let theirs = &doc.theirs_lines()[region.theirs.clone()];
+                out.extend(ours.iter().chain(theirs).map(|line| ResultRow::Line {
+                    text: display_text(line).to_owned().into(),
+                    muted: false,
+                }));
+                continue;
+            }
             // The choice-based UI never produces Edited, but assemble
             // supports it — render it rather than mis-render.
             (Some(Choice::Edited(text)), _) => {
