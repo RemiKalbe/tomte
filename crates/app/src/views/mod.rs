@@ -94,7 +94,7 @@ impl Shell {
         let shell = cx.weak_entity();
         let merge = self
             .merge
-            .get_or_insert_with(|| cx.new(|_| MergeView::new(shell)))
+            .get_or_insert_with(|| cx.new(|cx| MergeView::new(shell, cx)))
             .clone();
         merge.update(cx, |view, cx| view.load(target, cx));
         self.route = Route::Merge;
@@ -282,7 +282,7 @@ impl Render for Shell {
                         Route::Merge => {
                             let shell = cx.weak_entity();
                             self.merge
-                                .get_or_insert_with(|| cx.new(|_| MergeView::new(shell)))
+                                .get_or_insert_with(|| cx.new(|cx| MergeView::new(shell, cx)))
                                 .clone()
                                 .into_any_element()
                         }
@@ -582,8 +582,8 @@ mod render_smoke {
             let (_view, vis) = cx.add_window_view(|_window, cx| {
                 let state = cx.new(|_| model_with_data());
                 let shell = cx.weak_entity();
-                let merge = cx.new(|_| {
-                    let mut view = MergeView::new(shell);
+                let merge = cx.new(|cx| {
+                    let mut view = MergeView::new(shell, cx);
                     pose(&mut view);
                     view
                 });

@@ -33,6 +33,7 @@ pub const STATES: &[(&str, &str)] = &[
     ("review-banner", "action outcome banner with Undo"),
     ("review-working", "action in flight"),
     ("merge", "three-pane editor with unresolved conflicts"),
+    ("merge-auto", "no conflicts: auto-merged regions, overridable strips"),
     ("merge-templated", "templated file with protected 🔒 spans"),
     ("merge-resolved", "all regions decided, Save enabled"),
     ("merge-loading", "inputs loading"),
@@ -254,8 +255,8 @@ fn templated_inputs() -> MergeInputs {
 
 fn posed_merge(cx: &mut Context<Shell>, inputs: MergeInputs, resolve_all: bool) -> Entity<MergeView> {
     let shell = cx.weak_entity();
-    cx.new(|_| {
-        let mut view = MergeView::new(shell);
+    cx.new(|cx| {
+        let mut view = MergeView::new(shell, cx);
         view.target = Some(inputs.target.clone());
         let mut loaded = LoadedMerge::new(Arc::new(inputs));
         if resolve_all {
@@ -271,8 +272,8 @@ fn posed_merge(cx: &mut Context<Shell>, inputs: MergeInputs, resolve_all: bool) 
 
 fn posed_merge_loading(cx: &mut Context<Shell>) -> Entity<MergeView> {
     let shell = cx.weak_entity();
-    cx.new(|_| {
-        let mut view = MergeView::new(shell);
+    cx.new(|cx| {
+        let mut view = MergeView::new(shell, cx);
         view.target = Some(home(".config/editor.toml"));
         view.loading = true;
         view
@@ -357,6 +358,25 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "merge" => {
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, conflict_inputs(), false));
+            s
+        }
+        "merge-auto" => {
+            // The 2026-07-30 user report: source added lines, disk changed a
+            // different line — diff3 auto-merges, every region overridable.
+            let base = "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\"\n  ],\n  \"theme\": \"dark\"\n}\n";
+            let ours = "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\"\n  ],\n  \"theme\": \"light\"\n}\n";
+            let theirs = "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\",\n    \"hindsight\",\n    \"xberg\"\n  ],\n  \"theme\": \"dark\"\n}\n";
+            let inputs = MergeInputs {
+                target: home(".config/opencode/opencode.json"),
+                ours: ours.into(),
+                theirs: theirs.into(),
+                base: Some(base.into()),
+                source_path: home(".local/share/chezmoi/dot_config/opencode/opencode.json"),
+                templated: false,
+                span_map: None,
+            };
+            let mut s = shell(Route::Merge, rich_model());
+            s.merge = Some(posed_merge(cx, inputs, false));
             s
         }
         "merge-templated" => {

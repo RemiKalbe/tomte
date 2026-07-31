@@ -26,8 +26,8 @@ use czui_core::cmd::SystemRunner;
 use czui_core::merge::{Choice, MergeDocument, RegionKind};
 use czui_core::template::anchor::{SpanMap, SpanOrigin};
 use gpui::{
-    AnyElement, Context, Div, ElementId, Rgba, ScrollStrategy, SharedString, Stateful,
-    UniformListScrollHandle, WeakEntity, Window, div, prelude::*, uniform_list,
+    AnyElement, App, ClickEvent, Context, Div, FocusHandle, KeyBinding, Rgba, ScrollHandle,
+    SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, uniform_list,
 };
 
 use super::review::{
@@ -137,81 +137,174 @@ fn protected_line_set(lines: &[String], map: &SpanMap) -> HashSet<usize> {
     out
 }
 
-/// One row of the result pane: an assembled line, or the placeholder for an
-/// unresolved conflict (with its inline pick buttons).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ResultRow {
-    Line {
-        text: SharedString,
-        /// Unchanged context renders muted; chosen/auto-changed lines normal.
-        muted: bool,
-    },
-    Placeholder {
-        region: usize,
-        /// The cursor (next ↓) sits on this conflict.
+actions!(
+    merge_editor,
+    [
+        PickDisk,
+        PickSource,
+        PickBase,
+        PickBoth,
+        NextConflict,
+        UndoChoice,
+        RedoChoice
+    ]
+);
+
+/// Key bindings for the merge editor (active only while its pane has
+/// focus via the "MergeEditor" key context). Registered by every app entry
+/// point (main / gallery / live) so behavior is identical everywhere.
+pub fn register_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("1", PickDisk, Some("MergeEditor")),
+        KeyBinding::new("2", PickSource, Some("MergeEditor")),
+        KeyBinding::new("3", PickBase, Some("MergeEditor")),
+        KeyBinding::new("b", PickBoth, Some("MergeEditor")),
+        KeyBinding::new("n", NextConflict, Some("MergeEditor")),
+        KeyBinding::new("cmd-z", UndoChoice, Some("MergeEditor")),
+        KeyBinding::new("cmd-shift-z", RedoChoice, Some("MergeEditor")),
+    ]);
+}
+
+/// What one region renders as (merge-editor-v2 spec step 3). Pure and
+/// testable; the render walk consumes it directly.
+#[derive(Debug, PartialEq)]
+enum RegionDisplay {
+    /// Unchanged context lines (muted).
+    Context { lines: Vec<SharedString> },
+    /// Open decision: a conflict with no choice, a revisited decision, or an
+    /// auto-resolved region (current = the engine default, overridable).
+    /// `provenance` carries both sides for true re-deciding; auto regions
+    /// show their materialized default instead (spec: one strip line per
+    /// changed region, full provenance only where a human must look).
+    Deciding {
+        current: Option<ui::ChoiceKind>,
         focused: bool,
+        has_base: bool,
+        /// Some => show ours/theirs provenance blocks; None => show `lines`.
+        provenance: Option<(Vec<SharedString>, Vec<SharedString>)>,
+        lines: Vec<(SharedString, Option<ui::Side>)>,
+    },
+    /// Explicit decision, collapsed: strip names it, lines show the result.
+    Decided {
+        choice: ui::ChoiceKind,
+        lines: Vec<(SharedString, Option<ui::Side>)>,
     },
 }
 
-/// The assembled-so-far result: mirrors `MergeDocument::assemble`'s defaults
-/// and override rules exactly, but renders unresolved conflicts as
-/// placeholder rows instead of failing.
-fn result_rows(state: &MergeState) -> Vec<ResultRow> {
-    let doc = &state.doc;
-    let mut out = Vec::new();
-    for (idx, region) in doc.regions.iter().enumerate() {
-        let (lines, muted): (&[String], bool) = match (state.resolution.get(idx), region.kind) {
-            (Some(Choice::Ours), _) => (&doc.ours_lines()[region.ours.clone()], false),
-            (Some(Choice::Theirs), _) => (&doc.theirs_lines()[region.theirs.clone()], false),
-            (Some(Choice::Base), _) => (&doc.base_lines()[region.base.clone()], false),
-            (Some(Choice::Both), _) => {
-                let ours = &doc.ours_lines()[region.ours.clone()];
-                let theirs = &doc.theirs_lines()[region.theirs.clone()];
-                out.extend(ours.iter().chain(theirs).map(|line| ResultRow::Line {
-                    text: display_text(line).to_owned().into(),
-                    muted: false,
-                }));
-                continue;
-            }
-            // The choice-based UI never produces Edited, but assemble
-            // supports it — render it rather than mis-render.
-            (Some(Choice::Edited(text)), _) => {
-                out.extend(text.split_inclusive('\n').map(|line| ResultRow::Line {
-                    text: display_text(line).to_owned().into(),
-                    muted: false,
-                }));
-                continue;
-            }
-            (None, RegionKind::Unchanged) => (&doc.base_lines()[region.base.clone()], true),
-            (None, RegionKind::OursOnly | RegionKind::BothSame) => {
-                (&doc.ours_lines()[region.ours.clone()], false)
-            }
-            (None, RegionKind::TheirsOnly) => (&doc.theirs_lines()[region.theirs.clone()], false),
-            (None, RegionKind::Conflict) => {
-                out.push(ResultRow::Placeholder {
-                    region: idx,
-                    focused: state.cursor == Some(idx),
-                });
-                continue;
-            }
-        };
-        out.extend(lines.iter().map(|line| ResultRow::Line {
-            text: display_text(line).to_owned().into(),
-            muted,
-        }));
+fn choice_kind(choice: &Choice) -> ui::ChoiceKind {
+    match choice {
+        Choice::Ours => ui::ChoiceKind::Ours,
+        Choice::Theirs => ui::ChoiceKind::Theirs,
+        Choice::Base => ui::ChoiceKind::Base,
+        Choice::Both => ui::ChoiceKind::Both,
+        Choice::Edited(_) => ui::ChoiceKind::Edited,
     }
-    out
 }
 
-/// Row index of `region`'s placeholder, for the `next ↓` scroll.
-fn placeholder_row_ix(rows: &[ResultRow], region: usize) -> Option<usize> {
-    rows.iter()
-        .position(|row| matches!(row, ResultRow::Placeholder { region: r, .. } if *r == region))
+fn side_lines(
+    doc: &MergeDocument,
+    region: &czui_core::merge::MergeRegion,
+    side: ui::Side,
+) -> Vec<SharedString> {
+    let lines = match side {
+        ui::Side::Ours => &doc.ours_lines()[region.ours.clone()],
+        ui::Side::Theirs => &doc.theirs_lines()[region.theirs.clone()],
+        ui::Side::Base => &doc.base_lines()[region.base.clone()],
+    };
+    lines
+        .iter()
+        .map(|l| SharedString::from(display_text(l).to_owned()))
+        .collect()
 }
 
-/// Map a `resolve_merged` result onto its banner. Done banners are handed to
-/// Review (undoable there); protected-span rejections and errors stay in the
-/// merge editor and are never undoable (nothing was mutated).
+/// Materialized lines for a choice, each tagged with its provenance side
+/// (None = edited text, tinted as such).
+fn choice_lines(
+    doc: &MergeDocument,
+    region: &czui_core::merge::MergeRegion,
+    choice: &Choice,
+) -> Vec<(SharedString, Option<ui::Side>)> {
+    let tag = |side: ui::Side| {
+        side_lines(doc, region, side)
+            .into_iter()
+            .map(move |l| (l, Some(side)))
+            .collect::<Vec<_>>()
+    };
+    match choice {
+        Choice::Ours => tag(ui::Side::Ours),
+        Choice::Theirs => tag(ui::Side::Theirs),
+        Choice::Base => tag(ui::Side::Base),
+        Choice::Both => {
+            let mut out = tag(ui::Side::Ours);
+            out.extend(tag(ui::Side::Theirs));
+            out
+        }
+        Choice::Edited(text) => text
+            .split_inclusive('\n')
+            .map(|l| (SharedString::from(display_text(l).to_owned()), None))
+            .collect(),
+    }
+}
+
+/// The engine's default choice for a region that needs no human decision.
+fn auto_choice(kind: RegionKind) -> Option<Choice> {
+    match kind {
+        RegionKind::OursOnly | RegionKind::BothSame => Some(Choice::Ours),
+        RegionKind::TheirsOnly => Some(Choice::Theirs),
+        RegionKind::Unchanged | RegionKind::Conflict => None,
+    }
+}
+
+/// Compute the display for region `idx` from the single source of truth.
+fn region_display(
+    state: &MergeState,
+    idx: usize,
+    revisiting: &std::collections::HashSet<usize>,
+) -> RegionDisplay {
+    let doc = &state.doc;
+    let region = &doc.regions[idx];
+    let has_base = !state.degraded_base;
+    match (state.resolution.get(idx), region.kind) {
+        (None, RegionKind::Unchanged) => RegionDisplay::Context {
+            lines: side_lines(doc, region, ui::Side::Base),
+        },
+        (None, RegionKind::Conflict) => RegionDisplay::Deciding {
+            current: None,
+            focused: state.cursor == Some(idx),
+            has_base,
+            provenance: Some((
+                side_lines(doc, region, ui::Side::Ours),
+                side_lines(doc, region, ui::Side::Theirs),
+            )),
+            lines: Vec::new(),
+        },
+        (None, kind) => {
+            let auto = auto_choice(kind).expect("changed non-conflict region has a default");
+            RegionDisplay::Deciding {
+                current: Some(choice_kind(&auto)),
+                focused: false,
+                has_base,
+                provenance: None,
+                lines: choice_lines(doc, region, &auto),
+            }
+        }
+        (Some(choice), _) if revisiting.contains(&idx) => RegionDisplay::Deciding {
+            current: Some(choice_kind(choice)),
+            focused: state.cursor == Some(idx),
+            has_base,
+            provenance: Some((
+                side_lines(doc, region, ui::Side::Ours),
+                side_lines(doc, region, ui::Side::Theirs),
+            )),
+            lines: Vec::new(),
+        },
+        (Some(choice), _) => RegionDisplay::Decided {
+            choice: choice_kind(choice),
+            lines: choice_lines(doc, region, choice),
+        },
+    }
+}
+
 fn merge_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBanner {
     match result {
         Ok(ResolveOutcome::Done {
@@ -300,11 +393,25 @@ pub struct MergeView {
     /// Banner for saves that STAY here (protected span, errors); successful
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
-    result_scroll: UniformListScrollHandle,
+    result_scroll: ScrollHandle,
+    /// Decided regions whose strip the user reopened (non-destructive).
+    revisiting: std::collections::HashSet<usize>,
+    undo: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
+    focus_handle: FocusHandle,
+}
+
+/// One document-level undo step: a choice change on one region, with the
+/// cursor restored so undo never "jumps" (merge-editor-v2 spec).
+struct UndoEntry {
+    region: usize,
+    prev: Option<Choice>,
+    next: Choice,
+    prev_cursor: Option<usize>,
 }
 
 impl MergeView {
-    pub fn new(shell: WeakEntity<Shell>) -> Self {
+    pub fn new(shell: WeakEntity<Shell>, cx: &mut Context<Self>) -> Self {
         Self {
             shell,
             target: None,
@@ -313,7 +420,11 @@ impl MergeView {
             loaded: None,
             saving: false,
             banner: None,
-            result_scroll: UniformListScrollHandle::new(),
+            result_scroll: ScrollHandle::new(),
+            revisiting: std::collections::HashSet::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -358,27 +469,82 @@ impl MergeView {
         .detach();
     }
 
-    /// Record a per-region choice (placeholder buttons in the result pane).
-    fn pick(&mut self, region: usize, choice: Choice, cx: &mut Context<Self>) {
+    /// The single mutation funnel (merge-editor-v2 spec): record the undo
+    /// entry, apply the choice, close any revisit, advance the cursor.
+    /// Every pick path — click, keybinding, redo — lands here.
+    fn apply(&mut self, region: usize, choice: Choice, cx: &mut Context<Self>) {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        loaded.state.pick(region, choice);
+        let prev = loaded.state.resolution.get(region).cloned();
+        let prev_cursor = loaded.state.cursor;
+        loaded.state.pick(region, choice.clone());
+        self.revisiting.remove(&region);
+        self.undo.push(UndoEntry {
+            region,
+            prev,
+            next: choice,
+            prev_cursor,
+        });
+        self.redo.clear();
         cx.notify();
     }
 
-    /// `next ↓`: advance the cursor to the next unresolved conflict and
-    /// scroll the result pane to its placeholder row.
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.undo.pop() else {
+            return;
+        };
+        let Some(loaded) = &mut self.loaded else {
+            return;
+        };
+        match &entry.prev {
+            Some(choice) => loaded.state.resolution.set(entry.region, choice.clone()),
+            None => loaded.state.resolution.unset(entry.region),
+        }
+        loaded.state.cursor = entry.prev_cursor;
+        self.redo.push(entry);
+        cx.notify();
+    }
+
+    fn redo(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.redo.pop() else {
+            return;
+        };
+        let Some(loaded) = &mut self.loaded else {
+            return;
+        };
+        loaded.state.pick(entry.region, entry.next.clone());
+        self.undo.push(entry);
+        cx.notify();
+    }
+
+    /// Reopen a decided region's strip (non-destructive: the choice stands
+    /// until a new pick replaces it — Resolution is truth, so revisiting is
+    /// free, unlike Zed's dissolve-on-pick).
+    fn revisit(&mut self, region: usize, cx: &mut Context<Self>) {
+        self.revisiting.insert(region);
+        if let Some(loaded) = &mut self.loaded {
+            loaded.state.cursor = Some(region);
+        }
+        cx.notify();
+    }
+
+    /// Pick at the cursor (keybindings route here).
+    fn pick_at_cursor(&mut self, choice: Choice, cx: &mut Context<Self>) {
+        let Some(region) = self.loaded.as_ref().and_then(|l| l.state.cursor) else {
+            return;
+        };
+        self.apply(region, choice, cx);
+    }
+
+    /// `Next ↓`: advance the cursor to the next unresolved conflict and
+    /// scroll its region block into view (one column child per region).
     fn next(&mut self, cx: &mut Context<Self>) {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
         if let Some(region) = loaded.state.next_unresolved() {
-            let rows = result_rows(&loaded.state);
-            if let Some(ix) = placeholder_row_ix(&rows, region) {
-                self.result_scroll
-                    .scroll_to_item(ix, ScrollStrategy::Center);
-            }
+            self.result_scroll.scroll_to_item(region);
         }
         cx.notify();
     }
@@ -471,7 +637,21 @@ impl MergeView {
                         .whitespace_nowrap()
                         .text_color(if open == 0 { theme.ok } else { theme.conflict })
                         .child(if total == 0 {
-                            "No conflicts to resolve".to_string()
+                            let changed = loaded
+                                .state
+                                .doc
+                                .regions
+                                .iter()
+                                .filter(|r| r.kind != RegionKind::Unchanged)
+                                .count();
+                            if changed == 0 {
+                                "Nothing to merge".to_string()
+                            } else {
+                                format!(
+                                    "auto-merged · {changed} changed region{} — review below",
+                                    if changed == 1 { "" } else { "s" }
+                                )
+                            }
                         } else {
                             let s = if total == 1 { "" } else { "s" };
                             format!("{total} conflict{s}, {} resolved", total - open)
@@ -565,9 +745,13 @@ impl MergeView {
             );
         };
 
-        let degraded = loaded.state.degraded_base;
-        let rows = Rc::new(result_rows(&loaded.state));
+        let state = &loaded.state;
+        let degraded = state.degraded_base;
         let view = cx.weak_entity();
+        let blocks: Vec<AnyElement> = (0..state.doc.regions.len())
+            .map(|idx| region_block(state, idx, &self.revisiting, theme, &view))
+            .collect();
+
         div()
             .flex_1()
             .min_h_0()
@@ -622,13 +806,15 @@ impl MergeView {
                     .border_1()
                     .border_color(theme.border)
                     .child(
-                        uniform_list("merge-result", rows.len(), move |range, _window, _cx| {
-                            range
-                                .map(|ix| result_row_el(&rows[ix], degraded, theme, &view))
-                                .collect()
-                        })
-                        .track_scroll(self.result_scroll.clone())
-                        .flex_1(),
+                        div()
+                            .id("merge-result")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.result_scroll)
+                            .flex()
+                            .flex_col()
+                            .children(blocks),
                     ),
             )
             .into_any_element()
@@ -638,7 +824,30 @@ impl MergeView {
 impl Render for MergeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        // Claim focus on arrival so the keybindings work immediately.
+        if self.loaded.is_some() && !self.focus_handle.is_focused(window) {
+            self.focus_handle.focus(window);
+        }
         div()
+            .track_focus(&self.focus_handle)
+            .key_context("MergeEditor")
+            .on_action(cx.listener(|this, _: &PickDisk, _w, cx| {
+                this.pick_at_cursor(Choice::Ours, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PickSource, _w, cx| {
+                this.pick_at_cursor(Choice::Theirs, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PickBase, _w, cx| {
+                if !this.loaded.as_ref().is_some_and(|l| l.state.degraded_base) {
+                    this.pick_at_cursor(Choice::Base, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PickBoth, _w, cx| {
+                this.pick_at_cursor(Choice::Both, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextConflict, _w, cx| this.next(cx)))
+            .on_action(cx.listener(|this, _: &UndoChoice, _w, cx| this.undo(cx)))
+            .on_action(cx.listener(|this, _: &RedoChoice, _w, cx| this.redo(cx)))
             .flex_1()
             .min_h_0()
             .flex()
@@ -725,90 +934,130 @@ fn pane_row(line: &PaneLine, side: PaneSide, theme: Theme) -> Div {
         .child(ui::line_text(line.text.clone()))
 }
 
-fn result_row_el(
-    row: &ResultRow,
-    degraded_base: bool,
+/// One region's block in the result column: strip (when the region changed)
+/// over its lines. One column child per region so `Next ↓` can
+/// scroll_to_item(region index).
+fn region_block(
+    state: &MergeState,
+    idx: usize,
+    revisiting: &std::collections::HashSet<usize>,
     theme: Theme,
     view: &WeakEntity<MergeView>,
 ) -> AnyElement {
-    match row {
-        ResultRow::Line { text, muted } => ui::mono_line(theme)
-            .when(*muted, |el| el.text_color(theme.text_muted))
-            .child(ui::line_text(text.clone()))
+    let display = region_display(state, idx, revisiting);
+    let tinted_lines = |lines: Vec<(SharedString, Option<ui::Side>)>| {
+        div().flex().flex_col().children(lines.into_iter().map(|(text, side)| {
+            let row = ui::mono_line(theme)
+                .child(ui::line_gutter(theme.text_muted, ""))
+                .child(ui::line_text(text));
+            match side {
+                Some(side) => row.bg(Theme::wash(side.tint(theme), 0.07)),
+                None => row.bg(Theme::wash(theme.ok, 0.07)),
+            }
+        }))
+    };
+    let strip_for = |current, focused, has_base| {
+        let on_pick = {
+            let view = view.clone();
+            move |kind: ui::ChoiceKind, _ev: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                let choice = match kind {
+                    ui::ChoiceKind::Ours => Choice::Ours,
+                    ui::ChoiceKind::Theirs => Choice::Theirs,
+                    ui::ChoiceKind::Base => Choice::Base,
+                    ui::ChoiceKind::Both => Choice::Both,
+                    ui::ChoiceKind::Edited => return,
+                };
+                view.update(cx, |merge, cx| merge.apply(idx, choice, cx)).ok();
+            }
+        };
+        // Hand-editing lands with the TextArea integration (spec step 7).
+        let on_edit = |_: &ClickEvent, _: &mut Window, _: &mut App| {};
+        let on_revisit = {
+            let view = view.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                view.update(cx, |merge, cx| merge.revisit(idx, cx)).ok();
+            }
+        };
+        ui::decision_strip(
+            theme,
+            idx,
+            ui::StripState::Deciding {
+                has_base,
+                current,
+                focused,
+            },
+            on_pick,
+            on_edit,
+            on_revisit,
+        )
+    };
+
+    match display {
+        RegionDisplay::Context { lines } => div()
+            .flex()
+            .flex_col()
+            .children(lines.into_iter().map(|text| {
+                ui::mono_line(theme)
+                    .text_color(theme.text_muted)
+                    .child(ui::line_gutter(theme.text_muted, ""))
+                    .child(ui::line_text(text))
+            }))
             .into_any_element(),
-        ResultRow::Placeholder { region, focused } => {
-            let region = *region;
-            div()
-                .h_5()
+        RegionDisplay::Deciding {
+            current,
+            focused,
+            has_base,
+            provenance,
+            lines,
+        } => {
+            let block = div()
                 .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .text_xs()
-                .bg(Theme::wash(
-                    theme.conflict,
-                    if *focused { 0.15 } else { 0.08 },
-                ))
-                .child(div().text_color(theme.conflict).child("‹pick one›"))
-                .child(pick_button(
-                    "merge-pick-ours",
-                    "ours",
-                    region,
-                    Choice::Ours,
-                    theme.drift,
-                    theme,
-                    view,
-                ))
-                .child(pick_button(
-                    "merge-pick-theirs",
-                    "theirs",
-                    region,
-                    Choice::Theirs,
-                    theme.accent,
-                    theme,
-                    view,
-                ))
-                .when(!degraded_base, |el| {
-                    el.child(pick_button(
-                        "merge-pick-base",
-                        "base",
-                        region,
-                        Choice::Base,
-                        theme.text_muted,
+                .flex_col()
+                .my_1()
+                .child(strip_for(current, focused, has_base));
+            match provenance {
+                Some((ours, theirs)) => block
+                    .child(ui::provenance_label(theme, ui::Side::Ours))
+                    .child(ui::provenance_rows(
                         theme,
-                        view,
+                        ui::Side::Ours,
+                        &ours,
+                        &std::collections::HashSet::new(),
                     ))
-                })
+                    .child(ui::provenance_label(theme, ui::Side::Theirs))
+                    .child(ui::provenance_rows(
+                        theme,
+                        ui::Side::Theirs,
+                        &theirs,
+                        &std::collections::HashSet::new(),
+                    ))
+                    .into_any_element(),
+                None => block.child(tinted_lines(lines)).into_any_element(),
+            }
+        }
+        RegionDisplay::Decided { choice, lines } => {
+            let on_revisit = {
+                let view = view.clone();
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    view.update(cx, |merge, cx| merge.revisit(idx, cx)).ok();
+                }
+            };
+            div()
+                .flex()
+                .flex_col()
+                .my_1()
+                .child(ui::decision_strip(
+                    theme,
+                    idx,
+                    ui::StripState::Decided { choice },
+                    |_, _, _, _| {},
+                    |_, _, _| {},
+                    on_revisit,
+                ))
+                .child(tinted_lines(lines))
                 .into_any_element()
         }
     }
-}
-
-/// Inline pick button on a placeholder row, tinted like the pane it takes
-/// from (ours → drift, theirs → accent, base → muted).
-fn pick_button(
-    id: &'static str,
-    label: &'static str,
-    region: usize,
-    choice: Choice,
-    color: Rgba,
-    theme: Theme,
-    view: &WeakEntity<MergeView>,
-) -> Stateful<Div> {
-    let view = view.clone();
-    ui::button(
-        theme,
-        ElementId::named_usize(id, region),
-        label.into(),
-        ui::ButtonVariant::Outline(color),
-        ui::ButtonSize::Micro,
-        move |_ev, _window, cx| {
-            let choice = choice.clone();
-            view.update(cx, |merge, cx| merge.pick(region, choice, cx))
-                .ok();
-        },
-    )
-    .flex_none()
 }
 
 #[cfg(test)]
@@ -825,8 +1074,13 @@ mod tests {
 
     use super::super::review::BannerTint;
     use super::{
-        LoadedMerge, PaneSide, ResultRow, merge_banner, pane_lines, placeholder_row_ix,
-        protected_line_set, result_rows, row_bg,
+        LoadedMerge, PaneSide, RegionDisplay, merge_banner, pane_lines, protected_line_set,
+        region_display, row_bg,
+    };
+    use gpui::SharedString;
+    use czui_ui::components::{ChoiceKind, Side};
+    #[allow(unused_imports)]
+    use super::{
     };
 
     fn inputs(base: Option<&str>, ours: &str, theirs: &str) -> MergeInputs {
@@ -937,58 +1191,106 @@ mod tests {
     }
 
     #[test]
-    fn result_rows_render_placeholder_then_chosen_lines_after_pick() {
+    fn region_display_conflict_lifecycle() {
+        use std::collections::HashSet;
         let mut state = conflict_state();
         let region = state.conflicts()[0];
-        let rows = result_rows(&state);
-        assert_eq!(
-            rows,
-            [
-                ResultRow::Line {
-                    text: "a".into(),
-                    muted: true
-                },
-                ResultRow::Placeholder {
-                    region,
-                    focused: true // cursor starts on the first conflict
-                },
-                ResultRow::Line {
-                    text: "z".into(),
-                    muted: true
-                },
-            ]
-        );
-        assert_eq!(placeholder_row_ix(&rows, region), Some(1));
+        let none = HashSet::new();
 
-        state.pick(region, Choice::Theirs);
-        let rows = result_rows(&state);
-        assert_eq!(
-            rows[1],
-            ResultRow::Line {
-                text: "v = 3".into(),
-                muted: false
+        // Undecided conflict: open decision with both sides' provenance.
+        match region_display(&state, region, &none) {
+            RegionDisplay::Deciding {
+                current: None,
+                focused: true,
+                provenance: Some((ours, theirs)),
+                ..
+            } => {
+                assert_eq!(ours, vec![SharedString::from("v = 2")]);
+                assert_eq!(theirs, vec![SharedString::from("v = 3")]);
             }
-        );
-        assert_eq!(placeholder_row_ix(&rows, region), None);
+            other => panic!("expected open conflict, got {other:?}"),
+        }
+
+        // Picked: collapsed decided state with the chosen side's lines.
+        state.pick(region, Choice::Theirs);
+        match region_display(&state, region, &none) {
+            RegionDisplay::Decided {
+                choice: ChoiceKind::Theirs,
+                lines,
+            } => assert_eq!(
+                lines,
+                vec![(
+                    SharedString::from("v = 3"),
+                    Some(Side::Theirs)
+                )]
+            ),
+            other => panic!("expected decided, got {other:?}"),
+        }
+
+        // Revisiting reopens with the current choice marked.
+        let mut revisiting = HashSet::new();
+        revisiting.insert(region);
+        match region_display(&state, region, &revisiting) {
+            RegionDisplay::Deciding {
+                current: Some(ChoiceKind::Theirs),
+                provenance: Some(_),
+                ..
+            } => {}
+            other => panic!("expected revisit, got {other:?}"),
+        }
+
+        // Both: ours half then theirs half, each with its own provenance.
+        state.pick(region, Choice::Both);
+        match region_display(&state, region, &none) {
+            RegionDisplay::Decided {
+                choice: ChoiceKind::Both,
+                lines,
+            } => assert_eq!(
+                lines,
+                vec![
+                    (
+                        SharedString::from("v = 2"),
+                        Some(Side::Ours)
+                    ),
+                    (
+                        SharedString::from("v = 3"),
+                        Some(Side::Theirs)
+                    ),
+                ]
+            ),
+            other => panic!("expected both, got {other:?}"),
+        }
     }
 
     #[test]
-    fn result_rows_auto_regions_take_their_side_without_a_choice() {
-        // ours-only edit: the result shows the disk line, normal tint.
+    fn auto_region_shows_overridable_default() {
+        use std::collections::HashSet;
+        // ours-only edit: auto-resolved to disk, shown as an open (auto)
+        // decision so the user can override it — the merge-editor-v2 fix.
         let state = MergeState::new(&inputs(Some("a\nb\n"), "a\nB\n", "a\nb\n"));
-        assert_eq!(
-            result_rows(&state),
-            [
-                ResultRow::Line {
-                    text: "a".into(),
-                    muted: true
-                },
-                ResultRow::Line {
-                    text: "B".into(),
-                    muted: false
-                },
-            ]
-        );
+        let none = HashSet::new();
+        let region_ix = state
+            .doc
+            .regions
+            .iter()
+            .position(|r| r.kind == RegionKind::OursOnly)
+            .expect("ours-only region");
+        match region_display(&state, region_ix, &none) {
+            RegionDisplay::Deciding {
+                current: Some(ChoiceKind::Ours),
+                focused: false,
+                provenance: None,
+                lines,
+                ..
+            } => assert_eq!(
+                lines,
+                vec![(
+                    SharedString::from("B"),
+                    Some(Side::Ours)
+                )]
+            ),
+            other => panic!("expected auto decision, got {other:?}"),
+        }
     }
 
     fn done(committed: bool, pushed: bool, note: Option<&str>) -> ResolveOutcome {

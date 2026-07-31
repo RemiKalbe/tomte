@@ -276,6 +276,7 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
     }
 
     Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
+        views::merge::register_keys(cx);
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         let app = NSApplication::sharedApplication(mtm);
         if let Some(dark) = dark {
@@ -342,6 +343,7 @@ fn run_live(route: Route, paths: Paths) -> ExitCode {
     use objc2_app_kit::NSApplication;
 
     Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
+        views::merge::register_keys(cx);
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         set_accessory_policy(mtm);
 
@@ -848,6 +850,7 @@ fn main() -> ExitCode {
     }
 
     Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
+        views::merge::register_keys(cx);
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         set_accessory_policy(mtm);
         let (status, menu_rx) = StatusItem::install(mtm);

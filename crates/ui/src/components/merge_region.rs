@@ -16,7 +16,7 @@ use crate::components::mono::{line_gutter, line_text, mono_line};
 use crate::theme::Theme;
 
 /// Which side a provenance block shows.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     /// Disk (ours) — drift amber.
     Ours,

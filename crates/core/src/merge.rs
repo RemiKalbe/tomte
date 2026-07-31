@@ -270,6 +270,10 @@ impl Resolution {
     pub fn get(&self, region_index: usize) -> Option<&Choice> {
         self.choices.get(&region_index)
     }
+    /// Remove a recorded choice (undo of a first-time pick).
+    pub fn unset(&mut self, region_index: usize) {
+        self.choices.remove(&region_index);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
