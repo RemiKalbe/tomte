@@ -131,6 +131,28 @@ pub(super) fn journal_path() -> PathBuf {
 struct LoadedDetail {
     pub(super) provenance: Vec<ProvRow>,
     pub(super) preview: PreviewState,
+    /// The 3-way merge dry-run assembled cleanly (zero conflicts) AND the
+    /// result differs from both sides → "Keep both" is a real third option.
+    pub(super) auto_merge: Option<(std::sync::Arc<czui_app::merge_inputs::MergeInputs>, String)>,
+}
+
+/// Dry-run the 3-way merge; `Some` only when it auto-resolves to something
+/// neither side already is (otherwise Keep disk / Keep source cover it).
+fn auto_merge_blocking(target: &Path, journal: &Path) -> Option<(
+    std::sync::Arc<czui_app::merge_inputs::MergeInputs>,
+    String,
+)> {
+    let chezmoi = ChezmoiClient::new(Arc::new(SystemRunner), ChezmoiOptions::default());
+    let inputs = czui_app::merge_inputs::load(&chezmoi, journal, target).ok()?;
+    let state = czui_app::merge_state::MergeState::new(&inputs);
+    if !state.conflicts().is_empty() {
+        return None;
+    }
+    let assembled = state.assembled()?;
+    if assembled == inputs.ours || assembled == inputs.theirs {
+        return None;
+    }
+    Some((std::sync::Arc::new(inputs), assembled))
 }
 
 fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
@@ -144,6 +166,7 @@ fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
     LoadedDetail {
         provenance,
         preview: load_preview_blocking(target),
+        auto_merge: auto_merge_blocking(target, journal),
     }
 }
 
@@ -221,6 +244,48 @@ pub(crate) struct OutcomeBanner {
     pub(crate) tint: BannerTint,
     /// Successful resolutions offer an Undo button (spec §6.3).
     pub(crate) undoable: bool,
+}
+
+/// Banner for the "Keep both" quick action (merged write-back).
+fn keep_both_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBanner {
+    match result {
+        Ok(ResolveOutcome::Done {
+            note: None,
+            committed,
+            pushed,
+            ..
+        }) => OutcomeBanner {
+            text: if *committed && *pushed {
+                "Kept both (merged) · committed & pushed".into()
+            } else {
+                "Kept both (merged)".into()
+            },
+            tint: BannerTint::Ok,
+            undoable: true,
+        },
+        Ok(ResolveOutcome::Done {
+            note: Some(note), ..
+        }) => OutcomeBanner {
+            text: format!("Kept both (merged) · {note}").into(),
+            tint: BannerTint::Drift,
+            undoable: true,
+        },
+        Ok(ResolveOutcome::NeedsMergeEditor) => OutcomeBanner {
+            text: "Templated file · use the merge editor".into(),
+            tint: BannerTint::Drift,
+            undoable: false,
+        },
+        Ok(ResolveOutcome::ProtectedSpan { detail }) => OutcomeBanner {
+            text: format!("This change touches a templated value · {detail}").into(),
+            tint: BannerTint::Drift,
+            undoable: false,
+        },
+        Err(e) => OutcomeBanner {
+            text: format!("Keep both failed: {e}").into(),
+            tint: BannerTint::Conflict,
+            undoable: false,
+        },
+    }
 }
 
 /// Map an action result onto its banner. Tint policy: a `note` means the
@@ -448,6 +513,8 @@ pub struct ReviewView {
     /// Provenance for the selected target, newest first (background-loaded
     /// together with the preview).
     pub(super) provenance: Vec<ProvRow>,
+    /// Clean 3-way dry-run for the selected target → "Keep both" offered.
+    pub(super) auto_merge: Option<(std::sync::Arc<czui_app::merge_inputs::MergeInputs>, String)>,
     /// Outcome of the last resolve/undo action, rendered as a banner above
     /// the diff. `pub(super)` for the render-smoke tests.
     pub(super) last_outcome: Option<OutcomeBanner>,
@@ -467,6 +534,7 @@ impl ReviewView {
             selected: None,
             preview: PreviewState::Empty,
             provenance: Vec::new(),
+            auto_merge: None,
             last_outcome: None,
             action_in_flight: false,
         }
@@ -484,6 +552,7 @@ impl ReviewView {
         self.selected = Some(target.clone());
         self.preview = PreviewState::Loading;
         self.provenance.clear();
+        self.auto_merge = None;
         cx.notify();
 
         let journal = journal_path();
@@ -498,6 +567,7 @@ impl ReviewView {
                 // Stale guard: the user may have clicked elsewhere meanwhile.
                 if view.selected.as_deref() == Some(target.as_path()) {
                     view.provenance = loaded.provenance;
+                    view.auto_merge = loaded.auto_merge;
                     view.preview = loaded.preview;
                     cx.notify();
                 }
@@ -595,6 +665,38 @@ impl ReviewView {
             this.update(cx, |view, cx| {
                 view.action_in_flight = false;
                 view.last_outcome = Some(undo_banner(&result));
+                if let Some(target) = view.selected.clone() {
+                    view.select(target, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// "Keep both": write the clean auto-merge through the same snapshot →
+    /// resolve_merged pipeline the merge editor's Save uses (undoable).
+    fn run_keep_both(&mut self, cx: &mut Context<Self>) {
+        let Some((inputs, assembled)) = self.auto_merge.clone() else {
+            return;
+        };
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            return;
+        };
+        self.action_in_flight = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { engine.resolve_merged(&inputs, &assembled) })
+                .await;
+            this.update(cx, |view, cx| {
+                view.action_in_flight = false;
+                view.last_outcome = Some(keep_both_banner(&result));
                 if let Some(target) = view.selected.clone() {
                     view.select(target, cx);
                 }
@@ -883,6 +985,26 @@ impl ReviewView {
                             theme,
                             cx,
                         ))
+                        .when(self.auto_merge.is_some(), |el| {
+                            el.child(if engine_ready {
+                                ui::button(
+                                    theme,
+                                    "keep-both",
+                                    "Keep both".into(),
+                                    ui::ButtonVariant::Outline(theme.ok),
+                                    ui::ButtonSize::Sm,
+                                    cx.listener(|view, _ev, _window, cx| view.run_keep_both(cx)),
+                                )
+                            } else {
+                                ui::disabled_button(
+                                    theme,
+                                    "keep-both",
+                                    "Keep both".into(),
+                                    ui::ButtonSize::Sm,
+                                    Some("daemon not connected".into()),
+                                )
+                            })
+                        })
                         .into_any_element()
                 },
                 self.merge_editor_button(engine_ready, is_conflict, theme, cx)

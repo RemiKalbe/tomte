@@ -32,6 +32,7 @@ pub const STATES: &[(&str, &str)] = &[
     ("review-empty", "nothing selected"),
     ("review-banner", "action outcome banner with Undo"),
     ("review-working", "action in flight"),
+    ("review-keep-both", "clean auto-merge: third quick action offered"),
     ("merge", "three-pane editor with unresolved conflicts"),
     ("merge-auto", "no conflicts: auto-merged regions, overridable strips"),
     ("merge-templated", "templated file with protected 🔒 spans"),
@@ -335,7 +336,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             shell(Route::Dashboard, m)
         }
         "dashboard-disconnected" => shell(Route::Dashboard, SyncModel::default()),
-        "review" | "review-empty" | "review-banner" | "review-working" => {
+        "review" | "review-empty" | "review-banner" | "review-working" | "review-keep-both" => {
             let model = rich_model();
             let mut s = shell(Route::Review, model);
             let (banner, in_flight, selected) = match name {
@@ -352,7 +353,22 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 "review-working" => (None, true, true),
                 _ => (None, false, true),
             };
-            s.review = Some(posed_review(cx, s.state.clone(), banner, in_flight, selected));
+            let review = posed_review(cx, s.state.clone(), banner, in_flight, selected);
+            if name == "review-keep-both" {
+                review.update(cx, |view, _| {
+                    let inputs = czui_app::merge_inputs::MergeInputs {
+                        target: home(".config/zed/settings.json"),
+                        ours: "a\n".into(),
+                        theirs: "b\n".into(),
+                        base: Some("x\n".into()),
+                        source_path: home(".local/share/chezmoi/dot_config/zed/settings.json"),
+                        templated: false,
+                        span_map: None,
+                    };
+                    view.auto_merge = Some((Arc::new(inputs), "merged\n".into()));
+                });
+            }
+            s.review = Some(review);
             s
         }
         "merge" => {
