@@ -61,11 +61,20 @@ struct PaneLine {
 /// Per-line region tint. The conflict wash lands on every pane; one-sided
 /// changes tint only the pane that carries them; `BothSame` gets a subtle ok
 /// wash on the two changed panes.
+/// Changed lines are tinted by THE SIDE THEY BELONG TO — amber in the
+/// on-disk pane, blue in the source pane, muted in the base pane — matching
+/// the provenance blocks in the result. Conflict rows use a stronger wash of
+/// the same side tint so they still read hotter than one-sided changes.
 fn row_bg(kind: RegionKind, side: PaneSide, theme: &Theme) -> Option<Rgba> {
+    let side_tint = match side {
+        PaneSide::Ours => theme.drift,
+        PaneSide::Theirs => theme.accent,
+        PaneSide::Base => theme.text_muted,
+    };
     match (kind, side) {
-        (RegionKind::Conflict, _) => Some(Theme::wash(theme.conflict, 0.10)),
-        (RegionKind::OursOnly, PaneSide::Ours) => Some(Theme::wash(theme.drift, 0.08)),
-        (RegionKind::TheirsOnly, PaneSide::Theirs) => Some(Theme::wash(theme.accent, 0.08)),
+        (RegionKind::Conflict, _) => Some(Theme::wash(side_tint, 0.16)),
+        (RegionKind::OursOnly, PaneSide::Ours) => Some(Theme::wash(side_tint, 0.08)),
+        (RegionKind::TheirsOnly, PaneSide::Theirs) => Some(Theme::wash(side_tint, 0.08)),
         (RegionKind::BothSame, PaneSide::Ours | PaneSide::Theirs) => {
             Some(Theme::wash(theme.ok, 0.06))
         }
@@ -1126,13 +1135,24 @@ mod tests {
     }
 
     #[test]
-    fn row_bg_tints_conflicts_everywhere_and_one_sided_changes_on_their_pane() {
+    fn row_bg_tints_by_owning_side() {
         let t = Theme::dark();
+        // Conflict rows carry each pane's OWN tint (stronger wash), so a
+        // line's color always names where it comes from (user feedback,
+        // 2026-07-31).
+        assert_eq!(
+            row_bg(RegionKind::Conflict, PaneSide::Ours, &t),
+            Some(Theme::wash(t.drift, 0.16))
+        );
+        assert_eq!(
+            row_bg(RegionKind::Conflict, PaneSide::Theirs, &t),
+            Some(Theme::wash(t.accent, 0.16))
+        );
+        assert_eq!(
+            row_bg(RegionKind::Conflict, PaneSide::Base, &t),
+            Some(Theme::wash(t.text_muted, 0.16))
+        );
         for side in [PaneSide::Theirs, PaneSide::Base, PaneSide::Ours] {
-            assert_eq!(
-                row_bg(RegionKind::Conflict, side, &t),
-                Some(Theme::wash(t.conflict, 0.10))
-            );
             assert_eq!(row_bg(RegionKind::Unchanged, side, &t), None);
         }
         assert_eq!(
