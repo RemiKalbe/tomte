@@ -350,8 +350,22 @@ fn main() -> ExitCode {
     {
         let core = core.clone();
         std::thread::spawn(move || {
+            // Hourly safety rescan — but while DEGRADED (locked 1Password,
+            // broken decryption…), re-check every minute so recovery is
+            // visible moments after the user fixes the cause, not up to an
+            // hour later (2026-08-03 UX report: self-heal felt like magic).
+            let mut ticks_since_scan = 0u32;
             loop {
-                std::thread::sleep(Duration::from_secs(3600));
+                std::thread::sleep(Duration::from_secs(60));
+                ticks_since_scan += 1;
+                let degraded = core
+                    .try_lock()
+                    .map(|c| c.status_snapshot().2.is_some())
+                    .unwrap_or(false);
+                if !degraded && ticks_since_scan < 60 {
+                    continue;
+                }
+                ticks_since_scan = 0;
                 if let Ok(mut c) = core.lock()
                     && let Err(e) = c.full_rescan(now_ts())
                 {

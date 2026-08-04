@@ -233,10 +233,14 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
         Ok(c) => c,
         Err(std::sync::TryLockError::WouldBlock) => {
             return match request {
+                // A running scan is NOT a degradation — scanning:true is the
+                // whole story, and clients keep their last real degraded
+                // hint (2026-08-04: the busy text leaked into the degraded
+                // banner as "scan in progress… · re-checks every minute").
                 Request::Status => Response::Status {
                     drifted: Vec::new(),
                     in_sync: 0,
-                    degraded: Some("scan in progress…".into()),
+                    degraded: None,
                     scanning: true,
                 },
                 _ => Response::Error {

@@ -59,7 +59,12 @@ impl SyncModel {
         let placeholder = scanning && drifted.is_empty() && in_sync == 0;
         let have_data = !self.drifted.is_empty() || self.in_sync > 0;
         if placeholder && have_data {
-            self.degraded = degraded;
+            // Busy snapshots carry no hint; keep the last real one so a
+            // persistent degradation (locked 1Password) doesn't flicker off
+            // during every scan. A present hint (daemon "starting: …") wins.
+            if degraded.is_some() {
+                self.degraded = degraded;
+            }
             return;
         }
         self.drifted.clear();
@@ -773,11 +778,27 @@ mod tests {
             None,
             false,
         );
-        // rescan begins: daemon reports placeholder zeros + scanning
-        m.hydrate_status(vec![], 0, Some("scan in progress…".into()), true);
+        // A real degraded hint lands first (locked 1Password).
+        m.hydrate_status(
+            vec![summary("/a", "destination_drift", Some(1))],
+            954,
+            Some("Unlock 1Password and retry.".into()),
+            false,
+        );
+        // rescan begins: busy snapshot carries placeholder zeros + scanning
+        // and NO hint — stats AND the real hint must both survive.
+        m.hydrate_status(vec![], 0, None, true);
         assert_eq!(m.in_sync, 954, "stats must survive a rescan");
         assert_eq!(m.drifted.len(), 1);
         assert!(m.scanning);
+        assert_eq!(
+            m.degraded.as_deref(),
+            Some("Unlock 1Password and retry."),
+            "a persistent degradation must not flicker off during scans"
+        );
+        // A scanning status WITH a hint (daemon starting) still lands.
+        m.hydrate_status(vec![], 0, Some("chezmoid starting: building core".into()), true);
+        assert_eq!(m.degraded.as_deref(), Some("chezmoid starting: building core"));
         // scan lands: real data replaces
         m.hydrate_status(vec![], 955, None, false);
         assert_eq!(m.in_sync, 955);

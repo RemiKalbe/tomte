@@ -292,6 +292,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         paths: paths.clone(),
         expanded_scans: HashSet::new(),
         dashboard_action_in_flight: false,
+        unlock_in_flight: false,
     };
 
     // Component previews: bare Shell routed at the preview (no posed data).
@@ -330,7 +331,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "dashboard-degraded" => {
             let mut m = rich_model();
             m.degraded = Some(
-                "chezmoi cannot evaluate templates: 1Password is locked (set OP_ACCOUNT in Settings)"
+                "chezmoi cannot evaluate templates: 1Password CLI could not authenticate. Unlock 1Password and retry."
                     .into(),
             );
             shell(Route::Dashboard, m)

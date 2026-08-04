@@ -280,13 +280,20 @@ fn handshake_and_status_survive_a_long_scan_holding_the_core() {
     match recv(&mut reader) {
         ServerFrame::Reply {
             id: 3,
-            response: Response::Status {
-                drifted, degraded, ..
-            },
+            response:
+                Response::Status {
+                    drifted,
+                    degraded,
+                    scanning,
+                    ..
+                },
         } => {
             assert!(drifted.is_empty());
-            assert_eq!(degraded.as_deref(), Some("scan in progress…"));
+            // Busy is NOT a degradation: scanning carries the state and the
+            // hint stays clear so clients keep their last real one.
+            assert!(scanning, "busy status must report scanning");
+            assert_eq!(degraded, None);
         }
-        other => panic!("expected degraded status, got {other:?}"),
+        other => panic!("expected busy status, got {other:?}"),
     }
 }

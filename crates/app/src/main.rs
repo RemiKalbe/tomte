@@ -409,6 +409,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     paths,
                     expanded_scans: Default::default(),
                     dashboard_action_in_flight: false,
+                    unlock_in_flight: false,
                 }
             })
         },

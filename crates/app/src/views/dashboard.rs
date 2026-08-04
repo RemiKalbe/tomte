@@ -37,6 +37,26 @@ pub fn system_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// What the degraded banner's action button should do — matched against our
+/// own hint texts from `czui_core::chezmoi::classify_eval_stderr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DegradedRemedy {
+    /// 1Password is locked: the fix is an unlock prompt, not a setting.
+    UnlockOnePassword,
+    /// Configuration problem (account selection): Settings is the fix.
+    OpenSettings,
+}
+
+pub(super) fn degraded_remedy(hint: &str) -> Option<DegradedRemedy> {
+    if hint.contains("Unlock 1Password") {
+        Some(DegradedRemedy::UnlockOnePassword)
+    } else if hint.contains("Settings") {
+        Some(DegradedRemedy::OpenSettings)
+    } else {
+        None
+    }
+}
+
 /// Moved to czui-ui; re-exported so sibling views keep their import paths.
 pub(super) use czui_ui::components::{TextTooltip, shorten_home};
 
@@ -145,6 +165,9 @@ pub struct DashboardView {
     /// Copied from `Shell::dashboard_action_in_flight`: a quick action is
     /// running, so the inline row buttons yield to a "working…" marker.
     pub action_in_flight: bool,
+    /// Copied from `Shell::unlock_in_flight`: the 1Password unlock probe is
+    /// waiting on the user's approval.
+    pub unlock_in_flight: bool,
 }
 
 impl DashboardView {
@@ -186,6 +209,7 @@ impl DashboardView {
             .try_global::<crate::EngineSlot>()
             .and_then(|slot| slot.0.clone());
         let busy = self.action_in_flight;
+        let unlock_in_flight = self.unlock_in_flight;
 
         div()
             .flex()
@@ -242,27 +266,85 @@ impl DashboardView {
                     )),
             )
             .when_some(degraded, |el, hint| {
-                let settings_remedy = {
-                    let h = hint.to_lowercase();
-                    h.contains("1password") || h.contains("op_account")
-                };
                 let shell = shell.clone();
-                let action = settings_remedy.then(|| {
-                    ui::button(
-                        theme,
-                        "degraded-open-settings",
-                        "Open Settings".into(),
-                        ui::ButtonVariant::Outline(theme.drift),
-                        ui::ButtonSize::Micro,
-                        move |_event, _window, cx| {
-                            let _ = shell.update(cx, |shell, cx| {
-                                shell.route = super::Route::Settings;
-                                cx.notify();
-                            });
-                        },
-                    )
-                    .into_any_element()
-                });
+                let remedy = degraded_remedy(&hint);
+                // The button IS the instruction — drop our own hint's
+                // redundant trailing imperative so the text stays short
+                // (the banner clips rather than ellipsizes; gpui quirk).
+                let hint = if remedy == Some(DegradedRemedy::UnlockOnePassword) {
+                    hint.trim_end()
+                        .trim_end_matches("Unlock 1Password and retry.")
+                        .trim_end()
+                        .to_string()
+                } else {
+                    hint
+                };
+                let action = match remedy {
+                    _ if unlock_in_flight => Some(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child("waiting for 1Password…")
+                            .into_any_element(),
+                    ),
+                    Some(DegradedRemedy::UnlockOnePassword) => Some(
+                        ui::button(
+                            theme,
+                            "degraded-unlock-1p",
+                            "Unlock 1Password".into(),
+                            ui::ButtonVariant::Outline(theme.drift),
+                            ui::ButtonSize::Micro,
+                            {
+                                let shell = shell.clone();
+                                let engine = engine.clone();
+                                move |_event, _window, cx| {
+                                    trigger_onepassword_unlock(
+                                        shell.clone(),
+                                        engine.clone(),
+                                        cx,
+                                    );
+                                }
+                            },
+                        )
+                        .into_any_element(),
+                    ),
+                    Some(DegradedRemedy::OpenSettings) => Some(
+                        ui::button(
+                            theme,
+                            "degraded-open-settings",
+                            "Open Settings".into(),
+                            ui::ButtonVariant::Outline(theme.drift),
+                            ui::ButtonSize::Micro,
+                            move |_event, _window, cx| {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.route = super::Route::Settings;
+                                    cx.notify();
+                                });
+                            },
+                        )
+                        .into_any_element(),
+                    ),
+                    None => None,
+                };
+                // Self-healing is real but was invisible — say it in the
+                // non-truncating action slot (long hints ellipsize; the
+                // promise and the button never do).
+                let action = Some(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::wash(theme.drift, 0.7))
+                                .child("re-checks every minute"),
+                        )
+                        .when_some(action, |el, a| el.child(a))
+                        .into_any_element(),
+                );
                 el.child(
                     ui::banner(theme, ui::BannerTint::Drift, hint.into(), action)
                         .mx_4()
@@ -377,6 +459,50 @@ fn skeleton_rows(theme: Theme) -> gpui::AnyElement {
                 )
         }))
         .into_any_element()
+}
+
+/// Run a cheap `op` command: with 1Password desktop-app integration this
+/// pops the system unlock prompt (Touch ID / password). Whatever the
+/// outcome, ask the daemon to rescan — if the user authorized, the next
+/// scan heals; if not, the banner honestly stays.
+fn trigger_onepassword_unlock(
+    shell: WeakEntity<Shell>,
+    engine: Option<Arc<ResolveEngine>>,
+    cx: &mut App,
+) {
+    let set_flag = |cx: &mut App, value: bool| {
+        let _ = shell.update(cx, |shell, cx| {
+            shell.unlock_in_flight = value;
+            cx.notify();
+        });
+    };
+    set_flag(cx, true);
+    let shell2 = shell.clone();
+    cx.spawn(async move |cx| {
+        let _ = cx
+            .background_executor()
+            .spawn(async move {
+                use czui_core::cmd::{CommandRequest, CommandRunner as _};
+                // Generous timeout: this intentionally waits for a human to
+                // approve the 1Password prompt.
+                let _ = SystemRunner.run(
+                    CommandRequest::new("op")
+                        .args(["whoami", "--format=json"])
+                        .timeout(std::time::Duration::from_secs(120)),
+                );
+                if let Some(engine) = engine {
+                    let _ = engine.ipc.request(czui_proto::Request::Rescan);
+                }
+            })
+            .await;
+        let _ = cx.update(|cx| {
+            let _ = shell2.update(cx, |shell, cx| {
+                shell.unlock_in_flight = false;
+                cx.notify();
+            });
+        });
+    })
+    .detach();
 }
 
 /// One mockup-B health tile: big value, muted label, optional action slot.
@@ -749,7 +875,7 @@ mod tests {
     use czui_app::resolve::{ResolveError, ResolveOutcome};
 
     use super::super::review::ResolveAction;
-    use super::quick_action_body;
+    use super::{DegradedRemedy, degraded_remedy, quick_action_body};
 
     fn done(note: Option<&str>) -> ResolveOutcome {
         ResolveOutcome::Done {
@@ -758,6 +884,24 @@ mod tests {
             pushed: note.is_none(),
             note: note.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn degraded_remedy_matches_cause() {
+        // Locked 1P: the fix is an unlock prompt, not Settings.
+        assert_eq!(
+            degraded_remedy("1Password CLI could not authenticate. Unlock 1Password and retry."),
+            Some(DegradedRemedy::UnlockOnePassword)
+        );
+        // Config problem: Settings is right.
+        assert_eq!(
+            degraded_remedy(
+                "Select a 1Password account in Settings (sets OP_ACCOUNT for all chezmoi calls)."
+            ),
+            Some(DegradedRemedy::OpenSettings)
+        );
+        // Unknown causes get no button, just the honest text.
+        assert_eq!(degraded_remedy("age decryption failed"), None);
     }
 
     #[test]

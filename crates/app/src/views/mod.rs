@@ -65,6 +65,9 @@ pub struct Shell {
     /// from Shell state on every render (unlike the long-lived ReviewView,
     /// which tracks its own in-flight flag).
     pub dashboard_action_in_flight: bool,
+    /// The 1Password unlock probe (degraded-banner button) is waiting on the
+    /// user's approval.
+    pub unlock_in_flight: bool,
 }
 
 impl Shell {
@@ -268,6 +271,7 @@ impl Render for Shell {
                             now_ts: dashboard::system_now,
                             expanded_scans: self.expanded_scans.clone(),
                             action_in_flight: self.dashboard_action_in_flight,
+                            unlock_in_flight: self.unlock_in_flight,
                         }
                         .render(theme, cx)
                         .into_any_element(),
@@ -393,6 +397,7 @@ mod render_smoke {
                     paths: smoke_paths(),
                     expanded_scans,
                     dashboard_action_in_flight: false,
+                    unlock_in_flight: false,
                 }
             });
             vis.run_until_parked();
@@ -449,6 +454,7 @@ mod render_smoke {
                     // also exercises the dashboard's "working…" swap when the
                     // shell flag is up (the drifted row is in the timeline)
                     dashboard_action_in_flight: in_flight,
+                    unlock_in_flight: false,
                 }
             });
             vis.run_until_parked();
@@ -466,6 +472,7 @@ mod render_smoke {
                 paths: smoke_paths(),
                 expanded_scans: HashSet::new(),
                 dashboard_action_in_flight: true,
+                unlock_in_flight: false,
             }
         });
         vis.run_until_parked();
@@ -489,6 +496,7 @@ mod render_smoke {
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
                     dashboard_action_in_flight: false,
+                    unlock_in_flight: false,
                 }
             });
             vis.run_until_parked();
@@ -596,6 +604,7 @@ mod render_smoke {
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
                     dashboard_action_in_flight: false,
+                    unlock_in_flight: false,
                 }
             });
             vis.run_until_parked();
