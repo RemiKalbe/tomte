@@ -56,8 +56,31 @@ impl GitClient {
     }
 
     pub fn fetch(&self, remote: &str) -> Result<(), GitError> {
-        self.run(&["fetch", "--quiet", remote], Duration::from_secs(120))?;
-        Ok(())
+        // A locked 1Password SSH agent leaves ssh sitting on a GUI prompt;
+        // without these, a post-sleep fetch hangs the full timeout while
+        // HOLDING THE DAEMON'S CORE LOCK, which the app then misreads as a
+        // stuck daemon (2026-08-02 sleep/wake incident). BatchMode + no
+        // terminal prompt turn a locked agent into a fast, honest failure
+        // surfaced as a degraded hint.
+        let out = self.runner.run(
+            CommandRequest::new("git")
+                .args(["fetch", "--quiet", remote])
+                .cwd(&self.repo)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env(
+                    "GIT_SSH_COMMAND",
+                    "ssh -o BatchMode=yes -o ConnectTimeout=10",
+                )
+                .timeout(Duration::from_secs(30)),
+        )?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(GitError::Exit {
+                code: out.exit_code,
+                stderr: out.stderr_utf8(),
+            })
+        }
     }
 
     pub fn rev_parse(&self, rev: &str) -> Result<String, GitError> {

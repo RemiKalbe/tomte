@@ -165,7 +165,12 @@ fn second_daemon_defers_to_the_first() {
         .expect("second daemon");
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(out.status.success(), "second daemon errored: {text}");
-    assert!(text.contains("already running"), "{text}");
+    // Two legitimate defer paths: the flock loser (single-instance lock,
+    // pre-socket) or the healthy-daemon probe ("already running").
+    assert!(
+        text.contains("already running") || text.contains("another instance holds"),
+        "{text}"
+    );
 }
 
 #[test]

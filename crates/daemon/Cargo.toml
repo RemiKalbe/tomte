@@ -12,6 +12,7 @@ path = "src/main.rs"
 name = "czui_daemon"
 
 [dependencies]
+libc.workspace = true
 czui-core = { path = "../core" }
 czui-journal = { path = "../journal" }
 czui-proto = { path = "../proto" }

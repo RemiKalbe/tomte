@@ -142,6 +142,32 @@ fn main() -> ExitCode {
         };
     }
 
+    // Single-instance lock, held for the process lifetime: concurrent
+    // spawns race unlink+bind and orphan each other (observed 2026-08-02:
+    // nine daemons each serving a socket inode nobody could reach). flock
+    // makes losers exit before touching the socket path at all.
+    let lock_path = socket_path.with_extension("sock.lock");
+    let lock_file = match std::fs::File::create(&lock_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("chezmoid: cannot create {}: {e}", lock_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: flock on a fd we own; LOCK_NB never blocks.
+        if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            println!(
+                "chezmoid: another instance holds {} — exiting",
+                lock_path.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+    }
+    // Keep the lock for the daemon's lifetime.
+    std::mem::forget(lock_file);
+
     // Single-instance guard: if a healthy daemon already answers on the
     // socket, exit instead of stealing the path from it (spawn races from
     // the app must converge on ONE daemon). A stale socket file (no
@@ -163,6 +189,30 @@ fn main() -> ExitCode {
         }
     };
     println!("chezmoid: listening on {}", socket_path.display());
+
+    // Self-reap when displaced: if the socket path ever stops pointing at
+    // OUR bound inode (a successor re-bound it, or the file vanished), this
+    // process is an unreachable orphan — exit so it can't accumulate.
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let our_ino = match std::fs::metadata(&socket_path) {
+            Ok(m) => m.ino(),
+            Err(_) => 0,
+        };
+        let path = socket_path.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let current = std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0);
+                if current != our_ino {
+                    eprintln!(
+                        "chezmoid: socket path no longer ours (displaced by a successor) — exiting"
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
     // Serve immediately with an empty core: clients get instant Hello and an
     // honest "starting" status while we fight a possibly-slow chezmoi below
     // (a locked secret manager can stall it for minutes).

@@ -1311,6 +1311,7 @@ dependencies = [
  "czui-journal",
  "czui-proto",
  "gethostname",
+ "libc",
  "notify",
  "serde",
  "serde_json",
