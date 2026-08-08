@@ -444,7 +444,7 @@ fn skeleton_rows(theme: Theme) -> gpui::AnyElement {
                 .gap_2()
                 .child(
                     div()
-                        .w_12()
+                        .w(gpui::px(56.))
                         .h_2()
                         .flex_none()
                         .rounded_sm()
@@ -587,10 +587,12 @@ fn render_line(
                 .hover(|el| el.bg(Theme::wash(theme.text, 0.05)))
                 .child(
                     div()
-                        .w_12()
+                        .w(gpui::px(56.))
                         .flex_none()
                         .text_xs()
                         .text_right()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
                         .text_color(theme.text_muted)
                         .child(time.clone()),
                 )
@@ -648,10 +650,12 @@ fn render_line(
                 .group("activity-row")
                 .child(
                     div()
-                        .w_12()
+                        .w(gpui::px(56.))
                         .flex_none()
                         .text_xs()
                         .text_right()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
                         .text_color(theme.text_muted)
                         .child(time.clone()),
                 )

@@ -36,10 +36,14 @@ pub fn event_row_children(
     let (glyph, glyph_color) = spec.glyph;
     let mut children: Vec<AnyElement> = vec![
         div()
-            .w_12()
+            // w_14: "22m ago" overflows w_12 and wrapped (2026-08-08);
+            // nowrap so a pathological stamp clips instead of ever wrapping.
+            .w(gpui::px(56.))
             .flex_none()
             .text_xs()
             .text_right()
+            .whitespace_nowrap()
+            .overflow_hidden()
             .text_color(theme.text_muted)
             .child(spec.time)
             .into_any_element(),
