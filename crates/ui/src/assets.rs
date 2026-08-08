@@ -7,10 +7,16 @@ use std::borrow::Cow;
 use gpui::{AssetSource, Result, SharedString};
 
 /// `(virtual path, bytes)` for every embedded asset.
-const ASSETS: &[(&str, &[u8])] = &[(
-    "icons/chevron_down.svg",
-    include_bytes!("../assets/icons/chevron_down.svg"),
-)];
+const ASSETS: &[(&str, &[u8])] = &[
+    (
+        "icons/chevron_down.svg",
+        include_bytes!("../assets/icons/chevron_down.svg"),
+    ),
+    (
+        "icons/spinner.svg",
+        include_bytes!("../assets/icons/spinner.svg"),
+    ),
+];
 
 pub struct Assets;
 

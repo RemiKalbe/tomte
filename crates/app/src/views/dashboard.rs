@@ -362,19 +362,23 @@ impl DashboardView {
                         .justify_between()
                         .child(
                             div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.text_muted)
-                                .child("ACTIVITY"),
-                        )
-                        .when(scanning && have_data, |el| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.text_muted)
-                                    .child("rescanning…"),
-                            )
-                        }),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.text_muted)
+                                        .child("ACTIVITY"),
+                                )
+                                // Scan in flight: a quiet spinner, no words
+                                // (2026-08-08: the banner + "rescanning…"
+                                // pair was loud for a routine background op).
+                                .when(scanning, |el| {
+                                    el.child(ui::spinner(theme, "activity-scan-spinner"))
+                                }),
+                        ),
                 )
             })
             .child(if lines.is_empty() {

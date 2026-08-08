@@ -51,6 +51,11 @@ impl SyncModel {
         degraded: Option<String>,
         scanning: bool,
     ) {
+        // Stale-daemon immunity: pre-2026-08-04 daemons report their busy
+        // state as a degraded hint. Busy is not a degradation — drop it here
+        // so an old binary lingering on the socket (bundle installs, launch
+        // agents) can never resurrect the "scan in progress" banner.
+        let degraded = degraded.filter(|d| !d.contains("scan in progress"));
         self.scanning = scanning;
         // A scan in progress reports placeholder zeros — keep showing the
         // last known numbers instead of wiping the UI (the "everything reset

@@ -15,6 +15,7 @@ pub const COMPONENTS: &[(&str, &str)] = &[
     ("code-chip", "inline + standalone code chips"),
     ("toolbar", "floating Save/Revert toolbar"),
     ("merge-region", "decision strip states + provenance rows"),
+    ("spinner", "indeterminate scan/load spinner"),
 ];
 
 fn noop(_: &ClickEvent, _: &mut Window, _: &mut App) {}
@@ -264,6 +265,24 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 ))
                 .into_any_element()
         }
+        "spinner" => variant(
+            theme,
+            "next to a section header",
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text_muted)
+                        .child("ACTIVITY"),
+                )
+                .child(spinner(theme, "prev-spinner"))
+                .into_any_element(),
+        )
+        .into_any_element(),
         _ => return None,
     };
     Some(el)
