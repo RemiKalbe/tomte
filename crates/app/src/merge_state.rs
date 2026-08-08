@@ -112,6 +112,7 @@ mod tests {
             base: base.map(str::to_string),
             source_path: PathBuf::from("/src/dot_testrc"),
             templated: false,
+            template: None,
             span_map: None,
         }
     }

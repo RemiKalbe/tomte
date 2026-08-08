@@ -177,8 +177,13 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 "    \"@xberg-io/opencode-xberg\",".into(),
                 "    \"@xberg-io/opencode-crawlberg\",".into(),
             ];
-            let mut protected = std::collections::HashSet::new();
-            protected.insert(1usize);
+            let mut protected = std::collections::HashMap::new();
+            protected.insert(
+                1usize,
+                gpui::SharedString::from(
+                    "in template:\n    \"{{ .xberg.crawlberg }}\",",
+                ),
+            );
             div()
                 .flex()
                 .flex_col()
@@ -239,7 +244,13 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                     div()
                         .w_full()
                         .child(provenance_label(theme, Side::Ours))
-                        .child(provenance_rows(theme, Side::Ours, &lines, &protected))
+                        // Protected spans anchor to the SOURCE side only.
+                        .child(provenance_rows(
+                            theme,
+                            Side::Ours,
+                            &lines,
+                            &std::collections::HashMap::new(),
+                        ))
                         .into_any_element(),
                 ))
                 .child(variant(

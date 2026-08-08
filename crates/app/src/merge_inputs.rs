@@ -31,6 +31,9 @@ pub struct MergeInputs {
     pub source_path: PathBuf,
     /// Source ends in `.tmpl`.
     pub templated: bool,
+    /// Raw template source (the `.tmpl` file) when templated — the UI shows
+    /// protected lines' template-side text on hover.
+    pub template: Option<String>,
     /// Present when templated: protected spans over `theirs` (rendered).
     pub span_map: Option<SpanMap>,
 }
@@ -70,12 +73,13 @@ pub fn load(
     let ours = String::from_utf8(ours_bytes).map_err(|_| MergeInputsError::Binary)?;
     let base = load_base(chezmoi, journal_path, target)?;
     let templated = is_templated(&source_path);
-    let span_map = if templated {
+    let (template, span_map) = if templated {
         let template = std::fs::read_to_string(&source_path)?;
         let segments = lex(&template)?;
-        Some(anchor(&template, &segments, &theirs))
+        let map = anchor(&template, &segments, &theirs);
+        (Some(template), Some(map))
     } else {
-        None
+        (None, None)
     };
     Ok(MergeInputs {
         target: target.to_path_buf(),
@@ -84,6 +88,7 @@ pub fn load(
         base,
         source_path,
         templated,
+        template,
         span_map,
     })
 }

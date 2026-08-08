@@ -230,6 +230,7 @@ fn conflict_inputs() -> MergeInputs {
         base: Some(base.into()),
         source_path: home(".local/share/chezmoi/dot_config/editor.toml"),
         templated: false,
+        template: None,
         span_map: None,
     }
 }
@@ -250,6 +251,7 @@ fn templated_inputs() -> MergeInputs {
         base: None,
         source_path: home(".local/share/chezmoi/dot_gitconfig.tmpl"),
         templated: true,
+        template: Some(template.into()),
         span_map,
     }
 }
@@ -364,6 +366,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                         base: Some("x\n".into()),
                         source_path: home(".local/share/chezmoi/dot_config/zed/settings.json"),
                         templated: false,
+                        template: None,
                         span_map: None,
                     };
                     view.auto_merge = Some((Arc::new(inputs), "merged\n".into()));
@@ -390,6 +393,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 base: Some(base.into()),
                 source_path: home(".local/share/chezmoi/dot_config/opencode/opencode.json"),
                 templated: false,
+                template: None,
                 span_map: None,
             };
             let mut s = shell(Route::Merge, rich_model());

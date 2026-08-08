@@ -5,14 +5,16 @@
 //! Tint mapping (established app vocabulary, NOT GitHub's purple):
 //! ours/disk = drift amber, theirs/source = accent blue.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use gpui::{
-    App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*,
+    App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*, px,
 };
 
 use crate::components::button::{ButtonSize, ButtonVariant, button};
-use crate::components::mono::{line_gutter, line_text, mono_line};
+use crate::components::chip::{ChipVariant, chip};
+use crate::components::mono::{line_text, mono_line};
+use crate::components::tooltip::text_tooltip;
 use crate::theme::Theme;
 
 /// Which side a provenance block shows.
@@ -205,16 +207,23 @@ pub fn provenance_label(theme: Theme, side: Side) -> Div {
         .child(div().text_color(tint).child(side.label()))
 }
 
+/// Width of the leading "template" column when a block has protected lines
+/// (mirrors the pane gutter: uniform per block, the chip can never clip).
+const TEMPLATE_GUTTER: f32 = 76.;
+
 /// Read-only tinted mono rows for one side of an undecided region.
 /// Structurally read-only: these are divs, there is no edit path.
-/// `protected`: line indexes carrying the template-protected glyph.
+/// `protected`: line index → hover text (the template's own line) for
+/// template-generated lines; those rows scream "template" via a leading
+/// chip and answer WHY on hover.
 pub fn provenance_rows(
     theme: Theme,
     side: Side,
     lines: &[SharedString],
-    protected: &HashSet<usize>,
+    protected: &HashMap<usize, SharedString>,
 ) -> Div {
     let tint = side.tint(theme);
+    let template_gutter = !protected.is_empty();
     div()
         .flex()
         .flex_col()
@@ -222,11 +231,32 @@ pub fn provenance_rows(
         .border_color(tint)
         .bg(Theme::wash(tint, 0.07))
         .children(lines.iter().enumerate().map(|(ix, line)| {
-            mono_line(theme)
-                .child(line_gutter(
-                    theme.drift,
-                    if protected.contains(&ix) { "⚿" } else { "" },
-                ))
-                .child(line_text(line.clone()))
+            let tip = protected.get(&ix).cloned();
+            let row = mono_line(theme)
+                .when(tip.is_some(), |el| el.bg(Theme::wash(theme.drift, 0.15)))
+                .when(template_gutter, |el| {
+                    el.child(
+                        div()
+                            .w(px(TEMPLATE_GUTTER))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .when(tip.is_some(), |el| {
+                                el.child(div().text_color(theme.drift).child("{}")).child(
+                                    chip(theme, "template", ChipVariant::Wash(theme.drift))
+                                        .flex_none(),
+                                )
+                            }),
+                    )
+                })
+                .child(line_text(line.clone()));
+            match tip {
+                Some(tip) => row
+                    .id(ElementId::named_usize("prov-tmpl", ix))
+                    .tooltip(text_tooltip(tip))
+                    .into_any_element(),
+                None => row.into_any_element(),
+            }
         }))
 }

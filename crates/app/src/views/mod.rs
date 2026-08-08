@@ -526,6 +526,7 @@ mod render_smoke {
                 base: Some("a\nv = 1\nz\n".into()),
                 source_path: PathBuf::from("/tmp/smoke/src/dot_testrc"),
                 templated: false,
+                template: None,
                 span_map: None,
             }
         }
@@ -541,6 +542,7 @@ mod render_smoke {
                 base: None,
                 source_path: PathBuf::from("/tmp/smoke/src/dot_testrc.tmpl"),
                 templated: true,
+                template: Some(template.into()),
                 span_map: Some(span_map),
             }
         }

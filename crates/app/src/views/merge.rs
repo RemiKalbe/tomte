@@ -11,7 +11,7 @@
 //! saves hand their [`OutcomeBanner`] to Review and route back; protected-span
 //! rejections and errors stay here, reported honestly (spec §10).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use czui_core::cmd::SystemRunner;
 use czui_core::merge::{Choice, MergeDocument, RegionKind};
 use czui_core::template::anchor::{SpanMap, SpanOrigin};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, FocusHandle, KeyBinding, Rgba, ScrollHandle,
-    SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, uniform_list,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, KeyBinding, Rgba, ScrollHandle,
+    SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, px, uniform_list,
 };
 
 use super::review::{
@@ -54,8 +54,9 @@ struct PaneLine {
     /// pane at render via [`row_bg`].
     kind: RegionKind,
     /// The line contains a byte of a protected template span (theirs pane
-    /// only): amber underlay + 🔒 gutter.
-    protected: bool,
+    /// only). Payload: the template's own line(s), shown on hover — the
+    /// point is "this text is GENERATED, here is the template behind it".
+    protected: Option<SharedString>,
 }
 
 /// Per-line region tint. The conflict wash lands on every pane; one-sided
@@ -85,7 +86,11 @@ fn row_bg(kind: RegionKind, side: PaneSide, theme: &Theme) -> Option<Rgba> {
 /// Flatten one side of the document into pane rows. Regions partition each
 /// side's lines in order, so concatenating their side ranges covers every
 /// line exactly once.
-fn pane_lines(doc: &MergeDocument, side: PaneSide, protected: &HashSet<usize>) -> Vec<PaneLine> {
+fn pane_lines(
+    doc: &MergeDocument,
+    side: PaneSide,
+    protected: &HashMap<usize, SharedString>,
+) -> Vec<PaneLine> {
     let lines = match side {
         PaneSide::Theirs => doc.theirs_lines(),
         PaneSide::Base => doc.base_lines(),
@@ -102,7 +107,7 @@ fn pane_lines(doc: &MergeDocument, side: PaneSide, protected: &HashSet<usize>) -
             out.push(PaneLine {
                 text: display_text(&lines[ix]).to_owned().into(),
                 kind: region.kind,
-                protected: protected.contains(&ix),
+                protected: protected.get(&ix).cloned(),
             });
         }
     }
@@ -121,10 +126,31 @@ fn span_is_protected(origin: &SpanOrigin) -> bool {
     )
 }
 
-/// Line indices (into `lines`, whose concatenation is the rendered text the
-/// span map covers) containing at least one protected byte. Approximated to
-/// whole lines — precision polish deferred (plan 7 Task 3).
-fn protected_line_set(lines: &[String], map: &SpanMap) -> HashSet<usize> {
+/// The template line containing byte `pos` of `template`, trimmed.
+fn template_line_at(template: &str, pos: usize) -> &str {
+    let start = template[..pos.min(template.len())]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = template[start..]
+        .find('\n')
+        .map(|i| start + i)
+        .unwrap_or(template.len());
+    template[start..end].trim_end()
+}
+
+/// Per-line protection info: line index (into `lines`, whose concatenation
+/// is the rendered text the span map covers) → hover text explaining WHY,
+/// preferably the template's own line for that span. Approximated to whole
+/// lines — precision polish deferred (plan 7 Task 3).
+fn protected_line_info(
+    lines: &[String],
+    map: &SpanMap,
+    template: Option<&str>,
+) -> HashMap<usize, SharedString> {
+    // Re-lex for segment source ranges: cheap, and it succeeded at load
+    // time or there would be no span map.
+    let segments = template.and_then(|t| czui_core::template::lexer::lex(t).ok());
     let mut starts = Vec::with_capacity(lines.len() + 1);
     let mut offset = 0usize;
     for line in lines {
@@ -132,18 +158,41 @@ fn protected_line_set(lines: &[String], map: &SpanMap) -> HashSet<usize> {
         offset += line.len();
     }
     starts.push(offset);
-    let mut out = HashSet::new();
+    let mut reasons: HashMap<usize, Vec<String>> = HashMap::new();
     for span in &map.spans {
         if span.range.is_empty() || !span_is_protected(&span.origin) {
             continue;
         }
+        let reason = match (&span.origin, template, &segments) {
+            (SpanOrigin::Action { segment }, Some(t), Some(segs)) => segs
+                .get(*segment)
+                .map(|seg| template_line_at(t, seg.src.start).to_string())
+                .unwrap_or_else(|| "template expression".to_string()),
+            (SpanOrigin::Action { .. }, _, _) => "template expression".to_string(),
+            (SpanOrigin::Literal { src, .. }, Some(t), _) => {
+                format!("repeated literal: {}", template_line_at(t, src.start))
+            }
+            (SpanOrigin::Literal { .. }, _, _) => "repeated template literal".to_string(),
+            (SpanOrigin::Unmapped, _, _) => "unanchored template output".to_string(),
+        };
         for ix in 0..lines.len() {
             if span.range.start < starts[ix + 1] && starts[ix] < span.range.end {
-                out.insert(ix);
+                let list = reasons.entry(ix).or_default();
+                if !list.contains(&reason) {
+                    list.push(reason.clone());
+                }
             }
         }
     }
-    out
+    reasons
+        .into_iter()
+        .map(|(ix, list)| {
+            (
+                ix,
+                SharedString::from(format!("in template:\n{}", list.join("\n"))),
+            )
+        })
+        .collect()
 }
 
 actions!(
@@ -364,6 +413,8 @@ pub(super) struct LoadedMerge {
     theirs_rows: Rc<Vec<PaneLine>>,
     base_rows: Rc<Vec<PaneLine>>,
     ours_rows: Rc<Vec<PaneLine>>,
+    /// Theirs-pane line index → template hover text (protected spans).
+    protected: Rc<HashMap<usize, SharedString>>,
 }
 
 impl LoadedMerge {
@@ -372,13 +423,16 @@ impl LoadedMerge {
         let protected = inputs
             .span_map
             .as_ref()
-            .map(|map| protected_line_set(state.doc.theirs_lines(), map))
+            .map(|map| {
+                protected_line_info(state.doc.theirs_lines(), map, inputs.template.as_deref())
+            })
             .unwrap_or_default();
-        let none = HashSet::new();
+        let none = HashMap::new();
         Self {
             theirs_rows: Rc::new(pane_lines(&state.doc, PaneSide::Theirs, &protected)),
             base_rows: Rc::new(pane_lines(&state.doc, PaneSide::Base, &none)),
             ours_rows: Rc::new(pane_lines(&state.doc, PaneSide::Ours, &none)),
+            protected: Rc::new(protected),
             inputs,
             state,
         }
@@ -757,8 +811,9 @@ impl MergeView {
         let state = &loaded.state;
         let degraded = state.degraded_base;
         let view = cx.weak_entity();
+        let protected = loaded.protected.clone();
         let blocks: Vec<AnyElement> = (0..state.doc.regions.len())
-            .map(|idx| region_block(state, idx, &self.revisiting, theme, &view))
+            .map(|idx| region_block(state, idx, &self.revisiting, &protected, theme, &view))
             .collect();
 
         div()
@@ -887,13 +942,16 @@ fn pane_col(
     theme: Theme,
 ) -> AnyElement {
     let rows = rows.clone();
+    let template_gutter = rows.iter().any(|r| r.protected.is_some());
     ui::list_pane(theme, Some((label, tint)))
         .flex_1()
         .min_w_0()
         .h_full()
         .child(
             uniform_list(id, rows.len(), move |range, _window, _cx| {
-                range.map(|ix| pane_row(&rows[ix], side, theme)).collect()
+                range
+                    .map(|ix| pane_row(ix, &rows[ix], side, template_gutter, theme))
+                    .collect()
             })
             .flex_1(),
         )
@@ -921,26 +979,60 @@ fn degraded_base_col(theme: Theme) -> AnyElement {
         .into_any_element()
 }
 
-fn pane_row(line: &PaneLine, side: PaneSide, theme: Theme) -> Div {
+/// Width of the leading "template" column, reserved by EVERY row of a pane
+/// that contains any protected lines — alignment stays uniform and the chip
+/// can never clip (trailing chips do: uniform_list sizes rows to the widest
+/// line).
+const TEMPLATE_GUTTER: f32 = 76.;
+
+fn pane_row(
+    ix: usize,
+    line: &PaneLine,
+    side: PaneSide,
+    template_gutter: bool,
+    theme: Theme,
+) -> AnyElement {
     // Protected spans get the amber underlay regardless of region kind — the
     // write-back rejection is the stronger fact.
-    let bg = if line.protected {
+    let bg = if line.protected.is_some() {
         Some(Theme::wash(theme.drift, 0.15))
     } else {
         row_bg(line.kind, side, &theme)
     };
-    ui::mono_line(theme)
+    let row = ui::mono_line(theme)
         .text_color(if line.kind == RegionKind::Unchanged {
             theme.text_muted
         } else {
             theme.text
         })
         .when_some(bg, |el, bg| el.bg(bg))
-        .child(ui::line_gutter(
-            theme.drift,
-            if line.protected { "⚿" } else { "" },
-        ))
-        .child(ui::line_text(line.text.clone()))
+        .when(template_gutter, |el| {
+            el.child(
+                div()
+                    .w(px(TEMPLATE_GUTTER))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(line.protected.is_some(), |el| {
+                        el.child(div().text_color(theme.drift).child("{}")).child(
+                            ui::chip(theme, "template", ui::ChipVariant::Wash(theme.drift))
+                                .flex_none(),
+                        )
+                    }),
+            )
+        })
+        .child(ui::line_text(line.text.clone()));
+    match &line.protected {
+        // Generated line: the chip says WHAT it is; hover shows the
+        // template's own line — the WHY (2026-08-08 feedback: ⚿ said
+        // nothing about templates).
+        Some(tip) => row
+            .id(ElementId::named_usize("tmpl-line", ix))
+            .tooltip(ui::text_tooltip(tip.clone()))
+            .into_any_element(),
+        None => row.into_any_element(),
+    }
 }
 
 /// One region's block in the result column: strip (when the region changed)
@@ -950,6 +1042,7 @@ fn region_block(
     state: &MergeState,
     idx: usize,
     revisiting: &std::collections::HashSet<usize>,
+    protected: &HashMap<usize, SharedString>,
     theme: Theme,
     view: &WeakEntity<MergeView>,
 ) -> AnyElement {
@@ -1025,22 +1118,32 @@ fn region_block(
                 .my_1()
                 .child(strip_for(current, focused, has_base));
             match provenance {
-                Some((ours, theirs)) => block
-                    .child(ui::provenance_label(theme, ui::Side::Ours))
-                    .child(ui::provenance_rows(
-                        theme,
-                        ui::Side::Ours,
-                        &ours,
-                        &std::collections::HashSet::new(),
-                    ))
-                    .child(ui::provenance_label(theme, ui::Side::Theirs))
-                    .child(ui::provenance_rows(
-                        theme,
-                        ui::Side::Theirs,
-                        &theirs,
-                        &std::collections::HashSet::new(),
-                    ))
-                    .into_any_element(),
+                Some((ours, theirs)) => {
+                    // Protected map is keyed by GLOBAL theirs-line index;
+                    // this block's rows are region-local.
+                    let region = &state.doc.regions[idx];
+                    let theirs_protected: HashMap<usize, SharedString> = protected
+                        .iter()
+                        .filter(|(gix, _)| region.theirs.contains(gix))
+                        .map(|(gix, tip)| (gix - region.theirs.start, tip.clone()))
+                        .collect();
+                    block
+                        .child(ui::provenance_label(theme, ui::Side::Ours))
+                        .child(ui::provenance_rows(
+                            theme,
+                            ui::Side::Ours,
+                            &ours,
+                            &HashMap::new(),
+                        ))
+                        .child(ui::provenance_label(theme, ui::Side::Theirs))
+                        .child(ui::provenance_rows(
+                            theme,
+                            ui::Side::Theirs,
+                            &theirs,
+                            &theirs_protected,
+                        ))
+                        .into_any_element()
+                }
                 None => block.child(tinted_lines(lines)).into_any_element(),
             }
         }
@@ -1083,7 +1186,7 @@ mod tests {
 
     use super::super::review::BannerTint;
     use super::{
-        LoadedMerge, PaneSide, RegionDisplay, merge_banner, pane_lines, protected_line_set,
+        LoadedMerge, PaneSide, RegionDisplay, merge_banner, pane_lines, protected_line_info,
         region_display, row_bg,
     };
     use gpui::SharedString;
@@ -1100,6 +1203,7 @@ mod tests {
             base: base.map(str::to_string),
             source_path: PathBuf::from("/src/dot_testrc"),
             templated: false,
+            template: None,
             span_map: None,
         }
     }
@@ -1116,7 +1220,7 @@ mod tests {
     #[test]
     fn pane_lines_cover_every_side_line_with_region_kinds() {
         let state = conflict_state();
-        let none = std::collections::HashSet::new();
+        let none = std::collections::HashMap::new();
         for side in [PaneSide::Theirs, PaneSide::Base, PaneSide::Ours] {
             let rows = pane_lines(&state.doc, side, &none);
             assert_eq!(rows.len(), 3, "{side:?} pane covers all lines");
@@ -1128,7 +1232,7 @@ mod tests {
                     RegionKind::Unchanged
                 ]
             );
-            assert!(rows.iter().all(|r| !r.protected));
+            assert!(rows.iter().all(|r| r.protected.is_none()));
         }
         let ours = pane_lines(&state.doc, PaneSide::Ours, &none);
         assert_eq!(ours[1].text.as_ref(), "v = 2", "newline stripped");
@@ -1174,19 +1278,22 @@ mod tests {
     }
 
     #[test]
-    fn protected_line_set_marks_lines_touching_templated_values() {
+    fn protected_line_info_marks_lines_and_names_the_template_line() {
         let template = "email = {{ .email }}\neditor = hx\n";
         let rendered = "email = a@b.c\neditor = hx\n";
         let map = anchor(template, &lex(template).unwrap(), rendered);
         let lines: Vec<String> = rendered.split_inclusive('\n').map(str::to_owned).collect();
-        let protected = protected_line_set(&lines, &map);
+        let protected = protected_line_info(&lines, &map, Some(template));
+        // The hover text carries the template's OWN line for that span
+        // (2026-08-08 feedback: the glyph alone said nothing).
+        let tip = protected.get(&0).expect("value line is protected");
         assert!(
-            protected.contains(&0),
-            "the {{{{ .email }}}} value line is protected: {protected:?}"
+            tip.contains("email = {{ .email }}"),
+            "tooltip names the template line: {tip}"
         );
         assert!(
-            !protected.contains(&1),
-            "the literal editor line is not protected: {protected:?}"
+            !protected.contains_key(&1),
+            "the literal editor line is not protected"
         );
     }
 
@@ -1202,12 +1309,13 @@ mod tests {
             base: Some(rendered.into()),
             source_path: PathBuf::from("/src/dot_testrc.tmpl"),
             templated: true,
+            template: Some(template.into()),
             span_map: Some(map),
         }));
-        assert!(loaded.theirs_rows[0].protected);
-        assert!(!loaded.theirs_rows[1].protected);
-        assert!(loaded.base_rows.iter().all(|r| !r.protected));
-        assert!(loaded.ours_rows.iter().all(|r| !r.protected));
+        assert!(loaded.theirs_rows[0].protected.is_some());
+        assert!(loaded.theirs_rows[1].protected.is_none());
+        assert!(loaded.base_rows.iter().all(|r| r.protected.is_none()));
+        assert!(loaded.ours_rows.iter().all(|r| r.protected.is_none()));
     }
 
     #[test]
