@@ -245,6 +245,7 @@ enum RegionDisplay {
     /// Explicit decision, collapsed: strip names it, lines show the result.
     Decided {
         choice: ui::ChoiceKind,
+        focused: bool,
         lines: Vec<(SharedString, Option<ui::Side>)>,
     },
 }
@@ -358,6 +359,7 @@ fn region_display(
         },
         (Some(choice), _) => RegionDisplay::Decided {
             choice: choice_kind(choice),
+            focused: state.cursor == Some(idx),
             lines: choice_lines(doc, region, choice),
         },
     }
@@ -457,6 +459,10 @@ pub struct MergeView {
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
     result_scroll: ScrollHandle,
+    /// One scroll handle per input pane (theirs/base/ours); wheel on any
+    /// pane mirrors its offset to the others so the three columns compare
+    /// without independent scrolling.
+    pane_scrolls: [gpui::UniformListScrollHandle; 3],
     /// Decided regions whose strip the user reopened (non-destructive).
     revisiting: std::collections::HashSet<usize>,
     undo: Vec<UndoEntry>,
@@ -484,6 +490,7 @@ impl MergeView {
             saving: false,
             banner: None,
             result_scroll: ScrollHandle::new(),
+            pane_scrolls: std::array::from_fn(|_| gpui::UniformListScrollHandle::new()),
             revisiting: std::collections::HashSet::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -600,13 +607,18 @@ impl MergeView {
         self.apply(region, choice, cx);
     }
 
-    /// `Next ↓`: advance the cursor to the next unresolved conflict and
-    /// scroll its region block into view (one column child per region).
+    /// `Next ↓`: advance the cursor to the next unresolved conflict — or,
+    /// once everything is resolved, to the next changed region, so every
+    /// decision point stays reachable for revisiting (2026-08-08 feedback).
     fn next(&mut self, cx: &mut Context<Self>) {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        if let Some(region) = loaded.state.next_unresolved() {
+        let region = loaded
+            .state
+            .next_unresolved()
+            .or_else(|| loaded.state.next_changed());
+        if let Some(region) = region {
             self.result_scroll.scroll_to_item(region);
         }
         cx.notify();
@@ -720,12 +732,21 @@ impl MergeView {
                             format!("{total} conflict{s}, {} resolved", total - open)
                         }),
                 );
-            if open > 0 {
+            let changed = loaded
+                .state
+                .doc
+                .regions
+                .iter()
+                .any(|r| r.kind != RegionKind::Unchanged);
+            if changed {
+                // Conflict-red while decisions are owed; neutral afterwards
+                // (it then walks decided/auto regions for revisiting).
+                let tint = if open > 0 { theme.conflict } else { theme.text };
                 bar = bar.child(ui::button(
                     theme,
                     "merge-next",
                     "Next ↓".into(),
-                    ui::ButtonVariant::Outline(theme.conflict),
+                    ui::ButtonVariant::Outline(tint),
                     ui::ButtonSize::Sm,
                     cx.listener(|view, _ev, _window, cx| view.next(cx)),
                 ));
@@ -838,6 +859,8 @@ impl MergeView {
                         &loaded.theirs_rows,
                         PaneSide::Theirs,
                         false,
+                        0,
+                        &self.pane_scrolls,
                         theme,
                     ))
                     .child(if degraded {
@@ -850,6 +873,8 @@ impl MergeView {
                             &loaded.base_rows,
                             PaneSide::Base,
                             true,
+                            1,
+                            &self.pane_scrolls,
                             theme,
                         )
                     })
@@ -860,6 +885,8 @@ impl MergeView {
                         &loaded.ours_rows,
                         PaneSide::Ours,
                         true,
+                        2,
+                        &self.pane_scrolls,
                         theme,
                     )),
             )
@@ -927,6 +954,7 @@ fn banner_el(banner: &OutcomeBanner, theme: Theme) -> Div {
 /// One read-only pane column: an attached label header (the user should
 /// never have to map floating toolbar chips onto panes by position) over a
 /// bordered `uniform_list` of its lines.
+#[allow(clippy::too_many_arguments)]
 fn pane_col(
     id: &'static str,
     label: &'static str,
@@ -934,11 +962,16 @@ fn pane_col(
     rows: &Rc<Vec<PaneLine>>,
     side: PaneSide,
     divider: bool,
+    me: usize,
+    scrolls: &[gpui::UniformListScrollHandle; 3],
     theme: Theme,
 ) -> AnyElement {
     let rows = rows.clone();
     let template_gutter = rows.iter().any(|r| r.protected.is_some());
+    let scrolls = scrolls.clone();
+    let my_scroll = scrolls[me].clone();
     div()
+        .id(ElementId::named_usize("merge-pane-wrap", me))
         .flex_1()
         .min_w_0()
         .h_full()
@@ -952,8 +985,21 @@ fn pane_col(
                     .map(|ix| pane_row(ix, &rows[ix], side, template_gutter, theme))
                     .collect()
             })
+            .track_scroll(scrolls[me].clone())
             .flex_1(),
         )
+        // Scroll sync: this wrapper's wheel handler runs AFTER the inner
+        // list already applied the wheel (children dispatch first), so the
+        // leader's offset is fresh — mirror it to the other two panes.
+        .on_scroll_wheel(move |_event, _window, cx| {
+            let offset = my_scroll.0.borrow().base_handle.offset();
+            for (ix, other) in scrolls.iter().enumerate() {
+                if ix != me {
+                    other.0.borrow().base_handle.set_offset(offset);
+                }
+            }
+            cx.refresh_windows();
+        })
         .into_any_element()
 }
 
@@ -1151,7 +1197,11 @@ fn region_block(
                 None => block.child(tinted_lines(lines)).into_any_element(),
             }
         }
-        RegionDisplay::Decided { choice, lines } => {
+        RegionDisplay::Decided {
+            choice,
+            focused,
+            lines,
+        } => {
             let on_revisit = {
                 let view = view.clone();
                 move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -1165,7 +1215,7 @@ fn region_block(
                 .child(ui::decision_strip(
                     theme,
                     idx,
-                    ui::StripState::Decided { choice },
+                    ui::StripState::Decided { choice, focused },
                     |_, _, _, _| {},
                     |_, _, _| {},
                     on_revisit,
@@ -1348,6 +1398,7 @@ mod tests {
         match region_display(&state, region, &none) {
             RegionDisplay::Decided {
                 choice: ChoiceKind::Theirs,
+                focused: false,
                 lines,
             } => assert_eq!(
                 lines,
@@ -1376,6 +1427,7 @@ mod tests {
         match region_display(&state, region, &none) {
             RegionDisplay::Decided {
                 choice: ChoiceKind::Both,
+                focused: false,
                 lines,
             } => assert_eq!(
                 lines,

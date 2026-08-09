@@ -83,6 +83,35 @@ impl MergeState {
         next
     }
 
+    /// Every region where the user has a choice to make or revisit: all
+    /// non-Unchanged regions, in document order.
+    pub fn changed_regions(&self) -> Vec<usize> {
+        self.doc
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind != czui_core::merge::RegionKind::Unchanged)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Advance the cursor to the next changed region after the current one,
+    /// wrapping — used once every conflict is resolved so the user can still
+    /// walk (and re-decide) every decision point.
+    pub fn next_changed(&mut self) -> Option<usize> {
+        let changed = self.changed_regions();
+        let next = match self.cursor {
+            Some(current) => changed
+                .iter()
+                .copied()
+                .find(|&region| region > current)
+                .or_else(|| changed.first().copied()),
+            None => changed.first().copied(),
+        };
+        self.cursor = next;
+        next
+    }
+
     /// The assembled result once every conflict has a choice; `None` while
     /// any is still undecided.
     pub fn assembled(&self) -> Option<String> {

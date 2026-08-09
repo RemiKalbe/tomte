@@ -232,6 +232,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                         2,
                         StripState::Decided {
                             choice: ChoiceKind::Both,
+                            focused: false,
                         },
                         noop_pick,
                         noop,

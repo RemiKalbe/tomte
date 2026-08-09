@@ -80,7 +80,9 @@ pub enum StripState {
         focused: bool,
     },
     /// A decision exists; collapsed affordance names it and offers revisit.
-    Decided { choice: ChoiceKind },
+    /// `focused`: the region cursor sits here (Next ↓ walks decided regions
+    /// too once every conflict is resolved).
+    Decided { choice: ChoiceKind, focused: bool },
 }
 
 /// One-line decision strip rendered above a changed region (Zed
@@ -110,6 +112,13 @@ pub fn decision_strip(
             current,
             focused,
         } => {
+            let strip = strip.when(focused, |el| {
+                el.border_l_2().border_color(if current.is_none() {
+                    theme.conflict
+                } else {
+                    theme.accent
+                })
+            });
             let pick_button = |id: &'static str,
                                kind: ChoiceKind,
                                label: &'static str,
@@ -176,7 +185,10 @@ pub fn decision_strip(
                     on_edit,
                 ))
         }
-        StripState::Decided { choice } => strip
+        StripState::Decided { choice, focused } => strip
+            .when(focused, |el| {
+                el.border_l_2().border_color(theme.accent)
+            })
             .child(
                 div()
                     .text_color(theme.text_muted)
