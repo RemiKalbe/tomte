@@ -1027,8 +1027,11 @@ fn spawn_update_loop(cx: &mut App, state: Entity<SyncModel>) {
             if alive.is_err() {
                 break; // app released
             }
+            // 20min: one unauthenticated GitHub request per tick (limit is
+            // 60/h/IP) — cheap, and the app is young enough that releases
+            // land daily, not monthly.
             cx.background_executor()
-                .timer(Duration::from_secs(24 * 60 * 60))
+                .timer(Duration::from_secs(20 * 60))
                 .await;
         }
     })

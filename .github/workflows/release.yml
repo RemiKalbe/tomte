@@ -21,6 +21,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe needs tag history for the compare link
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install chezmoi (e2e tests)
@@ -106,7 +108,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#v}"
+          # The CHANGELOG section IS the release body — published complete
+          # from the first second (2026-08-09: --generate-notes plus a
+          # post-publish edit left a window where the in-app updater staged
+          # a bare compare link as "release notes").
+          awk -v v="$version" '
+            $0 ~ "^## " v " " || $0 ~ "^## " v "$" { on=1; next }
+            /^## / { on=0 }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [[ -s notes.md ]] || { echo "::error::CHANGELOG.md has no ## $version section"; exit 1; }
+          prev="$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)"
+          if [[ -n "$prev" ]]; then
+            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$prev" "$GITHUB_REF_NAME" >> notes.md
+          fi
           gh release create "$GITHUB_REF_NAME" \
             "Tomte-$version.zip" "Tomte-$version.dmg" \
             --title "Tomte $version" \
-            --generate-notes
+            --notes-file notes.md

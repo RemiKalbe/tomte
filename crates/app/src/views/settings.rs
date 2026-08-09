@@ -860,13 +860,17 @@ impl SettingsView {
                 .text_xs()
                 .text_color(theme.text)
                 .children(lines.into_iter().take(MAX_LINES).map(|l| {
-                    // Markdown-lite: headings lose their #'s and gain
-                    // weight; everything else renders verbatim.
+                    // Markdown-lite: #/### headings render medium-weight,
+                    // "- " bullets become "• ", **markers** are stripped
+                    // (weight-per-span isn't worth a markdown engine here).
                     let heading = l.starts_with('#');
-                    let text = SharedString::from(l.trim_start_matches('#').trim().to_string());
+                    let mut text = l.trim_start_matches('#').trim().replace("**", "");
+                    if let Some(rest) = text.strip_prefix("- ") {
+                        text = format!("•  {rest}");
+                    }
                     div()
                         .when(heading, |el| el.font_weight(FontWeight::MEDIUM))
-                        .child(text)
+                        .child(SharedString::from(text))
                 }))
                 .when(clipped, |el| {
                     el.child(

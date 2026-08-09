@@ -25,6 +25,8 @@ ws_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 [[ "$ws_version" == "$version" ]] \
     || die "workspace Cargo.toml says $ws_version — bump it first"
 git rev-parse "v$version" >/dev/null 2>&1 && die "tag v$version already exists"
+grep -q "^## $version" CHANGELOG.md \
+    || die "CHANGELOG.md has no '## $version' section — write the notes first"
 
 # Gate 2: the full local quality bar, exit codes only.
 cargo fmt --all --check
