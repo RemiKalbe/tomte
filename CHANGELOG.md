@@ -4,10 +4,16 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
-## Unreleased
+## 0.1.2 — 2026-08-09
+
+Tomte gets its real face, everywhere.
 
 ### Changed
 
+- **App icon, rendered by Apple's toolchain.** The Icon Composer document
+  is now compiled with `actool`: correct proportions and glass treatment
+  in the flattened icon, and on macOS 26 the app carries the genuine
+  dynamic Liquid Glass icon (`Assets.car`), not an approximation.
 - Update checks run every 20 minutes (was daily) — the app is young and
   releases land often.
 - Release notes now live in this file and ship with the release the moment
