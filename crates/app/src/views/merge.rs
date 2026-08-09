@@ -417,6 +417,9 @@ pub(super) struct LoadedMerge {
     ours_rows: Rc<Vec<PaneLine>>,
     /// Theirs-pane line index → template hover text (protected spans).
     protected: Rc<HashMap<usize, SharedString>>,
+    /// Per-region first-line index per column [theirs, base, ours], plus a
+    /// totals sentinel row — the basis for region-aligned scroll sync.
+    region_line_starts: Rc<Vec<[usize; 3]>>,
 }
 
 impl LoadedMerge {
@@ -430,7 +433,17 @@ impl LoadedMerge {
             })
             .unwrap_or_default();
         let none = HashMap::new();
+        let mut region_line_starts = Vec::with_capacity(state.doc.regions.len() + 1);
+        let mut acc = [0usize; 3];
+        for region in &state.doc.regions {
+            region_line_starts.push(acc);
+            acc[0] += region.theirs.len();
+            acc[1] += region.base.len();
+            acc[2] += region.ours.len();
+        }
+        region_line_starts.push(acc);
         Self {
+            region_line_starts: Rc::new(region_line_starts),
             theirs_rows: Rc::new(pane_lines(&state.doc, PaneSide::Theirs, &protected)),
             base_rows: Rc::new(pane_lines(&state.doc, PaneSide::Base, &none)),
             ours_rows: Rc::new(pane_lines(&state.doc, PaneSide::Ours, &none)),
@@ -605,6 +618,73 @@ impl MergeView {
             return;
         };
         self.apply(region, choice, cx);
+    }
+
+    /// Region-aligned scroll sync: `leader` is 0..=2 for the input panes or
+    /// 3 for the result view. Reads the leader's viewport-top position, maps
+    /// it to (region, fraction-through-region), and positions every other
+    /// surface at ITS version of that point — panes advance at their own
+    /// rates per region, empty sides pin at the boundary, and the result's
+    /// variable-height blocks map through their measured child bounds.
+    fn sync_from(&mut self, leader: usize, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let starts = loaded.region_line_starts.clone();
+        if starts.len() < 2 {
+            return;
+        }
+
+        // Result-block geometry (content-relative), measured post-layout.
+        let result_block = |k: usize| -> Option<(f32, f32)> {
+            let origin = self.result_scroll.bounds_for_item(0)?.top();
+            let b = self.result_scroll.bounds_for_item(k)?;
+            Some((f32::from(b.top() - origin), f32::from(b.size.height)))
+        };
+
+        let (k, f) = if leader == 3 {
+            let scroll_top = -f32::from(self.result_scroll.offset().y);
+            let regions = starts.len() - 1;
+            let mut found = (regions - 1, 1.0f32);
+            for k in 0..regions {
+                if let Some((top, height)) = result_block(k)
+                    && scroll_top < top + height
+                {
+                    let f = if height > 0.0 {
+                        ((scroll_top - top) / height).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    found = (k, f);
+                    break;
+                }
+            }
+            found
+        } else {
+            let line =
+                -f32::from(self.pane_scrolls[leader].0.borrow().base_handle.offset().y)
+                    / PANE_ROW_H;
+            region_at(&starts, leader, line)
+        };
+
+        for col in 0..3 {
+            if leader == col {
+                continue;
+            }
+            let y = gpui::px(-(line_at(&starts, col, k, f) * PANE_ROW_H));
+            let handle = self.pane_scrolls[col].0.borrow();
+            let mut offset = handle.base_handle.offset();
+            offset.y = y;
+            handle.base_handle.set_offset(offset);
+        }
+        if leader != 3
+            && let Some((top, height)) = result_block(k)
+        {
+            let mut offset = self.result_scroll.offset();
+            offset.y = gpui::px(-(top + f * height));
+            self.result_scroll.set_offset(offset);
+        }
+        cx.notify();
     }
 
     /// `Next ↓`: advance the cursor to the next unresolved conflict — or,
@@ -861,6 +941,7 @@ impl MergeView {
                         false,
                         0,
                         &self.pane_scrolls,
+                        &view,
                         theme,
                     ))
                     .child(if degraded {
@@ -875,6 +956,7 @@ impl MergeView {
                             true,
                             1,
                             &self.pane_scrolls,
+                            &view,
                             theme,
                         )
                     })
@@ -887,6 +969,7 @@ impl MergeView {
                         true,
                         2,
                         &self.pane_scrolls,
+                        &view,
                         theme,
                     )),
             )
@@ -900,6 +983,12 @@ impl MergeView {
                     .flex()
                     .flex_col()
                     .pt_1()
+                    .on_scroll_wheel({
+                        let view = view.clone();
+                        move |_event, _window, cx| {
+                            view.update(cx, |merge, cx| merge.sync_from(3, cx)).ok();
+                        }
+                    })
                     .children(blocks),
             )
             .into_any_element()
@@ -964,12 +1053,12 @@ fn pane_col(
     divider: bool,
     me: usize,
     scrolls: &[gpui::UniformListScrollHandle; 3],
+    view: &WeakEntity<MergeView>,
     theme: Theme,
 ) -> AnyElement {
     let rows = rows.clone();
     let template_gutter = rows.iter().any(|r| r.protected.is_some());
-    let scrolls = scrolls.clone();
-    let my_scroll = scrolls[me].clone();
+    let view = view.clone();
     div()
         .id(ElementId::named_usize("merge-pane-wrap", me))
         .flex_1()
@@ -990,15 +1079,9 @@ fn pane_col(
         )
         // Scroll sync: this wrapper's wheel handler runs AFTER the inner
         // list already applied the wheel (children dispatch first), so the
-        // leader's offset is fresh — mirror it to the other two panes.
+        // leader's fresh position drives the region-aligned mapping.
         .on_scroll_wheel(move |_event, _window, cx| {
-            let offset = my_scroll.0.borrow().base_handle.offset();
-            for (ix, other) in scrolls.iter().enumerate() {
-                if ix != me {
-                    other.0.borrow().base_handle.set_offset(offset);
-                }
-            }
-            cx.refresh_windows();
+            view.update(cx, |merge, cx| merge.sync_from(me, cx)).ok();
         })
         .into_any_element()
 }
@@ -1027,6 +1110,42 @@ fn degraded_base_col(theme: Theme) -> AnyElement {
                 .child("no snapshot · merging 2-way"),
         )
         .into_any_element()
+}
+
+/// Fixed mono row height (`h_5` = 20px) — the unit converting pane scroll
+/// offsets to line positions for region-aligned sync.
+const PANE_ROW_H: f32 = 20.;
+
+/// Region-aligned scroll mapping (2026-08-08 feedback: raw offset mirroring
+/// is not 1:1 across panes). `starts` has one row per region plus a totals
+/// sentinel; `starts[k][col]` is the first line of region k in that column.
+/// Returns which region the given line sits in and the fraction through it.
+fn region_at(starts: &[[usize; 3]], col: usize, line: f32) -> (usize, f32) {
+    let regions = starts.len().saturating_sub(1);
+    if regions == 0 {
+        return (0, 0.0);
+    }
+    let mut k = regions - 1; // saturate at the last region on overscroll
+    for i in 0..regions {
+        if (starts[i][col] as f32) <= line && line < (starts[i + 1][col] as f32) {
+            k = i;
+            break;
+        }
+    }
+    let len = (starts[k + 1][col] - starts[k][col]) as f32;
+    let f = if len > 0.0 {
+        ((line - starts[k][col] as f32) / len).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (k, f)
+}
+
+/// The line position in `col` for region `k` at fraction `f` — zero-length
+/// regions pin at their boundary (the "know when to stop" behavior).
+fn line_at(starts: &[[usize; 3]], col: usize, k: usize, f: f32) -> f32 {
+    let len = (starts[k + 1][col] - starts[k][col]) as f32;
+    starts[k][col] as f32 + f * len
 }
 
 /// Width of the leading "template" column, reserved by EVERY row of a pane
@@ -1240,8 +1359,8 @@ mod tests {
 
     use super::super::review::BannerTint;
     use super::{
-        LoadedMerge, PaneSide, RegionDisplay, merge_banner, pane_lines, protected_line_info,
-        region_display, row_bg,
+        LoadedMerge, PaneSide, RegionDisplay, line_at, merge_banner, pane_lines,
+        protected_line_info, region_at, region_display, row_bg,
     };
     use gpui::SharedString;
     use czui_ui::components::{ChoiceKind, Side};
@@ -1370,6 +1489,34 @@ mod tests {
         assert!(loaded.theirs_rows[1].protected.is_none());
         assert!(loaded.base_rows.iter().all(|r| r.protected.is_none()));
         assert!(loaded.ours_rows.iter().all(|r| r.protected.is_none()));
+    }
+
+    #[test]
+    fn region_scroll_mapping_is_piecewise_and_pins_empty_sides() {
+        // Two regions: region 0 has 4 theirs-lines but 0 ours-lines
+        // (theirs-only insertion); region 1 has 2 lines everywhere.
+        let starts = vec![[0usize, 0, 0], [4, 4, 0], [6, 6, 2]];
+
+        // Halfway through region 0 in theirs…
+        let (k, f) = region_at(&starts, 0, 2.0);
+        assert_eq!(k, 0);
+        assert!((f - 0.5).abs() < 1e-6);
+        // …maps to ours PINNED at its region-0 boundary (empty side).
+        assert_eq!(line_at(&starts, 2, k, f), 0.0);
+        // …and base advances proportionally.
+        assert!((line_at(&starts, 1, k, f) - 2.0).abs() < 1e-6);
+
+        // A line inside region 1 of ours maps back to region 1 (the
+        // zero-length region 0 is skipped for that column).
+        let (k, f) = region_at(&starts, 2, 1.0);
+        assert_eq!(k, 1);
+        assert!((f - 0.5).abs() < 1e-6);
+        assert!((line_at(&starts, 0, k, f) - 5.0).abs() < 1e-6);
+
+        // Overscroll saturates at the last region, fraction clamped.
+        let (k, f) = region_at(&starts, 0, 99.0);
+        assert_eq!(k, 1);
+        assert!((f - 1.0).abs() < 1e-6);
     }
 
     #[test]
