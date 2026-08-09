@@ -1,58 +1,39 @@
 #!/usr/bin/env bash
-# Rasterize the app icon from bundle/Tomte.icon (the Icon Composer source
-# of truth) into bundle/AppIcon.icns, and the menubar template glyph into
-# crates/app/assets/menubar@2x.png.
+# Compile bundle/Tomte.icon (the Icon Composer document) with Apple's own
+# renderer — no hand-rolled compositing (2026-08-09: a reverse-engineered
+# SVG flattening mangled the glyph scale and lost the glass treatment).
 #
-# The .icns is a flattened approximation of the Icon Composer document:
-# macOS squircle (Big Sur grid: 824/1024 with 100px margins), automatic
-# gradient derived from the document's fill color, white glyph at the
-# document's scale. Pre-Tahoe systems and our hand-rolled bundle consume
-# .icns; the .icon bundle stays for a future Xcode/actool pipeline.
+#   actool (Xcode 26+) emits BOTH:
+#     bundle/AppIcon.icns  flattened fallback  → CFBundleIconFile (macOS 13+)
+#     bundle/Assets.car    dynamic Liquid Glass → CFBundleIconName (macOS 26+)
 #
-# Requires: rsvg-convert (brew install librsvg), iconutil (macOS).
+# Also renders the menubar template glyph from the document's source SVG.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-glyph="bundle/Tomte.icon/Assets/gnome.svg"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# White-glyph composite on the gradient squircle. Glyph paths are inlined
-# from the source SVG with the fill overridden to white (mirrors the
-# icon.json layer fill), drawn at the document's scale (5.5 × 150 = 825px
-# on the 1024 canvas, centered).
-{
-    echo '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">'
-    echo '  <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">'
-    echo '    <stop offset="0" stop-color="#5A6AC6"/>'
-    echo '    <stop offset="1" stop-color="#4351AF"/>'
-    echo '  </linearGradient></defs>'
-    echo '  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>'
-    echo '  <g transform="translate(99.5,99.5) scale(5.5)" fill="#ffffff">'
-    sed -n 's/.*\(<path[^>]*>\).*/\1/p' "$glyph" | sed 's/class="[^"]*"//'
-    echo '  </g>'
-    echo '</svg>'
-} > "$work/appicon.svg"
+xcrun actool bundle/Tomte.icon --compile "$work" \
+    --platform macosx --minimum-deployment-target 13.0 \
+    --app-icon Tomte \
+    --output-partial-info-plist "$work/partial.plist" > "$work/actool.log" \
+    || { cat "$work/actool.log" >&2; exit 1; }
+[[ -f "$work/Tomte.icns" && -f "$work/Assets.car" ]] \
+    || { echo "actool produced no icns/car — Xcode 26+ required" >&2; exit 1; }
+cp "$work/Tomte.icns" bundle/AppIcon.icns
+cp "$work/Assets.car" bundle/Assets.car
 
-iconset="$work/AppIcon.iconset"
-mkdir -p "$iconset"
-for size in 16 32 128 256 512; do
-    rsvg-convert -w "$size" -h "$size" "$work/appicon.svg" \
-        -o "$iconset/icon_${size}x${size}.png"
-    double=$((size * 2))
-    rsvg-convert -w "$double" -h "$double" "$work/appicon.svg" \
-        -o "$iconset/icon_${size}x${size}@2x.png"
-done
-iconutil -c icns "$iconset" -o bundle/AppIcon.icns
+# README header image: Apple's largest flattened rep (256px, shown at 128).
+iconutil --convert iconset bundle/AppIcon.icns -o "$work/AppIcon.iconset"
+mkdir -p docs/assets
+cp "$work/AppIcon.iconset/icon_128x128@2x.png" docs/assets/tomte-icon.png
 
 # Menubar template: alpha is the only channel macOS uses; 36px backing for
-# an 18pt status item.
-rsvg-convert -w 36 -h 36 "$glyph" -o crates/app/assets/menubar@2x.png
+# an 18pt status item. Requires rsvg-convert (brew install librsvg).
+rsvg-convert -w 36 -h 36 bundle/Tomte.icon/Assets/gnome.svg \
+    -o crates/app/assets/menubar@2x.png
 
-# README header image.
-mkdir -p docs/assets
-rsvg-convert -w 512 -h 512 "$work/appicon.svg" -o docs/assets/tomte-icon.png
-
-echo "bundle/AppIcon.icns + crates/app/assets/menubar@2x.png + docs/assets/tomte-icon.png"
+echo "bundle/AppIcon.icns + bundle/Assets.car + docs/assets/tomte-icon.png + menubar@2x.png"

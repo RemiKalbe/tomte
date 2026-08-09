@@ -27,6 +27,9 @@ cp "$repo_root/target/release/tomted" "$app/Contents/MacOS/tomted"
 cp "$repo_root/bundle/Info.plist" "$app/Contents/Info.plist"
 mkdir -p "$app/Contents/Resources"
 cp "$repo_root/bundle/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+# Dynamic Liquid Glass icon (CFBundleIconName → Assets.car, macOS 26+);
+# older systems fall back to the icns via CFBundleIconFile.
+cp "$repo_root/bundle/Assets.car" "$app/Contents/Resources/Assets.car"
 
 plist="$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$plist"
