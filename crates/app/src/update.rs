@@ -32,6 +32,18 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AvailableUpdate {
     pub version: String,
     pub zip_url: String,
+    /// Release notes (the GitHub release body — `--generate-notes` output,
+    /// hand-editable on GitHub afterwards). Shown in Settings before the
+    /// user restarts into the new version.
+    pub notes: Option<String>,
+}
+
+/// A downloaded, signature-verified bundle waiting for its restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedUpdate {
+    pub version: String,
+    pub staged: PathBuf,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +93,10 @@ pub fn pick_update(latest_json: &str, current: &str) -> Result<Option<AvailableU
         return Ok(None);
     }
     let version = tag.strip_prefix('v').unwrap_or(tag).to_string();
+    let notes = v["body"]
+        .as_str()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty());
     let want = format!("Tomte-{version}.zip");
     let zip_url = v["assets"]
         .as_array()
@@ -89,7 +105,11 @@ pub fn pick_update(latest_json: &str, current: &str) -> Result<Option<AvailableU
         .find(|a| a["name"].as_str() == Some(want.as_str()))
         .and_then(|a| a["browser_download_url"].as_str())
         .map(str::to_owned);
-    Ok(zip_url.map(|zip_url| AvailableUpdate { version, zip_url }))
+    Ok(zip_url.map(|zip_url| AvailableUpdate {
+        version,
+        zip_url,
+        notes,
+    }))
 }
 
 /// Extract `TeamIdentifier=XXXX` from `codesign -dvv` output.
@@ -273,7 +293,10 @@ mod tests {
             .iter()
             .map(|name| format!(r#"{{"name":"{name}","browser_download_url":"https://x/{name}"}}"#))
             .collect();
-        format!(r#"{{"tag_name":"{tag}","assets":[{}]}}"#, assets.join(","))
+        format!(
+            r#"{{"tag_name":"{tag}","body":"- faster scans\n- bug fixes","assets":[{}]}}"#,
+            assets.join(",")
+        )
     }
 
     #[test]
@@ -291,6 +314,7 @@ mod tests {
         let up = pick_update(&json, "0.1.0").unwrap().unwrap();
         assert_eq!(up.version, "0.2.0");
         assert_eq!(up.zip_url, "https://x/Tomte-0.2.0.zip");
+        assert_eq!(up.notes.as_deref(), Some("- faster scans\n- bug fixes"));
         // same or older → no update
         assert_eq!(pick_update(&json, "0.2.0").unwrap(), None);
         assert_eq!(pick_update(&json, "0.3.0").unwrap(), None);

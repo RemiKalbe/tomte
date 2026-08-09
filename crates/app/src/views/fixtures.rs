@@ -57,6 +57,14 @@ pub const STATES: &[(&str, &str)] = &[
         "settings-dirty",
         "unsaved edits: floating Save/Revert toolbar",
     ),
+    (
+        "settings-update-ready",
+        "staged update: restart button, release notes, sidebar hint",
+    ),
+    (
+        "settings-update-checking",
+        "update check in flight: spinner + downloading note",
+    ),
 ];
 
 /// All gallery states: the screen poses above plus one `comp:<name>` state
@@ -507,6 +515,39 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 view
             });
             s.settings = Some(posed);
+            s
+        }
+        "settings-update-ready" => {
+            let mut m = rich_model();
+            m.update_ready = Some(tomte_app::update::StagedUpdate {
+                version: "0.2.0".into(),
+                staged: std::path::PathBuf::from("/tmp/updates/unpacked/Tomte.app"),
+                notes: Some(
+                    "## What's new in 0.2.0\n\n\
+                     - Merge editor: butter-smooth synced scrolling across all panes\n\
+                     - Fetch now button with honest failure states\n\
+                     - Saves wait their turn instead of failing mid-scan\n\
+                     - Resolved items leave the review list instantly"
+                        .into(),
+                ),
+            });
+            let mut s = shell(Route::Settings, m);
+            let state = s.state.clone();
+            s.settings = Some(cx.new(|_| {
+                super::settings::SettingsView::posed_for_gallery(paths.clone(), state, false)
+            }));
+            s
+        }
+        "settings-update-checking" => {
+            let mut s = shell(Route::Settings, rich_model());
+            let state = s.state.clone();
+            s.settings = Some(cx.new(|_| {
+                let mut view =
+                    super::settings::SettingsView::posed_for_gallery(paths.clone(), state, false);
+                view.update_checking = true;
+                view.update_note = Some("downloading 0.2.0…".into());
+                view
+            }));
             s
         }
         "settings-dirty" => {

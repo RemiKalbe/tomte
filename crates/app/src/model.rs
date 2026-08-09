@@ -31,10 +31,10 @@ const ATTENTION_CLASSES: [&str; 3] = ["conflict", "local_source_diverged", "eval
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncModel {
-    /// A verified, staged newer bundle: (version, staged .app path). Set by
-    /// the updater loop / Settings check; the Settings row offers the
-    /// restart and the sidebar footer surfaces that it exists.
-    pub update_ready: Option<(String, std::path::PathBuf)>,
+    /// A verified, staged newer bundle. Set by the updater loop / Settings
+    /// check; the Settings row offers the restart (and shows the release
+    /// notes), the sidebar footer surfaces that it exists.
+    pub update_ready: Option<crate::update::StagedUpdate>,
     /// Current drifted targets, unique by target path.
     pub drifted: Vec<DriftSummary>,
     pub in_sync: u64,
@@ -849,7 +849,10 @@ mod tests {
 
     #[test]
     fn fetch_feedback_lifecycle() {
-        let mut m = SyncModel::default();
+        let mut m = SyncModel {
+            fetch_started_ts: Some(100),
+            ..Default::default()
+        };
         // Click: in-flight armed by the view.
         m.fetch_started_ts = Some(100);
         // Failure push: in-flight clears, error surfaces, timeline row lands.

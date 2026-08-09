@@ -190,7 +190,7 @@ impl Shell {
         let update_ready = model
             .update_ready
             .as_ref()
-            .map(|(v, _)| format!("{v} ready — Settings to restart"));
+            .map(|u| format!("update ready · {}", u.version));
         let freshness = match model.last_fetch_ts {
             Some(ts) => format!("origin: fetched {}", time_ago(dashboard::system_now(), ts)),
             None => "origin: never fetched".to_string(),

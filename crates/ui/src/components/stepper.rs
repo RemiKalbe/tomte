@@ -6,6 +6,9 @@ use crate::theme::Theme;
 
 /// Segmented numeric stepper: `− │ value │ +` in one bordered group (Zed's
 /// number-field shape).
+// Established component-builder shape (cf. decision_strip): pure fn taking
+// theme + ids + data + handlers; splitting it would hide the parallelism.
+#[allow(clippy::too_many_arguments)]
 pub fn stepper(
     theme: Theme,
     dec_id: &'static str,

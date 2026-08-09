@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, Context, Corner, Div, ElementId, SharedString, Stateful, Window, anchored,
-    deferred, div, point, prelude::*, px,
+    AnyElement, Context, Corner, Div, ElementId, FontWeight, SharedString, Stateful, Window,
+    anchored, deferred, div, point, prelude::*, px,
 };
 use tomte_app::theme::Theme;
 use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
@@ -180,9 +180,10 @@ pub struct SettingsView {
     paths: SettingsPaths,
     /// Shared model — read for `update_ready`, written by the manual check.
     state: gpui::Entity<tomte_app::model::SyncModel>,
-    /// Manual update check in flight / last outcome line.
-    update_checking: bool,
-    update_note: Option<SharedString>,
+    /// Manual update check in flight / last outcome line. `pub(super)` so
+    /// the gallery can pose the states (fixtures never touch the network).
+    pub(super) update_checking: bool,
+    pub(super) update_note: Option<SharedString>,
     /// Clamped 5..=120; replaced by the background settings load.
     interval: u64,
     /// The on-disk settings landed — until then every control is inert so
@@ -742,6 +743,210 @@ fn path_row(theme: Theme, label: &'static str, path: &Path, divider: bool) -> Di
     )
 }
 
+impl SettingsView {
+    /// "Updates" section: version fact + check/restart control. Dev builds
+    /// (no bundle / no baked Team ID) show why the control is inert instead
+    /// of a button that silently can't work.
+    fn updates_row(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        use tomte_app::update::{BUILT_TEAM_ID, CURRENT_VERSION, running_bundle};
+        let ready = self.state.read(cx).update_ready.clone();
+        let notes = ready.as_ref().and_then(|u| u.notes.clone());
+        let enabled = BUILT_TEAM_ID.is_some()
+            && std::env::current_exe()
+                .ok()
+                .and_then(|exe| running_bundle(&exe))
+                .is_some();
+        let description: AnyElement = div()
+            .text_xs()
+            .text_color(theme.text_muted)
+            .child(match (&ready, &self.update_note) {
+                (Some(u), _) => SharedString::from(format!(
+                    "Tomte {CURRENT_VERSION} · {} downloaded and verified",
+                    u.version
+                )),
+                (None, Some(note)) => {
+                    SharedString::from(format!("Tomte {CURRENT_VERSION} · {note}"))
+                }
+                (None, None) => SharedString::from(format!("Tomte {CURRENT_VERSION}")),
+            })
+            .into_any_element();
+        let control: AnyElement = if let Some(u) = ready {
+            let staged = u.staged.clone();
+            ui::button(
+                theme,
+                "update-restart",
+                format!("Restart to update to {}", u.version).into(),
+                ui::ButtonVariant::Wash(theme.accent),
+                ui::ButtonSize::Sm,
+                move |_ev, _window, cx| crate::restart_to_update(staged.clone(), cx),
+            )
+            .into_any_element()
+        } else if self.update_checking {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(ui::spinner(theme, "update-check-spinner"))
+                .into_any_element()
+        } else if !enabled {
+            ui::disabled_button(
+                theme,
+                "update-check",
+                "Check for updates".into(),
+                ui::ButtonSize::Sm,
+                Some("dev build — updater is inert outside a signed Tomte.app".into()),
+            )
+            .into_any_element()
+        } else {
+            ui::button(
+                theme,
+                "update-check",
+                "Check for updates".into(),
+                ui::ButtonVariant::Outline(theme.text),
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.run_update_check(cx)),
+            )
+            .into_any_element()
+        };
+        let row = setting_row(
+            theme,
+            "Application updates",
+            Some(description),
+            control,
+            false,
+        );
+        // Release notes for the staged version: what you get by restarting,
+        // readable BEFORE committing to it. Plain text (the GitHub release
+        // body), quiet block, capped — the release page has the full story.
+        let Some(notes) = notes else { return row };
+        const MAX_LINES: usize = 14;
+        let lines: Vec<&str> = notes.lines().collect();
+        let clipped = lines.len() > MAX_LINES;
+        div().flex().flex_col().child(row).child(
+            div()
+                .mb_3()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(Theme::wash(theme.text_muted, 0.04))
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .text_xs()
+                .text_color(theme.text)
+                .children(lines.into_iter().take(MAX_LINES).map(|l| {
+                    // Markdown-lite: headings lose their #'s and gain
+                    // weight; everything else renders verbatim.
+                    let heading = l.starts_with('#');
+                    let text = SharedString::from(l.trim_start_matches('#').trim().to_string());
+                    div()
+                        .when(heading, |el| el.font_weight(FontWeight::MEDIUM))
+                        .child(text)
+                }))
+                .when(clipped, |el| {
+                    el.child(
+                        div()
+                            .text_color(theme.text_muted)
+                            .child("… full notes on the GitHub release"),
+                    )
+                }),
+        )
+    }
+
+    fn run_update_check(&mut self, cx: &mut Context<Self>) {
+        use tomte_app::update::Updater;
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.update_note = None;
+        cx.notify();
+        let stage_dir = self
+            .paths
+            .journal
+            .parent()
+            .map(|d| d.join("updates"))
+            .unwrap_or_else(|| std::path::PathBuf::from("updates"));
+        let state = self.state.clone();
+        cx.spawn(async move |this, cx| {
+            let updater = std::sync::Arc::new(Updater {
+                runner: std::sync::Arc::new(SystemRunner),
+                stage_dir,
+            });
+            // Phase 1: the cheap check — so "downloading X…" can show as
+            // honest progress before the (much longer) download phase.
+            let checked = {
+                let updater = updater.clone();
+                cx.background_executor()
+                    .spawn(async move { updater.check().map_err(|e| e.to_string()) })
+                    .await
+            };
+            let update = match checked {
+                Ok(Some(update)) => update,
+                Ok(None) => {
+                    this.update(cx, |view, cx| {
+                        view.update_checking = false;
+                        view.update_note = Some("up to date".into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+                Err(e) => {
+                    this.update(cx, |view, cx| {
+                        view.update_checking = false;
+                        view.update_note = Some(format!("update check failed: {e}").into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let downloading = format!("downloading {}…", update.version);
+            this.update(cx, |view, cx| {
+                view.update_note = Some(downloading.into());
+                cx.notify();
+            })
+            .ok();
+            let outcome = {
+                let updater = updater.clone();
+                let update = update.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        updater
+                            .download_and_stage(&update)
+                            .map(|staged| {
+                                Some(tomte_app::update::StagedUpdate {
+                                    version: update.version.clone(),
+                                    staged,
+                                    notes: update.notes.clone(),
+                                })
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                    .await
+            };
+            this.update(cx, |view, cx| {
+                view.update_checking = false;
+                match outcome {
+                    Ok(Some(ready)) => {
+                        state.update(cx, |model, cx| {
+                            model.update_ready = Some(ready);
+                            cx.notify();
+                        });
+                    }
+                    Ok(None) => view.update_note = Some("up to date".into()),
+                    Err(e) => view.update_note = Some(format!("update check failed: {e}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tomte_core::cmd::CommandError;
@@ -913,129 +1118,5 @@ mod tests {
         // invalid toml → defaults (same policy as the daemon)
         std::fs::write(&p, "not toml [[[").unwrap();
         assert_eq!(load_settings_blocking(&p).fetch_interval_minutes, 15);
-    }
-}
-
-impl SettingsView {
-    /// "Updates" section: version fact + check/restart control. Dev builds
-    /// (no bundle / no baked Team ID) show why the control is inert instead
-    /// of a button that silently can't work.
-    fn updates_row(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
-        use tomte_app::update::{BUILT_TEAM_ID, CURRENT_VERSION, running_bundle};
-        let ready = self.state.read(cx).update_ready.clone();
-        let enabled = BUILT_TEAM_ID.is_some()
-            && std::env::current_exe()
-                .ok()
-                .and_then(|exe| running_bundle(&exe))
-                .is_some();
-        let description: AnyElement = div()
-            .text_xs()
-            .text_color(theme.text_muted)
-            .child(match (&ready, &self.update_note) {
-                (Some((v, _)), _) => SharedString::from(format!(
-                    "Tomte {CURRENT_VERSION} · {v} downloaded and verified"
-                )),
-                (None, Some(note)) => {
-                    SharedString::from(format!("Tomte {CURRENT_VERSION} · {note}"))
-                }
-                (None, None) => SharedString::from(format!("Tomte {CURRENT_VERSION}")),
-            })
-            .into_any_element();
-        let control: AnyElement = if let Some((version, staged)) = ready {
-            ui::button(
-                theme,
-                "update-restart",
-                format!("Restart to update to {version}").into(),
-                ui::ButtonVariant::Wash(theme.accent),
-                ui::ButtonSize::Sm,
-                move |_ev, _window, cx| crate::restart_to_update(staged.clone(), cx),
-            )
-            .into_any_element()
-        } else if !enabled {
-            ui::disabled_button(
-                theme,
-                "update-check",
-                "Check for updates".into(),
-                ui::ButtonSize::Sm,
-                Some("dev build — updater is inert outside a signed Tomte.app".into()),
-            )
-            .into_any_element()
-        } else if self.update_checking {
-            div()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .child(ui::spinner(theme, "update-check-spinner"))
-                .into_any_element()
-        } else {
-            ui::button(
-                theme,
-                "update-check",
-                "Check for updates".into(),
-                ui::ButtonVariant::Outline(theme.text),
-                ui::ButtonSize::Sm,
-                cx.listener(|view, _ev, _window, cx| view.run_update_check(cx)),
-            )
-            .into_any_element()
-        };
-        setting_row(
-            theme,
-            "Application updates",
-            Some(description),
-            control,
-            false,
-        )
-    }
-
-    fn run_update_check(&mut self, cx: &mut Context<Self>) {
-        use tomte_app::update::Updater;
-        if self.update_checking {
-            return;
-        }
-        self.update_checking = true;
-        self.update_note = None;
-        cx.notify();
-        let stage_dir = self
-            .paths
-            .journal
-            .parent()
-            .map(|d| d.join("updates"))
-            .unwrap_or_else(|| std::path::PathBuf::from("updates"));
-        let state = self.state.clone();
-        cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move {
-                    let updater = Updater {
-                        runner: std::sync::Arc::new(SystemRunner),
-                        stage_dir,
-                    };
-                    match updater.check() {
-                        Ok(None) => Ok(None),
-                        Ok(Some(update)) => updater
-                            .download_and_stage(&update)
-                            .map(|staged| Some((update.version, staged)))
-                            .map_err(|e| e.to_string()),
-                        Err(e) => Err(e.to_string()),
-                    }
-                })
-                .await;
-            this.update(cx, |view, cx| {
-                view.update_checking = false;
-                match outcome {
-                    Ok(Some(ready)) => {
-                        state.update(cx, |model, cx| {
-                            model.update_ready = Some(ready);
-                            cx.notify();
-                        });
-                    }
-                    Ok(None) => view.update_note = Some("up to date".into()),
-                    Err(e) => view.update_note = Some(format!("update check failed: {e}").into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 }

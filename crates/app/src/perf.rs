@@ -44,7 +44,7 @@ pub fn time<T>(tag: &'static str, f: impl FnOnce() -> T) -> T {
             eprintln!(
                 "perf[{tag}] n={}/s avg={}µs max={}µs",
                 agg.n,
-                (agg.sum.as_micros() as u64) / agg.n.max(1) as u64,
+                (agg.sum.as_micros() as u64) / agg.n.max(1),
                 agg.max.as_micros(),
             );
             agg.n = 0;

@@ -226,6 +226,14 @@ pub fn register_keys(cx: &mut App) {
 
 /// What one region renders as (merge-editor-v2 spec step 3). Pure and
 /// testable; the render walk consumes it directly.
+/// Both sides of a re-decidable region: (ours lines, theirs lines, theirs
+/// region-local protected map).
+type ProvenanceSides = (
+    Vec<SharedString>,
+    Vec<SharedString>,
+    HashMap<usize, SharedString>,
+);
+
 #[derive(Debug, PartialEq)]
 enum RegionDisplay {
     /// Unchanged context lines (muted).
@@ -241,11 +249,7 @@ enum RegionDisplay {
         has_base: bool,
         /// Some => show ours/theirs provenance blocks (with the theirs
         /// side's region-local protected map); None => show `lines`.
-        provenance: Option<(
-            Vec<SharedString>,
-            Vec<SharedString>,
-            HashMap<usize, SharedString>,
-        )>,
+        provenance: Option<ProvenanceSides>,
         lines: Vec<(SharedString, Option<ui::Side>)>,
     },
     /// Explicit decision, collapsed: strip names it, lines show the result.
