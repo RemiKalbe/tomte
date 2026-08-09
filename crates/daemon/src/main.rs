@@ -98,6 +98,13 @@ fn sanitize_path() {
 }
 
 fn main() -> ExitCode {
+    // SIG_IGN dispositions survive exec, and whoever spawned us may have
+    // been launched with SIGTERM ignored (observed 2026-08-08: such daemons
+    // shrugged off pkill and squatted the socket). A daemon must die on
+    // TERM no matter its ancestry.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
     let once = std::env::args().any(|a| a == "--once");
     sanitize_path();
     let support = app_support_dir();
