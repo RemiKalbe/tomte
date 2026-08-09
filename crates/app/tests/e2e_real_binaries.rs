@@ -202,6 +202,9 @@ fn daemon_serves_degraded_status_while_chezmoi_is_unavailable() {
         )
         .env("HOME", &e2e.scratch.home)
         .env("PATH", "/usr/bin:/bin") // no chezmoi here
+        // …and keep it that way: the daemon would otherwise adopt the
+        // login shell's PATH and find the real chezmoi (2026-08-09).
+        .env("TOMTE_NO_SHELL_PATH", "1")
         .spawn()
         .expect("start tomted");
     let sock = e2e.socket();

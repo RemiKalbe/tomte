@@ -390,6 +390,11 @@ pub fn merged_login_path(
 /// shell's PATH once at startup, the same trick editors use. Best-effort
 /// and bounded: a broken shell init must not wedge boot.
 pub fn adopt_login_shell_path() {
+    // Hermetic-test escape hatch: e2e suites that simulate missing tools
+    // via a stripped PATH must not have it silently repaired.
+    if std::env::var_os("TOMTE_NO_SHELL_PATH").is_some() {
+        return;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let shell_path = SystemRunner
         .run(
