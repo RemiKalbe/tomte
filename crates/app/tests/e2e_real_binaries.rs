@@ -14,21 +14,31 @@ fn tomte_bin() -> PathBuf {
 
 /// The real tomted binary. CARGO_BIN_EXE_* only exists for the crate's own
 /// bins, so build the daemon's and locate it next to ours in target/.
+///
+/// Built ONCE per test process: these tests run in parallel threads, and
+/// concurrent `cargo build` invocations re-linking target/debug/tomted while
+/// a sibling test's subprocess exec'd it produced ENOENT on cold CI runners
+/// (2026-08-09).
 fn tomted_bin() -> PathBuf {
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "tomte-daemon", "--bin", "tomted"])
-        .status()
-        .expect("cargo build tomted");
-    assert!(status.success(), "building tomted failed");
-    // target/debug/deps/../tomte → target/debug/tomted
-    let mut dir = tomte_bin();
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let bin = dir.join("tomted");
-    assert!(bin.is_file(), "tomted not found at {}", bin.display());
-    bin
+    static TOMTED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    TOMTED
+        .get_or_init(|| {
+            let status = Command::new(env!("CARGO"))
+                .args(["build", "-p", "tomte-daemon", "--bin", "tomted"])
+                .status()
+                .expect("cargo build tomted");
+            assert!(status.success(), "building tomted failed");
+            // target/debug/deps/../tomte → target/debug/tomted
+            let mut dir = tomte_bin();
+            dir.pop();
+            if dir.ends_with("deps") {
+                dir.pop();
+            }
+            let bin = dir.join("tomted");
+            assert!(bin.is_file(), "tomted not found at {}", bin.display());
+            bin
+        })
+        .clone()
 }
 
 struct E2e {

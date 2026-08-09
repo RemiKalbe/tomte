@@ -23,6 +23,11 @@ jobs:
         run: brew install chezmoi
       - name: fmt
         run: cargo fmt --all --check
+      # Bin artifacts exist BEFORE tests run: the e2e suite spawns the real
+      # target/debug/{tomte,tomted}, and building them from inside parallel
+      # tests raced on cold runners.
+      - name: build
+        run: cargo build --workspace
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
