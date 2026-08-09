@@ -106,6 +106,10 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
     }
     let once = std::env::args().any(|a| a == "--once");
+    // Launchd/bundle launches carry a bare PATH; adopt the login shell's
+    // (chezmoi/git/op live in Homebrew or user dirs), THEN drop ephemeral
+    // entries — order matters, both lists can carry /var/folders shims.
+    tomte_core::cmd::adopt_login_shell_path();
     sanitize_path();
     let support = app_support_dir();
     let settings = Settings::load(&env_path("TOMTE_SETTINGS", support.join("settings.toml")));

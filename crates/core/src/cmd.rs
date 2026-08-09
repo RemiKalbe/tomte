@@ -353,3 +353,76 @@ mod tests {
         assert_eq!(calls[0].args, vec!["managed"]);
     }
 }
+
+/// Union of the current PATH, the login shell's PATH, and existing brew
+/// fallbacks — `None` when nothing new would be added. Pure so the merge
+/// is testable; [`adopt_login_shell_path`] owns the process mutation.
+pub fn merged_login_path(
+    current: &std::ffi::OsStr,
+    shell_path: &str,
+    fallbacks: &[&str],
+) -> Option<std::ffi::OsString> {
+    let mut entries: Vec<PathBuf> = std::env::split_paths(current).collect();
+    let mut changed = false;
+    for p in std::env::split_paths(shell_path.trim()) {
+        if !p.as_os_str().is_empty() && !entries.contains(&p) {
+            entries.push(p);
+            changed = true;
+        }
+    }
+    for f in fallbacks {
+        let p = PathBuf::from(f);
+        if p.is_dir() && !entries.contains(&p) {
+            entries.push(p);
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    std::env::join_paths(entries).ok()
+}
+
+/// GUI-launched processes inherit launchd's minimal PATH — no Homebrew,
+/// no user tool dirs — so `op`/`chezmoi`/`git` exist in a terminal but
+/// vanish inside the bundled .app (2026-08-08: the released build's
+/// 1Password account picker errored on every machine). Harvest the login
+/// shell's PATH once at startup, the same trick editors use. Best-effort
+/// and bounded: a broken shell init must not wedge boot.
+pub fn adopt_login_shell_path() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell_path = SystemRunner
+        .run(
+            CommandRequest::new(&shell)
+                .args(["-l", "-c", "printenv PATH"])
+                .timeout(Duration::from_secs(5)),
+        )
+        .ok()
+        .filter(|o| o.success())
+        .map(|o| o.stdout_utf8())
+        .unwrap_or_default();
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(joined) = merged_login_path(
+        &current,
+        &shell_path,
+        &["/opt/homebrew/bin", "/usr/local/bin"],
+    ) {
+        // Startup-only, before any threads spawn subprocesses.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::merged_login_path;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn merges_new_entries_and_skips_known_ones() {
+        let merged =
+            merged_login_path(OsStr::new("/usr/bin:/bin"), "/opt/x/bin:/usr/bin", &[]).unwrap();
+        assert_eq!(merged.to_str().unwrap(), "/usr/bin:/bin:/opt/x/bin");
+        // nothing new → None
+        assert!(merged_login_path(OsStr::new("/usr/bin:/bin"), "/usr/bin", &[]).is_none());
+    }
+}

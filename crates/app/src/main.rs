@@ -876,6 +876,10 @@ fn main() -> ExitCode {
             }
         }
     }
+    // Finder/updater launches carry launchd's bare PATH — the released
+    // 0.1.0 couldn't find `op` (or chezmoi, from a clean install). Adopt
+    // the login shell's PATH before anything spawns a subprocess.
+    tomte_core::cmd::adopt_login_shell_path();
     let paths = resolve_paths();
     if std::env::args().any(|a| a == "--verify-connectivity") {
         return verify_connectivity(&resolve_paths());

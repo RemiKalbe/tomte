@@ -143,6 +143,23 @@ enum AccountsState {
     Unavailable,
 }
 
+/// Kick (or re-kick) the `op account list` probe; lands in
+/// [`SettingsView::accounts`]. Shared by construction and the retry row.
+fn spawn_accounts_load(cx: &mut Context<SettingsView>) {
+    cx.spawn(async move |this, cx| {
+        let accounts = cx
+            .background_executor()
+            .spawn(async move { load_accounts_blocking(&SystemRunner) })
+            .await;
+        this.update(cx, |view, cx| {
+            view.accounts = accounts;
+            cx.notify();
+        })
+        .ok();
+    })
+    .detach();
+}
+
 /// Run `op account list --format=json` and map every failure mode to the
 /// single [`AccountsState::Unavailable`] state row.
 fn load_accounts_blocking(runner: &dyn CommandRunner) -> AccountsState {
@@ -228,18 +245,7 @@ impl SettingsView {
         .detach();
 
         // Account list from `op`, off the main thread.
-        cx.spawn(async move |this, cx| {
-            let accounts = cx
-                .background_executor()
-                .spawn(async move { load_accounts_blocking(&SystemRunner) })
-                .await;
-            this.update(cx, |view, cx| {
-                view.accounts = accounts;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        spawn_accounts_load(cx);
 
         Self {
             paths,
@@ -557,6 +563,24 @@ impl SettingsView {
                     "1Password CLI not found or errored",
                     theme.drift,
                 ));
+                // A dead-end error row invited quit-and-relaunch
+                // (2026-08-08 onboarding feedback): failures retry in place.
+                menu = menu.child(
+                    div()
+                        .id("accounts-retry")
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(theme.accent)
+                        .cursor_pointer()
+                        .hover(|el| el.bg(Theme::wash(theme.text, 0.06)))
+                        .child("Retry detection")
+                        .on_click(cx.listener(|view, _ev, _window, cx| {
+                            view.accounts = AccountsState::Loading;
+                            spawn_accounts_load(cx);
+                            cx.notify();
+                        })),
+                );
             }
             AccountsState::Ready(accounts) => {
                 let rows: Vec<(Option<String>, SharedString, Option<SharedString>)> = accounts
