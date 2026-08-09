@@ -1340,11 +1340,16 @@ fn pane_row(ix: usize, line: &PaneLine, side: PaneSide, theme: Theme) -> AnyElem
     // panes' root indentation apart): EVERY mono row in the merge editor
     // carries the same 16px gutter, protected lines fill it with an amber
     // {} and the hover tooltip tells the full story.
+    //
+    // Text darkens only when THIS pane is washed, i.e. this side actually
+    // changed (2026-08-08: counterpart spans of one-sided changes rendered
+    // black-on-white — an unwashed "changed" line reads as a rendering
+    // glitch, and a side with no change deserves no emphasis at all).
     let row = ui::mono_line(theme)
-        .text_color(if line.kind == RegionKind::Unchanged {
-            theme.text_muted
-        } else {
+        .text_color(if bg.is_some() {
             theme.text
+        } else {
+            theme.text_muted
         })
         .when_some(bg, |el, bg| el.bg(bg))
         .child(ui::line_gutter(
