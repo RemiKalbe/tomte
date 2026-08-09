@@ -50,7 +50,13 @@ impl SyncModel {
         in_sync: u64,
         degraded: Option<String>,
         scanning: bool,
+        last_fetch_ts: Option<u64>,
     ) {
+        // Daemon-side freshness beats what we remember; None keeps ours
+        // (busy snapshots carry no data).
+        if last_fetch_ts.is_some() {
+            self.last_fetch_ts = last_fetch_ts;
+        }
         // Stale-daemon immunity: pre-2026-08-04 daemons report their busy
         // state as a degraded hint. Busy is not a degradation — drop it here
         // so an old binary lingering on the socket (bundle installs, launch
@@ -418,6 +424,7 @@ mod tests {
             12,
             Some("chezmoi doctor".into()),
             false,
+            None,
         );
         assert_eq!(m.in_sync, 12);
         assert_eq!(m.degraded.as_deref(), Some("chezmoi doctor"));
@@ -610,6 +617,7 @@ mod tests {
                 0,
                 None,
                 false,
+                None,
             );
             assert_eq!(m.needs_attention(), want, "classes {classes:?}");
         }
@@ -640,6 +648,7 @@ mod tests {
                 0,
                 None,
                 false,
+                None,
             );
             assert_eq!(m.status_title(), want, "classes {classes:?}");
         }
@@ -657,7 +666,7 @@ mod tests {
 
         // connected + clean: sync-all enabled, no review entry
         m.connected = true;
-        m.hydrate_status(vec![], 42, None, false);
+        m.hydrate_status(vec![], 42, None, false, None);
         m.last_fetch_ts = Some(1_000 - 30);
         let (header, freshness, review, sync_all) = m.menu_spec(1_000);
         assert_eq!(header, "All in sync · 42 files");
@@ -782,6 +791,7 @@ mod tests {
             954,
             None,
             false,
+            None,
         );
         // A real degraded hint lands first (locked 1Password).
         m.hydrate_status(
@@ -789,10 +799,11 @@ mod tests {
             954,
             Some("Unlock 1Password and retry.".into()),
             false,
+            None,
         );
         // rescan begins: busy snapshot carries placeholder zeros + scanning
         // and NO hint — stats AND the real hint must both survive.
-        m.hydrate_status(vec![], 0, None, true);
+        m.hydrate_status(vec![], 0, None, true, None);
         assert_eq!(m.in_sync, 954, "stats must survive a rescan");
         assert_eq!(m.drifted.len(), 1);
         assert!(m.scanning);
@@ -802,10 +813,16 @@ mod tests {
             "a persistent degradation must not flicker off during scans"
         );
         // A scanning status WITH a hint (daemon starting) still lands.
-        m.hydrate_status(vec![], 0, Some("chezmoid starting: building core".into()), true);
+        m.hydrate_status(
+            vec![],
+            0,
+            Some("chezmoid starting: building core".into()),
+            true,
+            None,
+        );
         assert_eq!(m.degraded.as_deref(), Some("chezmoid starting: building core"));
         // scan lands: real data replaces
-        m.hydrate_status(vec![], 955, None, false);
+        m.hydrate_status(vec![], 955, None, false, None);
         assert_eq!(m.in_sync, 955);
         assert!(m.drifted.is_empty());
         assert!(!m.scanning);

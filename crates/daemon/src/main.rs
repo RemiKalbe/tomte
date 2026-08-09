@@ -330,18 +330,19 @@ fn main() -> ExitCode {
         });
     }
 
-    // fetch timer
+    // fetch timer — first fetch RIGHT AWAY (a fresh daemon used to show
+    // "never fetched" for a whole interval, 2026-08-08), then the interval.
     {
         let core = core.clone();
         let interval = Duration::from_secs(settings.fetch_interval_minutes.max(1) * 60);
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(interval);
                 if let Ok(mut c) = core.lock()
                     && let Err(e) = c.handle_fetch(now_ts())
                 {
                     eprintln!("chezmoid: fetch failed: {e}");
                 }
+                std::thread::sleep(interval);
             }
         });
     }

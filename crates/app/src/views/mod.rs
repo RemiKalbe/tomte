@@ -328,6 +328,7 @@ mod render_smoke {
             42,
             Some("degraded hint".into()),
             false,
+            None,
         );
         let info = |ts: u64| TimelineRow {
             ts,

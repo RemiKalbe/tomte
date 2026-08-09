@@ -30,6 +30,9 @@ pub enum Request {
         ttl_secs: u32,
     },
     Rescan,
+    /// Fetch origin now (acknowledged immediately; completion arrives as a
+    /// FetchDone push, like Rescan/ScanDone).
+    Fetch,
     /// Ask the daemon to exit cleanly (the app respawns it after settings
     /// changes; spec §9 restart-to-apply without user action).
     Shutdown,
@@ -87,6 +90,11 @@ pub enum Response {
         /// "all in sync" (first-launch data-consistency bug).
         #[serde(default)]
         scanning: bool,
+        /// Timestamp of the last SUCCESSFUL origin fetch, daemon-side — so
+        /// freshness survives app restarts instead of living only in pushes
+        /// (the 2026-08-08 perpetual "never fetched" bug).
+        #[serde(default)]
+        last_fetch_ts: Option<u64>,
     },
     Timeline {
         events: Vec<EventSummary>,

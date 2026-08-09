@@ -110,6 +110,7 @@ fn rich_model() -> SyncModel {
         951,
         None,
         false,
+        None,
     );
     m.last_fetch_ts = Some(now() - 240);
     let row = |ts: u64, kind: &str, target: Option<PathBuf>, class: Option<&str>| TimelineRow {
@@ -314,7 +315,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 connected: true,
                 ..Default::default()
             };
-            m.hydrate_status(vec![], 955, None, false);
+            m.hydrate_status(vec![], 955, None, false, None);
             m.last_fetch_ts = Some(now() - 120);
             shell(Route::Dashboard, m)
         }

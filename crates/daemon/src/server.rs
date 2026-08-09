@@ -221,6 +221,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                 in_sync: 0,
                 degraded: Some(why.clone()),
                 scanning: true,
+                last_fetch_ts: None,
             },
             _ => Response::Error { message: why },
         };
@@ -242,6 +243,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     in_sync: 0,
                     degraded: None,
                     scanning: true,
+                    last_fetch_ts: None,
                 },
                 _ => Response::Error {
                     message: "daemon busy (scan in progress) — retry shortly".into(),
@@ -263,6 +265,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                 in_sync,
                 degraded,
                 scanning: false,
+                last_fetch_ts: c.last_fetch_ts(),
             }
         }
         Request::Timeline { limit, before_id } => match c.journal().timeline(limit, before_id) {
@@ -299,6 +302,22 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     && let Err(e) = c.full_rescan(now_fn())
                 {
                     eprintln!("chezmoid: requested rescan failed: {e}");
+                }
+            });
+            Response::Ok
+        }
+        Request::Fetch => {
+            // Same async shape as Rescan: ack now, fetch on a thread,
+            // completion arrives as the FetchDone push (success only).
+            drop(c);
+            let core = ctx.core.get().cloned();
+            let now_fn = ctx.now_fn;
+            std::thread::spawn(move || {
+                if let Some(core) = core
+                    && let Ok(mut c) = core.lock()
+                    && let Err(e) = c.handle_fetch(now_fn())
+                {
+                    eprintln!("chezmoid: requested fetch failed: {e}");
                 }
             });
             Response::Ok

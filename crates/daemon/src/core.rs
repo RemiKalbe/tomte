@@ -62,6 +62,9 @@ pub struct DaemonCore {
     paused: bool,
     /// Outcome of the previous full scan — journal scans only on change.
     last_scan_drifted: Option<u32>,
+    /// Last SUCCESSFUL origin fetch (seeded from the journal at startup so
+    /// freshness survives daemon restarts).
+    last_fetch_ts: Option<u64>,
     /// Shared with the socket server so Subscribe never needs the core
     /// lock (the initial scan can hold it for minutes on secret-manager
     /// timeouts — head-of-line blocking the handshake was a real bug).
@@ -90,6 +93,19 @@ impl DaemonCore {
         let source_dir = chezmoi.source_dir()?;
         let managed: BTreeSet<PathBuf> = chezmoi.managed()?.into_iter().collect();
         let scanner = DriftScanner::new(chezmoi.clone(), git.clone(), remote_ref.clone());
+        let last_fetch_ts = journal
+            .timeline(200, None)
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .filter(|r| r.kind == "fetch")
+                    .find(|r| {
+                        r.meta
+                            .as_ref()
+                            .is_none_or(|m| m.get("error").is_none())
+                    })
+                    .map(|r| r.ts)
+            });
         Ok(Self {
             chezmoi,
             git,
@@ -104,6 +120,7 @@ impl DaemonCore {
             degraded: None,
             paused: false,
             last_scan_drifted: None,
+            last_fetch_ts,
             subscribers,
         })
     }
@@ -478,6 +495,9 @@ impl DaemonCore {
         match self.git.fetch("origin") {
             Ok(()) => {}
             Err(e) => {
+                // A FAILED fetch is journaled but emits no FetchDone — the
+                // app's freshness tile must never claim "fetched Xs ago" for
+                // a fetch that died (2026-08-08).
                 self.journal.record_event(NewEvent {
                     target: None,
                     ts: now_ts,
@@ -486,13 +506,10 @@ impl DaemonCore {
                     to_hash: None,
                     meta: Some(serde_json::json!({"error": e.to_string()})),
                 })?;
-                self.emit(Event::FetchDone {
-                    ts: now_ts,
-                    behind: 0,
-                });
                 return Ok(());
             }
         }
+        self.last_fetch_ts = Some(now_ts);
         let behind = self
             .git
             .divergence(&self.remote_ref)
@@ -550,5 +567,9 @@ impl DaemonCore {
             })
             .collect();
         (drifted, self.in_sync_count, self.degraded.clone())
+    }
+
+    pub fn last_fetch_ts(&self) -> Option<u64> {
+        self.last_fetch_ts
     }
 }

@@ -230,9 +230,8 @@ fn print_status(socket: &Path) -> ExitCode {
             drifted,
             in_sync,
             degraded,
-            scanning,
+            ..
         }) => {
-            let _ = scanning;
             let mut line = format!("{} drifted, {} in sync", drifted.len(), in_sync);
             if let Some(hint) = degraded {
                 line.push_str(&format!(", degraded: {hint}"));
@@ -567,11 +566,12 @@ async fn refresh_status(
         in_sync,
         degraded,
         scanning,
+        last_fetch_ts,
     }) = resp
     {
         return cx
             .update_entity(state, |model, cx| {
-                model.hydrate_status(drifted, in_sync, degraded, scanning);
+                model.hydrate_status(drifted, in_sync, degraded, scanning, last_fetch_ts);
                 cx.notify();
             })
             .is_ok();
@@ -643,9 +643,10 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                     in_sync,
                     degraded,
                     scanning,
+                    last_fetch_ts,
                 } = status_resp
                 {
-                    model.hydrate_status(drifted, in_sync, degraded, scanning);
+                    model.hydrate_status(drifted, in_sync, degraded, scanning, last_fetch_ts);
                 }
                 model.hydrate_timeline(rows);
                 cx.notify();

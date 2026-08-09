@@ -222,3 +222,82 @@ fn daemon_serves_degraded_status_while_chezmoi_is_unavailable() {
         "expected a 'starting' degraded status, got: {text}"
     );
 }
+
+#[test]
+fn fetch_request_updates_freshness_and_pushes_fetch_done() {
+    use czui_app::ipc::IpcClient;
+    use czui_proto::{Event, Request, Response};
+    use std::time::Duration;
+
+    let e2e = E2e::new();
+    // Boot the real daemon binary against the scratch home (its origin is a
+    // local bare repo, so Fetch is a real `git fetch`).
+    let mut daemon = Command::new(&e2e.chezmoid)
+        .env("CZUI_SOCKET", e2e.socket())
+        .env(
+            "CZUI_JOURNAL",
+            e2e.scratch.root.path().join("fetch-journal.db"),
+        )
+        .env(
+            "CZUI_SETTINGS",
+            e2e.scratch.root.path().join("fetch-settings.toml"),
+        )
+        .env("HOME", &e2e.scratch.home)
+        .spawn()
+        .expect("start chezmoid");
+    let sock = e2e.socket();
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let client = IpcClient::connect(&sock).expect("connect");
+    let events = client.subscribe().expect("subscribe");
+
+    // Manual fetch: acknowledged immediately; retry through busy/starting.
+    for _ in 0..60 {
+        match client.request(Request::Fetch) {
+            Ok(Response::Ok) => break,
+            Ok(Response::Error { message })
+                if message.contains("busy") || message.contains("starting") =>
+            {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            other => panic!("fetch request failed: {other:?}"),
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match events.recv_timeout(left) {
+            Ok(Event::FetchDone { ts, .. }) => {
+                assert!(ts > 0);
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("no FetchDone push: {e}"),
+        }
+    }
+    // Freshness survives in Status (not just the push) — the perpetual
+    // "never fetched" fix. Immediately after the push the fetch thread may
+    // still hold the core (busy Status carries no ts), so poll briefly like
+    // a real client would.
+    let mut carried = false;
+    for _ in 0..20 {
+        match client.request(Request::Status) {
+            Ok(Response::Status {
+                last_fetch_ts: Some(_),
+                ..
+            }) => {
+                carried = true;
+                break;
+            }
+            Ok(Response::Status { .. }) => std::thread::sleep(Duration::from_millis(250)),
+            other => panic!("status failed: {other:?}"),
+        }
+    }
+    assert!(carried, "Status must carry last_fetch_ts once idle");
+    let _ = client.request(Request::Shutdown);
+    let _ = daemon.wait();
+}

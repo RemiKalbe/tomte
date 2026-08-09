@@ -247,7 +247,7 @@ impl DashboardView {
                         freshness.to_string(),
                         "origin",
                         freshness_color,
-                        None,
+                        Some(fetch_now_button(theme, engine.clone())),
                     ))
                     .child(tile(
                         theme,
@@ -510,6 +510,38 @@ fn trigger_onepassword_unlock(
 }
 
 /// One mockup-B health tile: big value, muted label, optional action slot.
+/// "Fetch now" in the origin tile: ask the daemon to fetch immediately
+/// (ack now, FetchDone push updates the freshness). Muted+tooltip while
+/// disconnected — same contract as every other action.
+fn fetch_now_button(theme: Theme, engine: Option<Arc<ResolveEngine>>) -> gpui::AnyElement {
+    match engine {
+        Some(engine) => ui::button(
+            theme,
+            "tile-fetch-now",
+            "Fetch now".into(),
+            ui::ButtonVariant::Wash(theme.accent),
+            ui::ButtonSize::Sm,
+            move |_event, _window, cx| {
+                let engine = engine.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = engine.ipc.request(czui_proto::Request::Fetch);
+                    })
+                    .detach();
+            },
+        )
+        .into_any_element(),
+        None => ui::disabled_button(
+            theme,
+            "tile-fetch-now",
+            "Fetch now".into(),
+            ui::ButtonSize::Sm,
+            Some("daemon not connected".into()),
+        )
+        .into_any_element(),
+    }
+}
+
 fn tile(
     theme: Theme,
     value: String,
