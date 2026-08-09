@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
-use czui_proto::{
+use tomte_proto::{
     ClientFrame, Event, EventSummary, PROTOCOL_VERSION, Request, Response, ServerFrame,
     check_hello, write_frame,
 };
@@ -96,7 +96,7 @@ fn handle_connection(stream: UnixStream, ctx: ServeCtx) -> std::io::Result<()> {
 
     for line in reader.lines() {
         let line = line?;
-        let frame: ClientFrame = match czui_proto::read_frame(&line) {
+        let frame: ClientFrame = match tomte_proto::read_frame(&line) {
             Ok(f) => f,
             Err(e) => {
                 // no id to echo; use 0 per protocol convention for parse errors
@@ -158,7 +158,7 @@ fn handle_connection(stream: UnixStream, ctx: ServeCtx) -> std::io::Result<()> {
     Ok(())
 }
 
-fn event_summaries(rows: Vec<czui_journal::EventRow>) -> Vec<EventSummary> {
+fn event_summaries(rows: Vec<tomte_journal::EventRow>) -> Vec<EventSummary> {
     rows.into_iter()
         .map(|e| EventSummary {
             id: e.id,
@@ -209,11 +209,11 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
             .map(|e| e.clone())
             .unwrap_or_else(|_| "starting".to_string());
         // Before the first failure the placeholder reason is "starting" —
-        // don't render the comical "chezmoid starting: starting".
+        // don't render the comical "tomted starting: starting".
         let why = if why == "starting" {
-            "chezmoid starting…".to_string()
+            "tomted starting…".to_string()
         } else {
-            format!("chezmoid starting: {why}")
+            format!("tomted starting: {why}")
         };
         return match request {
             Request::Status => Response::Status {
@@ -256,8 +256,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     Err(std::sync::TryLockError::WouldBlock) => {
                         if std::time::Instant::now() >= deadline {
                             return Response::Error {
-                                message: "daemon busy (scan in progress) — retry shortly"
-                                    .into(),
+                                message: "daemon busy (scan in progress) — retry shortly".into(),
                             };
                         }
                     }
@@ -320,7 +319,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     && let Ok(mut c) = core.lock()
                     && let Err(e) = c.full_rescan(now_fn())
                 {
-                    eprintln!("chezmoid: requested rescan failed: {e}");
+                    eprintln!("tomted: requested rescan failed: {e}");
                 }
             });
             Response::Ok
@@ -336,7 +335,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     && let Ok(mut c) = core.lock()
                     && let Err(e) = c.handle_fetch(now_fn())
                 {
-                    eprintln!("chezmoid: requested fetch failed: {e}");
+                    eprintln!("tomted: requested fetch failed: {e}");
                 }
             });
             Response::Ok
@@ -359,10 +358,10 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
             let j = c.journal();
             match j.begin_session(ts) {
                 Ok(session) => {
-                    let _ = j.record_event(czui_journal::NewEvent {
+                    let _ = j.record_event(tomte_journal::NewEvent {
                         target: None,
                         ts,
-                        kind: czui_journal::EventKind::SessionStart,
+                        kind: tomte_journal::EventKind::SessionStart,
                         from_hash: None,
                         to_hash: None,
                         meta: Some(serde_json::json!({"session": session})),
@@ -390,10 +389,10 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
             let j = c.journal();
             match j.end_session(session, ts, &summary) {
                 Ok(()) => {
-                    let _ = j.record_event(czui_journal::NewEvent {
+                    let _ = j.record_event(tomte_journal::NewEvent {
                         target: None,
                         ts,
-                        kind: czui_journal::EventKind::SessionEnd,
+                        kind: tomte_journal::EventKind::SessionEnd,
                         from_hash: None,
                         to_hash: None,
                         meta: Some(serde_json::json!({"session": session, "summary": summary})),

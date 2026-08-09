@@ -10,15 +10,15 @@
 
 use std::path::{Path, PathBuf};
 
-use czui_app::theme::Theme;
-use czui_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
 use gpui::{
     AnyElement, Context, Corner, Div, ElementId, SharedString, Stateful, Window, anchored,
     deferred, div, point, prelude::*, px,
 };
+use tomte_app::theme::Theme;
+use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
 
-use czui_ui::components as ui;
 use serde::{Deserialize, Serialize};
+use tomte_ui::components as ui;
 
 /// Fetch-interval bounds and step (spec §9): 5..=120 minutes, 5-minute steps.
 pub const INTERVAL_MIN: u64 = 5;
@@ -93,7 +93,7 @@ pub fn parse_op_accounts(json: &str) -> Result<Vec<OpAccount>, String> {
 }
 
 /// On-disk settings shape — field-for-field compatible with
-/// `czui_daemon::settings::Settings` (round-trip covered by a test against
+/// `tomte_daemon::settings::Settings` (round-trip covered by a test against
 /// the daemon crate, which is a dev-dependency).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -315,12 +315,12 @@ impl SettingsView {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&path, text)?;
-                    // Restart chezmoid so the new settings apply without user
+                    // Restart tomted so the new settings apply without user
                     // action: ask it to exit; the app's reconnect loop
                     // respawns it (spec §9). Failure to reach the daemon is
                     // fine — it simply wasn't running.
-                    if let Ok(client) = czui_app::ipc::IpcClient::connect(&socket) {
-                        let _ = client.request(czui_proto::Request::Shutdown);
+                    if let Ok(client) = tomte_app::ipc::IpcClient::connect(&socket) {
+                        let _ = client.request(tomte_proto::Request::Shutdown);
                     }
                     Ok::<(), std::io::Error>(())
                 })
@@ -467,23 +467,26 @@ impl SettingsView {
             }),
         );
 
-        let control = div()
-            .flex()
-            .flex_col()
-            .items_end()
-            .child(button)
-            .when(self.menu_open, |el| {
-                // Zero-size marker: the anchored element positions at its own
-                // layout origin, so give it a point (the button's bottom-right
-                // corner), not a box with the menu's size.
-                el.child(div().h_0().w_0().child(deferred(
-                    anchored()
-                        .anchor(Corner::TopRight)
-                        .offset(point(px(0.), px(4.)))
-                        .snap_to_window_with_margin(px(8.))
-                        .child(self.account_menu(theme, cx)),
-                )))
-            });
+        let control =
+            div()
+                .flex()
+                .flex_col()
+                .items_end()
+                .child(button)
+                .when(self.menu_open, |el| {
+                    // Zero-size marker: the anchored element positions at its own
+                    // layout origin, so give it a point (the button's bottom-right
+                    // corner), not a box with the menu's size.
+                    el.child(
+                        div().h_0().w_0().child(deferred(
+                            anchored()
+                                .anchor(Corner::TopRight)
+                                .offset(point(px(0.), px(4.)))
+                                .snap_to_window_with_margin(px(8.))
+                                .child(self.account_menu(theme, cx)),
+                        )),
+                    )
+                });
 
         let description = div()
             .flex()
@@ -500,7 +503,13 @@ impl SettingsView {
             .child(ui::code_chip(theme, "op").py_0())
             .child("subprocess.")
             .into_any_element();
-        setting_row(theme, "Account", Some(description), control.into_any_element(), false)
+        setting_row(
+            theme,
+            "Account",
+            Some(description),
+            control.into_any_element(),
+            false,
+        )
     }
 
     /// The dropdown popover: "None" first (always a real choice), then the
@@ -516,7 +525,11 @@ impl SettingsView {
             .child(self.menu_item(0, None, "None (single account)".into(), None, theme, cx));
         match &self.accounts {
             AccountsState::Loading => {
-                menu = menu.child(ui::inert_menu_line(theme, "loading accounts…", theme.text_muted));
+                menu = menu.child(ui::inert_menu_line(
+                    theme,
+                    "loading accounts…",
+                    theme.text_muted,
+                ));
             }
             AccountsState::Unavailable => {
                 menu = menu.child(ui::inert_menu_line(
@@ -630,7 +643,12 @@ impl Render for SettingsView {
                             ))
                             .child(path_row(theme, "Socket", &self.paths.socket, true))
                             .child(path_row(theme, "Journal", &self.paths.journal, true))
-                            .child(path_row(theme, "Settings file", &self.paths.settings, false)),
+                            .child(path_row(
+                                theme,
+                                "Settings file",
+                                &self.paths.settings,
+                                false,
+                            )),
                     ),
             )
     }
@@ -700,8 +718,8 @@ fn path_row(theme: Theme, label: &'static str, path: &Path, divider: bool) -> Di
 
 #[cfg(test)]
 mod tests {
-    use czui_core::cmd::CommandError;
-    use czui_core::cmd::fake::FakeRunner;
+    use tomte_core::cmd::CommandError;
+    use tomte_core::cmd::fake::FakeRunner;
 
     use super::*;
 
@@ -824,19 +842,19 @@ mod tests {
         let p = dir.path().join("settings.toml");
 
         std::fs::write(&p, settings_toml(45, Some("personal"))).unwrap();
-        let s = czui_daemon::settings::Settings::load(&p);
+        let s = tomte_daemon::settings::Settings::load(&p);
         assert_eq!(s.fetch_interval_minutes, 45);
         assert_eq!(s.onepassword_account.as_deref(), Some("personal"));
 
         // None: the key is omitted entirely and the daemon default kicks in
         std::fs::write(&p, settings_toml(5, None)).unwrap();
-        let s = czui_daemon::settings::Settings::load(&p);
+        let s = tomte_daemon::settings::Settings::load(&p);
         assert_eq!(s.fetch_interval_minutes, 5);
         assert_eq!(s.onepassword_account, None);
 
         // exotic account values survive TOML string escaping
         std::fs::write(&p, settings_toml(120, Some("we\"ird \\ acct"))).unwrap();
-        let s = czui_daemon::settings::Settings::load(&p);
+        let s = tomte_daemon::settings::Settings::load(&p);
         assert_eq!(s.onepassword_account.as_deref(), Some("we\"ird \\ acct"));
     }
 

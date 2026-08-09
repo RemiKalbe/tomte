@@ -319,7 +319,7 @@ mod tests {
         std::fs::write(work.join("f.txt"), "two\n").unwrap();
         std::fs::write(work.join("new.txt"), "fresh\n").unwrap();
         c.add_all().unwrap();
-        let second = c.commit("chezmoi-ui: keep_disk f.txt").unwrap();
+        let second = c.commit("tomte: keep_disk f.txt").unwrap();
 
         assert_ne!(second, first, "commit must move HEAD");
         assert_eq!(second.len(), 40);

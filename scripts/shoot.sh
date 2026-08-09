@@ -1,5 +1,5 @@
 #!/bin/bash
-# Screenshot gallery states of chezmoi-ui without a human in the loop.
+# Screenshot gallery states of tomte without a human in the loop.
 #
 #   scripts/shoot.sh                     # every state, dark + light
 #   scripts/shoot.sh dashboard           # one state, dark + light
@@ -17,9 +17,9 @@ cd "$(dirname "$0")/.."
 STATE="${1:-all}"
 THEMES="${2:-dark light}"
 OUT="shots"
-BIN="target/debug/chezmoi-ui"
+BIN="target/debug/tomte"
 
-cargo build -p czui-app --quiet
+cargo build -p tomte-app --quiet
 mkdir -p "$OUT"
 
 if [[ "$STATE" == "all" ]]; then

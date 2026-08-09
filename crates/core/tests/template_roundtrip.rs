@@ -4,12 +4,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-use czui_core::cmd::SystemRunner;
-use czui_core::template::anchor::anchor;
-use czui_core::template::lexer::lex;
-use czui_core::template::verify::verify_write_back;
-use czui_core::template::writeback::{WriteBackError, write_back};
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+use tomte_core::cmd::SystemRunner;
+use tomte_core::template::anchor::anchor;
+use tomte_core::template::lexer::lex;
+use tomte_core::template::verify::verify_write_back;
+use tomte_core::template::writeback::{WriteBackError, write_back};
 
 fn scratch_chezmoi() -> (tempfile::TempDir, ChezmoiClient) {
     let dir = tempfile::tempdir().unwrap();

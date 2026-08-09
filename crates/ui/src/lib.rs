@@ -1,6 +1,6 @@
-//! czui-ui: the design system. Theme tokens plus every reusable component,
+//! tomte-ui: the design system. Theme tokens plus every reusable component,
 //! one file per component — the single styling source for all views and for
-//! the gallery's component-isolation previews (`chezmoi-ui --gallery
+//! the gallery's component-isolation previews (`tomte --gallery
 //! comp:<name>`).
 //!
 //! Components are pure builders: `Theme` + data + plain click handlers

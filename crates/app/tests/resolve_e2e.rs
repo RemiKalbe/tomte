@@ -11,20 +11,20 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use czui_app::ipc::IpcClient;
-use czui_app::merge_inputs;
-use czui_app::merge_state::MergeState;
-use czui_app::resolve::{ResolveEngine, ResolveOutcome};
-use czui_core::cmd::SystemRunner;
-use czui_core::drift::{ContentHash, DriftClass};
-use czui_core::git::GitClient;
-use czui_core::merge::Choice;
-use czui_core::scanner::FileDrift;
-use czui_core::testsupport::{Scratch, git, sh};
-use czui_daemon::core::DaemonCore;
-use czui_daemon::server::{ServeCtx, serve};
-use czui_journal::Journal;
-use czui_proto::{DriftSummary, Event, Request, Response};
+use tomte_app::ipc::IpcClient;
+use tomte_app::merge_inputs;
+use tomte_app::merge_state::MergeState;
+use tomte_app::resolve::{ResolveEngine, ResolveOutcome};
+use tomte_core::cmd::SystemRunner;
+use tomte_core::drift::{ContentHash, DriftClass};
+use tomte_core::git::GitClient;
+use tomte_core::merge::Choice;
+use tomte_core::scanner::FileDrift;
+use tomte_core::testsupport::{Scratch, git, sh};
+use tomte_daemon::core::DaemonCore;
+use tomte_daemon::server::{ServeCtx, serve};
+use tomte_journal::Journal;
+use tomte_proto::{DriftSummary, Event, Request, Response};
 
 /// Content written to the destination to fake a foreign edit.
 const DRIFTED: &[u8] = b"a=local\n";

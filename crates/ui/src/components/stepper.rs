@@ -1,8 +1,6 @@
 //! Segmented numeric stepper (Zed's number-field shape).
 
-use gpui::{
-    App, ClickEvent, Div, SharedString, Stateful, Window, div, prelude::*,
-};
+use gpui::{App, ClickEvent, Div, SharedString, Stateful, Window, div, prelude::*};
 
 use crate::theme::Theme;
 
@@ -70,4 +68,3 @@ fn seg_button(
                 .on_click(on_click)
         })
 }
-

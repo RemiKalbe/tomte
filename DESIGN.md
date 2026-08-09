@@ -1,4 +1,4 @@
-# chezmoi-ui design system
+# tomte design system
 
 The style is settled and approved: GitHub palette, Zed density and idioms, GPUI flexbox layout. Refinement happens inside this language.
 
@@ -35,7 +35,7 @@ Rules:
 
 ## Where the system lives
 
-`crates/ui` (czui-ui) owns the theme, embedded SVG assets, and every reusable component — one file per component under `src/components/`, pure builders (Theme + data + plain click handlers, no Entity coupling). `src/preview.rs` registers component-isolation previews; the gallery derives `comp:<name>` states from it (`scripts/shoot.sh comp:dropdown dark`). Views import via `use czui_ui::components as ui;`. New reusable styling goes in czui-ui first, never inline in a view.
+`crates/ui` (tomte-ui) owns the theme, embedded SVG assets, and every reusable component — one file per component under `src/components/`, pure builders (Theme + data + plain click handlers, no Entity coupling). `src/preview.rs` registers component-isolation previews; the gallery derives `comp:<name>` states from it (`scripts/shoot.sh comp:dropdown dark`). Views import via `use tomte_ui::components as ui;`. New reusable styling goes in tomte-ui first, never inline in a view.
 
 ## Components (established vocabulary)
 

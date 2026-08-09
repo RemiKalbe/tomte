@@ -111,7 +111,7 @@ impl Journal {
     }
 
     pub fn put_blob(&self, content: &[u8], now_ts: u64) -> Result<String, JournalError> {
-        let hash = czui_core::drift::ContentHash::of(content).to_hex();
+        let hash = tomte_core::drift::ContentHash::of(content).to_hex();
         let compressed = zstd::encode_all(content, 3)
             .map_err(|e| JournalError::Corrupt(format!("zstd encode: {e}")))?;
         self.conn.execute(
@@ -509,7 +509,7 @@ mod tests {
     fn blob_hash_matches_core_content_hash() {
         let j = Journal::open_in_memory("m").unwrap();
         let h = j.put_blob(b"abc", 1).unwrap();
-        assert_eq!(h, czui_core::drift::ContentHash::of(b"abc").to_hex());
+        assert_eq!(h, tomte_core::drift::ContentHash::of(b"abc").to_hex());
     }
 
     use std::path::Path;

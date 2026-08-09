@@ -1,12 +1,12 @@
 //! DaemonCore behavior against a real scratch chezmoi home.
 
-use czui_core::chezmoi::ChezmoiClient;
-use czui_core::cmd::SystemRunner;
-use czui_core::git::GitClient;
-use czui_core::testsupport::{Scratch, git, sh};
-use czui_daemon::core::DaemonCore;
-use czui_journal::Journal;
-use czui_proto::Event;
+use tomte_core::chezmoi::ChezmoiClient;
+use tomte_core::cmd::SystemRunner;
+use tomte_core::git::GitClient;
+use tomte_core::testsupport::{Scratch, git, sh};
+use tomte_daemon::core::DaemonCore;
+use tomte_journal::Journal;
+use tomte_proto::Event;
 
 fn core_for(s: &Scratch) -> DaemonCore {
     let chezmoi: ChezmoiClient = s.chezmoi();
@@ -53,7 +53,7 @@ fn foreign_dest_change_journals_and_pushes() {
         .unwrap();
     assert_eq!(kinds(&core, &target).len(), ks.len());
     // blob snapshot exists for the new content
-    let h = czui_core::drift::ContentHash::of(b"a=2\n").to_hex();
+    let h = tomte_core::drift::ContentHash::of(b"a=2\n").to_hex();
     assert!(core.journal().has_blob(&h).unwrap());
 }
 

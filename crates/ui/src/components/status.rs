@@ -37,7 +37,7 @@ pub fn status_text(theme: Theme, text: impl Into<SharedString>, tone: StatusTone
 /// one-line text with a REAL ellipsis and the full text in a tooltip.
 /// Definite width + line_clamp(1) is deliberate — gpui's `.truncate()`
 /// (whitespace_nowrap) memoizes the first unconstrained measure and never
-/// ellipsizes; see the czui-ui design notes.
+/// ellipsizes; see the tomte-ui design notes.
 pub fn status_dot_line(
     theme: Theme,
     dot: StatusTone,

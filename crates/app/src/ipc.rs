@@ -1,4 +1,4 @@
-//! Blocking IPC client for chezmoid (spec §3.3). Off-main-thread only.
+//! Blocking IPC client for tomted (spec §3.3). Off-main-thread only.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
-use czui_proto::{
+use tomte_proto::{
     ClientFrame, Event, PROTOCOL_VERSION, Request, Response, ServerFrame, read_frame, write_frame,
 };
 
@@ -24,7 +24,7 @@ pub enum IpcError {
     #[error("daemon rejected connection: {0}")]
     Rejected(String),
     #[error(
-        "spawned chezmoid but could not connect within {waited_secs}s; last error: {last}. \
+        "spawned tomted but could not connect within {waited_secs}s; last error: {last}. \
          Daemon stderr (if any) is in {log}"
     )]
     SpawnedButUnreachable {
@@ -66,7 +66,7 @@ impl IpcClient {
                     && theirs != PROTOCOL_VERSION
                 {
                     eprintln!(
-                        "chezmoi-ui: daemon speaks protocol {theirs}, we speak {PROTOCOL_VERSION} — shutting the old daemon down"
+                        "tomte: daemon speaks protocol {theirs}, we speak {PROTOCOL_VERSION} — shutting the old daemon down"
                     );
                     let _ = Self::shutdown_old_daemon(socket, theirs);
                 }
@@ -176,22 +176,22 @@ impl IpcClient {
         }
     }
 
-    pub fn connect_or_spawn(socket: &Path, chezmoid_bin: &Path) -> Result<Self, IpcError> {
+    pub fn connect_or_spawn(socket: &Path, tomted_bin: &Path) -> Result<Self, IpcError> {
         match Self::connect(socket) {
             Ok(c) => return Ok(c),
             Err(first) => {
                 eprintln!(
-                    "chezmoi-ui: no daemon at {} ({first}); spawning chezmoid",
+                    "tomte: no daemon at {} ({first}); spawning tomted",
                     socket.display()
                 );
             }
         }
         // Capture the daemon's output — a silently dying child was
         // undiagnosable when this was Stdio::null() (first-launch bug).
-        let log_path = socket.with_file_name("chezmoid.spawn.log");
+        let log_path = socket.with_file_name("tomted.spawn.log");
         let log = std::fs::File::create(&log_path)?;
         let log_err = log.try_clone()?;
-        let mut child = std::process::Command::new(chezmoid_bin)
+        let mut child = std::process::Command::new(tomted_bin)
             .stdout(log)
             .stderr(log_err)
             .spawn()?;
@@ -202,7 +202,7 @@ impl IpcClient {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(IpcError::SpawnedButUnreachable {
                     waited_secs: 0,
-                    last: format!("chezmoid exited at startup with {status}"),
+                    last: format!("tomted exited at startup with {status}"),
                     log: log_path.display().to_string(),
                 });
             }
@@ -226,9 +226,7 @@ mod tests {
     #[test]
     fn parses_version_from_mismatch_message() {
         assert_eq!(
-            parse_daemon_version(
-                "protocol version mismatch: daemon speaks 2, client speaks 3"
-            ),
+            parse_daemon_version("protocol version mismatch: daemon speaks 2, client speaks 3"),
             Some(2)
         );
         assert_eq!(parse_daemon_version("hello required first"), None);

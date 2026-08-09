@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-use czui_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
-use czui_core::git::GitClient;
-use czui_core::scanner::DriftScanner;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
+use tomte_core::git::GitClient;
+use tomte_core::scanner::DriftScanner;
 
 pub struct Scratch {
     pub root: tempfile::TempDir,

@@ -1,4 +1,4 @@
-//! Component-isolation previews (`chezmoi-ui --gallery comp:<name>`):
+//! Component-isolation previews (`tomte --gallery comp:<name>`):
 //! captioned variants of each library component, rendered bare in a compact
 //! window so pixel-level defects are visible before a screen ships.
 
@@ -48,8 +48,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
             .child(variant(
                 theme,
                 "enabled",
-                dropdown_button(theme, "prev-dd", "personal".into(), true, noop)
-                    .into_any_element(),
+                dropdown_button(theme, "prev-dd", "personal".into(), true, noop).into_any_element(),
             ))
             .child(variant(
                 theme,
@@ -93,7 +92,14 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 theme,
                 "enabled",
                 stepper(
-                    theme, "prev-s-d1", "prev-s-i1", "15 min".into(), true, true, noop, noop,
+                    theme,
+                    "prev-s-d1",
+                    "prev-s-i1",
+                    "15 min".into(),
+                    true,
+                    true,
+                    noop,
+                    noop,
                 )
                 .into_any_element(),
             ))
@@ -101,7 +107,14 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 theme,
                 "at minimum",
                 stepper(
-                    theme, "prev-s-d2", "prev-s-i2", "5 min".into(), false, true, noop, noop,
+                    theme,
+                    "prev-s-d2",
+                    "prev-s-i2",
+                    "5 min".into(),
+                    false,
+                    true,
+                    noop,
+                    noop,
                 )
                 .into_any_element(),
             ))
@@ -109,7 +122,14 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 theme,
                 "loading",
                 stepper(
-                    theme, "prev-s-d3", "prev-s-i3", "…".into(), false, false, noop, noop,
+                    theme,
+                    "prev-s-d3",
+                    "prev-s-i3",
+                    "…".into(),
+                    false,
+                    false,
+                    noop,
+                    noop,
                 )
                 .into_any_element(),
             ))
@@ -138,7 +158,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
             .child(variant(
                 theme,
                 "standalone value",
-                code_chip(theme, "~/Library/Application Support/ChezmoiUI/daemon.sock")
+                code_chip(theme, "~/Library/Application Support/Tomte/daemon.sock")
                     .into_any_element(),
             ))
             .into_any_element(),
@@ -181,9 +201,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
             let mut protected = std::collections::HashMap::new();
             protected.insert(
                 1usize,
-                gpui::SharedString::from(
-                    "in template:\n    \"{{ .xberg.crawlberg }}\",",
-                ),
+                gpui::SharedString::from("in template:\n    \"{{ .xberg.crawlberg }}\","),
             );
             div()
                 .flex()

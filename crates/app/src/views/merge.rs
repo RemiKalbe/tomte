@@ -16,20 +16,20 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use czui_app::merge_inputs::{self, MergeInputs};
-use czui_app::merge_state::MergeState;
-use czui_app::resolve::{ResolveError, ResolveOutcome};
-use czui_app::theme::Theme;
-use czui_ui::components as ui;
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-use czui_core::cmd::SystemRunner;
-use czui_core::merge::{Choice, MergeDocument, RegionKind};
-use czui_core::template::anchor::{SpanMap, SpanOrigin};
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, KeyBinding, Rgba,
     ScrollStrategy, SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*,
     uniform_list,
 };
+use tomte_app::merge_inputs::{self, MergeInputs};
+use tomte_app::merge_state::MergeState;
+use tomte_app::resolve::{ResolveError, ResolveOutcome};
+use tomte_app::theme::Theme;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+use tomte_core::cmd::SystemRunner;
+use tomte_core::merge::{Choice, MergeDocument, RegionKind};
+use tomte_core::template::anchor::{SpanMap, SpanOrigin};
+use tomte_ui::components as ui;
 
 use super::review::{
     BannerTint, OutcomeBanner, centered_note, display_text, journal_path, message_box,
@@ -117,7 +117,7 @@ fn pane_lines(
 
 /// Whether a rendered span is protected from write-back: templated values
 /// (`Action`), unanchored stretches (`Unmapped`), and repeated literals are
-/// all rejections in `czui_core::template::writeback`.
+/// all rejections in `tomte_core::template::writeback`.
 fn span_is_protected(origin: &SpanOrigin) -> bool {
     matches!(
         origin,
@@ -151,7 +151,7 @@ fn protected_line_info(
 ) -> HashMap<usize, SharedString> {
     // Re-lex for segment source ranges: cheap, and it succeeded at load
     // time or there would be no span map.
-    let segments = template.and_then(|t| czui_core::template::lexer::lex(t).ok());
+    let segments = template.and_then(|t| tomte_core::template::lexer::lex(t).ok());
     let mut starts = Vec::with_capacity(lines.len() + 1);
     let mut offset = 0usize;
     for line in lines {
@@ -268,7 +268,7 @@ fn choice_kind(choice: &Choice) -> ui::ChoiceKind {
 
 fn side_lines(
     doc: &MergeDocument,
-    region: &czui_core::merge::MergeRegion,
+    region: &tomte_core::merge::MergeRegion,
     side: ui::Side,
 ) -> Vec<SharedString> {
     let lines = match side {
@@ -286,7 +286,7 @@ fn side_lines(
 /// (None = edited text, tinted as such).
 fn choice_lines(
     doc: &MergeDocument,
-    region: &czui_core::merge::MergeRegion,
+    region: &tomte_core::merge::MergeRegion,
     choice: &Choice,
 ) -> Vec<(SharedString, Option<ui::Side>)> {
     let tag = |side: ui::Side| {
@@ -593,9 +593,7 @@ impl MergeView {
             return;
         };
         let displays: Vec<RegionDisplay> = (0..loaded.state.doc.regions.len())
-            .map(|idx| {
-                region_display(&loaded.state, idx, &self.revisiting, &loaded.protected)
-            })
+            .map(|idx| region_display(&loaded.state, idx, &self.revisiting, &loaded.protected))
             .collect();
         let (rows, starts) = flatten_displays(&displays);
         self.display_cache = Rc::new(displays);
@@ -683,9 +681,9 @@ impl MergeView {
     /// offsets in the same frame (2026-08-08: notifying per wheel tick was
     /// part of the lag).
     fn sync_from(&mut self, leader: usize) {
-        // Perf bisection switch: CZUI_NOSYNC=1 disables follower updates so
+        // Perf bisection switch: TOMTE_NOSYNC=1 disables follower updates so
         // frame-rate cost can be attributed (tree vs per-event sync work).
-        if std::env::var_os("CZUI_NOSYNC").is_some() {
+        if std::env::var_os("TOMTE_NOSYNC").is_some() {
             return;
         }
         let Some(loaded) = &self.loaded else {
@@ -697,8 +695,7 @@ impl MergeView {
         }
 
         let (k, f) = if leader == 3 {
-            let row = -f32::from(self.result_scroll.0.borrow().base_handle.offset().y)
-                / PANE_ROW_H;
+            let row = -f32::from(self.result_scroll.0.borrow().base_handle.offset().y) / PANE_ROW_H;
             let rs = &self.result_row_starts;
             let regions = rs.len().saturating_sub(1);
             if regions == 0 {
@@ -719,9 +716,8 @@ impl MergeView {
             };
             (k, f)
         } else {
-            let line =
-                -f32::from(self.pane_scrolls[leader].0.borrow().base_handle.offset().y)
-                    / PANE_ROW_H;
+            let line = -f32::from(self.pane_scrolls[leader].0.borrow().base_handle.offset().y)
+                / PANE_ROW_H;
             region_at(starts, leader, line)
         };
 
@@ -852,33 +848,32 @@ impl MergeView {
         if let Some(loaded) = &self.loaded {
             let (decided, total) = loaded.state.progress();
             let open = total - decided;
-            bar = bar
-                .child(
-                    div()
-                        .text_xs()
-                        .whitespace_nowrap()
-                        .text_color(if open == 0 { theme.ok } else { theme.conflict })
-                        .child(if total == 0 {
-                            let changed = loaded
-                                .state
-                                .doc
-                                .regions
-                                .iter()
-                                .filter(|r| r.kind != RegionKind::Unchanged)
-                                .count();
-                            if changed == 0 {
-                                "Nothing to merge".to_string()
-                            } else {
-                                format!(
-                                    "auto-merged · {changed} changed region{} — review below",
-                                    if changed == 1 { "" } else { "s" }
-                                )
-                            }
+            bar = bar.child(
+                div()
+                    .text_xs()
+                    .whitespace_nowrap()
+                    .text_color(if open == 0 { theme.ok } else { theme.conflict })
+                    .child(if total == 0 {
+                        let changed = loaded
+                            .state
+                            .doc
+                            .regions
+                            .iter()
+                            .filter(|r| r.kind != RegionKind::Unchanged)
+                            .count();
+                        if changed == 0 {
+                            "Nothing to merge".to_string()
                         } else {
-                            let s = if total == 1 { "" } else { "s" };
-                            format!("{total} conflict{s}, {} resolved", total - open)
-                        }),
-                );
+                            format!(
+                                "auto-merged · {changed} changed region{} — review below",
+                                if changed == 1 { "" } else { "s" }
+                            )
+                        }
+                    } else {
+                        let s = if total == 1 { "" } else { "s" };
+                        format!("{total} conflict{s}, {} resolved", total - open)
+                    }),
+            );
             let changed = loaded
                 .state
                 .doc
@@ -1059,13 +1054,7 @@ impl MergeView {
                             range
                                 .map(|ix| {
                                     flat_row_el(
-                                        ix,
-                                        &rows[ix],
-                                        &displays,
-                                        cursor,
-                                        has_base,
-                                        theme,
-                                        &view,
+                                        ix, &rows[ix], &displays, cursor, has_base, theme, &view,
                                     )
                                 })
                                 .collect()
@@ -1104,20 +1093,20 @@ impl MergeView {
         div()
             .track_focus(&self.focus_handle)
             .key_context("MergeEditor")
-            .on_action(cx.listener(|this, _: &PickDisk, _w, cx| {
-                this.pick_at_cursor(Choice::Ours, cx)
-            }))
-            .on_action(cx.listener(|this, _: &PickSource, _w, cx| {
-                this.pick_at_cursor(Choice::Theirs, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &PickDisk, _w, cx| this.pick_at_cursor(Choice::Ours, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PickSource, _w, cx| this.pick_at_cursor(Choice::Theirs, cx)),
+            )
             .on_action(cx.listener(|this, _: &PickBase, _w, cx| {
                 if !this.loaded.as_ref().is_some_and(|l| l.state.degraded_base) {
                     this.pick_at_cursor(Choice::Base, cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &PickBoth, _w, cx| {
-                this.pick_at_cursor(Choice::Both, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &PickBoth, _w, cx| this.pick_at_cursor(Choice::Both, cx)),
+            )
             .on_action(cx.listener(|this, _: &NextConflict, _w, cx| this.next(cx)))
             .on_action(cx.listener(|this, _: &UndoChoice, _w, cx| this.undo(cx)))
             .on_action(cx.listener(|this, _: &RedoChoice, _w, cx| this.redo(cx)))
@@ -1272,12 +1261,10 @@ fn flatten_displays(displays: &[RegionDisplay]) -> (Vec<FlatRow>, Vec<usize>) {
                             tip: None,
                         }));
                         rows.push(FlatRow::ProvLabel(ui::Side::Theirs));
-                        rows.extend(theirs.iter().enumerate().map(|(ix, l)| {
-                            FlatRow::ProvLine {
-                                side: ui::Side::Theirs,
-                                text: l.clone(),
-                                tip: theirs_protected.get(&ix).cloned(),
-                            }
+                        rows.extend(theirs.iter().enumerate().map(|(ix, l)| FlatRow::ProvLine {
+                            side: ui::Side::Theirs,
+                            text: l.clone(),
+                            tip: theirs_protected.get(&ix).cloned(),
                         }));
                     }
                     None => rows.extend(lines.iter().map(|(l, side)| FlatRow::Line {
@@ -1447,7 +1434,8 @@ fn flat_row_el(
                         ui::ChoiceKind::Both => Choice::Both,
                         ui::ChoiceKind::Edited => return,
                     };
-                    view.update(cx, |merge, cx| merge.apply(idx, choice, cx)).ok();
+                    view.update(cx, |merge, cx| merge.apply(idx, choice, cx))
+                        .ok();
                 }
             };
             // Hand-editing lands with the TextArea integration (spec step 7).
@@ -1458,8 +1446,7 @@ fn flat_row_el(
                     view.update(cx, |merge, cx| merge.revisit(idx, cx)).ok();
                 }
             };
-            ui::decision_strip(theme, idx, state, on_pick, on_edit, on_revisit)
-                .into_any_element()
+            ui::decision_strip(theme, idx, state, on_pick, on_edit, on_revisit).into_any_element()
         }
     }
 }
@@ -1469,24 +1456,23 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use czui_app::merge_inputs::MergeInputs;
-    use czui_app::merge_state::MergeState;
-    use czui_app::resolve::{ResolveError, ResolveOutcome};
-    use czui_app::theme::Theme;
-    use czui_core::merge::{Choice, RegionKind};
-    use czui_core::template::{anchor::anchor, lexer::lex};
+    use tomte_app::merge_inputs::MergeInputs;
+    use tomte_app::merge_state::MergeState;
+    use tomte_app::resolve::{ResolveError, ResolveOutcome};
+    use tomte_app::theme::Theme;
+    use tomte_core::merge::{Choice, RegionKind};
+    use tomte_core::template::{anchor::anchor, lexer::lex};
 
     use super::super::review::BannerTint;
+    #[allow(unused_imports)]
+    use super::{};
     use super::{
         LoadedMerge, PaneSide, RegionDisplay, line_at, merge_banner, next_target, pane_lines,
         protected_line_info, region_at, region_display, row_bg,
     };
     use gpui::SharedString;
     use std::collections::HashMap;
-    use czui_ui::components::{ChoiceKind, Side};
-    #[allow(unused_imports)]
-    use super::{
-    };
+    use tomte_ui::components::{ChoiceKind, Side};
 
     fn inputs(base: Option<&str>, ours: &str, theirs: &str) -> MergeInputs {
         MergeInputs {
@@ -1696,10 +1682,7 @@ mod tests {
                 lines,
             } => assert_eq!(
                 lines,
-                vec![(
-                    SharedString::from("v = 3"),
-                    Some(Side::Theirs)
-                )]
+                vec![(SharedString::from("v = 3"), Some(Side::Theirs))]
             ),
             other => panic!("expected decided, got {other:?}"),
         }
@@ -1726,14 +1709,8 @@ mod tests {
             } => assert_eq!(
                 lines,
                 vec![
-                    (
-                        SharedString::from("v = 2"),
-                        Some(Side::Ours)
-                    ),
-                    (
-                        SharedString::from("v = 3"),
-                        Some(Side::Theirs)
-                    ),
+                    (SharedString::from("v = 2"), Some(Side::Ours)),
+                    (SharedString::from("v = 3"), Some(Side::Theirs)),
                 ]
             ),
             other => panic!("expected both, got {other:?}"),
@@ -1760,13 +1737,7 @@ mod tests {
                 provenance: None,
                 lines,
                 ..
-            } => assert_eq!(
-                lines,
-                vec![(
-                    SharedString::from("B"),
-                    Some(Side::Ours)
-                )]
-            ),
+            } => assert_eq!(lines, vec![(SharedString::from("B"), Some(Side::Ours))]),
             other => panic!("expected auto decision, got {other:?}"),
         }
     }

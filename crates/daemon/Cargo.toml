@@ -1,21 +1,21 @@
 [package]
-name = "czui-daemon"
+name = "tomte-daemon"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "chezmoid"
+name = "tomted"
 path = "src/main.rs"
 
 [lib]
-name = "czui_daemon"
+name = "tomte_daemon"
 
 [dependencies]
 libc.workspace = true
-czui-core = { path = "../core" }
-czui-journal = { path = "../journal" }
-czui-proto = { path = "../proto" }
+tomte-core = { path = "../core" }
+tomte-journal = { path = "../journal" }
+tomte-proto = { path = "../proto" }
 notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,5 +24,5 @@ toml.workspace = true
 gethostname.workspace = true
 
 [dev-dependencies]
-czui-core = { path = "../core", features = ["test-support"] }
+tomte-core = { path = "../core", features = ["test-support"] }
 tempfile.workspace = true

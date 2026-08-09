@@ -7,9 +7,7 @@
 
 use std::collections::HashMap;
 
-use gpui::{
-    App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*,
-};
+use gpui::{App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*};
 
 use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::mono::{line_gutter, line_text, mono_line};
@@ -118,22 +116,20 @@ pub fn decision_strip(
                     theme.accent
                 })
             });
-            let pick_button = |id: &'static str,
-                               kind: ChoiceKind,
-                               label: &'static str,
-                               tint: Rgba| {
-                let on_pick = on_pick.clone();
-                let selected = current == Some(kind);
-                button(
-                    theme,
-                    ElementId::named_usize(id, region_ix),
-                    label.into(),
-                    ButtonVariant::Outline(tint),
-                    ButtonSize::Micro,
-                    move |ev, window, cx| on_pick(kind, ev, window, cx),
-                )
-                .when(selected, |el| el.bg(Theme::wash(tint, 0.2)))
-            };
+            let pick_button =
+                |id: &'static str, kind: ChoiceKind, label: &'static str, tint: Rgba| {
+                    let on_pick = on_pick.clone();
+                    let selected = current == Some(kind);
+                    button(
+                        theme,
+                        ElementId::named_usize(id, region_ix),
+                        label.into(),
+                        ButtonVariant::Outline(tint),
+                        ButtonSize::Micro,
+                        move |ev, window, cx| on_pick(kind, ev, window, cx),
+                    )
+                    .when(selected, |el| el.bg(Theme::wash(tint, 0.2)))
+                };
             strip
                 .child(
                     div()
@@ -168,12 +164,7 @@ pub fn decision_strip(
                         theme.text_muted,
                     ))
                 })
-                .child(pick_button(
-                    "pick-both",
-                    ChoiceKind::Both,
-                    "both",
-                    theme.ok,
-                ))
+                .child(pick_button("pick-both", ChoiceKind::Both, "both", theme.ok))
                 .child(div().w_2())
                 .child(button(
                     theme,
@@ -185,9 +176,7 @@ pub fn decision_strip(
                 ))
         }
         StripState::Decided { choice, focused } => strip
-            .when(focused, |el| {
-                el.border_l_2().border_color(theme.accent)
-            })
+            .when(focused, |el| el.border_l_2().border_color(theme.accent))
             .child(
                 div()
                     .text_color(theme.text_muted)

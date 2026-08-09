@@ -1,11 +1,11 @@
 //! Pure domain state for the app shell (spec §3.2): no gpui imports, fully
 //! unit-testable. Hydrated from `Response::Status` + the read-only journal,
-//! then kept live by `czui_proto::Event` pushes.
+//! then kept live by `tomte_proto::Event` pushes.
 
 use std::path::PathBuf;
 
-use czui_journal::EventRow;
-use czui_proto::{DriftSummary, Event};
+use tomte_journal::EventRow;
+use tomte_proto::{DriftSummary, Event};
 
 /// Rows the dashboard timeline renders; journal-hydrated rows and synthetic
 /// rows from live pushes share this shape. `kind` uses the journal's kind
@@ -227,14 +227,14 @@ impl SyncModel {
             .count()
     }
 
-    /// NSStatusItem title: "cz", or "cz ●N" when N targets need a human.
+    /// NSStatusItem title: "tomte", or "tomte ●N" when N targets need a human.
     pub fn status_title(&self) -> String {
         if !self.connected || self.scanning {
-            return "cz …".to_string();
+            return "tomte …".to_string();
         }
         match self.needs_attention() {
-            0 => "cz".to_string(),
-            n => format!("cz ●{n}"),
+            0 => "tomte".to_string(),
+            n => format!("tomte ●{n}"),
         }
     }
 
@@ -243,7 +243,7 @@ impl SyncModel {
     /// sync-all enabled). Sync-all needs a clean tree AND a live daemon.
     pub fn menu_spec(&self, now_ts: u64) -> (String, String, Option<String>, bool) {
         let header = if !self.connected {
-            "chezmoid not connected".to_string()
+            "tomted not connected".to_string()
         } else if self.scanning {
             "scanning…".to_string()
         } else if self.drifted.is_empty() {
@@ -415,8 +415,8 @@ pub fn kind_glyph(kind: &str) -> &'static str {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use czui_journal::EventRow;
-    use czui_proto::{DriftSummary, Event};
+    use tomte_journal::EventRow;
+    use tomte_proto::{DriftSummary, Event};
 
     use super::*;
 
@@ -453,7 +453,10 @@ mod tests {
     fn confirm_resolved_removes_target_now_and_repeat_is_inert() {
         let mut m = SyncModel::default();
         m.hydrate_status(
-            vec![summary("/a", "conflict", Some(1)), summary("/b", "drifted", Some(2))],
+            vec![
+                summary("/a", "conflict", Some(1)),
+                summary("/b", "drifted", Some(2)),
+            ],
             10,
             None,
             false,
@@ -686,12 +689,12 @@ mod tests {
     #[test]
     fn status_title_shows_attention_count() {
         let cases: Vec<(Vec<&str>, &str)> = vec![
-            (vec![], "cz"),
-            (vec!["destination_drift"], "cz"), // drifted but nothing urgent
-            (vec!["conflict"], "cz ●1"),
+            (vec![], "tomte"),
+            (vec!["destination_drift"], "tomte"), // drifted but nothing urgent
+            (vec!["conflict"], "tomte ●1"),
             (
                 vec!["conflict", "eval_failed", "local_source_diverged"],
-                "cz ●3",
+                "tomte ●3",
             ),
         ];
         for (classes, want) in cases {
@@ -719,7 +722,7 @@ mod tests {
         // disconnected: sync-all locked out even with zero drift
         let mut m = SyncModel::default();
         let (header, freshness, review, sync_all) = m.menu_spec(1_000);
-        assert_eq!(header, "chezmoid not connected");
+        assert_eq!(header, "tomted not connected");
         assert_eq!(freshness, "origin: never fetched");
         assert_eq!(review, None);
         assert!(!sync_all);
@@ -852,7 +855,10 @@ mod tests {
         });
         assert_eq!(m.fetch_started_ts, None);
         assert_eq!(m.fetch_failed.as_deref(), Some("ssh: connect timeout"));
-        assert_eq!(m.timeline.first().map(|r| r.kind.as_str()), Some("fetch_failed"));
+        assert_eq!(
+            m.timeline.first().map(|r| r.kind.as_str()),
+            Some("fetch_failed")
+        );
         assert_eq!(m.last_fetch_ts, None, "failure never claims freshness");
         // Success clears the failure.
         m.fetch_started_ts = Some(120);
@@ -897,11 +903,14 @@ mod tests {
         m.hydrate_status(
             vec![],
             0,
-            Some("chezmoid starting: building core".into()),
+            Some("tomted starting: building core".into()),
             true,
             None,
         );
-        assert_eq!(m.degraded.as_deref(), Some("chezmoid starting: building core"));
+        assert_eq!(
+            m.degraded.as_deref(),
+            Some("tomted starting: building core")
+        );
         // scan lands: real data replaces
         m.hydrate_status(vec![], 955, None, false, None);
         assert_eq!(m.in_sync, 955);

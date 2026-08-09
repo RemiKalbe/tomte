@@ -13,9 +13,9 @@ use gpui::{
     AppContext as _, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px,
 };
 
-use czui_app::model::{SyncModel, time_ago};
-use czui_app::theme::Theme;
-use czui_ui::components as ui;
+use tomte_app::model::{SyncModel, time_ago};
+use tomte_app::theme::Theme;
+use tomte_ui::components as ui;
 
 use dashboard::DashboardView;
 use merge::MergeView;
@@ -182,7 +182,10 @@ impl Shell {
         } else if drifted > 0 {
             (ui::StatusTone::Drift, format!("{drifted} drifted"))
         } else {
-            (ui::StatusTone::Ok, format!("in sync · {} files", model.in_sync))
+            (
+                ui::StatusTone::Ok,
+                format!("in sync · {} files", model.in_sync),
+            )
         };
         let freshness = match model.last_fetch_ts {
             Some(ts) => format!("origin: fetched {}", time_ago(dashboard::system_now(), ts)),
@@ -209,7 +212,7 @@ impl Shell {
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
-                    .child("CHEZMOI UI"),
+                    .child("TOMTE"),
             )
             .child(self.nav_item(theme, "Dashboard", Route::Dashboard, None, cx))
             .child(self.nav_item(theme, "Review", Route::Review, review_badge, cx))
@@ -247,7 +250,7 @@ impl Render for Shell {
                 .justify_center()
                 .p_8()
                 .child(
-                    czui_ui::preview::render_component(name, theme)
+                    tomte_ui::preview::render_component(name, theme)
                         .unwrap_or_else(|| div().child("unknown component").into_any_element()),
                 )
                 .into_any_element();
@@ -309,8 +312,8 @@ mod render_smoke {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use czui_app::model::{SyncModel, TimelineRow};
     use gpui::TestAppContext;
+    use tomte_app::model::{SyncModel, TimelineRow};
 
     use super::*;
 
@@ -320,7 +323,7 @@ mod render_smoke {
             ..Default::default()
         };
         m.hydrate_status(
-            vec![czui_proto::DriftSummary {
+            vec![tomte_proto::DriftSummary {
                 target: PathBuf::from("/tmp/smoke/.zshrc"),
                 class: "destination_drift".into(),
                 since_ts: Some(10),
@@ -512,12 +515,12 @@ mod render_smoke {
     /// synthetic; no subprocess runs.
     #[gpui::test]
     fn merge_view_renders_all_states_without_panicking(cx: &mut TestAppContext) {
-        use czui_app::merge_inputs::MergeInputs;
-        use czui_core::merge::Choice;
-        use czui_core::template::{anchor::anchor, lexer::lex};
         use merge::{LoadedMerge, MergeView};
         use review::BannerTint;
         use std::sync::Arc;
+        use tomte_app::merge_inputs::MergeInputs;
+        use tomte_core::merge::Choice;
+        use tomte_core::template::{anchor::anchor, lexer::lex};
 
         fn plain_conflict() -> MergeInputs {
             MergeInputs {

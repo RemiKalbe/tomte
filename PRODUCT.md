@@ -1,4 +1,4 @@
-# chezmoi-ui
+# tomte
 
 ## Register
 
@@ -29,7 +29,7 @@ Calm and factual. Humanized labels ("modified on disk", not "destination_drift")
 
 - Electron-style marketing chrome, hero metrics, onboarding tours.
 - GitHub Desktop's roominess: this wants Zed density.
-- Raw CLI vocabulary leaking into the UI (class slugs, exit codes, "chezmoid" internals) except in diagnostics.
+- Raw CLI vocabulary leaking into the UI (class slugs, exit codes, "tomted" internals) except in diagnostics.
 
 ## Strategic principles
 

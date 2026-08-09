@@ -27,7 +27,7 @@ impl Settings {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!(
-                        "chezmoid: invalid settings at {}: {e}; using defaults",
+                        "tomted: invalid settings at {}: {e}; using defaults",
                         path.display()
                     );
                     Settings::default()
@@ -51,7 +51,17 @@ pub fn app_support_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library/Application Support/ChezmoiUI")
+    let dir = home.join("Library/Application Support/Tomte");
+    // One-time migration from the app's pre-rename identity (2026-08-08:
+    // chezmoi-ui → Tomte): adopt the old directory wholesale — the journal
+    // holds history and undo snapshots that must not be silently orphaned.
+    if !dir.exists() {
+        let old = home.join("Library/Application Support/ChezmoiUI");
+        if old.exists() {
+            let _ = std::fs::rename(&old, &dir);
+        }
+    }
+    dir
 }
 
 #[cfg(test)]

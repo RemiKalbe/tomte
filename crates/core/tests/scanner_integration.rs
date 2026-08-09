@@ -1,7 +1,7 @@
 mod support;
 
-use czui_core::drift::DriftClass;
 use support::{Scratch, git};
+use tomte_core::drift::DriftClass;
 
 #[test]
 fn clean_state_is_in_sync() {

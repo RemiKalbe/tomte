@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use czui_core::cmd::{CommandRequest, CommandRunner};
+use tomte_core::cmd::{CommandRequest, CommandRunner};
 
 /// Escape a string for a double-quoted AppleScript literal. Backslash and
 /// double quote are the only metacharacters that matter: the script reaches
@@ -46,13 +46,13 @@ pub fn notify(runner: &dyn CommandRunner, title: &str, body: &str) {
     match runner.run(req) {
         Ok(out) if !out.success() => {
             eprintln!(
-                "chezmoi-ui: osascript exited {}: {}",
+                "tomte: osascript exited {}: {}",
                 out.exit_code,
                 out.stderr_utf8().trim()
             );
         }
         Ok(_) => {}
-        Err(e) => eprintln!("chezmoi-ui: notification failed: {e}"),
+        Err(e) => eprintln!("tomte: notification failed: {e}"),
     }
 }
 
@@ -78,8 +78,8 @@ pub fn remote_advanced_body(target: &Path) -> String {
 mod tests {
     use std::path::Path;
 
-    use czui_core::cmd::CommandError;
-    use czui_core::cmd::fake::FakeRunner;
+    use tomte_core::cmd::CommandError;
+    use tomte_core::cmd::fake::FakeRunner;
 
     use super::*;
 
@@ -109,7 +109,7 @@ mod tests {
     fn notify_shells_osascript_with_one_e_flag() {
         let fake = FakeRunner::new();
         fake.push_ok(0, "", "");
-        notify(&fake, "chezmoi-ui", "2 files drifted");
+        notify(&fake, "tomte", "2 files drifted");
         let calls = fake.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, "osascript");
@@ -117,7 +117,7 @@ mod tests {
             calls[0].args,
             vec![
                 "-e".to_string(),
-                r#"display notification "2 files drifted" with title "chezmoi-ui""#.to_string(),
+                r#"display notification "2 files drifted" with title "tomte""#.to_string(),
             ]
         );
     }

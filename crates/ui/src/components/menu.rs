@@ -1,8 +1,6 @@
 //! Popover menus: container, selectable rows, inert status lines.
 
-use gpui::{
-    App, ClickEvent, Div, ElementId, SharedString, Stateful, Window, div, prelude::*, px,
-};
+use gpui::{App, ClickEvent, Div, ElementId, SharedString, Stateful, Window, div, prelude::*, px};
 
 use crate::theme::Theme;
 
@@ -68,4 +66,3 @@ pub fn inert_menu_line(theme: Theme, text: &'static str, color: gpui::Rgba) -> D
         .text_color(color)
         .child(text)
 }
-

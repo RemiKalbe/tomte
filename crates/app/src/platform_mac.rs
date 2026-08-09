@@ -36,7 +36,7 @@ struct TargetIvars {
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "CzuiMenuTarget"]
+    #[name = "TomteMenuTarget"]
     #[ivars = TargetIvars]
     struct MenuTarget;
 
@@ -92,7 +92,7 @@ impl StatusItem {
         let bar = NSStatusBar::systemStatusBar();
         let item = bar.statusItemWithLength(NSVariableStatusItemLength);
         let this = Self { item, target };
-        this.set_title(mtm, "cz");
+        this.set_title(mtm, "tomte");
         (this, rx)
     }
 

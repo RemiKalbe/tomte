@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Install a LaunchAgent that runs the BUNDLED chezmoid at login.
+# Install a LaunchAgent that runs the BUNDLED tomted at login.
 # User-invoked only; run scripts/bundle.sh first.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-chezmoid="$repo_root/target/bundle/Chezmoi UI.app/Contents/MacOS/chezmoid"
+tomted="$repo_root/target/bundle/Tomte.app/Contents/MacOS/tomted"
 
-if [[ ! -x "$chezmoid" ]]; then
-    echo "error: bundled chezmoid not found at:" >&2
-    echo "  $chezmoid" >&2
+if [[ ! -x "$tomted" ]]; then
+    echo "error: bundled tomted not found at:" >&2
+    echo "  $tomted" >&2
     echo "run scripts/bundle.sh first." >&2
     exit 1
 fi
 
-label="com.remikalbe.chezmoid"
+label="com.remikalbe.tomted"
 plist="$HOME/Library/LaunchAgents/$label.plist"
-log_dir="$HOME/Library/Application Support/ChezmoiUI"
-log_file="$log_dir/chezmoid.launchd.log"
+log_dir="$HOME/Library/Application Support/Tomte"
+log_file="$log_dir/tomted.launchd.log"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$log_dir"
 
@@ -29,7 +29,7 @@ cat > "$plist" <<EOF
 	<string>$label</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>$chezmoid</string>
+		<string>$tomted</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -47,7 +47,7 @@ launchctl bootout "gui/$UID/$label" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$plist"
 
 echo "installed and started: $label"
-echo "  daemon: $chezmoid"
+echo "  daemon: $tomted"
 echo "  logs:   $log_file"
 echo
 echo "to uninstall:"

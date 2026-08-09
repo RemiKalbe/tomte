@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiError};
-use czui_core::drift::{ContentHash, DriftClass};
-use czui_core::git::{GitClient, GitError};
-use czui_core::scanner::{DriftScanner, FileDrift, ScanError};
-use czui_journal::{EventKind, Journal, JournalError, NewEvent};
-use czui_proto::{DriftSummary, Event};
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
+use tomte_core::drift::{ContentHash, DriftClass};
+use tomte_core::git::{GitClient, GitError};
+use tomte_core::scanner::{DriftScanner, FileDrift, ScanError};
+use tomte_journal::{EventKind, Journal, JournalError, NewEvent};
+use tomte_proto::{DriftSummary, Event};
 
 const BLOB_CAP: usize = 4 * 1024 * 1024;
 
@@ -93,19 +93,12 @@ impl DaemonCore {
         let source_dir = chezmoi.source_dir()?;
         let managed: BTreeSet<PathBuf> = chezmoi.managed()?.into_iter().collect();
         let scanner = DriftScanner::new(chezmoi.clone(), git.clone(), remote_ref.clone());
-        let last_fetch_ts = journal
-            .timeline(200, None)
-            .ok()
-            .and_then(|rows| {
-                rows.into_iter()
-                    .filter(|r| r.kind == "fetch")
-                    .find(|r| {
-                        r.meta
-                            .as_ref()
-                            .is_none_or(|m| m.get("error").is_none())
-                    })
-                    .map(|r| r.ts)
-            });
+        let last_fetch_ts = journal.timeline(200, None).ok().and_then(|rows| {
+            rows.into_iter()
+                .filter(|r| r.kind == "fetch")
+                .find(|r| r.meta.as_ref().is_none_or(|m| m.get("error").is_none()))
+                .map(|r| r.ts)
+        });
         Ok(Self {
             chezmoi,
             git,

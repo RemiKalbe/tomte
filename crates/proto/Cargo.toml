@@ -1,11 +1,11 @@
 [package]
-name = "czui-proto"
+name = "tomte-proto"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "czui_proto"
+name = "tomte_proto"
 
 [dependencies]
 serde.workspace = true

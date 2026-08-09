@@ -1,10 +1,10 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-use czui_core::cmd::SystemRunner;
-use czui_core::git::GitClient;
-use czui_core::scanner::DriftScanner;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+use tomte_core::cmd::SystemRunner;
+use tomte_core::git::GitClient;
+use tomte_core::scanner::DriftScanner;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

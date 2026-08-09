@@ -4,14 +4,14 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
-use czui_core::chezmoi::ChezmoiClient;
-use czui_core::cmd::SystemRunner;
-use czui_core::git::GitClient;
-use czui_core::testsupport::Scratch;
-use czui_daemon::core::DaemonCore;
-use czui_daemon::server::serve;
-use czui_journal::Journal;
-use czui_proto::{
+use tomte_core::chezmoi::ChezmoiClient;
+use tomte_core::cmd::SystemRunner;
+use tomte_core::git::GitClient;
+use tomte_core::testsupport::Scratch;
+use tomte_daemon::core::DaemonCore;
+use tomte_daemon::server::serve;
+use tomte_journal::Journal;
+use tomte_proto::{
     ClientFrame, PROTOCOL_VERSION, Request, Response, ServerFrame, read_frame, write_frame,
 };
 
@@ -29,7 +29,7 @@ fn setup() -> (Scratch, Arc<Mutex<DaemonCore>>, UnixStream) {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::ready(served, || 1000, Arc::new(|| {})),
+            tomte_daemon::server::ServeCtx::ready(served, || 1000, Arc::new(|| {})),
         )
     });
     let stream = UnixStream::connect(&sock).unwrap();
@@ -99,7 +99,7 @@ fn handshake_then_status_and_push() {
     match recv(&mut reader) {
         ServerFrame::Push {
             event:
-                czui_proto::Event::Drift {
+                tomte_proto::Event::Drift {
                     target: t,
                     ts: 1234,
                     ..
@@ -196,7 +196,7 @@ fn shutdown_replies_ok_then_fires_hook() {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::ready(
+            tomte_daemon::server::ServeCtx::ready(
                 core,
                 || 1000,
                 Arc::new(move || hook_flag.store(true, Ordering::SeqCst)),
@@ -240,7 +240,7 @@ fn handshake_and_status_survive_a_long_scan_holding_the_core() {
     let sock = s.root.path().join("busy.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     // ServeCtx must be built BEFORE the lock is contended (as the binary does).
-    let ctx = czui_daemon::server::ServeCtx::ready(core.clone(), || 7, Arc::new(|| {}));
+    let ctx = tomte_daemon::server::ServeCtx::ready(core.clone(), || 7, Arc::new(|| {}));
     std::thread::spawn(move || serve(listener, ctx));
 
     // Simulate a minutes-long initial scan: hold the core lock for the whole test.

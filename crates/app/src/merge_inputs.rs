@@ -7,10 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiError};
-use czui_core::template::anchor::{SpanMap, anchor};
-use czui_core::template::lexer::{LexError, lex};
-use czui_journal::{Journal, JournalError};
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
+use tomte_core::template::anchor::{SpanMap, anchor};
+use tomte_core::template::lexer::{LexError, lex};
+use tomte_journal::{Journal, JournalError};
 
 use crate::resolve::{RO_MACHINE, is_templated};
 
@@ -126,9 +126,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-    use czui_core::cmd::fake::FakeRunner;
-    use czui_journal::Journal;
+    use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+    use tomte_core::cmd::fake::FakeRunner;
+    use tomte_journal::Journal;
 
     use super::{MergeInputsError, load};
 

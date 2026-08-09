@@ -1,8 +1,6 @@
 //! Dropdown trigger button (the popover menu lives in [`super::menu`]).
 
-use gpui::{
-    App, ClickEvent, Div, ElementId, SharedString, Stateful, Window, div, prelude::*,
-};
+use gpui::{App, ClickEvent, Div, ElementId, SharedString, Stateful, Window, div, prelude::*};
 
 use crate::components::icon::chevron_down;
 use crate::theme::Theme;
@@ -40,4 +38,3 @@ pub fn dropdown_button(
         .child(label)
         .child(chevron_down(theme))
 }
-

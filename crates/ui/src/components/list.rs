@@ -1,8 +1,6 @@
 //! List chassis: interactive rows and the bordered list pane.
 
-use gpui::{
-    App, ClickEvent, Div, ElementId, Rgba, Stateful, Window, div, prelude::*,
-};
+use gpui::{App, ClickEvent, Div, ElementId, Rgba, Stateful, Window, div, prelude::*};
 
 use crate::theme::Theme;
 
@@ -31,7 +29,13 @@ pub fn list_row(
 /// Same chassis without identity or interactivity (inert display rows).
 pub fn inert_list_row(theme: Theme) -> Div {
     let _ = theme;
-    div().h_7().px_2().rounded_sm().flex().items_center().gap_2()
+    div()
+        .h_7()
+        .px_2()
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .gap_2()
 }
 
 /// The label strip a pane carries on its top edge: tint dot + muted label.
@@ -58,5 +62,7 @@ pub fn list_pane(theme: Theme, label: Option<(&'static str, Rgba)>) -> Div {
         .border_color(theme.border)
         .flex()
         .flex_col()
-        .when_some(label, |el, (text, tint)| el.child(pane_label(theme, text, tint)))
+        .when_some(label, |el, (text, tint)| {
+            el.child(pane_label(theme, text, tint))
+        })
 }

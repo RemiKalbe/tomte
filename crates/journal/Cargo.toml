@@ -1,14 +1,14 @@
 [package]
-name = "czui-journal"
+name = "tomte-journal"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "czui_journal"
+name = "tomte_journal"
 
 [dependencies]
-czui-core = { path = "../core" }
+tomte-core = { path = "../core" }
 rusqlite.workspace = true
 zstd.workspace = true
 serde.workspace = true

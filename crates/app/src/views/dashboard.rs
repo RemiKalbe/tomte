@@ -3,25 +3,25 @@
 //! scan/fetch noise collapses into one expandable line.
 //!
 //! Pure logic (relative time, glyphs, labels, grouping) lives in
-//! `czui_app::model`; this module renders and never blocks.
+//! `tomte_app::model`; this module renders and never blocks.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use czui_app::model::{
-    SyncModel, TimelineItem, TimelineRow, class_label, group_timeline, kind_glyph, kind_label,
-    time_ago,
-};
-use czui_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
-use czui_app::theme::Theme;
-use czui_ui::components as ui;
-use czui_core::cmd::SystemRunner;
 use gpui::{
     App, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful, WeakEntity,
     div, prelude::*, uniform_list,
 };
+use tomte_app::model::{
+    SyncModel, TimelineItem, TimelineRow, class_label, group_timeline, kind_glyph, kind_label,
+    time_ago,
+};
+use tomte_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
+use tomte_app::theme::Theme;
+use tomte_core::cmd::SystemRunner;
+use tomte_ui::components as ui;
 
 use crate::notify_osa::notify;
 
@@ -38,7 +38,7 @@ pub fn system_now() -> u64 {
 }
 
 /// What the degraded banner's action button should do — matched against our
-/// own hint texts from `czui_core::chezmoi::classify_eval_stderr`.
+/// own hint texts from `tomte_core::chezmoi::classify_eval_stderr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DegradedRemedy {
     /// 1Password is locked: the fix is an unlock prompt, not a setting.
@@ -57,8 +57,8 @@ pub(super) fn degraded_remedy(hint: &str) -> Option<DegradedRemedy> {
     }
 }
 
-/// Moved to czui-ui; re-exported so sibling views keep their import paths.
-pub(super) use czui_ui::components::{TextTooltip, shorten_home};
+/// Moved to tomte-ui; re-exported so sibling views keep their import paths.
+pub(super) use tomte_ui::components::{TextTooltip, shorten_home};
 
 /// One flattened display line for the uniform list.
 enum Line {
@@ -197,7 +197,11 @@ impl DashboardView {
             ("fetching…".into(), theme.text_muted)
         } else if let Some(err) = &model.fetch_failed {
             let brief = err.lines().next().unwrap_or("error");
-            let brief = if brief.len() > 40 { &brief[..40] } else { brief };
+            let brief = if brief.len() > 40 {
+                &brief[..40]
+            } else {
+                brief
+            };
             (format!("fetch failed · {brief}").into(), theme.conflict)
         } else {
             match model.last_fetch_ts {
@@ -318,11 +322,7 @@ impl DashboardView {
                                 let shell = shell.clone();
                                 let engine = engine.clone();
                                 move |_event, _window, cx| {
-                                    trigger_onepassword_unlock(
-                                        shell.clone(),
-                                        engine.clone(),
-                                        cx,
-                                    );
+                                    trigger_onepassword_unlock(shell.clone(), engine.clone(), cx);
                                 }
                             },
                         )
@@ -448,8 +448,6 @@ impl DashboardView {
     }
 }
 
-
-
 /// Skeleton rows while the first scan runs: the shape of the activity list,
 /// not a sentence about it.
 fn skeleton_rows(theme: Theme) -> gpui::AnyElement {
@@ -505,7 +503,7 @@ fn trigger_onepassword_unlock(
         let _ = cx
             .background_executor()
             .spawn(async move {
-                use czui_core::cmd::{CommandRequest, CommandRunner as _};
+                use tomte_core::cmd::{CommandRequest, CommandRunner as _};
                 // Generous timeout: this intentionally waits for a human to
                 // approve the 1Password prompt.
                 let _ = SystemRunner.run(
@@ -514,7 +512,7 @@ fn trigger_onepassword_unlock(
                         .timeout(std::time::Duration::from_secs(120)),
                 );
                 if let Some(engine) = engine {
-                    let _ = engine.ipc.request(czui_proto::Request::Rescan);
+                    let _ = engine.ipc.request(tomte_proto::Request::Rescan);
                 }
             })
             .await;
@@ -549,7 +547,11 @@ fn fetch_now_button(
             .child(ui::spinner(theme, "tile-fetch-spinner"))
             .into_any_element();
     }
-    let label: SharedString = if failed { "Retry".into() } else { "Fetch now".into() };
+    let label: SharedString = if failed {
+        "Retry".into()
+    } else {
+        "Fetch now".into()
+    };
     match engine {
         Some(engine) => ui::button(
             theme,
@@ -568,14 +570,14 @@ fn fetch_now_button(
                 cx.spawn(async move |cx| {
                     let outcome = cx
                         .background_executor()
-                        .spawn(async move { engine.ipc.request(czui_proto::Request::Fetch) })
+                        .spawn(async move { engine.ipc.request(tomte_proto::Request::Fetch) })
                         .await;
                     // Only failures resolve the spinner here — on an ack the
                     // FetchDone/FetchFailed push is the truth. (2026-08-08: a
                     // stale-protocol daemon rejected the request and the
                     // swallowed error left the spinner up forever.)
                     let error = match outcome {
-                        Ok(czui_proto::Response::Error { message }) => Some(message),
+                        Ok(tomte_proto::Response::Error { message }) => Some(message),
                         Ok(_) => None,
                         Err(e) => Some(e.to_string()),
                     };
@@ -803,7 +805,9 @@ fn render_line(
                                 .as_deref()
                                 .map(|c| theme.class_color(c))
                                 .unwrap_or(theme.text_muted);
-                            el.child(ui::chip(theme, label, ui::ChipVariant::Wash(color)).flex_none())
+                            el.child(
+                                ui::chip(theme, label, ui::ChipVariant::Wash(color)).flex_none(),
+                            )
                         }),
                 )
                 .when_some(quick, |el, actions| el.child(actions));
@@ -936,7 +940,7 @@ fn run_quick_action(
             .spawn(async move {
                 let result = action.run(&engine, &target);
                 let body = quick_action_body(action, &target, &result);
-                notify(&SystemRunner, "chezmoi-ui", &body);
+                notify(&SystemRunner, "tomte", &body);
                 matches!(result, Ok(ResolveOutcome::Done { .. }))
             })
             .await;
@@ -988,7 +992,7 @@ fn quick_action_body(
 mod tests {
     use std::path::Path;
 
-    use czui_app::resolve::{ResolveError, ResolveOutcome};
+    use tomte_app::resolve::{ResolveError, ResolveOutcome};
 
     use super::super::review::ResolveAction;
     use super::{DegradedRemedy, degraded_remedy, quick_action_body};

@@ -45,5 +45,7 @@ pub fn banner(
         .text_xs()
         .text_color(color)
         .child(div().flex_1().min_w_0().truncate().child(text))
-        .when_some(action, |el, action| el.child(div().flex_none().child(action)))
+        .when_some(action, |el, action| {
+            el.child(div().flex_none().child(action))
+        })
 }

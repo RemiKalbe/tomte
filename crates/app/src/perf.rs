@@ -1,4 +1,4 @@
-//! Opt-in micro-instrumentation (CZUI_PERF=1): per-tag timing aggregates
+//! Opt-in micro-instrumentation (TOMTE_PERF=1): per-tag timing aggregates
 //! printed once a second. Zero overhead when the env var is unset.
 
 use std::cell::RefCell;
@@ -18,7 +18,7 @@ struct Agg {
 
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CZUI_PERF").is_some())
+    *ON.get_or_init(|| std::env::var_os("TOMTE_PERF").is_some())
 }
 
 /// Time `f` under `tag`; aggregates print to stderr once per second.

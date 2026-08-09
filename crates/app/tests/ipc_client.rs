@@ -2,15 +2,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use czui_app::ipc::IpcClient;
-use czui_core::chezmoi::ChezmoiClient;
-use czui_core::cmd::SystemRunner;
-use czui_core::git::GitClient;
-use czui_core::testsupport::Scratch;
-use czui_daemon::core::DaemonCore;
-use czui_daemon::server::serve;
-use czui_journal::Journal;
-use czui_proto::{Event, Request, Response};
+use tomte_app::ipc::IpcClient;
+use tomte_core::chezmoi::ChezmoiClient;
+use tomte_core::cmd::SystemRunner;
+use tomte_core::git::GitClient;
+use tomte_core::testsupport::Scratch;
+use tomte_daemon::core::DaemonCore;
+use tomte_daemon::server::serve;
+use tomte_journal::Journal;
+use tomte_proto::{Event, Request, Response};
 
 #[test]
 fn connect_status_subscribe_roundtrip() {
@@ -27,7 +27,7 @@ fn connect_status_subscribe_roundtrip() {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::ready(served, || 42, std::sync::Arc::new(|| {})),
+            tomte_daemon::server::ServeCtx::ready(served, || 42, std::sync::Arc::new(|| {})),
         )
     });
 

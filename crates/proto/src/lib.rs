@@ -1,5 +1,5 @@
 //! IPC wire types (spec §3.3): newline-delimited JSON with request ids.
-//! Shared verbatim by chezmoid (server) and the app (client).
+//! Shared verbatim by tomted (server) and the app (client).
 
 use std::io;
 use std::path::PathBuf;

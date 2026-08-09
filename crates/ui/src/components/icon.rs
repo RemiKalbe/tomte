@@ -19,7 +19,6 @@ pub fn chevron_down(theme: Theme) -> Svg {
         .text_color(theme.text_muted)
 }
 
-
 /// Indeterminate spinner: a rotating arc, muted. Use anywhere work is in
 /// flight without progress info (scans, loads). One per id.
 pub fn spinner(theme: Theme, id: impl Into<ElementId>) -> impl IntoElement {

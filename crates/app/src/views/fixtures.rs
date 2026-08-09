@@ -1,6 +1,6 @@
 //! Gallery fixtures: named, fully-posed UI states built from synthetic data —
 //! no daemon, no IPC, no subprocesses (except the live `settings` state).
-//! `chezmoi-ui --gallery <name>` renders one in a real window so the agent
+//! `tomte --gallery <name>` renders one in a real window so the agent
 //! (or a human) can screenshot any state on demand instead of reproducing it
 //! by hand. The registry doubles as documentation of every reachable state.
 
@@ -8,12 +8,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use czui_app::merge_inputs::MergeInputs;
-use czui_app::model::{SyncModel, TimelineRow};
-use czui_core::merge::{Choice, MergeDocument, MergeOptions};
-use czui_core::template::{anchor::anchor, lexer::lex};
-use czui_proto::DriftSummary;
 use gpui::{AppContext as _, Context, Entity};
+use tomte_app::merge_inputs::MergeInputs;
+use tomte_app::model::{SyncModel, TimelineRow};
+use tomte_core::merge::{Choice, MergeDocument, MergeOptions};
+use tomte_core::template::{anchor::anchor, lexer::lex};
+use tomte_proto::DriftSummary;
 
 use super::merge::{LoadedMerge, MergeView};
 use super::review::{BannerTint, OutcomeBanner, PreviewState, ProvRow, ReviewView};
@@ -22,7 +22,10 @@ use super::{Route, Shell};
 
 /// Every state the gallery can pose: `(name, description)`.
 pub const STATES: &[(&str, &str)] = &[
-    ("dashboard", "populated: drifted files, mixed timeline, scan group"),
+    (
+        "dashboard",
+        "populated: drifted files, mixed timeline, scan group",
+    ),
     ("dashboard-empty", "everything in sync"),
     ("dashboard-scanning", "fresh boot, first scan running"),
     ("dashboard-rescanning", "data present, rescan in progress"),
@@ -32,27 +35,37 @@ pub const STATES: &[(&str, &str)] = &[
     ("review-empty", "nothing selected"),
     ("review-banner", "action outcome banner with Undo"),
     ("review-working", "action in flight"),
-    ("review-keep-both", "clean auto-merge: third quick action offered"),
+    (
+        "review-keep-both",
+        "clean auto-merge: third quick action offered",
+    ),
     ("merge", "three-pane editor with unresolved conflicts"),
-    ("merge-auto", "no conflicts: auto-merged regions, overridable strips"),
-    ("merge-big", "500-line templated file, many regions — scroll/perf testbed"),
+    (
+        "merge-auto",
+        "no conflicts: auto-merged regions, overridable strips",
+    ),
+    (
+        "merge-big",
+        "500-line templated file, many regions — scroll/perf testbed",
+    ),
     ("merge-templated", "templated file with protected 🔒 spans"),
     ("merge-resolved", "all regions decided, Save enabled"),
     ("merge-loading", "inputs loading"),
     ("settings", "live settings view (reads real settings/op)"),
     ("settings-menu", "settings with the account dropdown open"),
-    ("settings-dirty", "unsaved edits: floating Save/Revert toolbar"),
+    (
+        "settings-dirty",
+        "unsaved edits: floating Save/Revert toolbar",
+    ),
 ];
 
 /// All gallery states: the screen poses above plus one `comp:<name>` state
-/// per czui-ui preview registry entry.
+/// per tomte-ui preview registry entry.
 pub fn states() -> Vec<(String, &'static str)> {
-    let mut all: Vec<(String, &'static str)> = STATES
-        .iter()
-        .map(|(n, d)| (n.to_string(), *d))
-        .collect();
+    let mut all: Vec<(String, &'static str)> =
+        STATES.iter().map(|(n, d)| (n.to_string(), *d)).collect();
     all.extend(
-        czui_ui::preview::COMPONENTS
+        tomte_ui::preview::COMPONENTS
             .iter()
             .map(|(n, d)| (format!("comp:{n}"), *d)),
     );
@@ -174,7 +187,8 @@ fn now() -> u64 {
 
 /// Small believable config diff for the review preview.
 fn preview_document() -> MergeDocument {
-    let rendered = "theme = \"catppuccin\"\nfont_size = 14\nkeymap = \"vim\"\nformat_on_save = true\n";
+    let rendered =
+        "theme = \"catppuccin\"\nfont_size = 14\nkeymap = \"vim\"\nformat_on_save = true\n";
     let disk = "theme = \"catppuccin\"\nfont_size = 15\nkeymap = \"vim\"\nformat_on_save = true\ntelemetry = false\n";
     MergeDocument::compute(rendered, disk, rendered, MergeOptions::default())
 }
@@ -223,7 +237,8 @@ fn posed_review(
 /// one side-only change each — exercises every region kind.
 fn conflict_inputs() -> MergeInputs {
     let base = "editor = \"vim\"\nfont = \"Menlo\"\ntheme = \"dark\"\nsplits = true\n";
-    let ours = "editor = \"helix\"\nfont = \"Menlo\"\ntheme = \"dark\"\nsplits = true\nmouse = false\n";
+    let ours =
+        "editor = \"helix\"\nfont = \"Menlo\"\ntheme = \"dark\"\nsplits = true\nmouse = false\n";
     let theirs = "editor = \"zed --wait\"\nfont = \"GeistMono\"\ntheme = \"dark\"\nsplits = true\n";
     MergeInputs {
         target: home(".config/editor.toml"),
@@ -258,7 +273,11 @@ fn templated_inputs() -> MergeInputs {
     }
 }
 
-fn posed_merge(cx: &mut Context<Shell>, inputs: MergeInputs, resolve_all: bool) -> Entity<MergeView> {
+fn posed_merge(
+    cx: &mut Context<Shell>,
+    inputs: MergeInputs,
+    resolve_all: bool,
+) -> Entity<MergeView> {
     let shell = cx.weak_entity();
     cx.new(|cx| {
         let mut view = MergeView::new(shell, cx);
@@ -301,7 +320,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
 
     // Component previews: bare Shell routed at the preview (no posed data).
     if let Some(comp) = name.strip_prefix("comp:") {
-        let comp = czui_ui::preview::COMPONENTS
+        let comp = tomte_ui::preview::COMPONENTS
             .iter()
             .find(|(n, _)| *n == comp)?
             .0;
@@ -361,7 +380,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             let review = posed_review(cx, s.state.clone(), banner, in_flight, selected);
             if name == "review-keep-both" {
                 review.update(cx, |view, _| {
-                    let inputs = czui_app::merge_inputs::MergeInputs {
+                    let inputs = tomte_app::merge_inputs::MergeInputs {
                         target: home(".config/zed/settings.json"),
                         ours: "a\n".into(),
                         theirs: "b\n".into(),
@@ -443,8 +462,10 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "merge-auto" => {
             // The 2026-07-30 user report: source added lines, disk changed a
             // different line — diff3 auto-merges, every region overridable.
-            let base = "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\"\n  ],\n  \"theme\": \"dark\"\n}\n";
-            let ours = "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\"\n  ],\n  \"theme\": \"light\"\n}\n";
+            let base =
+                "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\"\n  ],\n  \"theme\": \"dark\"\n}\n";
+            let ours =
+                "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\"\n  ],\n  \"theme\": \"light\"\n}\n";
             let theirs = "{\n  \"plugin\": [\n    \"cmux\",\n    \"pty\",\n    \"hindsight\",\n    \"xberg\"\n  ],\n  \"theme\": \"dark\"\n}\n";
             let inputs = MergeInputs {
                 target: home(".config/opencode/opencode.json"),
@@ -489,9 +510,10 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         }
         "settings-dirty" => {
             let mut s = shell(Route::Settings, rich_model());
-            s.settings = Some(cx.new(|_| {
-                super::settings::SettingsView::posed_for_gallery(paths.clone(), true)
-            }));
+            s.settings =
+                Some(cx.new(|_| {
+                    super::settings::SettingsView::posed_for_gallery(paths.clone(), true)
+                }));
             s
         }
         _ => return None,

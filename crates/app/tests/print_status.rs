@@ -1,28 +1,28 @@
-//! `chezmoi-ui --print-status` against a real daemon server: the headless
+//! `tomte --print-status` against a real daemon server: the headless
 //! probe of the whole boot path (path resolution → connect → Status → print).
 
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
-use czui_core::chezmoi::ChezmoiClient;
-use czui_core::cmd::SystemRunner;
-use czui_core::git::GitClient;
-use czui_core::testsupport::Scratch;
-use czui_daemon::core::DaemonCore;
-use czui_daemon::server::serve;
-use czui_journal::Journal;
+use tomte_core::chezmoi::ChezmoiClient;
+use tomte_core::cmd::SystemRunner;
+use tomte_core::git::GitClient;
+use tomte_core::testsupport::Scratch;
+use tomte_daemon::core::DaemonCore;
+use tomte_daemon::server::serve;
+use tomte_journal::Journal;
 
 fn print_status(socket: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_chezmoi-ui"))
+    Command::new(env!("CARGO_BIN_EXE_tomte"))
         .arg("--print-status")
-        .env("CZUI_SOCKET", socket)
+        .env("TOMTE_SOCKET", socket)
         // --print-status must never spawn a daemon: point the spawn path at
         // a nonexistent binary so any regression fails loudly instead of
-        // silently launching a real chezmoid from PATH.
-        .env("CZUI_CHEZMOID", "/nonexistent/chezmoid")
+        // silently launching a real tomted from PATH.
+        .env("TOMTE_DAEMON", "/nonexistent/tomted")
         .output()
-        .expect("run chezmoi-ui --print-status")
+        .expect("run tomte --print-status")
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn print_status_reports_counts_from_a_live_daemon() {
     std::thread::spawn(move || {
         serve(
             listener,
-            czui_daemon::server::ServeCtx::ready(core, || 42, std::sync::Arc::new(|| {})),
+            tomte_daemon::server::ServeCtx::ready(core, || 42, std::sync::Arc::new(|| {})),
         )
     });
 
@@ -70,7 +70,7 @@ fn print_status_fails_cleanly_without_a_daemon() {
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains("cannot connect to chezmoid"),
+        stderr.contains("cannot connect to tomted"),
         "stderr: {stderr}"
     );
 }

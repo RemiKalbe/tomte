@@ -1,6 +1,6 @@
-//! chezmoi-ui — menubar-resident GPUI app (spec §3.2).
+//! tomte — menubar-resident GPUI app (spec §3.2).
 
-// Shared modules (ipc, model, theme) live in the czui_app lib target;
+// Shared modules (ipc, model, theme) live in the tomte_app lib target;
 // views and the AppKit platform layer stay bin-only.
 mod notify_osa;
 pub mod perf;
@@ -14,18 +14,18 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use czui_app::ipc::{IpcClient, IpcError};
-use czui_app::model::{SyncModel, TIMELINE_CAP};
-use czui_app::resolve::ResolveEngine;
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
-use czui_core::cmd::{CommandRunner, SystemRunner};
-use czui_core::git::GitClient;
-use czui_journal::Journal;
-use czui_proto::{Event, Request, Response};
 use gpui::{
     App, AppContext as _, Application, Bounds, Entity, WindowBounds, WindowOptions, px, size,
 };
 use objc2::MainThreadMarker;
+use tomte_app::ipc::{IpcClient, IpcError};
+use tomte_app::model::{SyncModel, TIMELINE_CAP};
+use tomte_app::resolve::ResolveEngine;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
+use tomte_core::cmd::{CommandRunner, SystemRunner};
+use tomte_core::git::GitClient;
+use tomte_journal::Journal;
+use tomte_proto::{Event, Request, Response};
 
 use notify_osa::{drift_body, notify, remote_advanced_body};
 use platform_mac::{MenuCommand, MenuSpec, StatusItem, set_accessory_policy};
@@ -53,7 +53,7 @@ impl gpui::Global for EngineSlot {}
 /// `chezmoi source-path`-style `source_dir` lookup is a subprocess — so
 /// callers run it on the background executor. The app builds its own
 /// chezmoi/git clients (options default; the app reads no settings today),
-/// mirroring czui-daemon's `build_core` shape.
+/// mirroring tomte-daemon's `build_core` shape.
 fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEngine, ChezmoiError> {
     let runner: Arc<dyn CommandRunner> = Arc::new(SystemRunner);
     let chezmoi = ChezmoiClient::new(runner.clone(), ChezmoiOptions::default());
@@ -68,7 +68,7 @@ fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEng
 }
 
 /// Resolved daemon-facing paths. Env overrides and defaults must match
-/// chezmoid's (`czui_daemon::settings`): both sides of the socket have to
+/// tomted's (`tomte_daemon::settings`): both sides of the socket have to
 /// agree on where it lives.
 struct Paths {
     socket: PathBuf,
@@ -76,9 +76,9 @@ struct Paths {
     /// Written and displayed by the Settings view; resolved here so all
     /// path policy lives in one place.
     settings: PathBuf,
-    /// The chezmoid binary `connect_or_spawn` launches when the daemon is
+    /// The tomted binary `connect_or_spawn` launches when the daemon is
     /// not already running.
-    chezmoid: PathBuf,
+    tomted: PathBuf,
 }
 
 impl Paths {
@@ -97,39 +97,49 @@ fn env_path(var: &str, default: PathBuf) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or(default)
 }
 
-/// Mirror of `czui_daemon::settings::app_support_dir` (the daemon crate is a
+/// Mirror of `tomte_daemon::settings::app_support_dir` (the daemon crate is a
 /// dev-dependency only, so the three lines are duplicated rather than linked).
 fn app_support_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library/Application Support/ChezmoiUI")
+    let dir = home.join("Library/Application Support/Tomte");
+    // One-time migration from the app's pre-rename identity (2026-08-08:
+    // chezmoi-ui → Tomte): adopt the old directory wholesale — the journal
+    // holds history and undo snapshots that must not be silently orphaned.
+    if !dir.exists() {
+        let old = home.join("Library/Application Support/ChezmoiUI");
+        if old.exists() {
+            let _ = std::fs::rename(&old, &dir);
+        }
+    }
+    dir
 }
 
-/// CZUI_CHEZMOID env override, else a `chezmoid` sibling of this binary
-/// (how a bundled .app ships), else bare `chezmoid` resolved via PATH.
-fn resolve_chezmoid() -> PathBuf {
-    if let Some(p) = std::env::var_os("CZUI_CHEZMOID") {
+/// TOMTE_DAEMON env override, else a `tomted` sibling of this binary
+/// (how a bundled .app ships), else bare `tomted` resolved via PATH.
+fn resolve_tomted() -> PathBuf {
+    if let Some(p) = std::env::var_os("TOMTE_DAEMON") {
         return PathBuf::from(p);
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let sibling = dir.join("chezmoid");
+        let sibling = dir.join("tomted");
         if sibling.is_file() {
             return sibling;
         }
     }
-    PathBuf::from("chezmoid")
+    PathBuf::from("tomted")
 }
 
 fn resolve_paths() -> Paths {
     let support = app_support_dir();
     Paths {
-        socket: env_path("CZUI_SOCKET", support.join("daemon.sock")),
-        journal: env_path("CZUI_JOURNAL", support.join("journal.db")),
-        settings: env_path("CZUI_SETTINGS", support.join("settings.toml")),
-        chezmoid: resolve_chezmoid(),
+        socket: env_path("TOMTE_SOCKET", support.join("daemon.sock")),
+        journal: env_path("TOMTE_JOURNAL", support.join("journal.db")),
+        settings: env_path("TOMTE_SETTINGS", support.join("settings.toml")),
+        tomted: resolve_tomted(),
     }
 }
 
@@ -139,9 +149,9 @@ fn resolve_paths() -> Paths {
 fn verify_connectivity(paths: &Paths) -> ExitCode {
     use std::time::Instant;
     println!("[1/5] socket: {}", paths.socket.display());
-    println!("      chezmoid: {}", paths.chezmoid.display());
+    println!("      tomted: {}", paths.tomted.display());
     let t0 = Instant::now();
-    let client = match IpcClient::connect_or_spawn(&paths.socket, &paths.chezmoid) {
+    let client = match IpcClient::connect_or_spawn(&paths.socket, &paths.tomted) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[2/5] FAIL connect_or_spawn: {e}");
@@ -219,7 +229,7 @@ fn print_status(socket: &Path) -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "chezmoi-ui: cannot connect to chezmoid at {}: {e}",
+                "tomte: cannot connect to tomted at {}: {e}",
                 socket.display()
             );
             return ExitCode::FAILURE;
@@ -240,11 +250,11 @@ fn print_status(socket: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(other) => {
-            eprintln!("chezmoi-ui: unexpected status reply: {other:?}");
+            eprintln!("tomte: unexpected status reply: {other:?}");
             ExitCode::FAILURE
         }
         Err(e) => {
-            eprintln!("chezmoi-ui: status request failed: {e}");
+            eprintln!("tomte: status request failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -270,65 +280,70 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
         NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     };
 
-    if !views::fixtures::states().iter().any(|(n, _)| *n == state_name) {
+    if !views::fixtures::states()
+        .iter()
+        .any(|(n, _)| *n == state_name)
+    {
         eprintln!("unknown gallery state: {state_name} (try --gallery-list)");
         return ExitCode::FAILURE;
     }
 
-    Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
-        views::merge::register_keys(cx);
-        let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
-        let app = NSApplication::sharedApplication(mtm);
-        if let Some(dark) = dark {
-            let name = if dark {
-                unsafe { NSAppearanceNameDarkAqua }
+    Application::new()
+        .with_assets(tomte_ui::Assets)
+        .run(move |cx: &mut App| {
+            views::merge::register_keys(cx);
+            let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(dark) = dark {
+                let name = if dark {
+                    unsafe { NSAppearanceNameDarkAqua }
+                } else {
+                    unsafe { NSAppearanceNameAqua }
+                };
+                let appearance = NSAppearance::appearanceNamed(name);
+                app.setAppearance(appearance.as_deref());
+            }
+
+            cx.activate(true);
+            let win_size = views::fixtures::window_size(&state_name);
+            let is_component = state_name.starts_with("comp:");
+            let bounds = Bounds::centered(None, win_size, cx);
+            let opened = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("chezmoi ui — gallery".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(gpui::point(px(12.), px(12.))),
+                    }),
+                    // Screens keep the app's floor; component previews are small
+                    // on purpose.
+                    window_min_size: (!is_component).then(|| size(px(840.), px(540.))),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    cx.new(|cx| {
+                        views::fixtures::build(&state_name, paths.clone(), cx)
+                            .expect("state name validated before run()")
+                    })
+                },
+            );
+            if opened.is_err() {
+                eprintln!("gallery: failed to open window");
+                std::process::exit(1);
+            }
+
+            // The capture script waits for this line, then shoots the window.
+            let windows = app.windows();
+            if let Some(win) = windows.iter().last() {
+                println!("GALLERY_WINDOW_ID: {}", win.windowNumber());
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
             } else {
-                unsafe { NSAppearanceNameAqua }
-            };
-            let appearance = NSAppearance::appearanceNamed(name);
-            app.setAppearance(appearance.as_deref());
-        }
-
-        cx.activate(true);
-        let win_size = views::fixtures::window_size(&state_name);
-        let is_component = state_name.starts_with("comp:");
-        let bounds = Bounds::centered(None, win_size, cx);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("chezmoi ui — gallery".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(gpui::point(px(12.), px(12.))),
-                }),
-                // Screens keep the app's floor; component previews are small
-                // on purpose.
-                window_min_size: (!is_component).then(|| size(px(840.), px(540.))),
-                ..Default::default()
-            },
-            |_, cx| {
-                cx.new(|cx| {
-                    views::fixtures::build(&state_name, paths.clone(), cx)
-                        .expect("state name validated before run()")
-                })
-            },
-        );
-        if opened.is_err() {
-            eprintln!("gallery: failed to open window");
-            std::process::exit(1);
-        }
-
-        // The capture script waits for this line, then shoots the window.
-        let windows = app.windows();
-        if let Some(win) = windows.iter().last() {
-            println!("GALLERY_WINDOW_ID: {}", win.windowNumber());
-            use std::io::Write as _;
-            std::io::stdout().flush().ok();
-        } else {
-            eprintln!("gallery: no NSWindow found after open");
-            std::process::exit(1);
-        }
-    });
+                eprintln!("gallery: no NSWindow found after open");
+                std::process::exit(1);
+            }
+        });
     ExitCode::SUCCESS
 }
 
@@ -342,39 +357,41 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
 fn run_live(route: Route, paths: Paths) -> ExitCode {
     use objc2_app_kit::NSApplication;
 
-    Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
-        views::merge::register_keys(cx);
-        let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
-        set_accessory_policy(mtm);
+    Application::new()
+        .with_assets(tomte_ui::Assets)
+        .run(move |cx: &mut App| {
+            views::merge::register_keys(cx);
+            let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
+            set_accessory_policy(mtm);
 
-        let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
-        cx.observe(&state, {
-            let mut announced = false;
-            move |state, cx| {
-                if !announced && state.read(cx).connected {
-                    announced = true;
-                    println!("LIVE_CONNECTED");
-                    use std::io::Write as _;
-                    std::io::stdout().flush().ok();
+            let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
+            cx.observe(&state, {
+                let mut announced = false;
+                move |state, cx| {
+                    if !announced && state.read(cx).connected {
+                        announced = true;
+                        println!("LIVE_CONNECTED");
+                        use std::io::Write as _;
+                        std::io::stdout().flush().ok();
+                    }
                 }
+            })
+            .detach();
+
+            let view_paths = paths.view_paths();
+            spawn_boot_and_event_loop(cx, state.clone(), paths);
+            open_shell(cx, route, state, view_paths);
+
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(win) = app.windows().iter().last() {
+                println!("GALLERY_WINDOW_ID: {}", win.windowNumber());
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
+            } else {
+                eprintln!("live: no NSWindow found after open");
+                std::process::exit(1);
             }
-        })
-        .detach();
-
-        let view_paths = paths.view_paths();
-        spawn_boot_and_event_loop(cx, state.clone(), paths);
-        open_shell(cx, route, state, view_paths);
-
-        let app = NSApplication::sharedApplication(mtm);
-        if let Some(win) = app.windows().iter().last() {
-            println!("GALLERY_WINDOW_ID: {}", win.windowNumber());
-            use std::io::Write as _;
-            std::io::stdout().flush().ok();
-        } else {
-            eprintln!("live: no NSWindow found after open");
-            std::process::exit(1);
-        }
-    });
+        });
     ExitCode::SUCCESS
 }
 
@@ -501,7 +518,7 @@ fn run_sync_all(cx: &mut App, state: &Entity<SyncModel>) {
                 Ok(_) => "synced with origin".to_string(),
                 Err(e) => format!("sync all failed: {e}"),
             };
-            notify(&SystemRunner, "chezmoi-ui", &body);
+            notify(&SystemRunner, "tomte", &body);
         })
         .detach();
 }
@@ -581,16 +598,16 @@ async fn refresh_status(
 
 fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Paths) {
     cx.spawn(async move |cx| {
-        // Reconnect forever: chezmoid may still be mid-initial-scan at app
+        // Reconnect forever: tomted may still be mid-initial-scan at app
         // launch, may be restarted after a settings save (Shutdown request),
         // or may crash — the app heals the connection on its own.
         let mut backoff_secs: u64 = 1;
         let mut last_spawn: Option<Instant> = None;
         loop {
-            let (socket, journal, chezmoid) = (
+            let (socket, journal, tomted) = (
                 paths.socket.clone(),
                 paths.journal.clone(),
-                paths.chezmoid.clone(),
+                paths.tomted.clone(),
             );
             // Spawn at most once per minute — a dying daemon must not turn
             // the reconnect loop into a spawn storm.
@@ -602,7 +619,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                 .background_executor()
                 .spawn(async move {
                     let client = if may_spawn {
-                        IpcClient::connect_or_spawn(&socket, &chezmoid)?
+                        IpcClient::connect_or_spawn(&socket, &tomted)?
                     } else {
                         IpcClient::connect(&socket)?
                     };
@@ -624,7 +641,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                 }
                 Err(e) => {
                     eprintln!(
-                        "chezmoi-ui: daemon connection failed (retrying in {backoff_secs}s): {e}"
+                        "tomte: daemon connection failed (retrying in {backoff_secs}s): {e}"
                     );
                     cx.background_executor()
                         .timer(Duration::from_secs(backoff_secs))
@@ -669,7 +686,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
             let slot = match engine {
                 Ok(engine) => EngineSlot(Some(Arc::new(engine))),
                 Err(e) => {
-                    eprintln!("chezmoi-ui: resolve actions unavailable (source dir lookup failed): {e}");
+                    eprintln!("tomte: resolve actions unavailable (source dir lookup failed): {e}");
                     EngineSlot(None)
                 }
             };
@@ -710,7 +727,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                     pending_drift = 0;
                     drift_window_started = None;
                     cx.background_executor()
-                        .spawn(async move { notify(&SystemRunner, "chezmoi-ui", &body) })
+                        .spawn(async move { notify(&SystemRunner, "tomte", &body) })
                         .detach();
                 }
                 match events.try_recv() {
@@ -738,7 +755,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                                     .spawn(async move {
                                         notify(
                                             &SystemRunner,
-                                            "chezmoi-ui",
+                                            "tomte",
                                             &remote_advanced_body(&target),
                                         );
                                     })
@@ -778,7 +795,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                                     if watchdog_armed && since.elapsed() > STUCK_LIMIT =>
                                 {
                                     eprintln!(
-                                        "chezmoi-ui: daemon scanning/starting for {}s (status: {}) — restarting it once; will not fire again until it reports healthy",
+                                        "tomte: daemon scanning/starting for {}s (status: {}) — restarting it once; will not fire again until it reports healthy",
                                         since.elapsed().as_secs(),
                                         degraded.as_deref().unwrap_or("no detail")
                                     );
@@ -874,36 +891,38 @@ fn main() -> ExitCode {
         return run_gallery(state, dark, paths.view_paths());
     }
 
-    Application::new().with_assets(czui_ui::Assets).run(move |cx: &mut App| {
-        views::merge::register_keys(cx);
-        let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
-        set_accessory_policy(mtm);
-        let (status, menu_rx) = StatusItem::install(mtm);
-        let status = Rc::new(status);
-        // The status item must live for the app's lifetime, but this closure
-        // is `on_finish_launching` — it returns right after launch (gpui
-        // app.rs:180), so leak one strong ref (plan Task 1 implementer note):
-        // one item for the process lifetime.
-        std::mem::forget(Rc::clone(&status));
+    Application::new()
+        .with_assets(tomte_ui::Assets)
+        .run(move |cx: &mut App| {
+            views::merge::register_keys(cx);
+            let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
+            set_accessory_policy(mtm);
+            let (status, menu_rx) = StatusItem::install(mtm);
+            let status = Rc::new(status);
+            // The status item must live for the app's lifetime, but this closure
+            // is `on_finish_launching` — it returns right after launch (gpui
+            // app.rs:180), so leak one strong ref (plan Task 1 implementer note):
+            // one item for the process lifetime.
+            std::mem::forget(Rc::clone(&status));
 
-        let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
+            let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
 
-        // Initial (disconnected) title + menu straight from the default
-        // model: header reads "chezmoid not connected" until hello lands.
-        refresh_status_item(&status, state.read(cx));
+            // Initial (disconnected) title + menu straight from the default
+            // model: header reads "tomted not connected" until hello lands.
+            refresh_status_item(&status, state.read(cx));
 
-        // Single choke point for "after every model change, update AppKit":
-        // everything else just updates the entity and notifies.
-        cx.observe(&state, {
-            let status = Rc::clone(&status);
-            move |state, cx| refresh_status_item(&status, state.read(cx))
-        })
-        .detach();
+            // Single choke point for "after every model change, update AppKit":
+            // everything else just updates the entity and notifies.
+            cx.observe(&state, {
+                let status = Rc::clone(&status);
+                move |state, cx| refresh_status_item(&status, state.read(cx))
+            })
+            .detach();
 
-        spawn_menu_command_loop(cx, menu_rx, state.clone(), paths.view_paths());
-        spawn_boot_and_event_loop(cx, state.clone(), paths);
-        spawn_freshness_loop(cx, state, status);
-    });
+            spawn_menu_command_loop(cx, menu_rx, state.clone(), paths.view_paths());
+            spawn_boot_and_event_loop(cx, state.clone(), paths);
+            spawn_freshness_loop(cx, state, status);
+        });
     ExitCode::SUCCESS
 }
 
@@ -911,8 +930,8 @@ fn main() -> ExitCode {
 mod tests {
     use std::path::PathBuf;
 
-    use czui_app::model::SyncModel;
-    use czui_proto::Event;
+    use tomte_app::model::SyncModel;
+    use tomte_proto::Event;
 
     use super::{NotifySignal, apply_and_signal};
 

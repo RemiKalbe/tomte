@@ -16,19 +16,19 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use czui_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
-use czui_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
-use czui_app::theme::Theme;
-use czui_ui::components as ui;
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
-use czui_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
-use czui_core::merge::{MergeDocument, MergeOptions, RegionKind, worddiff::word_diff};
-use czui_journal::{EventRow, Journal};
-use czui_proto::DriftSummary;
 use gpui::{
     AnyElement, Context, Div, ElementId, Entity, FontWeight, HighlightStyle, Rgba, SharedString,
     Stateful, StyledText, WeakEntity, Window, div, prelude::*, px, uniform_list,
 };
+use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
+use tomte_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
+use tomte_app::theme::Theme;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
+use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
+use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind, worddiff::word_diff};
+use tomte_journal::{EventRow, Journal};
+use tomte_proto::DriftSummary;
+use tomte_ui::components as ui;
 
 use super::Shell;
 use super::dashboard::{TextTooltip, system_now};
@@ -78,7 +78,7 @@ pub enum PreviewState {
     /// 2-way-lite document ready to render (see [`flatten_document`]).
     Ready(MergeDocument),
     /// `chezmoi cat` failed to evaluate the template/secret; payload is the
-    /// remediation hint from `czui_core::chezmoi::classify_eval_stderr`.
+    /// remediation hint from `tomte_core::chezmoi::classify_eval_stderr`.
     EvalFailed(String),
     /// Any other failure (chezmoi exit, io error reading the destination).
     Error(String),
@@ -112,18 +112,18 @@ impl From<EventRow> for ProvRow {
     }
 }
 
-/// Journal location: CZUI_JOURNAL override, else the app-support default.
+/// Journal location: TOMTE_JOURNAL override, else the app-support default.
 /// Mirror of `resolve_paths` in main.rs (which mirrors
-/// `czui_daemon::settings`) — kept in the views tree (shared with the merge
+/// `tomte_daemon::settings`) — kept in the views tree (shared with the merge
 /// editor) so views don't reach into the binary root module.
 pub(super) fn journal_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("CZUI_JOURNAL") {
+    if let Some(p) = std::env::var_os("TOMTE_JOURNAL") {
         return PathBuf::from(p);
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library/Application Support/ChezmoiUI/journal.db")
+    home.join("Library/Application Support/Tomte/journal.db")
 }
 
 /// Everything the detail pane needs for one target, computed entirely on the
@@ -133,18 +133,18 @@ struct LoadedDetail {
     pub(super) preview: PreviewState,
     /// The 3-way merge dry-run assembled cleanly (zero conflicts) AND the
     /// result differs from both sides → "Keep both" is a real third option.
-    pub(super) auto_merge: Option<(std::sync::Arc<czui_app::merge_inputs::MergeInputs>, String)>,
+    pub(super) auto_merge: Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)>,
 }
 
 /// Dry-run the 3-way merge; `Some` only when it auto-resolves to something
 /// neither side already is (otherwise Keep disk / Keep source cover it).
-fn auto_merge_blocking(target: &Path, journal: &Path) -> Option<(
-    std::sync::Arc<czui_app::merge_inputs::MergeInputs>,
-    String,
-)> {
+fn auto_merge_blocking(
+    target: &Path,
+    journal: &Path,
+) -> Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)> {
     let chezmoi = ChezmoiClient::new(Arc::new(SystemRunner), ChezmoiOptions::default());
-    let inputs = czui_app::merge_inputs::load(&chezmoi, journal, target).ok()?;
-    let state = czui_app::merge_state::MergeState::new(&inputs);
+    let inputs = tomte_app::merge_inputs::load(&chezmoi, journal, target).ok()?;
+    let state = tomte_app::merge_state::MergeState::new(&inputs);
     if !state.conflicts().is_empty() {
         return None;
     }
@@ -232,8 +232,8 @@ impl ResolveAction {
     }
 }
 
-/// Moved to czui-ui; re-exported so sibling views keep their import paths.
-pub(crate) use czui_ui::BannerTint;
+/// Moved to tomte-ui; re-exported so sibling views keep their import paths.
+pub(crate) use tomte_ui::BannerTint;
 
 /// The slim banner above the diff reporting the last action's outcome
 /// (spec §10: honest, including degraded commit/push results). Shared with
@@ -514,7 +514,7 @@ pub struct ReviewView {
     /// together with the preview).
     pub(super) provenance: Vec<ProvRow>,
     /// Clean 3-way dry-run for the selected target → "Keep both" offered.
-    pub(super) auto_merge: Option<(std::sync::Arc<czui_app::merge_inputs::MergeInputs>, String)>,
+    pub(super) auto_merge: Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)>,
     /// Outcome of the last resolve/undo action, rendered as a banner above
     /// the diff. `pub(super)` for the render-smoke tests.
     pub(super) last_outcome: Option<OutcomeBanner>,
@@ -593,10 +593,10 @@ impl ReviewView {
                             .arg("-t")
                             .arg(source.to_string_lossy());
                         if let Err(e) = SystemRunner.run(req) {
-                            eprintln!("chezmoi-ui: open -t failed: {e}");
+                            eprintln!("tomte: open -t failed: {e}");
                         }
                     }
-                    Err(e) => eprintln!("chezmoi-ui: source-path failed: {e}"),
+                    Err(e) => eprintln!("tomte: source-path failed: {e}"),
                 }
             })
             .detach();
@@ -752,7 +752,11 @@ impl ReviewView {
         if enabled {
             // Accent only when merging is this file's real resolution path
             // (a conflict); for one-click drifts it's a secondary option.
-            let color = if is_conflict { theme.accent } else { theme.text };
+            let color = if is_conflict {
+                theme.accent
+            } else {
+                theme.text
+            };
             base.border_color(if is_conflict {
                 theme.accent
             } else {
@@ -833,7 +837,10 @@ impl ReviewView {
     ) -> impl IntoElement + use<> {
         let mut ix = 0usize;
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (label, group) in [("NEEDS A DECISION", needs_you), ("SAFE TO RESOLVE", one_click)] {
+        for (label, group) in [
+            ("NEEDS A DECISION", needs_you),
+            ("SAFE TO RESOLVE", one_click),
+        ] {
             if group.is_empty() {
                 continue;
             }
@@ -944,7 +951,8 @@ impl ReviewView {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| selected.display().to_string())
             .into();
-        let path: SharedString = super::dashboard::shorten_home(&selected.display().to_string()).into();
+        let path: SharedString =
+            super::dashboard::shorten_home(&selected.display().to_string()).into();
 
         let engine_ready = cx
             .try_global::<crate::EngineSlot>()
@@ -976,68 +984,75 @@ impl ReviewView {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(ui::detail_header(theme, name, path, vec![
-                if self.action_in_flight {
-                    ui::status_text(theme, "working…", ui::StatusTone::Muted).into_any_element()
-                } else {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(self.action_button(
-                            "keep-disk",
-                            ResolveAction::KeepDisk,
-                            engine_ready,
-                            theme,
-                            cx,
-                        ))
-                        .child(self.action_button(
-                            "keep-source",
-                            ResolveAction::KeepSource,
-                            engine_ready,
-                            theme,
-                            cx,
-                        ))
-                        .when(self.auto_merge.is_some(), |el| {
-                            el.child(if engine_ready {
-                                ui::button(
-                                    theme,
-                                    "keep-both",
-                                    "Keep both".into(),
-                                    ui::ButtonVariant::Outline(theme.ok),
-                                    ui::ButtonSize::Sm,
-                                    cx.listener(|view, _ev, _window, cx| view.run_keep_both(cx)),
-                                )
-                            } else {
-                                ui::disabled_button(
-                                    theme,
-                                    "keep-both",
-                                    "Keep both".into(),
-                                    ui::ButtonSize::Sm,
-                                    Some("daemon not connected".into()),
-                                )
+            .child(ui::detail_header(
+                theme,
+                name,
+                path,
+                vec![
+                    if self.action_in_flight {
+                        ui::status_text(theme, "working…", ui::StatusTone::Muted).into_any_element()
+                    } else {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.action_button(
+                                "keep-disk",
+                                ResolveAction::KeepDisk,
+                                engine_ready,
+                                theme,
+                                cx,
+                            ))
+                            .child(self.action_button(
+                                "keep-source",
+                                ResolveAction::KeepSource,
+                                engine_ready,
+                                theme,
+                                cx,
+                            ))
+                            .when(self.auto_merge.is_some(), |el| {
+                                el.child(if engine_ready {
+                                    ui::button(
+                                        theme,
+                                        "keep-both",
+                                        "Keep both".into(),
+                                        ui::ButtonVariant::Outline(theme.ok),
+                                        ui::ButtonSize::Sm,
+                                        cx.listener(|view, _ev, _window, cx| {
+                                            view.run_keep_both(cx)
+                                        }),
+                                    )
+                                } else {
+                                    ui::disabled_button(
+                                        theme,
+                                        "keep-both",
+                                        "Keep both".into(),
+                                        ui::ButtonSize::Sm,
+                                        Some("daemon not connected".into()),
+                                    )
+                                })
                             })
-                        })
-                        .into_any_element()
-                },
-                self.merge_editor_button(engine_ready, is_conflict, theme, cx)
-                    .into_any_element(),
-                // External editor: real but rare — an icon, not a fourth
-                // competing button.
-                div()
-                    .id("open-in-editor")
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_md()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .cursor_pointer()
-                    .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                    .child("↗")
-                    .tooltip(ui::text_tooltip("Open in external editor"))
-                    .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
-                    .into_any_element(),
-            ]))
+                            .into_any_element()
+                    },
+                    self.merge_editor_button(engine_ready, is_conflict, theme, cx)
+                        .into_any_element(),
+                    // External editor: real but rare — an icon, not a fourth
+                    // competing button.
+                    div()
+                        .id("open-in-editor")
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(theme.text_muted)
+                        .cursor_pointer()
+                        .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                        .child("↗")
+                        .tooltip(ui::text_tooltip("Open in external editor"))
+                        .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
+                        .into_any_element(),
+                ],
+            ))
             .when_some(self.last_outcome.clone(), |el, banner| {
                 el.child(self.banner_el(&banner, theme, cx))
             })
@@ -1219,9 +1234,9 @@ fn diff_row(line: &DiffLine, theme: Theme) -> Div {
 mod tests {
     use std::path::Path;
 
-    use czui_app::resolve::{ResolveError, ResolveOutcome};
-    use czui_core::merge::{MergeDocument, MergeOptions, RegionKind};
-    use czui_proto::DriftSummary;
+    use tomte_app::resolve::{ResolveError, ResolveOutcome};
+    use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind};
+    use tomte_proto::DriftSummary;
 
     use super::{
         BannerTint, DiffLine, LineTint, ResolveAction, flatten_document, outcome_banner,
@@ -1440,10 +1455,7 @@ mod tests {
             ResolveAction::KeepDisk,
             &Ok(ResolveOutcome::NeedsMergeEditor),
         );
-        assert_eq!(
-            b.text.as_ref(),
-            "Templated file · use the merge editor"
-        );
+        assert_eq!(b.text.as_ref(), "Templated file · use the merge editor");
         assert_eq!(b.tint, BannerTint::Drift);
         assert!(!b.undoable);
 

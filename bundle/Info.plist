@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.remikalbe.chezmoi-ui</string>
+	<string>com.remikalbe.tomte</string>
 	<key>CFBundleName</key>
-	<string>Chezmoi UI</string>
+	<string>Tomte</string>
 	<key>CFBundleExecutable</key>
-	<string>chezmoi-ui</string>
+	<string>tomte</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

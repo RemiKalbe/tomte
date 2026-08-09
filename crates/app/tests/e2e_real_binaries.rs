@@ -1,39 +1,39 @@
 //! End-to-end connectivity with the REAL compiled binaries — the test the
-//! in-process suites couldn't be: `chezmoi-ui --verify-connectivity` spawning
-//! the actual `chezmoid`, over a real socket, against a scratch chezmoi home.
+//! in-process suites couldn't be: `tomte --verify-connectivity` spawning
+//! the actual `tomted`, over a real socket, against a scratch chezmoi home.
 //! This is the exact path the GUI takes at boot (minus windows).
 
 use std::path::PathBuf;
 use std::process::Command;
 
-use czui_core::testsupport::Scratch;
+use tomte_core::testsupport::Scratch;
 
-fn chezmoi_ui_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_chezmoi-ui"))
+fn tomte_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_tomte"))
 }
 
-/// The real chezmoid binary. CARGO_BIN_EXE_* only exists for the crate's own
+/// The real tomted binary. CARGO_BIN_EXE_* only exists for the crate's own
 /// bins, so build the daemon's and locate it next to ours in target/.
-fn chezmoid_bin() -> PathBuf {
+fn tomted_bin() -> PathBuf {
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "czui-daemon", "--bin", "chezmoid"])
+        .args(["build", "-p", "tomte-daemon", "--bin", "tomted"])
         .status()
-        .expect("cargo build chezmoid");
-    assert!(status.success(), "building chezmoid failed");
-    // target/debug/deps/../chezmoi-ui → target/debug/chezmoid
-    let mut dir = chezmoi_ui_bin();
+        .expect("cargo build tomted");
+    assert!(status.success(), "building tomted failed");
+    // target/debug/deps/../tomte → target/debug/tomted
+    let mut dir = tomte_bin();
     dir.pop();
     if dir.ends_with("deps") {
         dir.pop();
     }
-    let bin = dir.join("chezmoid");
-    assert!(bin.is_file(), "chezmoid not found at {}", bin.display());
+    let bin = dir.join("tomted");
+    assert!(bin.is_file(), "tomted not found at {}", bin.display());
     bin
 }
 
 struct E2e {
     scratch: Scratch,
-    chezmoid: PathBuf,
+    tomted: PathBuf,
 }
 
 impl E2e {
@@ -46,7 +46,7 @@ impl E2e {
         std::os::unix::fs::symlink(&scratch.source, share.join("chezmoi")).unwrap();
         Self {
             scratch,
-            chezmoid: chezmoid_bin(),
+            tomted: tomted_bin(),
         }
     }
 
@@ -54,30 +54,30 @@ impl E2e {
         self.scratch.root.path().join("e2e.sock")
     }
 
-    /// Run `chezmoi-ui --verify-connectivity` in a fully scratch environment.
-    /// `chezmoid_override` lets tests prove the no-spawn path.
-    fn verify(&self, chezmoid_override: Option<&str>) -> (bool, String) {
+    /// Run `tomte --verify-connectivity` in a fully scratch environment.
+    /// `tomted_override` lets tests prove the no-spawn path.
+    fn verify(&self, tomted_override: Option<&str>) -> (bool, String) {
         // HOME=<scratch home>: the real binaries then resolve the scratch
         // source (~/.local/share/chezmoi symlink) and destination (~) with
         // zero flags — exactly like production, hermetically.
-        let out = Command::new(chezmoi_ui_bin())
+        let out = Command::new(tomte_bin())
             .arg("--verify-connectivity")
-            .env("CZUI_SOCKET", self.socket())
+            .env("TOMTE_SOCKET", self.socket())
             .env(
-                "CZUI_JOURNAL",
+                "TOMTE_JOURNAL",
                 self.scratch.root.path().join("e2e-journal.db"),
             )
             .env(
-                "CZUI_SETTINGS",
+                "TOMTE_SETTINGS",
                 self.scratch.root.path().join("e2e-settings.toml"),
             )
             .env(
-                "CZUI_CHEZMOID",
-                chezmoid_override.unwrap_or(self.chezmoid.to_str().unwrap()),
+                "TOMTE_DAEMON",
+                tomted_override.unwrap_or(self.tomted.to_str().unwrap()),
             )
             .env("HOME", &self.scratch.home)
             .output()
-            .expect("run chezmoi-ui --verify-connectivity");
+            .expect("run tomte --verify-connectivity");
         let text = format!(
             "{}\n{}",
             String::from_utf8_lossy(&out.stdout),
@@ -100,19 +100,19 @@ fn app_spawns_real_daemon_and_full_boot_path_works() {
 fn app_connects_to_already_running_daemon_without_spawning() {
     let e2e = E2e::new();
     // Start the real daemon ourselves…
-    let mut daemon = Command::new(&e2e.chezmoid)
-        .env("CZUI_SOCKET", e2e.socket())
+    let mut daemon = Command::new(&e2e.tomted)
+        .env("TOMTE_SOCKET", e2e.socket())
         .env(
-            "CZUI_JOURNAL",
+            "TOMTE_JOURNAL",
             e2e.scratch.root.path().join("pre-journal.db"),
         )
         .env(
-            "CZUI_SETTINGS",
+            "TOMTE_SETTINGS",
             e2e.scratch.root.path().join("pre-settings.toml"),
         )
         .env("HOME", &e2e.scratch.home)
         .spawn()
-        .expect("start chezmoid");
+        .expect("start tomted");
     // Wait for it to bind (it needs a moment to start) before verifying.
     let sock = e2e.socket();
     for _ in 0..100 {
@@ -122,9 +122,9 @@ fn app_connects_to_already_running_daemon_without_spawning() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(sock.exists(), "pre-started daemon never bound its socket");
-    // …then verify with a nonexistent chezmoid path: connecting must succeed
+    // …then verify with a nonexistent tomted path: connecting must succeed
     // with no spawn possible.
-    let (ok, log) = e2e.verify(Some("/nonexistent/chezmoid"));
+    let (ok, log) = e2e.verify(Some("/nonexistent/tomted"));
     let _ = daemon.kill();
     let _ = daemon.wait();
     assert!(ok, "verify against pre-started daemon failed:\n{log}");
@@ -150,14 +150,14 @@ fn second_daemon_defers_to_the_first() {
     assert!(ok, "{log}");
     // A second real daemon started against the same socket must exit
     // "already running" instead of stealing the path.
-    let out = Command::new(&e2e.chezmoid)
-        .env("CZUI_SOCKET", e2e.socket())
+    let out = Command::new(&e2e.tomted)
+        .env("TOMTE_SOCKET", e2e.socket())
         .env(
-            "CZUI_JOURNAL",
+            "TOMTE_JOURNAL",
             e2e.scratch.root.path().join("dup-journal.db"),
         )
         .env(
-            "CZUI_SETTINGS",
+            "TOMTE_SETTINGS",
             e2e.scratch.root.path().join("dup-settings.toml"),
         )
         .env("HOME", &e2e.scratch.home)
@@ -176,24 +176,24 @@ fn second_daemon_defers_to_the_first() {
 #[test]
 fn daemon_serves_degraded_status_while_chezmoi_is_unavailable() {
     // The bug that ate a whole evening: chezmoi hanging (locked secret
-    // manager) used to kill chezmoid at startup, leaving the app retrying a
+    // manager) used to kill tomted at startup, leaving the app retrying a
     // dead socket forever. Now the daemon binds first and reports why it's
     // stuck. Simulate "chezmoi unavailable" with a PATH that has no chezmoi.
     let e2e = E2e::new();
-    let mut daemon = Command::new(&e2e.chezmoid)
-        .env("CZUI_SOCKET", e2e.socket())
+    let mut daemon = Command::new(&e2e.tomted)
+        .env("TOMTE_SOCKET", e2e.socket())
         .env(
-            "CZUI_JOURNAL",
+            "TOMTE_JOURNAL",
             e2e.scratch.root.path().join("deg-journal.db"),
         )
         .env(
-            "CZUI_SETTINGS",
+            "TOMTE_SETTINGS",
             e2e.scratch.root.path().join("deg-settings.toml"),
         )
         .env("HOME", &e2e.scratch.home)
         .env("PATH", "/usr/bin:/bin") // no chezmoi here
         .spawn()
-        .expect("start chezmoid");
+        .expect("start tomted");
     let sock = e2e.socket();
     for _ in 0..100 {
         if sock.exists() {
@@ -203,9 +203,9 @@ fn daemon_serves_degraded_status_while_chezmoi_is_unavailable() {
     }
     assert!(sock.exists(), "daemon must bind BEFORE resolving chezmoi");
 
-    let out = Command::new(chezmoi_ui_bin())
+    let out = Command::new(tomte_bin())
         .arg("--print-status")
-        .env("CZUI_SOCKET", &sock)
+        .env("TOMTE_SOCKET", &sock)
         .env("HOME", &e2e.scratch.home)
         .output()
         .expect("print-status");
@@ -218,33 +218,33 @@ fn daemon_serves_degraded_status_while_chezmoi_is_unavailable() {
     );
     assert!(out.status.success(), "print-status failed: {text}");
     assert!(
-        text.contains("degraded: chezmoid starting"),
+        text.contains("degraded: tomted starting"),
         "expected a 'starting' degraded status, got: {text}"
     );
 }
 
 #[test]
 fn fetch_request_updates_freshness_and_pushes_fetch_done() {
-    use czui_app::ipc::IpcClient;
-    use czui_proto::{Event, Request, Response};
     use std::time::Duration;
+    use tomte_app::ipc::IpcClient;
+    use tomte_proto::{Event, Request, Response};
 
     let e2e = E2e::new();
     // Boot the real daemon binary against the scratch home (its origin is a
     // local bare repo, so Fetch is a real `git fetch`).
-    let mut daemon = Command::new(&e2e.chezmoid)
-        .env("CZUI_SOCKET", e2e.socket())
+    let mut daemon = Command::new(&e2e.tomted)
+        .env("TOMTE_SOCKET", e2e.socket())
         .env(
-            "CZUI_JOURNAL",
+            "TOMTE_JOURNAL",
             e2e.scratch.root.path().join("fetch-journal.db"),
         )
         .env(
-            "CZUI_SETTINGS",
+            "TOMTE_SETTINGS",
             e2e.scratch.root.path().join("fetch-settings.toml"),
         )
         .env("HOME", &e2e.scratch.home)
         .spawn()
-        .expect("start chezmoid");
+        .expect("start tomted");
     let sock = e2e.socket();
     for _ in 0..100 {
         if sock.exists() {

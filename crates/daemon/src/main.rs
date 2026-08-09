@@ -1,4 +1,4 @@
-//! chezmoid — chezmoi-ui watcher daemon (spec §3.1).
+//! tomted — tomte watcher daemon (spec §3.1).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -7,14 +7,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use notify::{RecursiveMode, Watcher};
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-use czui_core::cmd::SystemRunner;
-use czui_core::git::GitClient;
-use czui_daemon::core::DaemonCore;
-use czui_daemon::debounce::Debouncer;
-use czui_daemon::server::serve;
-use czui_daemon::settings::{Settings, app_support_dir};
-use czui_journal::Journal;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+use tomte_core::cmd::SystemRunner;
+use tomte_core::git::GitClient;
+use tomte_daemon::core::DaemonCore;
+use tomte_daemon::debounce::Debouncer;
+use tomte_daemon::server::serve;
+use tomte_daemon::settings::{Settings, app_support_dir};
+use tomte_journal::Journal;
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -30,13 +30,13 @@ fn healthy_daemon_at(socket: &std::path::Path) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-    let frame = czui_proto::ClientFrame {
+    let frame = tomte_proto::ClientFrame {
         id: 0,
-        request: czui_proto::Request::Hello {
-            version: czui_proto::PROTOCOL_VERSION,
+        request: tomte_proto::Request::Hello {
+            version: tomte_proto::PROTOCOL_VERSION,
         },
     };
-    if czui_proto::write_frame(&mut stream, &frame).is_err() || stream.flush().is_err() {
+    if tomte_proto::write_frame(&mut stream, &frame).is_err() || stream.flush().is_err() {
         return false;
     }
     let mut line = String::new();
@@ -53,7 +53,7 @@ fn build_core(
     settings: &Settings,
     journal_path: &std::path::Path,
     machine: &str,
-    subscribers: Option<Arc<Mutex<Vec<std::sync::mpsc::Sender<czui_proto::Event>>>>>,
+    subscribers: Option<Arc<Mutex<Vec<std::sync::mpsc::Sender<tomte_proto::Event>>>>>,
 ) -> Result<DaemonCore, Box<dyn std::error::Error>> {
     let runner = Arc::new(SystemRunner);
     let chezmoi = ChezmoiClient::new(
@@ -86,7 +86,7 @@ fn sanitize_path() {
         .filter(|p| {
             let ephemeral = p.starts_with("/var/folders") || p.starts_with("/private/var/folders");
             if ephemeral {
-                eprintln!("chezmoid: dropping ephemeral PATH entry {}", p.display());
+                eprintln!("tomted: dropping ephemeral PATH entry {}", p.display());
             }
             !ephemeral
         })
@@ -108,14 +108,14 @@ fn main() -> ExitCode {
     let once = std::env::args().any(|a| a == "--once");
     sanitize_path();
     let support = app_support_dir();
-    let settings = Settings::load(&env_path("CZUI_SETTINGS", support.join("settings.toml")));
-    let journal_path = env_path("CZUI_JOURNAL", support.join("journal.db"));
-    let socket_path = env_path("CZUI_SOCKET", support.join("daemon.sock"));
+    let settings = Settings::load(&env_path("TOMTE_SETTINGS", support.join("settings.toml")));
+    let journal_path = env_path("TOMTE_JOURNAL", support.join("journal.db"));
+    let socket_path = env_path("TOMTE_SOCKET", support.join("daemon.sock"));
 
     if let Some(parent) = journal_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        eprintln!("chezmoid: cannot create {}: {e}", parent.display());
+        eprintln!("tomted: cannot create {}: {e}", parent.display());
         return ExitCode::FAILURE;
     }
 
@@ -126,7 +126,7 @@ fn main() -> ExitCode {
         let mut core = match build_core(&settings, &journal_path, &machine, None) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("chezmoid: init failed: {e}");
+                eprintln!("tomted: init failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -143,7 +143,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("chezmoid: initial scan failed: {e}");
+                eprintln!("tomted: initial scan failed: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -157,7 +157,7 @@ fn main() -> ExitCode {
     let lock_file = match std::fs::File::create(&lock_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("chezmoid: cannot create {}: {e}", lock_path.display());
+            eprintln!("tomted: cannot create {}: {e}", lock_path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -166,7 +166,7 @@ fn main() -> ExitCode {
         // SAFETY: flock on a fd we own; LOCK_NB never blocks.
         if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             println!(
-                "chezmoid: another instance holds {} — exiting",
+                "tomted: another instance holds {} — exiting",
                 lock_path.display()
             );
             return ExitCode::SUCCESS;
@@ -180,7 +180,7 @@ fn main() -> ExitCode {
     // the app must converge on ONE daemon). A stale socket file (no
     // listener / no Hello reply) is reclaimed below.
     if healthy_daemon_at(&socket_path) {
-        println!("chezmoid: already running at {}", socket_path.display());
+        println!("tomted: already running at {}", socket_path.display());
         return ExitCode::SUCCESS;
     }
 
@@ -191,11 +191,11 @@ fn main() -> ExitCode {
     let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("chezmoid: cannot bind {}: {e}", socket_path.display());
+            eprintln!("tomted: cannot bind {}: {e}", socket_path.display());
             return ExitCode::FAILURE;
         }
     };
-    println!("chezmoid: listening on {}", socket_path.display());
+    println!("tomted: listening on {}", socket_path.display());
 
     // Self-reap when displaced: if the socket path ever stops pointing at
     // OUR bound inode (a successor re-bound it, or the file vanished), this
@@ -213,7 +213,7 @@ fn main() -> ExitCode {
                 let current = std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0);
                 if current != our_ino {
                     eprintln!(
-                        "chezmoid: socket path no longer ours (displaced by a successor) — exiting"
+                        "tomted: socket path no longer ours (displaced by a successor) — exiting"
                     );
                     std::process::exit(0);
                 }
@@ -223,9 +223,9 @@ fn main() -> ExitCode {
     // Serve immediately with an empty core: clients get instant Hello and an
     // honest "starting" status while we fight a possibly-slow chezmoi below
     // (a locked secret manager can stall it for minutes).
-    let subscribers: Arc<Mutex<Vec<std::sync::mpsc::Sender<czui_proto::Event>>>> = Arc::default();
+    let subscribers: Arc<Mutex<Vec<std::sync::mpsc::Sender<tomte_proto::Event>>>> = Arc::default();
     let on_shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(0));
-    let ctx = czui_daemon::server::ServeCtx::starting(
+    let ctx = tomte_daemon::server::ServeCtx::starting(
         subscribers.clone(),
         machine.clone(),
         now_ts,
@@ -235,7 +235,7 @@ fn main() -> ExitCode {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             if let Err(e) = serve(listener, ctx) {
-                eprintln!("chezmoid: server failed: {e}");
+                eprintln!("tomted: server failed: {e}");
             }
         })
     };
@@ -255,13 +255,13 @@ fn main() -> ExitCode {
             Ok(core) => break Arc::new(Mutex::new(core)),
             Err(e) => {
                 eprintln!(
-                    "chezmoid[t={}]: startup blocked ({e}); retrying in 10s",
+                    "tomted[t={}]: startup blocked ({e}); retrying in 10s",
                     now_ts()
                 );
                 ctx.set_starting_error(e.to_string());
                 if std::time::Instant::now() > startup_deadline {
                     eprintln!(
-                        "chezmoid[t={}]: startup failed for 5 minutes — exiting so a fresh spawn can take over",
+                        "tomted[t={}]: startup failed for 5 minutes — exiting so a fresh spawn can take over",
                         now_ts()
                     );
                     return ExitCode::FAILURE;
@@ -271,13 +271,13 @@ fn main() -> ExitCode {
         }
     };
     ctx.set_core(core.clone());
-    println!("chezmoid: core ready");
+    println!("tomted: core ready");
 
     // Initial scan. A failure must not kill the daemon — the hourly rescan
     // and manual Rescan requests can recover it (spec §10).
     match core.lock().expect("core lock").full_rescan(now_ts()) {
-        Ok(drifted) => println!("chezmoid: initial scan done, {drifted} drifted"),
-        Err(e) => eprintln!("chezmoid: initial scan failed: {e}"),
+        Ok(drifted) => println!("tomted: initial scan done, {drifted} drifted"),
+        Err(e) => eprintln!("tomted: initial scan failed: {e}"),
     }
 
     // watcher → debouncer
@@ -292,7 +292,7 @@ fn main() -> ExitCode {
         }) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("chezmoid: watcher init failed: {e}");
+                eprintln!("tomted: watcher init failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -306,7 +306,7 @@ fn main() -> ExitCode {
                 RecursiveMode::NonRecursive
             };
             if let Err(e) = watcher.watch(&p, mode) {
-                eprintln!("chezmoid: watch {} failed: {e}", p.display());
+                eprintln!("tomted: watch {} failed: {e}", p.display());
             }
         }
     }
@@ -323,7 +323,7 @@ fn main() -> ExitCode {
                 };
                 let before: std::collections::BTreeSet<_> = c.watch_paths().into_iter().collect();
                 if let Err(e) = c.handle_paths_changed(&batch, now_ts()) {
-                    eprintln!("chezmoid: change handling failed: {e}");
+                    eprintln!("tomted: change handling failed: {e}");
                 }
                 let after: std::collections::BTreeSet<_> = c.watch_paths().into_iter().collect();
                 drop(c);
@@ -347,7 +347,7 @@ fn main() -> ExitCode {
                 if let Ok(mut c) = core.lock()
                     && let Err(e) = c.handle_fetch(now_ts())
                 {
-                    eprintln!("chezmoid: fetch failed: {e}");
+                    eprintln!("tomted: fetch failed: {e}");
                 }
                 std::thread::sleep(interval);
             }
@@ -377,7 +377,7 @@ fn main() -> ExitCode {
                 if let Ok(mut c) = core.lock()
                     && let Err(e) = c.full_rescan(now_ts())
                 {
-                    eprintln!("chezmoid: rescan failed: {e}");
+                    eprintln!("tomted: rescan failed: {e}");
                 }
             }
         });

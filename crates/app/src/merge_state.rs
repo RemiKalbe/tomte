@@ -2,7 +2,7 @@
 //! conflict cursor, and assembly gating over one `MergeDocument`. No gpui —
 //! the view layer drives this and renders whatever it reports.
 
-use czui_core::merge::{Choice, MergeDocument, MergeOptions, Resolution};
+use tomte_core::merge::{Choice, MergeDocument, MergeOptions, Resolution};
 
 use crate::merge_inputs::MergeInputs;
 
@@ -90,7 +90,7 @@ impl MergeState {
             .regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.kind != czui_core::merge::RegionKind::Unchanged)
+            .filter(|(_, r)| r.kind != tomte_core::merge::RegionKind::Unchanged)
             .map(|(i, _)| i)
             .collect()
     }
@@ -127,7 +127,7 @@ impl MergeState {
 mod tests {
     use std::path::PathBuf;
 
-    use czui_core::merge::{Choice, RegionKind};
+    use tomte_core::merge::{Choice, RegionKind};
 
     use super::MergeState;
     use crate::merge_inputs::MergeInputs;

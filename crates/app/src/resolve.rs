@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiError};
-use czui_core::git::{GitClient, GitError};
-use czui_core::template::anchor::SpanMap;
-use czui_core::template::verify::{VerifyError, verify_write_back};
-use czui_core::template::writeback::write_back;
-use czui_journal::{Journal, JournalError};
-use czui_proto::{Request, Response};
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
+use tomte_core::git::{GitClient, GitError};
+use tomte_core::template::anchor::SpanMap;
+use tomte_core::template::verify::{VerifyError, verify_write_back};
+use tomte_core::template::writeback::write_back;
+use tomte_journal::{Journal, JournalError};
+use tomte_proto::{Request, Response};
 
 use crate::ipc::{IpcClient, IpcError};
 use crate::merge_inputs::MergeInputs;
@@ -30,7 +30,7 @@ const EXPECT_TTL_SECS: u32 = 60;
 
 /// Machine label for the app's read-only journal handle. Only stamped on
 /// writes, which a read-only handle rejects — it never reaches the database.
-pub(crate) const RO_MACHINE: &str = "czui-app";
+pub(crate) const RO_MACHINE: &str = "tomte-app";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -416,9 +416,9 @@ pub fn is_templated(source_path: &Path) -> bool {
 }
 
 /// Message for the engine's fallback source-repo commit:
-/// `chezmoi-ui: <action> <file-name>`.
+/// `tomte: <action> <file-name>`.
 pub fn commit_message(action: &str, target: &Path) -> String {
-    format!("chezmoi-ui: {action} {}", display_name(target))
+    format!("tomte: {action} {}", display_name(target))
 }
 
 fn display_name(target: &Path) -> String {
@@ -487,9 +487,9 @@ fn append_note(note: &mut Option<String>, message: String) {
 
 #[cfg(test)]
 mod tests {
-    use czui_core::chezmoi::ChezmoiOptions;
-    use czui_core::cmd::fake::FakeRunner;
-    use czui_core::template::{anchor::anchor, lexer::lex};
+    use tomte_core::chezmoi::ChezmoiOptions;
+    use tomte_core::cmd::fake::FakeRunner;
+    use tomte_core::template::{anchor::anchor, lexer::lex};
 
     use super::*;
 
@@ -597,11 +597,11 @@ mod tests {
     fn commit_message_uses_action_and_file_name() {
         assert_eq!(
             commit_message("keep_disk", Path::new("/Users/x/.zshrc")),
-            "chezmoi-ui: keep_disk .zshrc"
+            "tomte: keep_disk .zshrc"
         );
         assert_eq!(
             commit_message("keep_disk", Path::new("/Users/x/.config/starship.toml")),
-            "chezmoi-ui: keep_disk starship.toml"
+            "tomte: keep_disk starship.toml"
         );
     }
 
@@ -609,7 +609,7 @@ mod tests {
     fn commit_message_falls_back_to_full_path_without_file_name() {
         assert_eq!(
             commit_message("keep_source", Path::new("/")),
-            "chezmoi-ui: keep_source /"
+            "tomte: keep_source /"
         );
     }
 

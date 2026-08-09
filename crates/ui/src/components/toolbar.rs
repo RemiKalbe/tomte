@@ -21,4 +21,3 @@ pub fn toolbar_pill(theme: Theme) -> Div {
         .items_center()
         .gap_2()
 }
-

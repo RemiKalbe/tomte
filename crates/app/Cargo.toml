@@ -1,22 +1,22 @@
 [package]
-name = "czui-app"
+name = "tomte-app"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "czui_app"
+name = "tomte_app"
 path = "src/lib.rs"
 
 [[bin]]
-name = "chezmoi-ui"
+name = "tomte"
 path = "src/main.rs"
 
 [dependencies]
-czui-core = { path = "../core" }
-czui-journal = { path = "../journal" }
-czui-proto = { path = "../proto" }
-czui-ui = { path = "../ui" }
+tomte-core = { path = "../core" }
+tomte-journal = { path = "../journal" }
+tomte-proto = { path = "../proto" }
+tomte-ui = { path = "../ui" }
 gpui.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
@@ -28,6 +28,6 @@ toml.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-czui-daemon = { path = "../daemon" }
-czui-core = { path = "../core", features = ["test-support"] }
+tomte-daemon = { path = "../daemon" }
+tomte-core = { path = "../core", features = ["test-support"] }
 tempfile.workspace = true

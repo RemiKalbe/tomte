@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use czui_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-use czui_core::cmd::SystemRunner;
-use czui_core::template::anchor::{SpanOrigin, anchor};
-use czui_core::template::lexer::lex;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+use tomte_core::cmd::SystemRunner;
+use tomte_core::template::anchor::{SpanOrigin, anchor};
+use tomte_core::template::lexer::lex;
 
 fn main() -> ExitCode {
     let Some(target) = std::env::args().nth(1) else {
