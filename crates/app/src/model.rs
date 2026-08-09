@@ -231,11 +231,12 @@ impl SyncModel {
             .count()
     }
 
-    /// NSStatusItem title beside the gnome icon: state only — "…" while
-    /// connecting/scanning, "●N" when N targets need a human, else empty.
+    /// NSStatusItem title beside the gnome icon: "●N" when N targets need
+    /// a human, else empty — scanning/connecting add NO text (a transient
+    /// "…" made every item to the left shift; the menu carries that state).
     pub fn status_title(&self) -> String {
         if !self.connected || self.scanning {
-            return "…".to_string();
+            return String::new();
         }
         match self.needs_attention() {
             0 => String::new(),

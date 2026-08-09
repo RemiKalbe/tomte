@@ -156,7 +156,7 @@ impl StatusItem {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
 
             let open = NSMenuItem::new(mtm);
-            open.setTitle(&NSString::from_str("Open chezmoi UI"));
+            open.setTitle(&NSString::from_str("Open Tomte"));
             open.setTarget(Some(&self.target));
             open.setAction(Some(sel!(openApp:)));
             menu.addItem(&open);
@@ -168,7 +168,7 @@ impl StatusItem {
             menu.addItem(&settings);
 
             let quit = NSMenuItem::new(mtm);
-            quit.setTitle(&NSString::from_str("Quit chezmoi UI"));
+            quit.setTitle(&NSString::from_str("Quit Tomte"));
             quit.setTarget(Some(&self.target));
             quit.setAction(Some(sel!(quitApp:)));
             menu.addItem(&quit);

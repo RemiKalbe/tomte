@@ -312,7 +312,7 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("chezmoi ui — gallery".into()),
+                        title: Some("Tomte — gallery".into()),
                         appears_transparent: true,
                         traffic_light_position: Some(gpui::point(px(12.), px(12.))),
                     }),
@@ -404,7 +404,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
             // Zed-style chrome: the sidebar runs to the top of the window,
             // traffic lights float over it (sidebar reserves pt_10).
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("chezmoi ui".into()),
+                title: Some("Tomte".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(gpui::point(px(12.), px(12.))),
             }),
