@@ -8,12 +8,11 @@
 use std::collections::HashMap;
 
 use gpui::{
-    App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*, px,
+    App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*,
 };
 
 use crate::components::button::{ButtonSize, ButtonVariant, button};
-use crate::components::chip::{ChipVariant, chip};
-use crate::components::mono::{line_text, mono_line};
+use crate::components::mono::{line_gutter, line_text, mono_line};
 use crate::components::tooltip::text_tooltip;
 use crate::theme::Theme;
 
@@ -221,13 +220,6 @@ pub fn provenance_label(theme: Theme, side: Side) -> Div {
 
 /// Width of the leading "template" column when a block has protected lines
 /// (mirrors the pane gutter: uniform per block, the chip can never clip).
-const TEMPLATE_GUTTER: f32 = 76.;
-
-/// Read-only tinted mono rows for one side of an undecided region.
-/// Structurally read-only: these are divs, there is no edit path.
-/// `protected`: line index → hover text (the template's own line) for
-/// template-generated lines; those rows scream "template" via a leading
-/// chip and answer WHY on hover.
 pub fn provenance_rows(
     theme: Theme,
     side: Side,
@@ -235,7 +227,6 @@ pub fn provenance_rows(
     protected: &HashMap<usize, SharedString>,
 ) -> Div {
     let tint = side.tint(theme);
-    let template_gutter = !protected.is_empty();
     div()
         .flex()
         .flex_col()
@@ -246,22 +237,10 @@ pub fn provenance_rows(
             let tip = protected.get(&ix).cloned();
             let row = mono_line(theme)
                 .when(tip.is_some(), |el| el.bg(Theme::wash(theme.drift, 0.15)))
-                .when(template_gutter, |el| {
-                    el.child(
-                        div()
-                            .w(px(TEMPLATE_GUTTER))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .when(tip.is_some(), |el| {
-                                el.child(div().text_color(theme.drift).child("{}")).child(
-                                    chip(theme, "template", ChipVariant::Wash(theme.drift))
-                                        .flex_none(),
-                                )
-                            }),
-                    )
-                })
+                .child(line_gutter(
+                    theme.drift,
+                    if tip.is_some() { "{}" } else { "" },
+                ))
                 .child(line_text(line.clone()));
             match tip {
                 Some(tip) => row
