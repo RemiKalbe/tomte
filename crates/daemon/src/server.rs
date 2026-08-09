@@ -233,8 +233,9 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
     // banner). Every other request WAITS ITS TURN: scans hold the core for
     // seconds and run constantly, so bouncing "busy — retry shortly" at the
     // user made saves a timing game (2026-08-08). Each connection has its
-    // own thread, so waiting here stalls nobody else; the bound stays under
-    // the client's 10s request timeout.
+    // own thread, so waiting here stalls nobody else; the bound rides well
+    // above a full scan (~9s over ~1k files, measured 2026-08-08) and under
+    // the client's 30s request timeout.
     let mut c = match core.try_lock() {
         Ok(c) => c,
         Err(std::sync::TryLockError::WouldBlock) => {
@@ -247,7 +248,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     last_fetch_ts: None,
                 };
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 match core.try_lock() {

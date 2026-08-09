@@ -19,7 +19,7 @@ pub enum IpcError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Proto(String),
-    #[error("request timed out (connected, but no reply within 10s)")]
+    #[error("request timed out (connected, but no reply within 30s)")]
     Timeout,
     #[error("daemon rejected connection: {0}")]
     Rejected(String),
@@ -155,7 +155,9 @@ impl IpcClient {
             write_frame(&mut *w, &ClientFrame { id, request })?;
             w.flush()?;
         }
-        rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
+        // 30s: requests may legitimately WAIT inside the daemon for a full
+        // scan to release the core (~9s over ~1k files) — see server.rs.
+        rx.recv_timeout(Duration::from_secs(30)).map_err(|_| {
             if let Ok(mut p) = self.pending.lock() {
                 p.remove(&id);
             }
