@@ -231,14 +231,15 @@ impl SyncModel {
             .count()
     }
 
-    /// NSStatusItem title: "tomte", or "tomte ●N" when N targets need a human.
+    /// NSStatusItem title beside the gnome icon: state only — "…" while
+    /// connecting/scanning, "●N" when N targets need a human, else empty.
     pub fn status_title(&self) -> String {
         if !self.connected || self.scanning {
-            return "tomte …".to_string();
+            return "…".to_string();
         }
         match self.needs_attention() {
-            0 => "tomte".to_string(),
-            n => format!("tomte ●{n}"),
+            0 => String::new(),
+            n => format!("●{n}"),
         }
     }
 
@@ -693,12 +694,12 @@ mod tests {
     #[test]
     fn status_title_shows_attention_count() {
         let cases: Vec<(Vec<&str>, &str)> = vec![
-            (vec![], "tomte"),
-            (vec!["destination_drift"], "tomte"), // drifted but nothing urgent
-            (vec!["conflict"], "tomte ●1"),
+            (vec![], ""),
+            (vec!["destination_drift"], ""), // drifted but nothing urgent
+            (vec!["conflict"], "●1"),
             (
                 vec!["conflict", "eval_failed", "local_source_diverged"],
-                "tomte ●3",
+                "●3",
             ),
         ];
         for (classes, want) in cases {

@@ -25,6 +25,8 @@ mkdir -p "$app/Contents/MacOS"
 cp "$repo_root/target/release/tomte" "$app/Contents/MacOS/tomte"
 cp "$repo_root/target/release/tomted" "$app/Contents/MacOS/tomted"
 cp "$repo_root/bundle/Info.plist" "$app/Contents/Info.plist"
+mkdir -p "$app/Contents/Resources"
+cp "$repo_root/bundle/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 
 plist="$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$plist"
