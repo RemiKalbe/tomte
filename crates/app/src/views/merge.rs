@@ -690,15 +690,12 @@ impl MergeView {
     /// `Next ↓`: advance the cursor to the next unresolved conflict — or,
     /// once everything is resolved, to the next changed region, so every
     /// decision point stays reachable for revisiting (2026-08-08 feedback).
+    /// Target selection lives in [`next_target`] (pure, tested).
     fn next(&mut self, cx: &mut Context<Self>) {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        let region = loaded
-            .state
-            .next_unresolved()
-            .or_else(|| loaded.state.next_changed());
-        if let Some(region) = region {
+        if let Some(region) = next_target(&mut loaded.state) {
             self.result_scroll.scroll_to_item(region);
         }
         cx.notify();
@@ -1112,6 +1109,18 @@ fn degraded_base_col(theme: Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// Choose Next ↓'s target: unresolved conflicts first; once none remain,
+/// cycle ALL changed regions. Branch explicitly — `next_unresolved()`
+/// clears the cursor when everything is resolved, so chaining it in front
+/// of `next_changed()` resets the cycle to the first region on every press.
+fn next_target(state: &mut MergeState) -> Option<usize> {
+    if state.unresolved().is_empty() {
+        state.next_changed()
+    } else {
+        state.next_unresolved()
+    }
+}
+
 /// Fixed mono row height (`h_5` = 20px) — the unit converting pane scroll
 /// offsets to line positions for region-aligned sync.
 const PANE_ROW_H: f32 = 20.;
@@ -1359,7 +1368,7 @@ mod tests {
 
     use super::super::review::BannerTint;
     use super::{
-        LoadedMerge, PaneSide, RegionDisplay, line_at, merge_banner, pane_lines,
+        LoadedMerge, PaneSide, RegionDisplay, line_at, merge_banner, next_target, pane_lines,
         protected_line_info, region_at, region_display, row_bg,
     };
     use gpui::SharedString;
@@ -1489,6 +1498,33 @@ mod tests {
         assert!(loaded.theirs_rows[1].protected.is_none());
         assert!(loaded.base_rows.iter().all(|r| r.protected.is_none()));
         assert!(loaded.ours_rows.iter().all(|r| r.protected.is_none()));
+    }
+
+    #[test]
+    fn next_target_cycles_changed_regions_when_no_conflicts_remain() {
+        // Auto-merged doc: two changed regions (ours-only + theirs-only),
+        // zero conflicts — the 2026-08-08 "Next only goes to the first" bug.
+        let mut state = MergeState::new(&inputs(
+            Some("a\nb\nc\n"),
+            "A\nb\nc\n", // ours changed region around line 1
+            "a\nb\nC\n", // theirs changed region around line 3
+        ));
+        assert!(state.unresolved().is_empty(), "no conflicts in this doc");
+        let changed = state.changed_regions();
+        assert!(changed.len() >= 2, "need at least two stops: {changed:?}");
+
+        let first = next_target(&mut state).expect("first stop");
+        let second = next_target(&mut state).expect("second stop");
+        assert_ne!(first, second, "Next must advance, not restart");
+        // Full cycle wraps back to the first stop.
+        let mut cur = second;
+        for _ in 0..changed.len() {
+            cur = next_target(&mut state).expect("cycling");
+            if cur == first {
+                break;
+            }
+        }
+        assert_eq!(cur, first, "cycle wraps to the first stop");
     }
 
     #[test]
