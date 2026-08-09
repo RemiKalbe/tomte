@@ -44,12 +44,17 @@ gh variable set APPLE_TEAM_ID --body "XXXXXXXXXX"
 
 1. Bump `version` in the workspace `Cargo.toml` (single source of truth —
    every crate inherits it, the bundle stamps it, the updater compares it).
-2. Commit, then tag and push:
+2. Commit, push main, then:
 
 ```sh
-git tag v0.1.0
-git push origin main v0.1.0
+./scripts/release.sh X.Y.Z
 ```
+
+The script is the local gate: clean tree, HEAD == origin/main, tag ==
+workspace version, fmt + clippy + full test suite — every check an exit
+code — and only then tags and pushes. Hand-pushing a tag skips nothing
+in CI (the workflow re-tests), but the script exists so a broken tag
+never leaves the machine.
 
 The Release workflow then: runs the full test suite → builds and signs
 `Tomte.app` (hardened runtime) → notarizes with `notarytool` and staples →
