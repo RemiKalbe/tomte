@@ -7,6 +7,7 @@ pub mod merge_inputs;
 pub mod merge_state;
 pub mod model;
 pub mod resolve;
+pub mod update;
 /// Re-export: the theme moved into the tomte-ui design-system crate; every
 /// existing `tomte_app::theme::Theme` import keeps working.
 pub use tomte_ui::theme;

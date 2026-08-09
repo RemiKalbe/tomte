@@ -13,6 +13,7 @@ name = "tomte"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 tomte-core = { path = "../core" }
 tomte-journal = { path = "../journal" }
 tomte-proto = { path = "../proto" }

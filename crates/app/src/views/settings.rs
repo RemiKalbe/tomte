@@ -178,6 +178,11 @@ pub struct SettingsPaths {
 
 pub struct SettingsView {
     paths: SettingsPaths,
+    /// Shared model — read for `update_ready`, written by the manual check.
+    state: gpui::Entity<tomte_app::model::SyncModel>,
+    /// Manual update check in flight / last outcome line.
+    update_checking: bool,
+    update_note: Option<SharedString>,
     /// Clamped 5..=120; replaced by the background settings load.
     interval: u64,
     /// The on-disk settings landed — until then every control is inert so
@@ -198,7 +203,11 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(paths: SettingsPaths, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        paths: SettingsPaths,
+        state: gpui::Entity<tomte_app::model::SyncModel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Current settings from disk, off the main thread.
         let settings_path = paths.settings.clone();
         cx.spawn(async move |this, cx| {
@@ -233,6 +242,9 @@ impl SettingsView {
 
         Self {
             paths,
+            state,
+            update_checking: false,
+            update_note: None,
             interval: SettingsDoc::default().fetch_interval_minutes,
             loaded: false,
             accounts: AccountsState::Loading,
@@ -246,7 +258,11 @@ impl SettingsView {
     /// Gallery-only: a fully-posed view with NO background loads, so the
     /// screenshot is deterministic (synthetic accounts, optional dirty edit).
     #[doc(hidden)]
-    pub fn posed_for_gallery(paths: SettingsPaths, dirty: bool) -> Self {
+    pub fn posed_for_gallery(
+        paths: SettingsPaths,
+        state: gpui::Entity<tomte_app::model::SyncModel>,
+        dirty: bool,
+    ) -> Self {
         let accounts = AccountsState::Ready(vec![
             OpAccount {
                 shorthand: Some("personal".into()),
@@ -261,6 +277,9 @@ impl SettingsView {
         ]);
         Self {
             paths,
+            state,
+            update_checking: false,
+            update_note: None,
             interval: if dirty { 25 } else { 15 },
             loaded: true,
             accounts,
@@ -648,7 +667,14 @@ impl Render for SettingsView {
                                 "Settings file",
                                 &self.paths.settings,
                                 false,
-                            )),
+                            ))
+                            .child(ui::section_header(
+                                theme,
+                                "Updates",
+                                ui::SectionHeaderStyle::MonoRuled { spaced: true },
+                                None,
+                            ))
+                            .child(self.updates_row(theme, cx)),
                     ),
             )
     }
@@ -887,5 +913,129 @@ mod tests {
         // invalid toml → defaults (same policy as the daemon)
         std::fs::write(&p, "not toml [[[").unwrap();
         assert_eq!(load_settings_blocking(&p).fetch_interval_minutes, 15);
+    }
+}
+
+impl SettingsView {
+    /// "Updates" section: version fact + check/restart control. Dev builds
+    /// (no bundle / no baked Team ID) show why the control is inert instead
+    /// of a button that silently can't work.
+    fn updates_row(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        use tomte_app::update::{BUILT_TEAM_ID, CURRENT_VERSION, running_bundle};
+        let ready = self.state.read(cx).update_ready.clone();
+        let enabled = BUILT_TEAM_ID.is_some()
+            && std::env::current_exe()
+                .ok()
+                .and_then(|exe| running_bundle(&exe))
+                .is_some();
+        let description: AnyElement = div()
+            .text_xs()
+            .text_color(theme.text_muted)
+            .child(match (&ready, &self.update_note) {
+                (Some((v, _)), _) => SharedString::from(format!(
+                    "Tomte {CURRENT_VERSION} · {v} downloaded and verified"
+                )),
+                (None, Some(note)) => {
+                    SharedString::from(format!("Tomte {CURRENT_VERSION} · {note}"))
+                }
+                (None, None) => SharedString::from(format!("Tomte {CURRENT_VERSION}")),
+            })
+            .into_any_element();
+        let control: AnyElement = if let Some((version, staged)) = ready {
+            ui::button(
+                theme,
+                "update-restart",
+                format!("Restart to update to {version}").into(),
+                ui::ButtonVariant::Wash(theme.accent),
+                ui::ButtonSize::Sm,
+                move |_ev, _window, cx| crate::restart_to_update(staged.clone(), cx),
+            )
+            .into_any_element()
+        } else if !enabled {
+            ui::disabled_button(
+                theme,
+                "update-check",
+                "Check for updates".into(),
+                ui::ButtonSize::Sm,
+                Some("dev build — updater is inert outside a signed Tomte.app".into()),
+            )
+            .into_any_element()
+        } else if self.update_checking {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(ui::spinner(theme, "update-check-spinner"))
+                .into_any_element()
+        } else {
+            ui::button(
+                theme,
+                "update-check",
+                "Check for updates".into(),
+                ui::ButtonVariant::Outline(theme.text),
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.run_update_check(cx)),
+            )
+            .into_any_element()
+        };
+        setting_row(
+            theme,
+            "Application updates",
+            Some(description),
+            control,
+            false,
+        )
+    }
+
+    fn run_update_check(&mut self, cx: &mut Context<Self>) {
+        use tomte_app::update::Updater;
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.update_note = None;
+        cx.notify();
+        let stage_dir = self
+            .paths
+            .journal
+            .parent()
+            .map(|d| d.join("updates"))
+            .unwrap_or_else(|| std::path::PathBuf::from("updates"));
+        let state = self.state.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let updater = Updater {
+                        runner: std::sync::Arc::new(SystemRunner),
+                        stage_dir,
+                    };
+                    match updater.check() {
+                        Ok(None) => Ok(None),
+                        Ok(Some(update)) => updater
+                            .download_and_stage(&update)
+                            .map(|staged| Some((update.version, staged)))
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.update_checking = false;
+                match outcome {
+                    Ok(Some(ready)) => {
+                        state.update(cx, |model, cx| {
+                            model.update_ready = Some(ready);
+                            cx.notify();
+                        });
+                    }
+                    Ok(None) => view.update_note = Some("up to date".into()),
+                    Err(e) => view.update_note = Some(format!("update check failed: {e}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }

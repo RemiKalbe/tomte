@@ -499,9 +499,10 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "settings" => shell(Route::Settings, rich_model()),
         "settings-menu" => {
             let mut s = shell(Route::Settings, rich_model());
+            let state = s.state.clone();
             let posed = cx.new(|_| {
                 let mut view =
-                    super::settings::SettingsView::posed_for_gallery(paths.clone(), false);
+                    super::settings::SettingsView::posed_for_gallery(paths.clone(), state, false);
                 view.menu_open = true;
                 view
             });
@@ -510,10 +511,10 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         }
         "settings-dirty" => {
             let mut s = shell(Route::Settings, rich_model());
-            s.settings =
-                Some(cx.new(|_| {
-                    super::settings::SettingsView::posed_for_gallery(paths.clone(), true)
-                }));
+            let state = s.state.clone();
+            s.settings = Some(cx.new(|_| {
+                super::settings::SettingsView::posed_for_gallery(paths.clone(), state, true)
+            }));
             s
         }
         _ => return None,

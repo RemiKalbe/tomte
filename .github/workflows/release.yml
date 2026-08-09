@@ -57,7 +57,13 @@ jobs:
           echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
 
       - name: Build + sign bundle
-        run: ./scripts/bundle.sh
+        env:
+          # Baked into the binary: the updater refuses any bundle whose
+          # signature is not from this team (docs/RELEASING.md step 3).
+          TOMTE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          [[ -n "$TOMTE_TEAM_ID" ]] || { echo "::error::APPLE_TEAM_ID repo variable unset"; exit 1; }
+          ./scripts/bundle.sh
 
       - name: Notarize + staple
         env:

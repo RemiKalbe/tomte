@@ -187,6 +187,10 @@ impl Shell {
                 format!("in sync · {} files", model.in_sync),
             )
         };
+        let update_ready = model
+            .update_ready
+            .as_ref()
+            .map(|(v, _)| format!("{v} ready — Settings to restart"));
         let freshness = match model.last_fetch_ts {
             Some(ts) => format!("origin: fetched {}", time_ago(dashboard::system_now(), ts)),
             None => "origin: never fetched".to_string(),
@@ -232,7 +236,10 @@ impl Shell {
                         status_line.into(),
                         px(170.),
                     ))
-                    .child(div().truncate().child(freshness)),
+                    .child(div().truncate().child(freshness))
+                    .when_some(update_ready, |el, line| {
+                        el.child(div().truncate().text_color(theme.accent).child(line))
+                    }),
             )
     }
 }
@@ -281,8 +288,11 @@ impl Render for Shell {
                         Route::Review => self.ensure_review(cx).into_any_element(),
                         Route::Settings => {
                             let paths = self.paths.clone();
+                            let state = self.state.clone();
                             self.settings
-                                .get_or_insert_with(|| cx.new(|cx| SettingsView::new(paths, cx)))
+                                .get_or_insert_with(|| {
+                                    cx.new(|cx| SettingsView::new(paths, state, cx))
+                                })
                                 .clone()
                                 .into_any_element()
                         }

@@ -854,6 +854,28 @@ fn spawn_freshness_loop(cx: &mut App, state: Entity<SyncModel>, status: Rc<Statu
 }
 
 fn main() -> ExitCode {
+    {
+        // `tomte --apply-update <staged.app> <target.app> <parent-pid>` —
+        // the swap helper, running FROM the staged bundle (see update.rs).
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("--apply-update") {
+            match (
+                args.get(2),
+                args.get(3),
+                args.get(4).and_then(|p| p.parse().ok()),
+            ) {
+                (Some(staged), Some(target), Some(pid)) => tomte_app::update::apply_update_main(
+                    std::path::Path::new(staged),
+                    std::path::Path::new(target),
+                    pid,
+                ),
+                _ => {
+                    eprintln!("usage: tomte --apply-update <staged.app> <target.app> <pid>");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
     let paths = resolve_paths();
     if std::env::args().any(|a| a == "--verify-connectivity") {
         return verify_connectivity(&resolve_paths());
@@ -921,6 +943,7 @@ fn main() -> ExitCode {
 
             spawn_menu_command_loop(cx, menu_rx, state.clone(), paths.view_paths());
             spawn_boot_and_event_loop(cx, state.clone(), paths);
+            spawn_update_loop(cx, state.clone());
             spawn_freshness_loop(cx, state, status);
         });
     ExitCode::SUCCESS
@@ -1041,4 +1064,82 @@ mod tests {
         // the model still ingested the pushes
         assert_eq!(m.last_fetch_ts, Some(2));
     }
+}
+
+/// Hand off to the staged bundle's swap helper and quit. The daemon is shut
+/// down first (best effort) so the relaunched app spawns the NEW tomted
+/// instead of talking to a downlevel one.
+pub fn restart_to_update(staged: std::path::PathBuf, cx: &mut App) {
+    let Some(bundle) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| tomte_app::update::running_bundle(&exe))
+    else {
+        return; // dev build — the Settings control is disabled anyway
+    };
+    if let Some(engine) = cx
+        .try_global::<EngineSlot>()
+        .and_then(|slot| slot.0.clone())
+    {
+        std::thread::spawn(move || {
+            let _ = engine.ipc.request(Request::Shutdown);
+        });
+    }
+    let helper = staged.join("Contents/MacOS/tomte");
+    let spawned = std::process::Command::new(helper)
+        .arg("--apply-update")
+        .arg(&staged)
+        .arg(&bundle)
+        .arg(std::process::id().to_string())
+        .spawn();
+    match spawned {
+        Ok(_) => cx.quit(),
+        Err(e) => eprintln!("tomte: cannot launch update helper: {e}"),
+    }
+}
+
+/// Daily check → verified stage → `model.update_ready`. Inert in dev builds
+/// (not a bundle / no baked Team ID): checking without being able to verify
+/// or swap would only produce noise.
+fn spawn_update_loop(cx: &mut App, state: Entity<SyncModel>) {
+    use tomte_app::update::{BUILT_TEAM_ID, Updater, running_bundle};
+    let in_bundle = std::env::current_exe()
+        .ok()
+        .and_then(|exe| running_bundle(&exe))
+        .is_some();
+    if !in_bundle || BUILT_TEAM_ID.is_none() {
+        return;
+    }
+    let stage_dir = app_support_dir().join("updates");
+    cx.spawn(async move |cx| {
+        loop {
+            let stage_dir = stage_dir.clone();
+            let staged = cx
+                .background_executor()
+                .spawn(async move {
+                    let updater = Updater {
+                        runner: std::sync::Arc::new(tomte_core::cmd::SystemRunner),
+                        stage_dir,
+                    };
+                    let update = updater.check().ok().flatten()?;
+                    let staged = updater.download_and_stage(&update).ok()?;
+                    Some((update.version, staged))
+                })
+                .await;
+            let alive = cx.update(|cx| {
+                if let Some(ready) = staged {
+                    state.update(cx, |model, cx| {
+                        model.update_ready = Some(ready);
+                        cx.notify();
+                    });
+                }
+            });
+            if alive.is_err() {
+                break; // app released
+            }
+            cx.background_executor()
+                .timer(Duration::from_secs(24 * 60 * 60))
+                .await;
+        }
+    })
+    .detach();
 }

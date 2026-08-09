@@ -31,6 +31,10 @@ const ATTENTION_CLASSES: [&str; 3] = ["conflict", "local_source_diverged", "eval
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncModel {
+    /// A verified, staged newer bundle: (version, staged .app path). Set by
+    /// the updater loop / Settings check; the Settings row offers the
+    /// restart and the sidebar footer surfaces that it exists.
+    pub update_ready: Option<(String, std::path::PathBuf)>,
     /// Current drifted targets, unique by target path.
     pub drifted: Vec<DriftSummary>,
     pub in_sync: u64,
