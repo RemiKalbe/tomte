@@ -816,27 +816,28 @@ impl MergeView {
             .map(|idx| region_block(state, idx, &self.revisiting, &protected, theme, &view))
             .collect();
 
+        // One shared grid of hairlines (2026-08-08 feedback): three input
+        // columns split by vertical dividers, one horizontal rule, then the
+        // result flowing as the pane's own content — no floating boxes.
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
             .child(
-                // Three equal read-only panes; the result pane below is the
-                // taller one (mockup A).
                 div()
                     .h_2_5()
                     .flex_none()
                     .flex()
-                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .child(pane_col(
                         "merge-pane-theirs",
                         "source (rendered)",
                         theme.accent,
                         &loaded.theirs_rows,
                         PaneSide::Theirs,
+                        false,
                         theme,
                     ))
                     .child(if degraded {
@@ -848,6 +849,7 @@ impl MergeView {
                             theme.text_muted,
                             &loaded.base_rows,
                             PaneSide::Base,
+                            true,
                             theme,
                         )
                     })
@@ -857,29 +859,21 @@ impl MergeView {
                         theme.drift,
                         &loaded.ours_rows,
                         PaneSide::Ours,
+                        true,
                         theme,
                     )),
             )
             .child(
                 div()
+                    .id("merge-result")
                     .flex_1()
                     .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.result_scroll)
                     .flex()
                     .flex_col()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .id("merge-result")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.result_scroll)
-                            .flex()
-                            .flex_col()
-                            .children(blocks),
-                    ),
+                    .pt_1()
+                    .children(blocks),
             )
             .into_any_element()
     }
@@ -939,14 +933,19 @@ fn pane_col(
     tint: Rgba,
     rows: &Rc<Vec<PaneLine>>,
     side: PaneSide,
+    divider: bool,
     theme: Theme,
 ) -> AnyElement {
     let rows = rows.clone();
     let template_gutter = rows.iter().any(|r| r.protected.is_some());
-    ui::list_pane(theme, Some((label, tint)))
+    div()
         .flex_1()
         .min_w_0()
         .h_full()
+        .flex()
+        .flex_col()
+        .when(divider, |el| el.border_l_1().border_color(theme.border))
+        .child(ui::pane_label(theme, label, tint))
         .child(
             uniform_list(id, rows.len(), move |range, _window, _cx| {
                 range
@@ -961,10 +960,15 @@ fn pane_col(
 /// The base column when no last-written snapshot exists: the merge degraded
 /// to 2-way, and the pane says so instead of duplicating theirs (spec §10).
 fn degraded_base_col(theme: Theme) -> AnyElement {
-    ui::list_pane(theme, Some(("last written", theme.text_muted)))
+    div()
         .flex_1()
         .min_w_0()
         .h_full()
+        .flex()
+        .flex_col()
+        .border_l_1()
+        .border_color(theme.border)
+        .child(ui::pane_label(theme, "last written", theme.text_muted))
         .child(
             div()
                 .flex_1()
