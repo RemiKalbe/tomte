@@ -51,4 +51,8 @@ iconutil -c icns "$iconset" -o bundle/AppIcon.icns
 # an 18pt status item.
 rsvg-convert -w 36 -h 36 "$glyph" -o crates/app/assets/menubar@2x.png
 
-echo "bundle/AppIcon.icns + crates/app/assets/menubar@2x.png"
+# README header image.
+mkdir -p docs/assets
+rsvg-convert -w 512 -h 512 "$work/appicon.svg" -o docs/assets/tomte-icon.png
+
+echo "bundle/AppIcon.icns + crates/app/assets/menubar@2x.png + docs/assets/tomte-icon.png"

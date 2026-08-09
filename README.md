@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/tomte-icon.png" width="128" alt="Tomte">
+</p>
+
 # Tomte
 
 A quiet macOS menubar app that keeps your dotfiles from drifting.
