@@ -1,0 +1,98 @@
+name: Release
+
+# Tag-driven: `git tag v0.1.0 && git push origin v0.1.0`.
+# The tag MUST match the workspace Cargo.toml version — the job refuses to
+# ship a bundle whose binary would report a different version than the tag.
+#
+# Required repository secrets (docs/RELEASING.md walks through creating them):
+#   MACOS_CERT_P12        base64 of the Developer ID Application .p12
+#   MACOS_CERT_PASSWORD   password protecting the .p12
+#   ASC_KEY_ID            App Store Connect API key id (notarytool)
+#   ASC_ISSUER_ID         App Store Connect issuer id
+#   ASC_KEY_P8            contents of the AuthKey_*.p8
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install chezmoi (e2e tests)
+        run: brew install chezmoi
+
+      - name: Tag matches workspace version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ "$version" != "$tag" ]]; then
+            echo "::error::tag v$tag but Cargo.toml says $version" && exit 1
+          fi
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Import signing certificate
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          security create-keychain -p ci "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p ci "$keychain"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k ci "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+          [[ -n "$identity" ]] || { echo "::error::no Developer ID identity in keychain"; exit 1; }
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Build + sign bundle
+        run: ./scripts/bundle.sh
+
+      - name: Notarize + staple
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          echo "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent target/bundle/Tomte.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" \
+            --wait
+          xcrun stapler staple target/bundle/Tomte.app
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # zip: what the in-app updater downloads (stapled app inside)
+          ditto -c -k --keepParent target/bundle/Tomte.app "Tomte-$version.zip"
+          # dmg: what humans download
+          staging="$RUNNER_TEMP/dmg"
+          mkdir -p "$staging"
+          cp -R target/bundle/Tomte.app "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname "Tomte $version" -srcfolder "$staging" \
+            -ov -format UDZO "Tomte-$version.dmg"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "Tomte-$version.zip" "Tomte-$version.dmg" \
+            --title "Tomte $version" \
+            --generate-notes

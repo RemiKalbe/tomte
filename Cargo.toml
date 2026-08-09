@@ -3,6 +3,7 @@ resolver = "2"
 members = ["crates/app", "crates/core", "crates/daemon", "crates/journal", "crates/proto", "crates/ui"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
