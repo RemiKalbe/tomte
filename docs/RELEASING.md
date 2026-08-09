@@ -42,9 +42,12 @@ gh variable set APPLE_TEAM_ID --body "XXXXXXXXXX"
 
 ## Cutting a release
 
-1. Bump `version` in the workspace `Cargo.toml` (single source of truth —
+1. Write the `## X.Y.Z` section in `CHANGELOG.md` — it becomes the GitHub
+   release body verbatim (plus an auto-appended compare link) and what the
+   in-app updater shows users.
+2. Bump `version` in the workspace `Cargo.toml` (single source of truth —
    every crate inherits it, the bundle stamps it, the updater compares it).
-2. Commit, push main, then:
+3. Commit, push main, then:
 
 ```sh
 ./scripts/release.sh X.Y.Z
