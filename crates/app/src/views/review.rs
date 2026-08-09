@@ -1038,6 +1038,12 @@ impl ReviewView {
 
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::time("review-render", || self.render_inner(window, cx))
+    }
+}
+
+impl ReviewView {
+    fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let now = system_now();
         let model = self.state.read(cx);

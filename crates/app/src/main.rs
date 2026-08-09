@@ -3,6 +3,7 @@
 // Shared modules (ipc, model, theme) live in the czui_app lib target;
 // views and the AppKit platform layer stay bin-only.
 mod notify_osa;
+pub mod perf;
 mod platform_mac;
 mod views;
 

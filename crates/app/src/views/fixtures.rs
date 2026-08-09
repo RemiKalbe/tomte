@@ -35,6 +35,7 @@ pub const STATES: &[(&str, &str)] = &[
     ("review-keep-both", "clean auto-merge: third quick action offered"),
     ("merge", "three-pane editor with unresolved conflicts"),
     ("merge-auto", "no conflicts: auto-merged regions, overridable strips"),
+    ("merge-big", "500-line templated file, many regions — scroll/perf testbed"),
     ("merge-templated", "templated file with protected 🔒 spans"),
     ("merge-resolved", "all regions decided, Save enabled"),
     ("merge-loading", "inputs loading"),
@@ -378,6 +379,64 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "merge" => {
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, conflict_inputs(), false));
+            s
+        }
+        "merge-big" => {
+            // Perf/scroll testbed: hundreds of lines, regions of every kind
+            // spread through the file, protected lines sprinkled in.
+            let mut base = String::new();
+            let mut ours = String::new();
+            let mut theirs = String::new();
+            let mut template = String::new();
+            for i in 0..100 {
+                // 4 context lines per stanza
+                for j in 0..4 {
+                    let line = format!("key_{i}_{j} = \"value\"\n");
+                    base.push_str(&line);
+                    ours.push_str(&line);
+                    theirs.push_str(&line);
+                    template.push_str(&line);
+                }
+                match i % 10 {
+                    // disk-only edit
+                    2 => {
+                        base.push_str(&format!("edited_{i} = 0\n"));
+                        theirs.push_str(&format!("edited_{i} = 0\n"));
+                        template.push_str(&format!("edited_{i} = 0\n"));
+                        ours.push_str(&format!("edited_{i} = 99\n"));
+                    }
+                    // source-only insertion (templated value)
+                    5 => {
+                        theirs.push_str(&format!("secret_{i} = hunter2\n"));
+                        template.push_str(&format!(
+                            "secret_{i} = {{{{ onepasswordRead \"op://v/it{i}\" }}}}\n"
+                        ));
+                    }
+                    // true conflict
+                    8 => {
+                        base.push_str(&format!("mode_{i} = a\n"));
+                        ours.push_str(&format!("mode_{i} = disk\n"));
+                        theirs.push_str(&format!("mode_{i} = src\n"));
+                        template.push_str(&format!("mode_{i} = src\n"));
+                    }
+                    _ => {}
+                }
+            }
+            let span_map = lex(&template)
+                .ok()
+                .map(|segments| anchor(&template, &segments, &theirs));
+            let inputs = MergeInputs {
+                target: home(".config/big.conf"),
+                ours,
+                theirs,
+                base: Some(base),
+                source_path: home(".local/share/chezmoi/dot_config/big.conf.tmpl"),
+                templated: true,
+                template: Some(template),
+                span_map,
+            };
+            let mut s = shell(Route::Merge, rich_model());
+            s.merge = Some(posed_merge(cx, inputs, false));
             s
         }
         "merge-auto" => {

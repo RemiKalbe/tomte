@@ -1080,6 +1080,12 @@ impl MergeView {
 
 impl Render for MergeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::time("merge-render", || self.render_inner(window, cx))
+    }
+}
+
+impl MergeView {
+    fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         // Cache safety net: poses (gallery/tests) set `loaded` directly
         // without going through load(); rebuild lazily when stale.
