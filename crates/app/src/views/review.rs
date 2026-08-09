@@ -1140,29 +1140,33 @@ fn diff_preview(doc: &MergeDocument, theme: Theme) -> AnyElement {
             theme.ok,
         );
     }
+    // The diff IS the pane content — no bordered sub-container (2026-08-08
+    // feedback); the +/− legend sits in a thin footer line under it.
     div()
         .flex_1()
         .min_h_0()
         .flex()
         .flex_col()
-        .gap_1()
-        .p_3()
-        .child(
-            div()
-                .flex()
-                .gap_3()
-                .text_xs()
-                .child(div().text_color(theme.accent).child("− source would write"))
-                .child(div().text_color(theme.drift).child("+ on disk now")),
-        )
         .child(
             uniform_list("review-diff", lines.len(), move |range, _window, _cx| {
                 range.map(|ix| diff_row(&lines[ix], theme)).collect()
             })
             .flex_1()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border),
+            .pt_1(),
+        )
+        .child(
+            div()
+                .flex_none()
+                .h_6()
+                .px_3()
+                .border_t_1()
+                .border_color(Theme::wash(theme.border, 0.7))
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_xs()
+                .child(div().text_color(theme.accent).child("− source would write"))
+                .child(div().text_color(theme.drift).child("+ on disk now")),
         )
         .into_any_element()
 }
