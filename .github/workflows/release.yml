@@ -49,11 +49,19 @@ jobs:
           echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
             -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          # The p12 carries only leaf + key; without Apple's Developer ID
+          # intermediate the identity is "invalid" and find-identity -v
+          # returns nothing (2026-08-09: first release run failed here).
+          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            -o "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" || true
           security set-key-partition-list -S apple-tool:,apple: -k ci "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
+          echo "identities in keychain (validity diagnostic):"
+          security find-identity -p codesigning "$keychain" || true
           identity="$(security find-identity -v -p codesigning "$keychain" \
             | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
-          [[ -n "$identity" ]] || { echo "::error::no Developer ID identity in keychain"; exit 1; }
+          [[ -n "$identity" ]] || { echo "::error::no VALID Developer ID identity — see diagnostic above"; exit 1; }
           echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
 
       - name: Build + sign bundle
