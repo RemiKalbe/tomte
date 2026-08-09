@@ -26,8 +26,9 @@ use czui_core::cmd::SystemRunner;
 use czui_core::merge::{Choice, MergeDocument, RegionKind};
 use czui_core::template::anchor::{SpanMap, SpanOrigin};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, KeyBinding, Rgba, ScrollHandle,
-    SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, uniform_list,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, KeyBinding, Rgba,
+    ScrollStrategy, SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*,
+    uniform_list,
 };
 
 use super::review::{
@@ -488,7 +489,7 @@ pub struct MergeView {
     /// Banner for saves that STAY here (protected span, errors); successful
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
-    result_scroll: ScrollHandle,
+    result_scroll: gpui::UniformListScrollHandle,
     /// One scroll handle per input pane (theirs/base/ours); wheel on any
     /// pane mirrors its offset to the others so the three columns compare
     /// without independent scrolling.
@@ -499,10 +500,11 @@ pub struct MergeView {
     /// mutations (pick/undo/revisit/load) — never per frame. Scrolling at
     /// 120Hz re-renders the window every tick (gpui refresh-on-wheel), so
     /// per-frame recomputation of every line was the 2026-08-08 lag.
-    display_cache: Vec<RegionDisplay>,
-    /// (top, height) per region block, content-relative; parallel to
-    /// `display_cache`.
-    geometry: Vec<(f32, f32)>,
+    display_cache: Rc<Vec<RegionDisplay>>,
+    /// Fixed-height rows backing the result uniform_list, plus per-region
+    /// start indices (parallel geometry for Next and scroll sync).
+    flat_rows: Rc<Vec<FlatRow>>,
+    result_row_starts: Rc<Vec<usize>>,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
     focus_handle: FocusHandle,
@@ -527,11 +529,12 @@ impl MergeView {
             loaded: None,
             saving: false,
             banner: None,
-            result_scroll: ScrollHandle::new(),
+            result_scroll: gpui::UniformListScrollHandle::new(),
             pane_scrolls: std::array::from_fn(|_| gpui::UniformListScrollHandle::new()),
             revisiting: std::collections::HashSet::new(),
-            display_cache: Vec::new(),
-            geometry: Vec::new(),
+            display_cache: Rc::new(Vec::new()),
+            flat_rows: Rc::new(Vec::new()),
+            result_row_starts: Rc::new(Vec::new()),
             undo: Vec::new(),
             redo: Vec::new(),
             focus_handle: cx.focus_handle(),
@@ -584,26 +587,20 @@ impl MergeView {
     /// resolution. Called on every state mutation; render only reads.
     fn rebuild_display(&mut self) {
         let Some(loaded) = &self.loaded else {
-            self.display_cache.clear();
-            self.geometry.clear();
+            self.display_cache = Rc::new(Vec::new());
+            self.flat_rows = Rc::new(Vec::new());
+            self.result_row_starts = Rc::new(Vec::new());
             return;
         };
-        self.display_cache = (0..loaded.state.doc.regions.len())
+        let displays: Vec<RegionDisplay> = (0..loaded.state.doc.regions.len())
             .map(|idx| {
                 region_display(&loaded.state, idx, &self.revisiting, &loaded.protected)
             })
             .collect();
-        let mut top = RESULT_PAD_TOP;
-        self.geometry = self
-            .display_cache
-            .iter()
-            .map(|d| {
-                let h = block_height(d);
-                let entry = (top, h);
-                top += h;
-                entry
-            })
-            .collect();
+        let (rows, starts) = flatten_displays(&displays);
+        self.display_cache = Rc::new(displays);
+        self.flat_rows = Rc::new(rows);
+        self.result_row_starts = Rc::new(starts);
     }
 
     /// The single mutation funnel (merge-editor-v2 spec): record the undo
@@ -686,29 +683,41 @@ impl MergeView {
     /// offsets in the same frame (2026-08-08: notifying per wheel tick was
     /// part of the lag).
     fn sync_from(&mut self, leader: usize) {
+        // Perf bisection switch: CZUI_NOSYNC=1 disables follower updates so
+        // frame-rate cost can be attributed (tree vs per-event sync work).
+        if std::env::var_os("CZUI_NOSYNC").is_some() {
+            return;
+        }
         let Some(loaded) = &self.loaded else {
             return;
         };
         let starts = &loaded.region_line_starts;
-        if starts.len() < 2 || self.geometry.len() + 1 != starts.len() {
+        if starts.len() < 2 || self.result_row_starts.len() != starts.len() {
             return;
         }
 
         let (k, f) = if leader == 3 {
-            let scroll_top = -f32::from(self.result_scroll.offset().y);
-            let mut found = (self.geometry.len() - 1, 1.0f32);
-            for (k, &(top, height)) in self.geometry.iter().enumerate() {
-                if scroll_top < top + height {
-                    let f = if height > 0.0 {
-                        ((scroll_top - top) / height).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    found = (k, f);
+            let row = -f32::from(self.result_scroll.0.borrow().base_handle.offset().y)
+                / PANE_ROW_H;
+            let rs = &self.result_row_starts;
+            let regions = rs.len().saturating_sub(1);
+            if regions == 0 {
+                return;
+            }
+            let mut k = regions - 1;
+            for i in 0..regions {
+                if (rs[i] as f32) <= row && row < (rs[i + 1] as f32) {
+                    k = i;
                     break;
                 }
             }
-            found
+            let len = (rs[k + 1] - rs[k]) as f32;
+            let f = if len > 0.0 {
+                ((row - rs[k] as f32) / len).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (k, f)
         } else {
             let line =
                 -f32::from(self.pane_scrolls[leader].0.borrow().base_handle.offset().y)
@@ -727,10 +736,13 @@ impl MergeView {
             handle.base_handle.set_offset(offset);
         }
         if leader != 3 {
-            let (top, height) = self.geometry[k];
-            let mut offset = self.result_scroll.offset();
-            offset.y = gpui::px(-(top + f * height));
-            self.result_scroll.set_offset(offset);
+            let rs = &self.result_row_starts;
+            let len = (rs[k + 1] - rs[k]) as f32;
+            let row = rs[k] as f32 + f * len;
+            let handle = self.result_scroll.0.borrow();
+            let mut offset = handle.base_handle.offset();
+            offset.y = gpui::px(-(row * PANE_ROW_H));
+            handle.base_handle.set_offset(offset);
         }
     }
 
@@ -743,10 +755,8 @@ impl MergeView {
             return;
         };
         if let Some(region) = next_target(&mut loaded.state) {
-            if let Some(&(top, _)) = self.geometry.get(region) {
-                let mut offset = self.result_scroll.offset();
-                offset.y = gpui::px(-(top - RESULT_PAD_TOP));
-                self.result_scroll.set_offset(offset);
+            if let Some(&row) = self.result_row_starts.get(region) {
+                self.result_scroll.scroll_to_item(row, ScrollStrategy::Top);
             }
             // Bring the input panes along to the same region.
             self.sync_from(3);
@@ -963,43 +973,7 @@ impl MergeView {
         let degraded = state.degraded_base;
         let cursor = state.cursor;
         let view = cx.weak_entity();
-        // Virtualized result: only blocks near the viewport materialize;
-        // spacers hold the geometry. O(viewport) per frame instead of
-        // O(document) — with gpui re-rendering on every wheel tick, this is
-        // what makes synced scrolling smooth.
-        let scroll_top = -f32::from(self.result_scroll.offset().y);
-        let overscan = 600.0f32;
-        let lo = scroll_top - overscan;
-        let hi = scroll_top + viewport_h + overscan;
-        let total: f32 = self.geometry.last().map(|&(t, h)| t + h).unwrap_or(0.);
-        let mut lead = 0.0f32;
-        let mut trail = 0.0f32;
-        let mut blocks: Vec<AnyElement> = Vec::new();
-        for (idx, display) in self.display_cache.iter().enumerate() {
-            let (top, height) = self.geometry[idx];
-            if top + height < lo {
-                lead += height;
-            } else if top > hi {
-                trail += height;
-            } else {
-                blocks.push(region_block(
-                    idx,
-                    display,
-                    cursor == Some(idx),
-                    theme,
-                    &view,
-                ));
-            }
-        }
-        let _ = total;
-        let blocks = {
-            let mut v: Vec<AnyElement> = Vec::with_capacity(blocks.len() + 2);
-            v.push(div().h(gpui::px(lead)).flex_none().into_any_element());
-            v.extend(blocks);
-            v.push(div().h(gpui::px(trail)).flex_none().into_any_element());
-            v
-        };
-
+        let _ = viewport_h;
         // One shared grid of hairlines (2026-08-08 feedback): three input
         // columns split by vertical dividers, one horizontal rule, then the
         // result flowing as the pane's own content — no floating boxes.
@@ -1058,21 +1032,40 @@ impl MergeView {
             )
             .child(
                 div()
-                    .id("merge-result")
+                    .id("merge-result-wrap")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.result_scroll)
                     .flex()
                     .flex_col()
-                    .pt_1()
                     .on_scroll_wheel({
                         let view = view.clone();
                         move |_event, _window, cx| {
                             view.update(cx, |merge, _cx| merge.sync_from(3)).ok();
                         }
                     })
-                    .children(blocks),
+                    .child({
+                        let rows = self.flat_rows.clone();
+                        let displays = self.display_cache.clone();
+                        let has_base = !degraded;
+                        let view = view.clone();
+                        uniform_list("merge-result", rows.len(), move |range, _window, _cx| {
+                            range
+                                .map(|ix| {
+                                    flat_row_el(
+                                        ix,
+                                        &rows[ix],
+                                        &displays,
+                                        cursor,
+                                        has_base,
+                                        theme,
+                                        &view,
+                                    )
+                                })
+                                .collect()
+                        })
+                        .track_scroll(self.result_scroll.clone())
+                        .flex_1()
+                    }),
             )
             .into_any_element()
     }
@@ -1222,35 +1215,81 @@ fn next_target(state: &mut MergeState) -> Option<usize> {
     }
 }
 
-/// Heights of the result column's fixed-size pieces — MUST mirror the
-/// render code (mono_line h_5, decision_strip h_6, provenance_label h_5,
-/// block my_1 margins). The analytic geometry powers both virtualization
-/// and region-aligned scroll sync.
-const RESULT_ROW_H: f32 = 20.;
-const RESULT_STRIP_H: f32 = 24.;
-const RESULT_LABEL_H: f32 = 20.;
-const RESULT_BLOCK_MARGIN: f32 = 8.;
-/// The result container's pt_1.
-const RESULT_PAD_TOP: f32 = 4.;
+/// One fixed-height (20px) row of the result uniform_list. The result
+/// column rides the same virtualization as the input panes — a plain
+/// scrollable column measured ~10fps slower under a 120Hz wheel stream
+/// (2026-08-08 perf bisection).
+#[derive(Debug)]
+enum FlatRow {
+    /// Unchanged context line (muted).
+    Context(SharedString),
+    /// Materialized decision line, tinted by its provenance side
+    /// (None = edited text).
+    Line {
+        text: SharedString,
+        side: Option<ui::Side>,
+    },
+    /// Decision strip for `region` (state derived at render).
+    Strip { region: usize },
+    /// Provenance block header for an open conflict.
+    ProvLabel(ui::Side),
+    /// Read-only provenance line; `tip` = template hover text.
+    ProvLine {
+        side: ui::Side,
+        text: SharedString,
+        tip: Option<SharedString>,
+    },
+}
 
-fn block_height(display: &RegionDisplay) -> f32 {
-    match display {
-        RegionDisplay::Context { lines } => lines.len() as f32 * RESULT_ROW_H,
-        RegionDisplay::Deciding {
-            provenance, lines, ..
-        } => {
-            let body = match provenance {
-                Some((ours, theirs, _)) => {
-                    2. * RESULT_LABEL_H + (ours.len() + theirs.len()) as f32 * RESULT_ROW_H
+/// Flatten region displays into uniform rows + per-region start indices
+/// (regions+1 entries; the sentinel is the total row count).
+fn flatten_displays(displays: &[RegionDisplay]) -> (Vec<FlatRow>, Vec<usize>) {
+    let mut rows = Vec::new();
+    let mut starts = Vec::with_capacity(displays.len() + 1);
+    for (region, display) in displays.iter().enumerate() {
+        starts.push(rows.len());
+        match display {
+            RegionDisplay::Context { lines } => {
+                rows.extend(lines.iter().map(|l| FlatRow::Context(l.clone())));
+            }
+            RegionDisplay::Deciding {
+                provenance, lines, ..
+            } => {
+                rows.push(FlatRow::Strip { region });
+                match provenance {
+                    Some((ours, theirs, theirs_protected)) => {
+                        rows.push(FlatRow::ProvLabel(ui::Side::Ours));
+                        rows.extend(ours.iter().map(|l| FlatRow::ProvLine {
+                            side: ui::Side::Ours,
+                            text: l.clone(),
+                            tip: None,
+                        }));
+                        rows.push(FlatRow::ProvLabel(ui::Side::Theirs));
+                        rows.extend(theirs.iter().enumerate().map(|(ix, l)| {
+                            FlatRow::ProvLine {
+                                side: ui::Side::Theirs,
+                                text: l.clone(),
+                                tip: theirs_protected.get(&ix).cloned(),
+                            }
+                        }));
+                    }
+                    None => rows.extend(lines.iter().map(|(l, side)| FlatRow::Line {
+                        text: l.clone(),
+                        side: *side,
+                    })),
                 }
-                None => lines.len() as f32 * RESULT_ROW_H,
-            };
-            RESULT_BLOCK_MARGIN + RESULT_STRIP_H + body
-        }
-        RegionDisplay::Decided { lines, .. } => {
-            RESULT_BLOCK_MARGIN + RESULT_STRIP_H + lines.len() as f32 * RESULT_ROW_H
+            }
+            RegionDisplay::Decided { lines, .. } => {
+                rows.push(FlatRow::Strip { region });
+                rows.extend(lines.iter().map(|(l, side)| FlatRow::Line {
+                    text: l.clone(),
+                    side: *side,
+                }));
+            }
         }
     }
+    starts.push(rows.len());
+    (rows, starts)
 }
 
 /// Fixed mono row height (`h_5` = 20px) — the unit converting pane scroll
@@ -1322,129 +1361,92 @@ fn pane_row(ix: usize, line: &PaneLine, side: PaneSide, theme: Theme) -> AnyElem
     }
 }
 
-/// One region's block in the result column: strip (when the region changed)
-/// over its lines. One column child per region so `Next ↓` can
-/// scroll_to_item(region index).
-fn region_block(
-    idx: usize,
-    display: &RegionDisplay,
-    cursor_here: bool,
+/// Render one fixed-height row of the result list. Strips derive their
+/// state from the cached display of their region; everything else is plain
+/// row composition (uniform_list keeps this O(viewport) — the plain scroll
+/// column measured ~10fps slower under a 120Hz wheel stream).
+fn flat_row_el(
+    ix: usize,
+    row: &FlatRow,
+    displays: &Rc<Vec<RegionDisplay>>,
+    cursor: Option<usize>,
+    has_base: bool,
     theme: Theme,
     view: &WeakEntity<MergeView>,
 ) -> AnyElement {
-    let tinted_lines = move |lines: Vec<(SharedString, Option<ui::Side>)>| {
-        div().flex().flex_col().children(lines.into_iter().map(move |(text, side)| {
+    match row {
+        FlatRow::Context(text) => ui::mono_line(theme)
+            .text_color(theme.text_muted)
+            .child(ui::line_gutter(theme.text_muted, ""))
+            .child(ui::line_text(text.clone()))
+            .into_any_element(),
+        FlatRow::Line { text, side } => {
             let row = ui::mono_line(theme)
                 .child(ui::line_gutter(theme.text_muted, ""))
-                .child(ui::line_text(text));
+                .child(ui::line_text(text.clone()));
             match side {
                 Some(side) => row.bg(Theme::wash(side.tint(theme), 0.07)),
                 None => row.bg(Theme::wash(theme.ok, 0.07)),
             }
-        }))
-    };
-    let strip_for = |current, focused, has_base| {
-        let on_pick = {
-            let view = view.clone();
-            move |kind: ui::ChoiceKind, _ev: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                let choice = match kind {
-                    ui::ChoiceKind::Ours => Choice::Ours,
-                    ui::ChoiceKind::Theirs => Choice::Theirs,
-                    ui::ChoiceKind::Base => Choice::Base,
-                    ui::ChoiceKind::Both => Choice::Both,
-                    ui::ChoiceKind::Edited => return,
-                };
-                view.update(cx, |merge, cx| merge.apply(idx, choice, cx)).ok();
-            }
-        };
-        // Hand-editing lands with the TextArea integration (spec step 7).
-        let on_edit = |_: &ClickEvent, _: &mut Window, _: &mut App| {};
-        let on_revisit = {
-            let view = view.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                view.update(cx, |merge, cx| merge.revisit(idx, cx)).ok();
-            }
-        };
-        ui::decision_strip(
-            theme,
-            idx,
-            ui::StripState::Deciding {
-                has_base,
-                current,
-                focused,
-            },
-            on_pick,
-            on_edit,
-            on_revisit,
-        )
-    };
-
-    match display {
-        RegionDisplay::Context { lines } => div()
-            .flex()
-            .flex_col()
-            .children(lines.iter().map(move |text| {
-                ui::mono_line(theme)
-                    .text_color(theme.text_muted)
-                    .child(ui::line_gutter(theme.text_muted, ""))
-                    .child(ui::line_text(text.clone()))
-            }))
-            .into_any_element(),
-        RegionDisplay::Deciding {
-            current,
-            has_base,
-            provenance,
-            lines,
-            ..
-        } => {
-            let block = div()
-                .flex()
-                .flex_col()
-                .my_1()
-                .child(strip_for(*current, cursor_here, *has_base));
-            match provenance {
-                Some((ours, theirs, theirs_protected)) => block
-                    .child(ui::provenance_label(theme, ui::Side::Ours))
-                    .child(ui::provenance_rows(
-                        theme,
-                        ui::Side::Ours,
-                        ours,
-                        &HashMap::new(),
-                    ))
-                    .child(ui::provenance_label(theme, ui::Side::Theirs))
-                    .child(ui::provenance_rows(
-                        theme,
-                        ui::Side::Theirs,
-                        theirs,
-                        theirs_protected,
-                    ))
+            .into_any_element()
+        }
+        FlatRow::ProvLabel(side) => ui::provenance_label(theme, *side).into_any_element(),
+        FlatRow::ProvLine { side, text, tip } => {
+            let tint = side.tint(theme);
+            let row = ui::mono_line(theme)
+                .bg(Theme::wash(tint, 0.07))
+                .when(tip.is_some(), |el| el.bg(Theme::wash(theme.drift, 0.15)))
+                .child(div().w_0p5().h_full().flex_none().bg(tint))
+                .child(ui::line_gutter(
+                    theme.drift,
+                    if tip.is_some() { "{}" } else { "" },
+                ))
+                .child(ui::line_text(text.clone()));
+            match tip {
+                Some(tip) => row
+                    .id(ElementId::named_usize("flat-prov-tmpl", ix))
+                    .tooltip(ui::text_tooltip(tip.clone()))
                     .into_any_element(),
-                None => block.child(tinted_lines(lines.clone())).into_any_element(),
+                None => row.into_any_element(),
             }
         }
-        RegionDisplay::Decided { choice, lines, .. } => {
+        FlatRow::Strip { region } => {
+            let idx = *region;
+            let cursor_here = cursor == Some(idx);
+            let state = match displays.get(idx) {
+                Some(RegionDisplay::Deciding { current, .. }) => ui::StripState::Deciding {
+                    has_base,
+                    current: *current,
+                    focused: cursor_here,
+                },
+                Some(RegionDisplay::Decided { choice, .. }) => ui::StripState::Decided {
+                    choice: *choice,
+                    focused: cursor_here,
+                },
+                _ => return div().into_any_element(),
+            };
+            let on_pick = {
+                let view = view.clone();
+                move |kind: ui::ChoiceKind, _ev: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                    let choice = match kind {
+                        ui::ChoiceKind::Ours => Choice::Ours,
+                        ui::ChoiceKind::Theirs => Choice::Theirs,
+                        ui::ChoiceKind::Base => Choice::Base,
+                        ui::ChoiceKind::Both => Choice::Both,
+                        ui::ChoiceKind::Edited => return,
+                    };
+                    view.update(cx, |merge, cx| merge.apply(idx, choice, cx)).ok();
+                }
+            };
+            // Hand-editing lands with the TextArea integration (spec step 7).
+            let on_edit = |_: &ClickEvent, _: &mut Window, _: &mut App| {};
             let on_revisit = {
                 let view = view.clone();
                 move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                     view.update(cx, |merge, cx| merge.revisit(idx, cx)).ok();
                 }
             };
-            div()
-                .flex()
-                .flex_col()
-                .my_1()
-                .child(ui::decision_strip(
-                    theme,
-                    idx,
-                    ui::StripState::Decided {
-                        choice: *choice,
-                        focused: cursor_here,
-                    },
-                    |_, _, _, _| {},
-                    |_, _, _| {},
-                    on_revisit,
-                ))
-                .child(tinted_lines(lines.clone()))
+            ui::decision_strip(theme, idx, state, on_pick, on_edit, on_revisit)
                 .into_any_element()
         }
     }

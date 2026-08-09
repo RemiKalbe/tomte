@@ -98,7 +98,7 @@ pub fn decision_strip(
     on_revisit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let strip = div()
-        .h_6()
+        .h_5()
         .px_2()
         .flex()
         .items_center()
