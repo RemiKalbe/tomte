@@ -38,6 +38,13 @@ pub struct SyncModel {
     /// Newest first, capped at [`TIMELINE_CAP`].
     pub timeline: Vec<TimelineRow>,
     pub last_fetch_ts: Option<u64>,
+    /// A manual fetch is in flight (set on click, cleared by the
+    /// FetchDone/FetchFailed push). Timestamped so a lost push can't stick
+    /// the tile in "fetching…" forever.
+    pub fetch_started_ts: Option<u64>,
+    /// The last fetch FAILED; the error hint shows on the origin tile until
+    /// a fetch succeeds or a new one starts.
+    pub fetch_failed: Option<String>,
     pub connected: bool,
     /// Daemon is starting or mid-scan: render "scanning", never "in sync".
     pub scanning: bool,
@@ -153,7 +160,20 @@ impl SyncModel {
                     class: None,
                 });
             }
+            Event::FetchFailed { ts, error } => {
+                self.fetch_started_ts = None;
+                self.fetch_failed = Some(error);
+                self.push_row(TimelineRow {
+                    ts,
+                    kind: "fetch_failed".into(),
+                    target: None,
+                    machine: LOCAL_MACHINE.into(),
+                    class: Some("eval_failed".into()),
+                });
+            }
             Event::FetchDone { ts, behind: _ } => {
+                self.fetch_started_ts = None;
+                self.fetch_failed = None;
                 self.last_fetch_ts = Some(ts);
                 self.push_row(TimelineRow {
                     ts,
@@ -357,6 +377,7 @@ pub fn kind_label(kind: &str) -> &'static str {
         "resolved" => "resolved",
         "eval_failed" => "can't evaluate",
         "fetch" => "scan",
+        "fetch_failed" => "fetch failed",
         "left_management" => "left management",
         "session_start" | "session_end" => "session",
         _ => "event",
@@ -550,6 +571,8 @@ mod tests {
 
         // FetchDone tracks freshness and logs a target-less row
         m.apply_event(Event::FetchDone { ts: 30, behind: 2 });
+        assert_eq!(m.fetch_started_ts, None);
+        assert_eq!(m.fetch_failed, None);
         assert_eq!(m.last_fetch_ts, Some(30));
         assert_eq!(m.timeline[0].kind, "fetch");
         assert_eq!(m.timeline[0].target, None);
@@ -778,6 +801,27 @@ mod tests {
         assert_eq!(m.timeline[0].ts, 509, "newest first");
         assert_eq!(m.timeline[TIMELINE_CAP - 1].ts, 10, "oldest rows trimmed");
         assert_eq!(m.drifted.len(), 510, "drift list is not capped");
+    }
+
+    #[test]
+    fn fetch_feedback_lifecycle() {
+        let mut m = SyncModel::default();
+        // Click: in-flight armed by the view.
+        m.fetch_started_ts = Some(100);
+        // Failure push: in-flight clears, error surfaces, timeline row lands.
+        m.apply_event(Event::FetchFailed {
+            ts: 110,
+            error: "ssh: connect timeout".into(),
+        });
+        assert_eq!(m.fetch_started_ts, None);
+        assert_eq!(m.fetch_failed.as_deref(), Some("ssh: connect timeout"));
+        assert_eq!(m.timeline.first().map(|r| r.kind.as_str()), Some("fetch_failed"));
+        assert_eq!(m.last_fetch_ts, None, "failure never claims freshness");
+        // Success clears the failure.
+        m.fetch_started_ts = Some(120);
+        m.apply_event(Event::FetchDone { ts: 130, behind: 0 });
+        assert_eq!(m.fetch_failed, None);
+        assert_eq!(m.last_fetch_ts, Some(130));
     }
 
     #[test]

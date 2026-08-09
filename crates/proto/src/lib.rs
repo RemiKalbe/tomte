@@ -128,6 +128,12 @@ pub enum Event {
         target: PathBuf,
         ts: u64,
     },
+    /// An origin fetch FAILED (locked agent, network, auth) — pushed so
+    /// clients can show honest feedback instead of silence.
+    FetchFailed {
+        ts: u64,
+        error: String,
+    },
     FetchDone {
         ts: u64,
         behind: u32,

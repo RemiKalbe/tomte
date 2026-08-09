@@ -506,6 +506,10 @@ impl DaemonCore {
                     to_hash: None,
                     meta: Some(serde_json::json!({"error": e.to_string()})),
                 })?;
+                self.emit(Event::FetchFailed {
+                    ts: now_ts,
+                    error: e.to_string(),
+                });
                 return Ok(());
             }
         }

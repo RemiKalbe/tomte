@@ -188,17 +188,30 @@ impl DashboardView {
         let counts_known = connected && (have_data || !scanning);
         // Freshness carries its own severity: recent is plain fact, stale is
         // drift-tinted, unknown is muted (never a bold alarm headline).
-        let (freshness, freshness_color): (SharedString, Rgba) = match model.last_fetch_ts {
-            Some(ts) => (
-                format!("fetched {}", time_ago(now, ts)).into(),
-                // 2x the default 15-min fetch interval before it reads stale.
-                if now.saturating_sub(ts) > 30 * 60 {
-                    theme.drift
-                } else {
-                    theme.text
-                },
-            ),
-            None => ("never fetched".into(), theme.text_muted),
+        // A manual fetch in flight (60s validity — a lost push must not
+        // stick the tile) and a failed fetch each say so plainly.
+        let fetching = model
+            .fetch_started_ts
+            .is_some_and(|t| now.saturating_sub(t) < 60);
+        let (freshness, freshness_color): (SharedString, Rgba) = if fetching {
+            ("fetching…".into(), theme.text_muted)
+        } else if let Some(err) = &model.fetch_failed {
+            let brief = err.lines().next().unwrap_or("error");
+            let brief = if brief.len() > 40 { &brief[..40] } else { brief };
+            (format!("fetch failed · {brief}").into(), theme.conflict)
+        } else {
+            match model.last_fetch_ts {
+                Some(ts) => (
+                    format!("fetched {}", time_ago(now, ts)).into(),
+                    // 2x the default 15-min fetch interval before stale.
+                    if now.saturating_sub(ts) > 30 * 60 {
+                        theme.drift
+                    } else {
+                        theme.text
+                    },
+                ),
+                None => ("never fetched".into(), theme.text_muted),
+            }
         };
 
         let lines: Rc<Vec<Line>> = Rc::new(build_lines(model, now, &expanded));
@@ -247,7 +260,13 @@ impl DashboardView {
                         freshness.to_string(),
                         "origin",
                         freshness_color,
-                        Some(fetch_now_button(theme, engine.clone())),
+                        Some(fetch_now_button(
+                            theme,
+                            engine.clone(),
+                            self.state.clone(),
+                            fetching,
+                            model.fetch_failed.is_some(),
+                        )),
                     ))
                     .child(tile(
                         theme,
@@ -513,16 +532,38 @@ fn trigger_onepassword_unlock(
 /// "Fetch now" in the origin tile: ask the daemon to fetch immediately
 /// (ack now, FetchDone push updates the freshness). Muted+tooltip while
 /// disconnected — same contract as every other action.
-fn fetch_now_button(theme: Theme, engine: Option<Arc<ResolveEngine>>) -> gpui::AnyElement {
+fn fetch_now_button(
+    theme: Theme,
+    engine: Option<Arc<ResolveEngine>>,
+    state: Entity<SyncModel>,
+    fetching: bool,
+    failed: bool,
+) -> gpui::AnyElement {
+    if fetching {
+        // In flight: the spinner IS the feedback (2026-08-08: clicking gave
+        // none); the FetchDone/FetchFailed push resolves it.
+        return div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .child(ui::spinner(theme, "tile-fetch-spinner"))
+            .into_any_element();
+    }
+    let label: SharedString = if failed { "Retry".into() } else { "Fetch now".into() };
     match engine {
         Some(engine) => ui::button(
             theme,
             "tile-fetch-now",
-            "Fetch now".into(),
+            label,
             ui::ButtonVariant::Wash(theme.accent),
             ui::ButtonSize::Sm,
             move |_event, _window, cx| {
                 let engine = engine.clone();
+                state.update(cx, |model, cx| {
+                    model.fetch_started_ts = Some(system_now());
+                    model.fetch_failed = None;
+                    cx.notify();
+                });
                 cx.background_executor()
                     .spawn(async move {
                         let _ = engine.ipc.request(czui_proto::Request::Fetch);
@@ -534,7 +575,7 @@ fn fetch_now_button(theme: Theme, engine: Option<Arc<ResolveEngine>>) -> gpui::A
         None => ui::disabled_button(
             theme,
             "tile-fetch-now",
-            "Fetch now".into(),
+            label,
             ui::ButtonSize::Sm,
             Some("daemon not connected".into()),
         )
