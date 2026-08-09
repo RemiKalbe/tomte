@@ -34,6 +34,14 @@ pub enum IpcError {
     },
 }
 
+/// Pull the daemon's advertised protocol version out of its hello-rejection
+/// message ("protocol version mismatch: daemon speaks 2, client speaks 3").
+fn parse_daemon_version(message: &str) -> Option<u32> {
+    let rest = message.split("daemon speaks ").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 pub struct IpcClient {
     writer: Mutex<UnixStream>,
     next_id: AtomicU64,
@@ -43,6 +51,34 @@ pub struct IpcClient {
 
 impl IpcClient {
     pub fn connect(socket: &Path) -> Result<Self, IpcError> {
+        let client = Self::connect_raw(socket)?;
+        match client.request(Request::Hello {
+            version: PROTOCOL_VERSION,
+        })? {
+            Response::HelloOk { .. } => Ok(client),
+            Response::Error { message } => {
+                // Version skew: an OLD daemon owns the socket (it holds the
+                // flock, so a fresh spawn can't displace it — 2026-08-08:
+                // a stale daemon silently ate every new-protocol request).
+                // Take over: hello at ITS version, ask it to shut down, and
+                // report the mismatch so connect_or_spawn respawns.
+                if let Some(theirs) = parse_daemon_version(&message)
+                    && theirs != PROTOCOL_VERSION
+                {
+                    eprintln!(
+                        "chezmoi-ui: daemon speaks protocol {theirs}, we speak {PROTOCOL_VERSION} — shutting the old daemon down"
+                    );
+                    let _ = Self::shutdown_old_daemon(socket, theirs);
+                }
+                Err(IpcError::Rejected(message))
+            }
+            other => Err(IpcError::Proto(format!(
+                "unexpected hello reply: {other:?}"
+            ))),
+        }
+    }
+
+    fn connect_raw(socket: &Path) -> Result<Self, IpcError> {
         let stream = UnixStream::connect(socket)?;
         let reader_stream = stream.try_clone()?;
         let pending: std::sync::Arc<Mutex<HashMap<u64, Sender<Response>>>> = Default::default();
@@ -79,15 +115,30 @@ impl IpcClient {
             }
         });
 
-        match client.request(Request::Hello {
-            version: PROTOCOL_VERSION,
-        })? {
-            Response::HelloOk { .. } => Ok(client),
-            Response::Error { message } => Err(IpcError::Rejected(message)),
-            other => Err(IpcError::Proto(format!(
-                "unexpected hello reply: {other:?}"
-            ))),
+        Ok(client)
+    }
+
+    /// Best-effort shutdown of an old-protocol daemon: hello at ITS version
+    /// (all versions have Hello + Shutdown), then Shutdown, then wait for
+    /// the socket to actually die.
+    fn shutdown_old_daemon(socket: &Path, version: u32) -> Result<(), IpcError> {
+        let client = Self::connect_raw(socket)?;
+        match client.request(Request::Hello { version })? {
+            Response::HelloOk { .. } => {}
+            other => return Err(IpcError::Proto(format!("old hello failed: {other:?}"))),
         }
+        let _ = client.request(Request::Shutdown);
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if UnixStream::connect(socket).is_err() {
+                break;
+            }
+        }
+        // The listener dies before the process exits and releases the
+        // sock.lock flock; a fresh daemon spawned in that window would lose
+        // the lock and quit. Give the old process a beat to actually die.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Ok(())
     }
 
     pub fn request(&self, request: Request) -> Result<Response, IpcError> {
@@ -163,5 +214,22 @@ impl IpcClient {
             last,
             log: log_path.display().to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_daemon_version;
+
+    #[test]
+    fn parses_version_from_mismatch_message() {
+        assert_eq!(
+            parse_daemon_version(
+                "protocol version mismatch: daemon speaks 2, client speaks 3"
+            ),
+            Some(2)
+        );
+        assert_eq!(parse_daemon_version("hello required first"), None);
+        assert_eq!(parse_daemon_version("daemon speaks garbage"), None);
     }
 }

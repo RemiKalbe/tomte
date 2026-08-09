@@ -564,11 +564,32 @@ fn fetch_now_button(
                     model.fetch_failed = None;
                     cx.notify();
                 });
-                cx.background_executor()
-                    .spawn(async move {
-                        let _ = engine.ipc.request(czui_proto::Request::Fetch);
-                    })
-                    .detach();
+                let state = state.clone();
+                cx.spawn(async move |cx| {
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move { engine.ipc.request(czui_proto::Request::Fetch) })
+                        .await;
+                    // Only failures resolve the spinner here — on an ack the
+                    // FetchDone/FetchFailed push is the truth. (2026-08-08: a
+                    // stale-protocol daemon rejected the request and the
+                    // swallowed error left the spinner up forever.)
+                    let error = match outcome {
+                        Ok(czui_proto::Response::Error { message }) => Some(message),
+                        Ok(_) => None,
+                        Err(e) => Some(e.to_string()),
+                    };
+                    if let Some(error) = error {
+                        let _ = cx.update(|cx| {
+                            state.update(cx, |model, cx| {
+                                model.fetch_started_ts = None;
+                                model.fetch_failed = Some(error);
+                                cx.notify();
+                            });
+                        });
+                    }
+                })
+                .detach();
             },
         )
         .into_any_element(),
