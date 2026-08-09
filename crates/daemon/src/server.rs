@@ -227,28 +227,46 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
         };
     };
 
-    // Everything else needs the core. Never block indefinitely: if a scan
-    // holds the lock, degrade honestly (spec §10) instead of timing out the
-    // client.
+    // Everything else needs the core. Status answers instantly with a busy
+    // snapshot (a running scan is NOT a degradation — scanning:true is the
+    // whole story; 2026-08-04: the busy text once leaked into the degraded
+    // banner). Every other request WAITS ITS TURN: scans hold the core for
+    // seconds and run constantly, so bouncing "busy — retry shortly" at the
+    // user made saves a timing game (2026-08-08). Each connection has its
+    // own thread, so waiting here stalls nobody else; the bound stays under
+    // the client's 10s request timeout.
     let mut c = match core.try_lock() {
         Ok(c) => c,
         Err(std::sync::TryLockError::WouldBlock) => {
-            return match request {
-                // A running scan is NOT a degradation — scanning:true is the
-                // whole story, and clients keep their last real degraded
-                // hint (2026-08-04: the busy text leaked into the degraded
-                // banner as "scan in progress… · re-checks every minute").
-                Request::Status => Response::Status {
+            if matches!(request, Request::Status) {
+                return Response::Status {
                     drifted: Vec::new(),
                     in_sync: 0,
                     degraded: None,
                     scanning: true,
                     last_fetch_ts: None,
-                },
-                _ => Response::Error {
-                    message: "daemon busy (scan in progress) — retry shortly".into(),
-                },
-            };
+                };
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                match core.try_lock() {
+                    Ok(c) => break c,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Response::Error {
+                                message: "daemon busy (scan in progress) — retry shortly"
+                                    .into(),
+                            };
+                        }
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Response::Error {
+                            message: "daemon state poisoned".into(),
+                        };
+                    }
+                }
+            }
         }
         Err(std::sync::TryLockError::Poisoned(_)) => {
             return Response::Error {

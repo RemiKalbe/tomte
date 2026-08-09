@@ -631,6 +631,12 @@ impl ReviewView {
             this.update(cx, |view, cx| {
                 view.action_in_flight = false;
                 view.last_outcome = Some(outcome_banner(action, &result));
+                if matches!(result, Ok(ResolveOutcome::Done { .. })) {
+                    view.state.update(cx, |model, cx| {
+                        model.confirm_resolved(&target);
+                        cx.notify();
+                    });
+                }
                 // Reload the preview so the diff reflects the new reality
                 // (re-selecting is the established refresh path).
                 if view.selected.as_deref() == Some(target.as_path()) {
@@ -689,6 +695,7 @@ impl ReviewView {
         };
         self.action_in_flight = true;
         cx.notify();
+        let resolved_target = inputs.target.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -697,6 +704,12 @@ impl ReviewView {
             this.update(cx, |view, cx| {
                 view.action_in_flight = false;
                 view.last_outcome = Some(keep_both_banner(&result));
+                if matches!(result, Ok(ResolveOutcome::Done { .. })) {
+                    view.state.update(cx, |model, cx| {
+                        model.confirm_resolved(&resolved_target);
+                        cx.notify();
+                    });
+                }
                 if let Some(target) = view.selected.clone() {
                     view.select(target, cx);
                 }

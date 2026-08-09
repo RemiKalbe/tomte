@@ -805,6 +805,7 @@ impl MergeView {
         self.saving = true;
         self.banner = None;
         cx.notify();
+        let resolved_target = inputs.target.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -815,7 +816,13 @@ impl MergeView {
                 let banner = merge_banner(&result);
                 if matches!(result, Ok(ResolveOutcome::Done { .. })) {
                     view.shell
-                        .update(cx, |shell, cx| shell.merge_done(banner, cx))
+                        .update(cx, |shell, cx| {
+                            shell.state.update(cx, |model, cx| {
+                                model.confirm_resolved(&resolved_target);
+                                cx.notify();
+                            });
+                            shell.merge_done(banner, cx);
+                        })
                         .ok();
                 } else {
                     view.banner = Some(banner);

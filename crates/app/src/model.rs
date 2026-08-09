@@ -203,6 +203,22 @@ impl SyncModel {
         }
     }
 
+    /// A resolution succeeded — the engine's success reply IS the truth, so
+    /// the target leaves the review list NOW instead of lingering until the
+    /// daemon's post-apply probe pushes seconds later (2026-08-08: "I still
+    /// see that item until it finally goes away — clunky"). The next pushes
+    /// reconcile for free: an in_sync Drift retain is a no-op, and if the
+    /// file genuinely re-drifts a fresh Drift event re-adds it.
+    pub fn confirm_resolved(&mut self, target: &std::path::Path) {
+        let before = self.drifted.len();
+        self.drifted.retain(|d| d.target != target);
+        // Count moves only when the target actually left the list — a repeat
+        // confirm (daemon push landed first) must not inflate in_sync.
+        if self.drifted.len() < before {
+            self.in_sync += 1;
+        }
+    }
+
     /// Number of drifted targets whose class demands a human decision.
     pub fn needs_attention(&self) -> usize {
         self.drifted
@@ -431,6 +447,27 @@ mod tests {
             to_hash: None,
             meta,
         }
+    }
+
+    #[test]
+    fn confirm_resolved_removes_target_now_and_repeat_is_inert() {
+        let mut m = SyncModel::default();
+        m.hydrate_status(
+            vec![summary("/a", "conflict", Some(1)), summary("/b", "drifted", Some(2))],
+            10,
+            None,
+            false,
+            None,
+        );
+        m.confirm_resolved(Path::new("/a"));
+        assert_eq!(m.drifted.len(), 1);
+        assert_eq!(m.drifted[0].target, Path::new("/b"));
+        assert_eq!(m.in_sync, 11);
+        // The daemon's later in_sync push (or a second confirm) is a no-op.
+        m.confirm_resolved(Path::new("/a"));
+        assert_eq!(m.in_sync, 11);
+        m.apply_event(drift("/a", "in_sync", 3));
+        assert_eq!(m.drifted.len(), 1);
     }
 
     #[test]

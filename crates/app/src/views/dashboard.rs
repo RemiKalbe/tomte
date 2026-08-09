@@ -930,14 +930,28 @@ fn run_quick_action(
     };
     flag(cx, &shell, true);
     cx.spawn(async move |cx| {
-        cx.background_executor()
+        let resolved_target = target.clone();
+        let resolved = cx
+            .background_executor()
             .spawn(async move {
                 let result = action.run(&engine, &target);
                 let body = quick_action_body(action, &target, &result);
                 notify(&SystemRunner, "chezmoi-ui", &body);
+                matches!(result, Ok(ResolveOutcome::Done { .. }))
             })
             .await;
-        let _ = cx.update(|cx| flag(cx, &shell, false));
+        let _ = cx.update(|cx| {
+            flag(cx, &shell, false);
+            if resolved {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.state.update(cx, |model, cx| {
+                        model.confirm_resolved(&resolved_target);
+                        cx.notify();
+                    });
+                    cx.notify();
+                });
+            }
+        });
     })
     .detach();
 }
