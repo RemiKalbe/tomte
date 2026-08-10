@@ -4,6 +4,30 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.3 — 2026-08-10
+
+First-run on a fresh machine actually works, and failures explain themselves.
+
+### Fixed
+
+- **Fresh installs never started.** On a machine that had never run Tomte,
+  the support directory didn't exist and the very first boot step died on
+  a bare "No such file or directory" — forever. The directory is now
+  created up front (found on a real second-machine install).
+- **Startup failures name their remedy.** If the daemon can't start
+  because of configuration — several 1Password accounts with none
+  selected, locked 1Password, a missing age identity — the status now
+  says exactly that, the dashboard banner gains its "Open Settings"
+  button, and the daemon keeps serving that answer instead of exiting
+  and respawning in a loop the app could only report as "not connected".
+- **"Not connected" explains itself**: what the background watcher is,
+  that it restarts automatically, and the last error it hit.
+
+### Changed
+
+- Settings: when several 1Password accounts exist and none is selected,
+  the Account row says so — right where the fix is.
+
 ## 0.1.2 — 2026-08-09
 
 Tomte gets its real face, everywhere.

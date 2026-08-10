@@ -142,6 +142,33 @@ fn app_connects_to_already_running_daemon_without_spawning() {
 }
 
 #[test]
+fn fresh_install_boots_with_no_support_dir() {
+    // The second-machine bug (2026-08-10): nothing had ever created the
+    // support directory, and connect_or_spawn failed on the spawn-log
+    // create BEFORE spawning the daemon — first run died on bare ENOENT.
+    let e2e = E2e::new();
+    let nested = e2e.scratch.root.path().join("fresh/never/created");
+    let socket = nested.join("e2e.sock");
+    assert!(!nested.exists(), "test premise: directory must not exist");
+    let out = Command::new(tomte_bin())
+        .arg("--verify-connectivity")
+        .env("TOMTE_SOCKET", &socket)
+        .env("TOMTE_JOURNAL", nested.join("journal.db"))
+        .env("TOMTE_SETTINGS", nested.join("settings.toml"))
+        .env("TOMTE_DAEMON", e2e.tomted.to_str().unwrap())
+        .env("HOME", &e2e.scratch.home)
+        .output()
+        .expect("run tomte --verify-connectivity");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "fresh-dir boot failed:\n{text}");
+    assert!(text.contains("CONNECTIVITY OK"), "{text}");
+}
+
+#[test]
 fn stale_socket_file_is_reclaimed() {
     let e2e = E2e::new();
     // A socket file with no listener behind it (daemon crashed / machine

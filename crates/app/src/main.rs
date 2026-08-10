@@ -113,6 +113,10 @@ fn app_support_dir() -> PathBuf {
             let _ = std::fs::rename(&old, &dir);
         }
     }
+    // A truly fresh machine has NO support dir, and connect_or_spawn
+    // creates the daemon's spawn log there BEFORE spawning — first run
+    // failed with a bare ENOENT forever (2026-08-10, second machine).
+    let _ = std::fs::create_dir_all(&dir);
     dir
 }
 

@@ -189,6 +189,11 @@ impl IpcClient {
         // Capture the daemon's output — a silently dying child was
         // undiagnosable when this was Stdio::null() (first-launch bug).
         let log_path = socket.with_file_name("tomted.spawn.log");
+        // The socket's directory may not exist yet (fresh install, custom
+        // TOMTE_SOCKET): creating the log must not be the reason boot fails.
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let log = std::fs::File::create(&log_path)?;
         let log_err = log.try_clone()?;
         let mut child = std::process::Command::new(tomted_bin)
