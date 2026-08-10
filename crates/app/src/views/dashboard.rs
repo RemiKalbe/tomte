@@ -404,12 +404,23 @@ impl DashboardView {
                 if scanning {
                     skeleton_rows(theme)
                 } else if !connected {
+                    // Spell out WHAT tomted is and WHY it's down — "daemon
+                    // not connected" alone reads as jargon with no next step
+                    // (2026-08-10, fresh second-machine install).
+                    let why = model
+                        .connect_error
+                        .as_deref()
+                        .and_then(|e| e.lines().last())
+                        .map(|e| format!("last error: {e}"))
+                        .unwrap_or_else(|| "reconnecting automatically…".into());
                     ui::empty_state(
                         theme,
                         "●",
                         theme.conflict,
-                        "Sync daemon not connected",
-                        "reconnecting automatically…",
+                        "Tomte's background watcher (tomted) isn't running",
+                        format!(
+                            "it scans your dotfiles for drift · restarts automatically · {why}"
+                        ),
                     )
                     .into_any_element()
                 } else {

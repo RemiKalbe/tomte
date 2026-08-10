@@ -92,6 +92,20 @@ pub enum EvalFailureKind {
     Unknown,
 }
 
+impl EvalFailureKind {
+    /// Short human name for status lines — never raw stderr.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OnePasswordMultipleAccounts => "1Password: multiple accounts",
+            Self::OnePasswordAuth => "1Password locked or signed out",
+            Self::AgeDecrypt => "age decryption failed",
+            Self::GpgDecrypt => "gpg decryption failed",
+            Self::TemplateError => "template error",
+            Self::Unknown => "chezmoi error",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EvalFailure {
     pub kind: EvalFailureKind,

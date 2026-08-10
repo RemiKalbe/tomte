@@ -31,6 +31,10 @@ const ATTENTION_CLASSES: [&str; 3] = ["conflict", "local_source_diverged", "eval
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncModel {
+    /// Why the last daemon connection attempt failed — the disconnected
+    /// state shows THIS instead of leaving "not connected" unexplained
+    /// (2026-08-10: a misconfigured second machine gave no clue at all).
+    pub connect_error: Option<String>,
     /// A verified, staged newer bundle. Set by the updater loop / Settings
     /// check; the Settings row offers the restart (and shows the release
     /// notes), the sidebar footer surfaces that it exists.
@@ -249,7 +253,7 @@ impl SyncModel {
     /// sync-all enabled). Sync-all needs a clean tree AND a live daemon.
     pub fn menu_spec(&self, now_ts: u64) -> (String, String, Option<String>, bool) {
         let header = if !self.connected {
-            "tomted not connected".to_string()
+            "background watcher not running — open Tomte".to_string()
         } else if self.scanning {
             "scanning…".to_string()
         } else if self.drifted.is_empty() {
@@ -728,7 +732,7 @@ mod tests {
         // disconnected: sync-all locked out even with zero drift
         let mut m = SyncModel::default();
         let (header, freshness, review, sync_all) = m.menu_spec(1_000);
-        assert_eq!(header, "tomted not connected");
+        assert_eq!(header, "background watcher not running — open Tomte");
         assert_eq!(freshness, "origin: never fetched");
         assert_eq!(review, None);
         assert!(!sync_all);

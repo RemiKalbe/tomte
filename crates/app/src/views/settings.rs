@@ -514,20 +514,40 @@ impl SettingsView {
                     )
                 });
 
+        // Several accounts and none picked: chezmoi's op calls fail with
+        // "multiple accounts found" until one is chosen — say so HERE, at
+        // the control that fixes it (2026-08-10: a fresh second machine
+        // showed "None (single account)" while two accounts existed).
+        let needs_pick = self.selected.is_none()
+            && matches!(&self.accounts, AccountsState::Ready(list) if list.len() > 1);
         let description = div()
             .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .text_xs()
-            .text_color(theme.text_muted)
-            .child("Injected as")
-            .child(ui::code_chip(theme, "OP_ACCOUNT").py_0())
-            .child("into every")
-            .child(ui::code_chip(theme, "chezmoi").py_0())
-            .child("and")
-            .child(ui::code_chip(theme, "op").py_0())
-            .child("subprocess.")
+            .flex_col()
+            .gap_0p5()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child("Injected as")
+                    .child(ui::code_chip(theme, "OP_ACCOUNT").py_0())
+                    .child("into every")
+                    .child(ui::code_chip(theme, "chezmoi").py_0())
+                    .child("and")
+                    .child(ui::code_chip(theme, "op").py_0())
+                    .child("subprocess.")
+            )
+            .when(needs_pick, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.drift)
+                        .child("Several 1Password accounts detected and none selected — chezmoi can't know which to use. Pick one, then Save."),
+                )
+            })
             .into_any_element();
         setting_row(
             theme,

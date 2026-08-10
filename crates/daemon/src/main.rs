@@ -262,8 +262,21 @@ fn main() -> ExitCode {
                     "tomted[t={}]: startup blocked ({e}); retrying in 10s",
                     now_ts()
                 );
-                ctx.set_starting_error(e.to_string());
-                if std::time::Instant::now() > startup_deadline {
+                // Route the raw error through the eval classifier so the
+                // status hint carries a remedy ("pick an account in
+                // Settings") instead of raw chezmoi stderr (2026-08-10: a
+                // second machine with two 1Password accounts and nothing
+                // configured showed only "not connected").
+                let msg = e.to_string();
+                let classified = tomte_core::chezmoi::classify_eval_stderr(&msg);
+                ctx.set_starting_error(match &classified {
+                    Some(f) => format!("{} — {}", f.kind.label(), f.hint),
+                    None => msg.clone(),
+                });
+                // Config errors (1Password account/auth, age identity) never
+                // heal by respawning — keep serving the WHY instead of
+                // exiting into a spawn loop the app reports as disconnected.
+                if classified.is_none() && std::time::Instant::now() > startup_deadline {
                     eprintln!(
                         "tomted[t={}]: startup failed for 5 minutes — exiting so a fresh spawn can take over",
                         now_ts()

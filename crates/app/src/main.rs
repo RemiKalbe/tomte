@@ -643,6 +643,10 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                     eprintln!(
                         "tomte: daemon connection failed (retrying in {backoff_secs}s): {e}"
                     );
+                    let _ = cx.update_entity(&state, |model, cx| {
+                        model.connect_error = Some(e.to_string());
+                        cx.notify();
+                    });
                     cx.background_executor()
                         .timer(Duration::from_secs(backoff_secs))
                         .await;
@@ -655,6 +659,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
             let client = std::sync::Arc::new(raw_client);
             let hydrated = cx.update_entity(&state, |model, cx| {
                 model.connected = true;
+                model.connect_error = None;
                 if let Response::Status {
                     drifted,
                     in_sync,
