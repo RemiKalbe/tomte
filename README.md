@@ -4,6 +4,14 @@
 
 # Tomte
 
+> [!WARNING]
+> **Very experimental.** I'm building Tomte around my own dotfiles setup
+> first, and it currently assumes a lot of it (chezmoi + a git remote +
+> 1Password, one repo, macOS on Apple silicon). The goal is to make it
+> great for everyone, but in its current state I don't recommend using
+> it yet — expect sharp edges, breaking changes, and opinionated
+> defaults.
+
 A quiet macOS menubar app that keeps your dotfiles from drifting.
 
 Tomte watches the files [chezmoi](https://chezmoi.io) manages and notices
