@@ -100,7 +100,7 @@ fn forget_triggers_left_management() {
 }
 
 #[test]
-fn fetch_detects_remote_changes() {
+fn fetch_integrates_when_fast_forward_is_lossless() {
     let s = Scratch::new();
     let mut core = core_for(&s);
     let rx = core.subscribe();
@@ -117,18 +117,63 @@ fn fetch_detects_remote_changes() {
     git(&other, &["push"]);
 
     core.handle_fetch(400).unwrap();
+    // New contract (2026-08-10): a clean, non-diverged repo INTEGRATES what
+    // fetch brought — fast-forward, then the file reads as source-ahead
+    // (apply-able) instead of remote_ahead purgatory.
     let target = s.home.join(".testrc");
-    assert!(kinds(&core, &target).contains(&"remote_advanced".to_string()));
+    assert!(kinds(&core, &target).contains(&"source_changed".to_string()));
+    let behind_after = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD..origin/main"])
+        .current_dir(&s.source)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&behind_after.stdout).trim(), "0");
     let events: Vec<Event> = rx.try_iter().collect();
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, Event::Drift { class, .. } if class == "remote_ahead"))
+            .any(|e| matches!(e, Event::Drift { class, .. } if class == "source_ahead")),
+        "{events:?}"
     );
     assert!(
         events
             .iter()
             .any(|e| matches!(e, Event::FetchDone { behind: 1, .. }))
+    );
+}
+
+#[test]
+fn fetch_leaves_diverged_repos_untouched() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    // second machine pushes…
+    let other = s.root.path().join("other");
+    sh(
+        s.root.path(),
+        "git",
+        &["clone", s.bare.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    std::fs::write(other.join("dot_testrc"), "a=remote\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "remote"]);
+    git(&other, &["push"]);
+    // …while the local source has its own unpushed commit → diverged.
+    std::fs::write(s.source.join("local_only"), "x\n").unwrap();
+    git(&s.source, &["add", "."]);
+    git(&s.source, &["commit", "-m", "local"]);
+
+    core.handle_fetch(400).unwrap();
+    let target = s.home.join(".testrc");
+    assert!(kinds(&core, &target).contains(&"remote_advanced".to_string()));
+    let behind_after = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD..origin/main"])
+        .current_dir(&s.source)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&behind_after.stdout).trim(),
+        "1",
+        "diverged repo must NOT be integrated"
     );
 }
 

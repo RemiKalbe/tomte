@@ -507,11 +507,9 @@ impl DaemonCore {
             }
         }
         self.last_fetch_ts = Some(now_ts);
-        let behind = self
-            .git
-            .divergence(&self.remote_ref)
-            .map(|d| d.behind)
-            .unwrap_or(0);
+        let div = self.git.divergence(&self.remote_ref).ok();
+        let behind = div.as_ref().map(|d| d.behind).unwrap_or(0);
+        let ahead = div.as_ref().map(|d| d.ahead).unwrap_or(0);
         self.journal.record_event(NewEvent {
             target: None,
             ts: now_ts,
@@ -520,10 +518,38 @@ impl DaemonCore {
             to_hash: None,
             meta: Some(serde_json::json!({"behind": behind})),
         })?;
+        // The paths fetch brought in — computed BEFORE integration so the
+        // probe below still knows what moved once HEAD catches up.
         let changed = self
             .git
             .changed_files("HEAD", &self.remote_ref)
             .unwrap_or_default();
+        // Integrate, don't just observe: with no local commits and a clean
+        // tree, fast-forwarding is lossless — and NOT doing it left every
+        // later push non-fast-forward ("I literally clicked fetch",
+        // 2026-08-10). Diverged or dirty repos stay untouched; those files
+        // keep their remote_ahead/diverged classifications for review.
+        if behind > 0
+            && ahead == 0
+            && self
+                .git
+                .dirty_files()
+                .map(|d| d.is_empty())
+                .unwrap_or(false)
+        {
+            match self.git.ff_merge(&self.remote_ref) {
+                Ok(()) => {
+                    tomte_core::log_info!(
+                        "fetch",
+                        "fast-forwarded {behind} commit(s) to {}",
+                        self.remote_ref
+                    );
+                }
+                Err(e) => {
+                    tomte_core::log_warn!("fetch", "fast-forward skipped: {e}");
+                }
+            }
+        }
         for rel in changed {
             let abs = self.source_dir.join(&rel);
             let Ok(targets) = self.chezmoi.target_paths(std::slice::from_ref(&abs)) else {

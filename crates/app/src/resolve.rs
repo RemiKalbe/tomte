@@ -308,6 +308,16 @@ impl ResolveEngine {
         let pushed = committed
             && match self.git.push("origin") {
                 Ok(()) => true,
+                Err(e) if e.to_string().contains("rejected") => {
+                    // Origin moved since our last integration: replay our
+                    // commit(s) on top and push again (2026-08-10: a clean
+                    // auto-merge ended in "couldn't push — conflict").
+                    tomte_core::log_warn!(
+                        "resolve",
+                        "push rejected (origin ahead) — fetching, rebasing, retrying"
+                    );
+                    self.recover_rejected_push(&mut note)
+                }
                 Err(e) => {
                     tomte_core::log_error!("resolve", "push failed: {e}");
                     append_note(&mut note, format!("push failed: {e}"));
@@ -315,6 +325,47 @@ impl ResolveEngine {
                 }
             };
         (committed, pushed, note)
+    }
+
+    /// Push bounced non-fast-forward: refresh origin, rebase our commits on
+    /// top, push once more. A rebase that conflicts is aborted and reported
+    /// honestly — repo-level divergence is the user's call, never ours.
+    fn recover_rejected_push(&self, note: &mut Option<String>) -> bool {
+        if let Err(e) = self.git.fetch("origin") {
+            append_note(note, format!("push rejected and re-fetch failed: {e}"));
+            return false;
+        }
+        let branch = self.git.head_branch().unwrap_or_else(|_| "main".into());
+        let upstream = format!("origin/{branch}");
+        match self.git.rebase(&upstream) {
+            Ok(()) => match self.git.push("origin") {
+                Ok(()) => {
+                    tomte_core::log_info!("resolve", "rebased onto {upstream} and pushed");
+                    append_note(
+                        note,
+                        format!("origin had new commits — rebased onto {upstream} and pushed"),
+                    );
+                    true
+                }
+                Err(e) => {
+                    tomte_core::log_error!("resolve", "push failed after rebase: {e}");
+                    append_note(note, format!("push failed even after rebase: {e}"));
+                    false
+                }
+            },
+            Err(e) => {
+                self.git.rebase_abort();
+                tomte_core::log_error!("resolve", "rebase onto {upstream} conflicted: {e}");
+                append_note(
+                    note,
+                    format!(
+                        "origin has diverging commits that conflict with this change — \
+                         resolve in the dotfiles repo manually (rebase aborted): {e}"
+                    ),
+                );
+                false
+            }
+        }
     }
 
     fn session_start(&self) -> Result<i64, ResolveError> {

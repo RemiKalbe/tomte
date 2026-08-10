@@ -1,3 +1,4 @@
+#![allow(dead_code)] // shared by several test binaries, each using a subset
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

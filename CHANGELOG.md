@@ -4,6 +4,23 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.5 — 2026-08-10
+
+The sync loop closes: fetch integrates, push recovers.
+
+### Fixed
+
+- **Fetch now integrates, not just observes.** Fetch downloaded origin's
+  commits but nothing ever moved the local branch forward — so on a
+  machine where origin was ahead, every push after a resolve was doomed
+  to a non-fast-forward rejection. When origin is ahead, the local tree
+  is clean, and there are no local commits, fetch now fast-forwards
+  (lossless by construction). Diverged or dirty repos stay untouched.
+- **A rejected push heals itself.** If origin moved between fetch and
+  push, Tomte re-fetches, rebases its commit on top, and pushes again.
+  If the rebase conflicts it aborts cleanly and says exactly that —
+  repo-level divergence is your call, never Tomte's.
+
 ## 0.1.4 — 2026-08-10
 
 You can always hand Tomte's homework to someone. Also: the 1Password

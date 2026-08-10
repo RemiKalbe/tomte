@@ -169,6 +169,25 @@ impl GitClient {
         Ok(())
     }
 
+    /// Fast-forward the current branch to `upstream`; refuses to create a
+    /// merge commit (`--ff-only`), so it is lossless by construction.
+    pub fn ff_merge(&self, upstream: &str) -> Result<(), GitError> {
+        self.run(&["merge", "--ff-only", upstream], Duration::from_secs(30))?;
+        Ok(())
+    }
+
+    /// Replay local commits on top of `upstream`. On failure the caller
+    /// MUST call [`Self::rebase_abort`] to restore the branch.
+    pub fn rebase(&self, upstream: &str) -> Result<(), GitError> {
+        self.run(&["rebase", upstream], Duration::from_secs(60))?;
+        Ok(())
+    }
+
+    /// Best-effort abort of an in-progress rebase.
+    pub fn rebase_abort(&self) {
+        let _ = self.run(&["rebase", "--abort"], Duration::from_secs(30));
+    }
+
     pub fn head_sha(&self) -> Result<String, GitError> {
         self.rev_parse("HEAD")
     }
