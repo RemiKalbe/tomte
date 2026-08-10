@@ -56,7 +56,21 @@ impl gpui::Global for EngineSlot {}
 /// mirroring tomte-daemon's `build_core` shape.
 fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEngine, ChezmoiError> {
     let runner: Arc<dyn CommandRunner> = Arc::new(SystemRunner);
-    let chezmoi = ChezmoiClient::new(runner.clone(), ChezmoiOptions::default());
+    // The APP runs the resolve pipeline, so its chezmoi calls need the
+    // configured 1Password account exactly like the daemon's (2026-08-10:
+    // selecting an account "didn't pick up" — only tomted ever read it).
+    let settings_path = env_path("TOMTE_SETTINGS", app_support_dir().join("settings.toml"));
+    let env = views::settings::chezmoi_env_from_settings(&settings_path);
+    if !env.is_empty() {
+        tomte_core::log_info!("engine", "chezmoi env from settings: OP_ACCOUNT set");
+    }
+    let chezmoi = ChezmoiClient::new(
+        runner.clone(),
+        ChezmoiOptions {
+            env,
+            ..ChezmoiOptions::default()
+        },
+    );
     let source_dir = chezmoi.source_dir()?;
     let git = GitClient::new(runner, source_dir);
     Ok(ResolveEngine {
@@ -885,6 +899,7 @@ fn main() -> ExitCode {
             }
         }
     }
+    tomte_core::logging::init(tomte_core::logging::dir_for(&app_support_dir()), "tomte");
     // Finder/updater launches carry launchd's bare PATH — the released
     // 0.1.0 couldn't find `op` (or chezmoi, from a clean install). Adopt
     // the login shell's PATH before anything spawns a subprocess.
@@ -895,6 +910,9 @@ fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "--print-status") {
         return print_status(&paths.socket);
+    }
+    if std::env::args().any(|a| a == "--diagnose") {
+        return diagnose(&paths);
     }
     if std::env::args().any(|a| a == "--gallery-list") {
         for (name, desc) in views::fixtures::states() {
@@ -1045,6 +1063,145 @@ fn spawn_update_loop(cx: &mut App, state: Entity<SyncModel>) {
         }
     })
     .detach();
+}
+
+/// `tomte --diagnose`: everything a bug report needs in one pasteable
+/// blob — versions, paths, socket/process state, daemon status, settings
+/// (account redacted to presence), and the tails of every log we keep.
+/// Built after "there are no logs to give you" (2026-08-10).
+fn diagnose(paths: &Paths) -> ExitCode {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "=== tomte diagnose · v{} ===",
+        tomte_app::update::CURRENT_VERSION
+    );
+    let _ = writeln!(out, "time: {}", tomte_core::logging::iso8601_utc(now_ts()));
+    let _ = writeln!(out, "exe: {:?}", std::env::current_exe().ok());
+    let _ = writeln!(out, "socket: {}", paths.socket.display());
+    let _ = writeln!(out, "  exists: {}", paths.socket.exists());
+    let _ = writeln!(
+        out,
+        "journal: {} (exists: {})",
+        paths.journal.display(),
+        paths.journal.exists()
+    );
+    let _ = writeln!(
+        out,
+        "tomted bin: {} (exists: {})",
+        paths.tomted.display(),
+        paths.tomted.exists()
+    );
+
+    let settings = std::fs::read_to_string(&paths.settings).unwrap_or_default();
+    let has_account = settings.contains("onepassword_account");
+    let _ = writeln!(
+        out,
+        "settings: {} (exists: {}, account configured: {has_account})",
+        paths.settings.display(),
+        paths.settings.exists()
+    );
+
+    for tool in ["chezmoi", "git", "op"] {
+        let found = tomte_core::cmd::CommandRunner::run(
+            &SystemRunner,
+            tomte_core::cmd::CommandRequest::new(tool)
+                .arg("--version")
+                .timeout(Duration::from_secs(10)),
+        );
+        let _ = match found {
+            Ok(o) if o.success() => writeln!(
+                out,
+                "{tool}: {}",
+                o.stdout_utf8().lines().next().unwrap_or("?")
+            ),
+            Ok(o) => writeln!(
+                out,
+                "{tool}: exit {} ({})",
+                o.exit_code,
+                o.stderr_utf8().lines().next().unwrap_or("")
+            ),
+            Err(e) => writeln!(out, "{tool}: NOT RUNNABLE ({e})"),
+        };
+    }
+    let _ = writeln!(out, "PATH: {}", std::env::var("PATH").unwrap_or_default());
+
+    let procs = tomte_core::cmd::CommandRunner::run(
+        &SystemRunner,
+        tomte_core::cmd::CommandRequest::new("pgrep")
+            .args(["-fl", "tomted"])
+            .timeout(Duration::from_secs(5)),
+    );
+    let _ = writeln!(
+        out,
+        "tomted processes:\n{}",
+        procs
+            .map(|o| o.stdout_utf8())
+            .unwrap_or_else(|e| format!("pgrep failed: {e}"))
+    );
+
+    match IpcClient::connect(&paths.socket) {
+        Ok(client) => match client.request(Request::Status) {
+            Ok(Response::Status {
+                drifted,
+                in_sync,
+                degraded,
+                scanning,
+                last_fetch_ts,
+            }) => {
+                let _ = writeln!(
+                    out,
+                    "daemon status: {} drifted, {in_sync} in sync, scanning: {scanning}, degraded: {:?}, last_fetch_ts: {last_fetch_ts:?}",
+                    drifted.len(),
+                    degraded
+                );
+                for d in drifted.iter().take(30) {
+                    let _ = writeln!(out, "  drifted: {} [{}]", d.target.display(), d.class);
+                }
+            }
+            other => {
+                let _ = writeln!(out, "daemon status: unexpected {other:?}");
+            }
+        },
+        Err(e) => {
+            let _ = writeln!(out, "daemon connect: FAILED ({e})");
+        }
+    }
+
+    let logs_dir = tomte_core::logging::dir_for(&app_support_dir());
+    for name in ["tomte.log", "tomted.log"] {
+        let path = logs_dir.join(name);
+        let _ = writeln!(out, "\n--- tail {} ---", path.display());
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let lines: Vec<&str> = text.lines().collect();
+                let start = lines.len().saturating_sub(120);
+                for l in &lines[start..] {
+                    let _ = writeln!(out, "{l}");
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(out, "(unreadable: {e})");
+            }
+        }
+    }
+    let spawn_log = paths.socket.with_file_name("tomted.spawn.log");
+    let _ = writeln!(out, "\n--- tail {} ---", spawn_log.display());
+    match std::fs::read_to_string(&spawn_log) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(60);
+            for l in &lines[start..] {
+                let _ = writeln!(out, "{l}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "(unreadable: {e})");
+        }
+    }
+    println!("{out}");
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

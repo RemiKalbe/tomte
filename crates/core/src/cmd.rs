@@ -124,6 +124,35 @@ pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&self, req: CommandRequest) -> Result<CommandOutput, CommandError> {
+        // Every subprocess through one logged chokepoint: most debugging
+        // questions are "what exactly did chezmoi/git/op say" (2026-08-10).
+        let t0 = std::time::Instant::now();
+        let described = format!("{} {}", req.program, req.args.join(" "));
+        let result = self.run_inner(req);
+        match &result {
+            Ok(out) if out.success() => {
+                crate::log_info!("cmd", "{described} → ok in {:?}", t0.elapsed());
+            }
+            Ok(out) => {
+                let stderr = out.stderr_utf8();
+                let brief: String = stderr.chars().take(600).collect();
+                crate::log_error!(
+                    "cmd",
+                    "{described} → exit {} in {:?}: {brief}",
+                    out.exit_code,
+                    t0.elapsed()
+                );
+            }
+            Err(e) => {
+                crate::log_error!("cmd", "{described} → {e} in {:?}", t0.elapsed());
+            }
+        }
+        result
+    }
+}
+
+impl SystemRunner {
+    fn run_inner(&self, req: CommandRequest) -> Result<CommandOutput, CommandError> {
         let mut cmd = Command::new(&req.program);
         cmd.args(&req.args)
             .stdin(if req.stdin.is_some() {

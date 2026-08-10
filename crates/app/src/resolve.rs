@@ -86,6 +86,7 @@ impl ResolveEngine {
     /// anything — `chezmoi re-add` silently ignores templates, and pretending
     /// success would be a lie.
     pub fn keep_disk(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
+        tomte_core::log_info!("resolve", "keep_disk {}", target.display());
         let source = self.chezmoi.source_path(target)?;
         if is_templated(&source) {
             return Ok(ResolveOutcome::NeedsMergeEditor);
@@ -116,6 +117,7 @@ impl ResolveEngine {
     /// Restore chezmoi's version: apply the target. No commit phase — apply
     /// never touches the source repo.
     pub fn keep_source(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
+        tomte_core::log_info!("resolve", "keep_source {}", target.display());
         let session = self.session_start()?;
         let hashes = self.snapshot_blobs(vec![target.to_path_buf()])?;
         let [dest_blob] = hashes.as_slice() else {
@@ -154,6 +156,7 @@ impl ResolveEngine {
         inputs: &MergeInputs,
         resolved: &str,
     ) -> Result<ResolveOutcome, ResolveError> {
+        tomte_core::log_info!("resolve", "resolve_merged {}", inputs.target.display());
         let target = inputs.target.as_path();
         let session = self.session_start()?;
         let hashes =
@@ -218,6 +221,7 @@ impl ResolveEngine {
     /// decisions (menu gating). Its applies make targets equal the rendered
     /// state, which the daemon probes as InSync — no ExpectChanges needed.
     pub fn sync_all(&self) -> Result<ResolveOutcome, ResolveError> {
+        tomte_core::log_info!("resolve", "sync_all");
         let session = self.session_start()?;
         self.session_decision(session, serde_json::json!({ "action": "sync_all" }))?;
         // Network/merge failures are semantic (Plan 7 owns conflicts): report
@@ -245,6 +249,7 @@ impl ResolveEngine {
     /// produced) is deferred to Plan 7's merge tooling — this only restores
     /// destination files.
     pub fn undo_last(&self) -> Result<Option<i64>, ResolveError> {
+        tomte_core::log_info!("resolve", "undo_last");
         let journal = Journal::open_read_only(&self.journal_path, RO_MACHINE)?;
         let Some((of, decisions)) = journal.last_finished_session()? else {
             return Ok(None);
@@ -288,6 +293,7 @@ impl ResolveEngine {
                 match self.git.add_all().and_then(|()| self.git.commit(&message)) {
                     Ok(_sha) => true,
                     Err(e) => {
+                        tomte_core::log_error!("resolve", "commit failed: {e}");
                         append_note(&mut note, format!("commit failed: {e}"));
                         false
                     }
@@ -303,6 +309,7 @@ impl ResolveEngine {
             && match self.git.push("origin") {
                 Ok(()) => true,
                 Err(e) => {
+                    tomte_core::log_error!("resolve", "push failed: {e}");
                     append_note(&mut note, format!("push failed: {e}"));
                     false
                 }

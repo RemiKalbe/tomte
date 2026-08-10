@@ -105,6 +105,7 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
     }
+    tomte_core::logging::init(tomte_core::logging::dir_for(&app_support_dir()), "tomted");
     let once = std::env::args().any(|a| a == "--once");
     // Launchd/bundle launches carry a bare PATH; adopt the login shell's
     // (chezmoi/git/op live in Homebrew or user dirs), THEN drop ephemeral

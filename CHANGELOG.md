@@ -4,6 +4,31 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.4 — 2026-08-10
+
+You can always hand Tomte's homework to someone. Also: the 1Password
+account you pick now applies to everything.
+
+### Fixed
+
+- **Resolves/merges now use your selected 1Password account.** Only the
+  daemon ever read it; the app — which runs the apply/merge pipeline —
+  called chezmoi without `OP_ACCOUNT`, so multi-account machines failed
+  applies even after configuring an account.
+
+### Added
+
+- **`tomte --diagnose`**: one command, one pasteable report — versions,
+  tool availability, paths, socket and process state, daemon status,
+  settings summary, and the tails of every log. This is THE thing to run
+  when something misbehaves.
+- **Real logs.** Both the app and the daemon write timestamped, rotating
+  logs to `~/Library/Application Support/Tomte/logs/` — every chezmoi /
+  git / op / curl invocation with duration, exit code, and stderr on
+  failure; every resolve-pipeline step; commit/push outcomes; panics.
+  The daemon spawn log also stopped truncating itself on every respawn.
+- Settings → Paths shows the logs directory.
+
 ## 0.1.3 — 2026-08-10
 
 First-run on a fresh machine actually works, and failures explain themselves.

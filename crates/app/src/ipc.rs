@@ -194,7 +194,13 @@ impl IpcClient {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let log = std::fs::File::create(&log_path)?;
+        // Append: the previous daemon's dying words are exactly what a
+        // "why is it down" investigation needs (2026-08-10: truncation on
+        // every respawn left nothing to read).
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
         let log_err = log.try_clone()?;
         let mut child = std::process::Command::new(tomted_bin)
             .stdout(log)

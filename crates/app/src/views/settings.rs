@@ -125,6 +125,17 @@ pub fn settings_toml(fetch_interval_minutes: u64, onepassword_account: Option<&s
 /// Read the current settings for the form. Same degrade-to-defaults policy
 /// as the daemon's `Settings::load`; the interval is additionally clamped so
 /// the stepper starts inside its own bounds.
+/// Env pairs chezmoi subprocesses need, derived from the settings file —
+/// shared by the app-side engine (main.rs) and this view's display.
+pub fn chezmoi_env_from_settings(path: &Path) -> Vec<(String, String)> {
+    match load_settings_blocking(path).onepassword_account {
+        Some(account) if !account.is_empty() => {
+            vec![("OP_ACCOUNT".to_string(), account)]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn load_settings_blocking(path: &Path) -> SettingsDoc {
     let mut doc: SettingsDoc = std::fs::read_to_string(path)
         .ok()
@@ -707,10 +718,16 @@ impl Render for SettingsView {
                             ))
                             .child(path_row(theme, "Socket", &self.paths.socket, true))
                             .child(path_row(theme, "Journal", &self.paths.journal, true))
+                            .child(path_row(theme, "Settings file", &self.paths.settings, true))
                             .child(path_row(
                                 theme,
-                                "Settings file",
-                                &self.paths.settings,
+                                "Logs",
+                                &self
+                                    .paths
+                                    .journal
+                                    .parent()
+                                    .map(|d| d.join("logs"))
+                                    .unwrap_or_default(),
                                 false,
                             ))
                             .child(ui::section_header(
