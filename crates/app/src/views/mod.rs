@@ -543,6 +543,8 @@ mod render_smoke {
                 let mut expanded_scans = HashSet::new();
                 expanded_scans.insert(30u64);
                 Shell {
+                    reconcile_queue: Vec::new(),
+                    reconcile_in_flight: false,
                     route,
                     state,
                     review: None,
@@ -598,6 +600,8 @@ mod render_smoke {
                     view
                 });
                 Shell {
+                    reconcile_queue: Vec::new(),
+                    reconcile_in_flight: false,
                     route: Route::Review,
                     state,
                     review: Some(review),
@@ -618,6 +622,8 @@ mod render_smoke {
         let (_view, vis) = cx.add_window_view(|_window, cx| {
             let state = cx.new(|_| model_with_data());
             Shell {
+                reconcile_queue: Vec::new(),
+                reconcile_in_flight: false,
                 route: Route::Dashboard,
                 state,
                 review: None,
@@ -642,6 +648,8 @@ mod render_smoke {
                     ..Default::default()
                 });
                 Shell {
+                    reconcile_queue: Vec::new(),
+                    reconcile_in_flight: false,
                     route: Route::Dashboard,
                     state,
                     review: None,
@@ -752,6 +760,8 @@ mod render_smoke {
                     view
                 });
                 Shell {
+                    reconcile_queue: Vec::new(),
+                    reconcile_in_flight: false,
                     route: Route::Merge,
                     state,
                     review: None,
