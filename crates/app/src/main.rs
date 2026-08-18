@@ -49,28 +49,30 @@ pub struct EngineSlot(pub Option<Arc<ResolveEngine>>);
 
 impl gpui::Global for EngineSlot {}
 
-/// Build the resolve engine for one daemon connection. Blocking — the
-/// `chezmoi source-path`-style `source_dir` lookup is a subprocess — so
-/// callers run it on the background executor. The app builds its own
-/// chezmoi/git clients (options default; the app reads no settings today),
-/// mirroring tomte-daemon's `build_core` shape.
-fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEngine, ChezmoiError> {
-    let runner: Arc<dyn CommandRunner> = Arc::new(SystemRunner);
-    // The APP runs the resolve pipeline, so its chezmoi calls need the
-    // configured 1Password account exactly like the daemon's (2026-08-10:
-    // selecting an account "didn't pick up" — only tomted ever read it).
+/// THE app-side chezmoi client factory. Every construction goes through
+/// here so settings-derived env (OP_ACCOUNT) can never be forgotten again —
+/// 2026-08-17: previews/auto-merge/merge-loading each built their own
+/// default-option clients and failed op templates on multi-account machines
+/// even though the engine was fixed in 0.1.4. A source-scan test fails the
+/// build if a new call site bypasses this.
+pub(crate) fn app_chezmoi_client() -> ChezmoiClient {
     let settings_path = env_path("TOMTE_SETTINGS", app_support_dir().join("settings.toml"));
     let env = views::settings::chezmoi_env_from_settings(&settings_path);
-    if !env.is_empty() {
-        tomte_core::log_info!("engine", "chezmoi env from settings: OP_ACCOUNT set");
-    }
-    let chezmoi = ChezmoiClient::new(
-        runner.clone(),
+    ChezmoiClient::new(
+        Arc::new(SystemRunner),
         ChezmoiOptions {
             env,
             ..ChezmoiOptions::default()
         },
-    );
+    )
+}
+
+/// Build the resolve engine for one daemon connection. Blocking — the
+/// `source_dir` lookup is a subprocess — so callers run it on the
+/// background executor.
+fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEngine, ChezmoiError> {
+    let runner: Arc<dyn CommandRunner> = Arc::new(SystemRunner);
+    let chezmoi = app_chezmoi_client();
     let source_dir = chezmoi.source_dir()?;
     let git = GitClient::new(runner, source_dir);
     Ok(ResolveEngine {

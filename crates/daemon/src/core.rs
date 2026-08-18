@@ -488,6 +488,23 @@ impl DaemonCore {
         match self.git.fetch("origin") {
             Ok(()) => {}
             Err(e) => {
+                // Raw git output makes users think the app is broken; the
+                // two field failure modes get named (2026-08-17): a locked
+                // 1Password holding the SSH key (timeout, empty stderr) and
+                // plain network loss.
+                let raw = e.to_string();
+                let e = if raw.contains("timed out") && raw.contains("stderr tail: \"\"") {
+                    format!(
+                        "{raw} — usually 1Password locked (the SSH key lives in its agent); retries on schedule"
+                    )
+                } else if raw.contains("Could not resolve host")
+                    || raw.contains("Couldn't connect")
+                    || raw.contains("unable to access")
+                {
+                    format!("{raw} — network unreachable; retries on schedule")
+                } else {
+                    raw
+                };
                 // A FAILED fetch is journaled but emits no FetchDone — the
                 // app's freshness tile must never claim "fetched Xs ago" for
                 // a fetch that died (2026-08-08).

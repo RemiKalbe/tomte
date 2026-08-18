@@ -4,6 +4,33 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.6 — 2026-08-17
+
+Previews stop lying about 1Password, and errors learn some manners.
+
+### Fixed
+
+- **Previews and merge loading now use your selected 1Password account.**
+  The 0.1.4 fix covered the resolve engine but three other code paths
+  (diff preview, keep-both probe, merge-editor loading) still built
+  their own chezmoi clients without `OP_ACCOUNT`. There is now exactly
+  ONE factory for app-side chezmoi clients, and a build-failing test
+  that catches any future bypass.
+- **Failed fetches journaled before a restart no longer masquerade as
+  successful "fetch" rows.**
+
+### Changed
+
+- The origin tile shows "fetch failed" instead of a raw git error
+  crammed into the header; hover it for the full message. Fetch
+  failures also name their likely cause — a locked 1Password holding
+  the SSH key, or the network being unreachable — instead of
+  "timed out; stderr tail: \"\"".
+- The activity feed collapses runs of background noise (scans, fetches,
+  fetch failures) into one expandable "N background events" line — no
+  more wall of identical rows after a night of retries. The bogus
+  "can't evaluate" chip on fetch failures is gone.
+
 ## 0.1.5 — 2026-08-10
 
 The sync loop closes: fetch integrates, push recovers.

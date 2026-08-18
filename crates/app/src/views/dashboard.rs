@@ -193,16 +193,15 @@ impl DashboardView {
         let fetching = model
             .fetch_started_ts
             .is_some_and(|t| now.saturating_sub(t) < 60);
+        // Errors are a STATE, not a headline: the tile says "fetch failed",
+        // the full message lives in a hover tooltip (2026-08-17: raw git
+        // stderr crammed into the tile header read as broken UI).
+        let fetch_error_detail: Option<SharedString> =
+            model.fetch_failed.clone().map(SharedString::from);
         let (freshness, freshness_color): (SharedString, Rgba) = if fetching {
             ("fetching…".into(), theme.text_muted)
-        } else if let Some(err) = &model.fetch_failed {
-            let brief = err.lines().next().unwrap_or("error");
-            let brief = if brief.len() > 40 {
-                &brief[..40]
-            } else {
-                brief
-            };
-            (format!("fetch failed · {brief}").into(), theme.conflict)
+        } else if model.fetch_failed.is_some() {
+            ("fetch failed".into(), theme.conflict)
         } else {
             match model.last_fetch_ts {
                 Some(ts) => (
@@ -259,19 +258,28 @@ impl DashboardView {
                         (drifted_count > 0)
                             .then(|| review_link(theme, drifted_count, shell.clone())),
                     ))
-                    .child(tile(
-                        theme,
-                        freshness.to_string(),
-                        "origin",
-                        freshness_color,
-                        Some(fetch_now_button(
+                    .child({
+                        let t = tile(
                             theme,
-                            engine.clone(),
-                            self.state.clone(),
-                            fetching,
-                            model.fetch_failed.is_some(),
-                        )),
-                    ))
+                            freshness.to_string(),
+                            "origin",
+                            freshness_color,
+                            Some(fetch_now_button(
+                                theme,
+                                engine.clone(),
+                                self.state.clone(),
+                                fetching,
+                                model.fetch_failed.is_some(),
+                            )),
+                        );
+                        match &fetch_error_detail {
+                            Some(detail) => t
+                                .id("origin-tile")
+                                .tooltip(ui::text_tooltip(detail.clone()))
+                                .into_any_element(),
+                            None => t.into_any_element(),
+                        }
+                    })
                     .child(tile(
                         theme,
                         if counts_known {
@@ -720,7 +728,7 @@ fn render_line(
                     div()
                         .text_xs()
                         .text_color(theme.text_muted)
-                        .child(format!("{count} scans")),
+                        .child(format!("{count} background events")),
                 )
                 .on_click(move |_event, _window, cx| {
                     let _ = shell.update(cx, |shell, cx| {

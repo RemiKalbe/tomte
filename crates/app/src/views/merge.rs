@@ -25,8 +25,6 @@ use tomte_app::merge_inputs::{self, MergeInputs};
 use tomte_app::merge_state::MergeState;
 use tomte_app::resolve::{ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
-use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
-use tomte_core::cmd::SystemRunner;
 use tomte_core::merge::{Choice, MergeDocument, RegionKind};
 use tomte_core::template::anchor::{SpanMap, SpanOrigin};
 use tomte_ui::components as ui;
@@ -563,8 +561,7 @@ impl MergeView {
                 let target = target.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        let client =
-                            ChezmoiClient::new(Arc::new(SystemRunner), ChezmoiOptions::default());
+                        let client = crate::app_chezmoi_client();
                         merge_inputs::load(&client, &journal, &target)
                     })
                     .await

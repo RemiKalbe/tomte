@@ -14,7 +14,6 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
 use gpui::{
     AnyElement, Context, Div, ElementId, Entity, FontWeight, HighlightStyle, Rgba, SharedString,
@@ -23,7 +22,7 @@ use gpui::{
 use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
 use tomte_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
-use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
+use tomte_core::chezmoi::ChezmoiError;
 use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
 use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind, worddiff::word_diff};
 use tomte_journal::{EventRow, Journal};
@@ -142,7 +141,7 @@ fn auto_merge_blocking(
     target: &Path,
     journal: &Path,
 ) -> Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)> {
-    let chezmoi = ChezmoiClient::new(Arc::new(SystemRunner), ChezmoiOptions::default());
+    let chezmoi = crate::app_chezmoi_client();
     let inputs = tomte_app::merge_inputs::load(&chezmoi, journal, target).ok()?;
     let state = tomte_app::merge_state::MergeState::new(&inputs);
     if !state.conflicts().is_empty() {
@@ -171,7 +170,7 @@ fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
 }
 
 fn load_preview_blocking(target: &Path) -> PreviewState {
-    let client = ChezmoiClient::new(Arc::new(SystemRunner), ChezmoiOptions::default());
+    let client = crate::app_chezmoi_client();
     let rendered = match client.cat(target) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(ChezmoiError::Eval(failure)) => return PreviewState::EvalFailed(failure.hint),
@@ -586,7 +585,7 @@ impl ReviewView {
         };
         cx.background_executor()
             .spawn(async move {
-                let client = ChezmoiClient::new(Arc::new(SystemRunner), ChezmoiOptions::default());
+                let client = crate::app_chezmoi_client();
                 match client.source_path(&target) {
                     Ok(source) => {
                         let req = CommandRequest::new("open")

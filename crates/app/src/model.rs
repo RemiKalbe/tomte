@@ -109,7 +109,16 @@ impl SyncModel {
             .take(TIMELINE_CAP)
             .map(|r| TimelineRow {
                 ts: r.ts,
-                kind: r.kind,
+                // Failed fetches journal as kind "fetch" with an error meta;
+                // rendering them as plain "fetch" after a restart hid every
+                // historical failure (2026-08-17).
+                kind: if r.kind == "fetch"
+                    && r.meta.as_ref().is_some_and(|m| m.get("error").is_some())
+                {
+                    "fetch_failed".to_string()
+                } else {
+                    r.kind
+                },
                 target: r.target,
                 machine: r.machine,
                 class: r
@@ -176,7 +185,10 @@ impl SyncModel {
                     kind: "fetch_failed".into(),
                     target: None,
                     machine: LOCAL_MACHINE.into(),
-                    class: Some("eval_failed".into()),
+                    // No class: the title IS the story, and a class would
+                    // exempt the row from info-grouping (2026-08-17: hours
+                    // of "fetch failed · can't evaluate" wallpaper).
+                    class: None,
                 });
             }
             Event::FetchDone { ts, behind: _ } => {
@@ -352,7 +364,7 @@ pub enum TimelineItem {
 pub fn group_timeline(rows: &[TimelineRow]) -> Vec<TimelineItem> {
     let mut items = Vec::new();
     let mut run: Vec<TimelineRow> = Vec::new();
-    let is_info = |r: &TimelineRow| r.target.is_none() && r.class.is_none();
+    let is_info = |r: &TimelineRow| r.target.is_none();
     let flush = |run: &mut Vec<TimelineRow>, items: &mut Vec<TimelineItem>| match run.len() {
         0 => {}
         1 => items.push(TimelineItem::Row(run.remove(0))),
