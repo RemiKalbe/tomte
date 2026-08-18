@@ -4,6 +4,13 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.11 — 2026-08-18
+
+### Changed
+
+- Review diff markers: back to the tinted side dots (the 0.1.9 design)
+  — the operator experiment in 0.1.10 wasn't it.
+
 ## 0.1.10 — 2026-08-18
 
 ### Changed
