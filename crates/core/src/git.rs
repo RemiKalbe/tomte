@@ -23,6 +23,15 @@ pub enum GitError {
     },
 }
 
+/// Outcome of starting `git merge <upstream>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeStart {
+    /// Fast-forward or auto-merged and committed.
+    Clean,
+    /// Mid-merge with these paths conflicted; resolve or abort.
+    Conflicts(Vec<PathBuf>),
+}
+
 #[derive(Clone)]
 pub struct GitClient {
     runner: Arc<dyn CommandRunner>,
@@ -186,6 +195,64 @@ impl GitClient {
     /// Best-effort abort of an in-progress rebase.
     pub fn rebase_abort(&self) {
         let _ = self.run(&["rebase", "--abort"], Duration::from_secs(30));
+    }
+
+    /// Merge `upstream` into the current branch. Clean merges commit
+    /// immediately (default message); a conflicted merge leaves the index
+    /// mid-merge and reports the conflicted paths — the caller resolves
+    /// them (or [`Self::merge_abort`]s).
+    pub fn merge(&self, upstream: &str) -> Result<MergeStart, GitError> {
+        match self.run(&["merge", "--no-edit", upstream], Duration::from_secs(60)) {
+            Ok(_) => Ok(MergeStart::Clean),
+            Err(e) => {
+                let conflicts = self.conflicted_files()?;
+                if conflicts.is_empty() {
+                    // Not a content conflict (dirty tree, unrelated
+                    // histories…): surface the original failure.
+                    return Err(e);
+                }
+                Ok(MergeStart::Conflicts(conflicts))
+            }
+        }
+    }
+
+    /// Paths with unresolved merge conflicts (index stage entries).
+    pub fn conflicted_files(&self) -> Result<Vec<PathBuf>, GitError> {
+        Ok(self
+            .run_utf8(&["diff", "--name-only", "--diff-filter=U"])?
+            .lines()
+            .map(PathBuf::from)
+            .collect())
+    }
+
+    /// One side of a conflicted path: stage 1 = common ancestor, 2 = ours
+    /// (local branch), 3 = theirs (the merged-in upstream). `None` when the
+    /// side has no version (added on one side only).
+    pub fn stage_blob(&self, stage: u8, rel_path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+        let spec = format!(":{stage}:{}", rel_path.display());
+        match self.run(&["show", &spec], Duration::from_secs(30)) {
+            Ok(out) => Ok(Some(out)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Mark a conflicted path resolved (after the caller wrote the file).
+    pub fn add_path(&self, rel_path: &Path) -> Result<(), GitError> {
+        let path = rel_path.display().to_string();
+        self.run(&["add", "--", &path], Duration::from_secs(30))?;
+        Ok(())
+    }
+
+    /// Conclude an in-progress (fully resolved) merge with the default
+    /// merge-commit message.
+    pub fn merge_commit(&self) -> Result<String, GitError> {
+        self.run(&["commit", "--no-edit"], Duration::from_secs(30))?;
+        self.rev_parse("HEAD")
+    }
+
+    /// Best-effort abort of an in-progress merge.
+    pub fn merge_abort(&self) {
+        let _ = self.run(&["merge", "--abort"], Duration::from_secs(30));
     }
 
     pub fn head_sha(&self) -> Result<String, GitError> {

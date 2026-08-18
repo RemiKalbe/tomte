@@ -29,6 +29,10 @@ pub const STATES: &[(&str, &str)] = &[
     ("dashboard-empty", "everything in sync"),
     ("dashboard-scanning", "fresh boot, first scan running"),
     ("dashboard-rescanning", "data present, rescan in progress"),
+    (
+        "dashboard-diverged",
+        "source repo diverged from origin: Reconcile banner",
+    ),
     ("dashboard-degraded", "1Password-style degraded banner"),
     ("dashboard-disconnected", "daemon not connected"),
     ("review", "sidebar groups + selected file with diff preview"),
@@ -315,6 +319,8 @@ fn posed_merge_loading(cx: &mut Context<Shell>) -> Entity<MergeView> {
 /// Build the posed Shell for a gallery state. `None` = unknown name.
 pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Option<Shell> {
     let mut shell = |route: Route, model: SyncModel| Shell {
+        reconcile_queue: Vec::new(),
+        reconcile_in_flight: false,
         route,
         state: cx.new(|_| model),
         review: None,
@@ -354,6 +360,11 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 ..Default::default()
             },
         ),
+        "dashboard-diverged" => {
+            let mut m = rich_model();
+            m.repo_diverged = Some((4, 2));
+            shell(Route::Dashboard, m)
+        }
         "dashboard-rescanning" => {
             let mut m = rich_model();
             m.scanning = true;

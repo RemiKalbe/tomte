@@ -111,3 +111,72 @@ fn conflicting_rebase_aborts_cleanly() {
         "abort must restore HEAD"
     );
 }
+
+#[test]
+fn conflicted_merge_resolves_through_stages_and_pushes() {
+    // The 2026-08-18 field failure: local unpushed commits + origin commits
+    // touching the same file. Recovery = merge, resolve via stages, commit,
+    // push — the plumbing behind Tomte's repo-reconcile flow.
+    let scratch = Scratch::new();
+    let git = GitClient::new(Arc::new(SystemRunner), scratch.source.clone());
+    unsigned(&scratch.source);
+    let other = other_clone(&scratch);
+    write(&other.join("dot_testrc"), "a=remote\n");
+    sh(&other, "git", &["add", "-A"]);
+    sh(&other, "git", &["commit", "-m", "remote"]);
+    sh(&other, "git", &["push", "origin", "main"]);
+    write(&scratch.source.join("dot_testrc"), "a=local\n");
+    git.add_all().unwrap();
+    git.commit("local").unwrap();
+
+    git.fetch("origin").unwrap();
+    let start = git.merge("origin/main").unwrap();
+    let conflicts = match start {
+        tomte_core::git::MergeStart::Conflicts(c) => c,
+        other => panic!("expected conflicts, got {other:?}"),
+    };
+    assert_eq!(conflicts, vec![std::path::PathBuf::from("dot_testrc")]);
+
+    // All three sides are readable mid-merge.
+    let rel = Path::new("dot_testrc");
+    let base = git.stage_blob(1, rel).unwrap().unwrap();
+    let ours = git.stage_blob(2, rel).unwrap().unwrap();
+    let theirs = git.stage_blob(3, rel).unwrap().unwrap();
+    assert_eq!(String::from_utf8_lossy(&base), "a=1\n");
+    assert_eq!(String::from_utf8_lossy(&ours), "a=local\n");
+    assert_eq!(String::from_utf8_lossy(&theirs), "a=remote\n");
+
+    // Resolve, conclude, push: both histories land.
+    write(&scratch.source.join("dot_testrc"), "a=resolved\n");
+    git.add_path(rel).unwrap();
+    assert!(git.conflicted_files().unwrap().is_empty());
+    git.merge_commit().unwrap();
+    git.push("origin").unwrap();
+    let div = git.divergence("origin/main").unwrap();
+    assert_eq!((div.behind, div.ahead), (0, 0));
+}
+
+#[test]
+fn merge_abort_restores_the_branch() {
+    let scratch = Scratch::new();
+    let git = GitClient::new(Arc::new(SystemRunner), scratch.source.clone());
+    unsigned(&scratch.source);
+    let other = other_clone(&scratch);
+    write(&other.join("dot_testrc"), "a=remote\n");
+    sh(&other, "git", &["add", "-A"]);
+    sh(&other, "git", &["commit", "-m", "remote"]);
+    sh(&other, "git", &["push", "origin", "main"]);
+    write(&scratch.source.join("dot_testrc"), "a=local\n");
+    git.add_all().unwrap();
+    git.commit("local").unwrap();
+    git.fetch("origin").unwrap();
+
+    let sha = git.head_sha().unwrap();
+    assert!(matches!(
+        git.merge("origin/main").unwrap(),
+        tomte_core::git::MergeStart::Conflicts(_)
+    ));
+    git.merge_abort();
+    assert_eq!(git.head_sha().unwrap(), sha);
+    assert!(git.conflicted_files().unwrap().is_empty());
+}

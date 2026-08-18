@@ -184,6 +184,7 @@ impl DashboardView {
         let scanning = model.scanning;
         let connected = model.connected;
         let degraded = model.degraded.clone();
+        let repo_diverged = model.repo_diverged;
         let have_data = drifted_count > 0 || in_sync > 0;
         let counts_known = connected && (have_data || !scanning);
         // Freshness carries its own severity: recent is plain fact, stale is
@@ -377,6 +378,39 @@ impl DashboardView {
                         .mx_4()
                         .mb_2()
                         .mt_0(),
+                )
+            })
+            .when_some(repo_diverged, |el, (ahead, behind)| {
+                // Diverged history blocks every push until reconciled
+                // (2026-08-18) — one button runs merge → per-conflict merge
+                // editor → push.
+                let shell = shell.clone();
+                let action = Some(
+                    ui::button(
+                        theme,
+                        "repo-reconcile",
+                        "Reconcile…".into(),
+                        ui::ButtonVariant::Wash(theme.accent),
+                        ui::ButtonSize::Sm,
+                        move |_ev, _window, cx| {
+                            let _ = shell.update(cx, |shell, cx| shell.start_reconcile(cx));
+                        },
+                    )
+                    .into_any_element(),
+                );
+                el.child(
+                    ui::banner(
+                        theme,
+                        ui::BannerTint::Conflict,
+                        format!(
+                            "dotfiles repo diverged from origin — {ahead} local / {behind} origin commit(s); resolving files can't push until reconciled"
+                        )
+                        .into(),
+                        action,
+                    )
+                    .mx_4()
+                    .mb_2()
+                    .mt_0(),
                 )
             })
             .when(!lines.is_empty() || scanning, |el| {

@@ -4,6 +4,23 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.7 — 2026-08-17
+
+The missing piece: when your dotfiles repo itself diverges, Tomte can
+now fix it — in the same merge editor as everything else.
+
+### Added
+
+- **Repo reconciliation.** When this machine and origin both have
+  commits the other lacks, every push is doomed until the histories
+  meet — previously Tomte could only say "resolve manually". Now the
+  dashboard shows a "dotfiles repo diverged" banner with one button:
+  Reconcile merges origin, and if source files conflict, each one opens
+  in the three-pane merge editor (common ancestor · this machine's
+  commits · origin's). Resolve them, and Tomte concludes the merge,
+  pushes, and rescans. Cancel aborts the whole merge cleanly. Stray
+  uncommitted source edits are committed first, same policy as resolves.
+
 ## 0.1.6 — 2026-08-17
 
 Previews stop lying about 1Password, and errors learn some manners.

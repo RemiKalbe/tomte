@@ -39,6 +39,11 @@ pub struct SyncModel {
     /// check; the Settings row offers the restart (and shows the release
     /// notes), the sidebar footer surfaces that it exists.
     pub update_ready: Option<crate::update::StagedUpdate>,
+    /// The SOURCE REPO has both local and origin commits the other lacks:
+    /// `(local_ahead, origin_behind)`. Set by the app-side divergence probe;
+    /// the dashboard offers Reconcile (2026-08-18: every resolve's push was
+    /// hostage to an unreconciled history conflict).
+    pub repo_diverged: Option<(u32, u32)>,
     /// Current drifted targets, unique by target path.
     pub drifted: Vec<DriftSummary>,
     pub in_sync: u64,

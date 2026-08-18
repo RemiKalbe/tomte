@@ -50,6 +50,14 @@ pub enum ResolveError {
     Failed(String),
 }
 
+/// Outcome of [`ResolveEngine::start_repo_reconcile`].
+pub enum RepoReconcile {
+    /// Merged clean — committed (and pushed unless noted).
+    Done { pushed: bool, note: Option<String> },
+    /// Mid-merge: resolve each in the merge editor, then finish.
+    Conflicts(Vec<std::sync::Arc<MergeInputs>>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveOutcome {
     Done {
@@ -366,6 +374,126 @@ impl ResolveEngine {
                 false
             }
         }
+    }
+
+    /// Reconcile a diverged source repo with origin (2026-08-18: local
+    /// unpushed commits + origin commits conflicted on the same file, and
+    /// EVERY resolve's push was hostage to it). Merge-based: one abortable
+    /// state, and stage 2/3 map onto the editor's disk/source vocabulary.
+    pub fn start_repo_reconcile(&self) -> Result<RepoReconcile, ResolveError> {
+        tomte_core::log_info!("reconcile", "start: fetching + merging origin");
+        // git merge refuses on a dirty tree; stray source edits become a
+        // commit first (same policy as commit_phase after a resolve).
+        if !self.git.dirty_files()?.is_empty() {
+            self.git.add_all()?;
+            self.git.commit("Update dotfiles (pre-reconcile)")?;
+            tomte_core::log_info!("reconcile", "committed stray local changes first");
+        }
+        self.git.fetch("origin")?;
+        let branch = self.git.head_branch().unwrap_or_else(|_| "main".into());
+        let upstream = format!("origin/{branch}");
+        match self.git.merge(&upstream)? {
+            tomte_core::git::MergeStart::Clean => {
+                tomte_core::log_info!("reconcile", "merged clean");
+                let mut note = None;
+                let pushed = match self.git.push("origin") {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tomte_core::log_error!("reconcile", "push failed: {e}");
+                        append_note(&mut note, format!("merged, but push failed: {e}"));
+                        false
+                    }
+                };
+                self.rescan()?;
+                Ok(RepoReconcile::Done { pushed, note })
+            }
+            tomte_core::git::MergeStart::Conflicts(rels) => {
+                tomte_core::log_info!(
+                    "reconcile",
+                    "merge conflicts in {} file(s): {rels:?}",
+                    rels.len()
+                );
+                let source_dir = self.chezmoi.source_dir()?;
+                let mut conflicts = Vec::new();
+                for rel in rels {
+                    let read = |stage: u8| -> String {
+                        self.git
+                            .stage_blob(stage, &rel)
+                            .ok()
+                            .flatten()
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .unwrap_or_default()
+                    };
+                    let abs = source_dir.join(&rel);
+                    // Display identity: the chezmoi target when resolvable,
+                    // else the repo-relative path (e.g. .chezmoiignore).
+                    let target = self
+                        .chezmoi
+                        .target_paths(std::slice::from_ref(&abs))
+                        .ok()
+                        .and_then(|mut t| t.pop())
+                        .unwrap_or_else(|| rel.clone());
+                    conflicts.push(std::sync::Arc::new(MergeInputs {
+                        target,
+                        ours: read(2),   // our local commits ("on disk" side)
+                        theirs: read(3), // origin's commits ("source" side)
+                        base: Some(read(1)),
+                        source_path: abs,
+                        // Repo-level resolution edits SOURCE TEXT directly —
+                        // template text merges as text; no span protection.
+                        templated: false,
+                        template: None,
+                        span_map: None,
+                    }));
+                }
+                Ok(RepoReconcile::Conflicts(conflicts))
+            }
+        }
+    }
+
+    /// Persist one resolved repo conflict: write the source file, mark it
+    /// resolved in the index. The merge concludes in
+    /// [`Self::finish_repo_reconcile`] once every conflict is resolved.
+    pub fn resolve_repo_conflict(
+        &self,
+        source_path: &Path,
+        resolved: &str,
+    ) -> Result<(), ResolveError> {
+        tomte_core::log_info!("reconcile", "resolved {}", source_path.display());
+        std::fs::write(source_path, resolved)?;
+        let source_dir = self.chezmoi.source_dir()?;
+        let rel = source_path.strip_prefix(&source_dir).unwrap_or(source_path);
+        self.git.add_path(rel)?;
+        Ok(())
+    }
+
+    /// Conclude the merge (all conflicts resolved), push, rescan.
+    pub fn finish_repo_reconcile(&self) -> Result<(bool, Option<String>), ResolveError> {
+        let leftover = self.git.conflicted_files()?;
+        if !leftover.is_empty() {
+            return Err(ResolveError::Failed(format!(
+                "still conflicted: {leftover:?}"
+            )));
+        }
+        self.git.merge_commit()?;
+        tomte_core::log_info!("reconcile", "merge committed");
+        let mut note = None;
+        let pushed = match self.git.push("origin") {
+            Ok(()) => true,
+            Err(e) => {
+                tomte_core::log_error!("reconcile", "push failed: {e}");
+                append_note(&mut note, format!("reconciled, but push failed: {e}"));
+                false
+            }
+        };
+        self.rescan()?;
+        Ok((pushed, note))
+    }
+
+    /// Bail out of an in-progress reconcile; the repo returns to pre-merge.
+    pub fn abort_repo_reconcile(&self) {
+        tomte_core::log_info!("reconcile", "aborted");
+        self.git.merge_abort();
     }
 
     fn session_start(&self) -> Result<i64, ResolveError> {

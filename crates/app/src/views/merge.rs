@@ -480,6 +480,10 @@ pub struct MergeView {
     /// Target being merged: set synchronously by `load`, guards stale
     /// background results. `pub(super)` for the render-smoke tests.
     pub(super) target: Option<PathBuf>,
+    /// Repo-reconcile mode: the inputs are a mid-merge source conflict;
+    /// Save writes the SOURCE file + `git add` (no chezmoi apply), Cancel
+    /// aborts the whole merge via the Shell.
+    pub(super) repo_reconcile: bool,
     /// Background `merge_inputs::load` in flight.
     pub(super) loading: bool,
     /// Load failure (binary content, chezmoi/journal/io errors) — rendered
@@ -526,6 +530,7 @@ impl MergeView {
         Self {
             shell,
             target: None,
+            repo_reconcile: false,
             loading: false,
             error: None,
             loaded: None,
@@ -546,7 +551,24 @@ impl MergeView {
     /// (Re)load the merge inputs for `target` on the background executor.
     /// Reopening the editor is always a fresh load — earlier choices for the
     /// same file do not survive (the inputs may have changed underneath).
+    /// Present prepared repo-conflict inputs (reconcile flow): no
+    /// background load — the engine already read the merge stages.
+    pub fn present_repo_conflict(
+        &mut self,
+        inputs: std::sync::Arc<MergeInputs>,
+        cx: &mut Context<Self>,
+    ) {
+        self.target = Some(inputs.target.clone());
+        self.repo_reconcile = true;
+        self.banner = None;
+        self.saving = false;
+        self.loaded = Some(LoadedMerge::new(inputs));
+        self.rebuild_display();
+        cx.notify();
+    }
+
     pub fn load(&mut self, target: PathBuf, cx: &mut Context<Self>) {
+        self.repo_reconcile = false;
         self.target = Some(target.clone());
         self.loading = true;
         self.error = None;
@@ -763,6 +785,14 @@ impl MergeView {
 
     /// Cancel: back to Review, discarding in-editor choices.
     fn cancel(&self, cx: &mut Context<Self>) {
+        if self.repo_reconcile {
+            // Bailing out of ONE conflict bails the whole merge — a
+            // half-resolved merge state would be worse than none.
+            self.shell
+                .update(cx, |shell, cx| shell.cancel_reconcile(cx))
+                .ok();
+            return;
+        }
         self.shell
             .update(cx, |shell, cx| {
                 shell.route = Route::Review;
@@ -802,6 +832,38 @@ impl MergeView {
         self.saving = true;
         self.banner = None;
         cx.notify();
+        if self.repo_reconcile {
+            // Reconcile flow: write the SOURCE file + git add; the Shell
+            // advances to the next conflict (or concludes the merge).
+            let source_path = inputs.source_path.clone();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { engine.resolve_repo_conflict(&source_path, &resolved) })
+                    .await;
+                this.update(cx, |view, cx| {
+                    view.saving = false;
+                    match result {
+                        Ok(()) => {
+                            view.shell
+                                .update(cx, |shell, cx| shell.reconcile_conflict_saved(cx))
+                                .ok();
+                        }
+                        Err(e) => {
+                            view.banner = Some(OutcomeBanner {
+                                text: format!("could not record the resolution: {e}").into(),
+                                tint: BannerTint::Conflict,
+                                undoable: false,
+                            });
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let resolved_target = inputs.target.clone();
         cx.spawn(async move |this, cx| {
             let result = cx

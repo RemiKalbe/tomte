@@ -60,6 +60,11 @@ pub struct Shell {
     /// Expanded scan-groups in the dashboard timeline, keyed by the group's
     /// newest event timestamp (stable across refreshes).
     pub expanded_scans: std::collections::HashSet<u64>,
+    /// Repo-reconcile flow: source conflicts still awaiting resolution
+    /// (front = the one currently in the editor), and whether the start /
+    /// finish stage is running on the background executor.
+    pub reconcile_queue: Vec<std::sync::Arc<tomte_app::merge_inputs::MergeInputs>>,
+    pub reconcile_in_flight: bool,
     /// A dashboard quick action (keep disk / keep source) is running on the
     /// background executor. Lives here because the dashboard body is rebuilt
     /// from Shell state on every render (unlike the long-lived ReviewView,
@@ -102,6 +107,141 @@ impl Shell {
         merge.update(cx, |view, cx| view.load(target, cx));
         self.route = Route::Merge;
         cx.notify();
+    }
+
+    /// Kick the repo-reconcile flow: fetch + merge origin on the background
+    /// executor; clean merges finish silently, conflicts open the merge
+    /// editor one source file at a time (2026-08-18).
+    pub fn start_reconcile(&mut self, cx: &mut Context<Self>) {
+        if self.reconcile_in_flight || !self.reconcile_queue.is_empty() {
+            return;
+        }
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            return;
+        };
+        self.reconcile_in_flight = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = {
+                let engine = engine.clone();
+                cx.background_executor()
+                    .spawn(async move { engine.start_repo_reconcile() })
+                    .await
+            };
+            this.update(cx, |shell, cx| {
+                shell.reconcile_in_flight = false;
+                match result {
+                    Ok(tomte_app::resolve::RepoReconcile::Done { pushed, note }) => {
+                        shell.reconcile_finished(pushed, note, cx);
+                    }
+                    Ok(tomte_app::resolve::RepoReconcile::Conflicts(queue)) => {
+                        shell.reconcile_queue = queue;
+                        shell.present_next_reconcile(cx);
+                    }
+                    Err(e) => {
+                        tomte_core::log_error!("reconcile", "start failed: {e}");
+                        engine.abort_repo_reconcile();
+                        crate::notify_osa::notify(
+                            &tomte_core::cmd::SystemRunner,
+                            "tomte",
+                            &format!("reconcile failed: {e}"),
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The merge editor recorded a resolution for the front conflict.
+    pub fn reconcile_conflict_saved(&mut self, cx: &mut Context<Self>) {
+        if !self.reconcile_queue.is_empty() {
+            self.reconcile_queue.remove(0);
+        }
+        self.present_next_reconcile(cx);
+    }
+
+    fn present_next_reconcile(&mut self, cx: &mut Context<Self>) {
+        if let Some(inputs) = self.reconcile_queue.first().cloned() {
+            let shell = cx.weak_entity();
+            let merge = self
+                .merge
+                .get_or_insert_with(|| cx.new(|cx| MergeView::new(shell, cx)))
+                .clone();
+            merge.update(cx, |view, cx| view.present_repo_conflict(inputs, cx));
+            self.route = Route::Merge;
+            cx.notify();
+            return;
+        }
+        // Every conflict resolved: conclude the merge, push, rescan.
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            return;
+        };
+        self.reconcile_in_flight = true;
+        self.route = Route::Dashboard;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { engine.finish_repo_reconcile() })
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.reconcile_in_flight = false;
+                match result {
+                    Ok((pushed, note)) => shell.reconcile_finished(pushed, note, cx),
+                    Err(e) => {
+                        tomte_core::log_error!("reconcile", "finish failed: {e}");
+                        crate::notify_osa::notify(
+                            &tomte_core::cmd::SystemRunner,
+                            "tomte",
+                            &format!("reconcile could not conclude: {e}"),
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reconcile_finished(&mut self, pushed: bool, note: Option<String>, cx: &mut Context<Self>) {
+        self.state.update(cx, |model, cx| {
+            model.repo_diverged = None;
+            cx.notify();
+        });
+        let body = match (pushed, note) {
+            (true, None) => "source repo reconciled with origin & pushed".to_string(),
+            (_, Some(note)) => format!("source repo reconciled — {note}"),
+            (false, None) => "source repo reconciled (push pending)".to_string(),
+        };
+        crate::notify_osa::notify(&tomte_core::cmd::SystemRunner, "tomte", &body);
+    }
+
+    /// Abandon the reconcile: abort the in-progress merge, restore the repo.
+    pub fn cancel_reconcile(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_queue.clear();
+        self.route = Route::Dashboard;
+        cx.notify();
+        if let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        {
+            cx.spawn(async move |_this, cx| {
+                cx.background_executor()
+                    .spawn(async move { engine.abort_repo_reconcile() })
+                    .await;
+            })
+            .detach();
+        }
     }
 
     /// Land a successful merge save: hand the outcome banner to Review (its

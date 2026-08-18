@@ -438,6 +438,8 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                 // whenever the entity notifies.
                 cx.observe(&state, |_, _, cx| cx.notify()).detach();
                 Shell {
+                    reconcile_queue: Vec::new(),
+                    reconcile_in_flight: false,
                     route,
                     state,
                     review: None,
@@ -977,6 +979,7 @@ fn main() -> ExitCode {
             spawn_menu_command_loop(cx, menu_rx, state.clone(), paths.view_paths());
             spawn_boot_and_event_loop(cx, state.clone(), paths);
             spawn_update_loop(cx, state.clone());
+            spawn_divergence_loop(cx, state.clone());
             spawn_freshness_loop(cx, state, status);
         });
     ExitCode::SUCCESS
@@ -1011,6 +1014,55 @@ pub fn restart_to_update(staged: std::path::PathBuf, cx: &mut App) {
         Ok(_) => cx.quit(),
         Err(e) => eprintln!("tomte: cannot launch update helper: {e}"),
     }
+}
+
+/// Every minute: is the source repo diverged from origin (both sides have
+/// commits)? App-side on purpose — no protocol change, and the engine's git
+/// client is already here. Sets `model.repo_diverged` for the dashboard's
+/// Reconcile banner.
+fn spawn_divergence_loop(cx: &mut App, state: Entity<SyncModel>) {
+    cx.spawn(async move |cx| {
+        loop {
+            let engine = cx
+                .update(|cx| {
+                    cx.try_global::<EngineSlot>()
+                        .and_then(|slot| slot.0.clone())
+                })
+                .ok()
+                .flatten();
+            let diverged = match engine {
+                Some(engine) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            let branch = engine.git.head_branch().unwrap_or_else(|_| "main".into());
+                            engine
+                                .git
+                                .divergence(&format!("origin/{branch}"))
+                                .ok()
+                                .filter(|d| d.ahead > 0 && d.behind > 0)
+                                .map(|d| (d.ahead, d.behind))
+                        })
+                        .await
+                }
+                None => None,
+            };
+            let alive = cx.update(|cx| {
+                state.update(cx, |model, cx| {
+                    if model.repo_diverged != diverged {
+                        model.repo_diverged = diverged;
+                        cx.notify();
+                    }
+                });
+            });
+            if alive.is_err() {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_secs(60))
+                .await;
+        }
+    })
+    .detach();
 }
 
 /// Daily check → verified stage → `model.update_ready`. Inert in dev builds
