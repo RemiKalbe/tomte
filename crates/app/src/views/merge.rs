@@ -834,32 +834,39 @@ impl MergeView {
         cx.notify();
         if self.repo_reconcile {
             // Reconcile flow: write the SOURCE file + git add; the Shell
-            // advances to the next conflict (or concludes the merge).
+            // advances to the next conflict (or concludes the merge). The
+            // Shell hand-off happens OUTSIDE this view's update — advancing
+            // re-presents this same MergeView entity, and nesting that
+            // panicked gpui ("already being updated", 2026-08-18 crash).
             let source_path = inputs.source_path.clone();
+            let shell = self.shell.clone();
             cx.spawn(async move |this, cx| {
                 let result = cx
                     .background_executor()
                     .spawn(async move { engine.resolve_repo_conflict(&source_path, &resolved) })
                     .await;
-                this.update(cx, |view, cx| {
-                    view.saving = false;
-                    match result {
-                        Ok(()) => {
-                            view.shell
-                                .update(cx, |shell, cx| shell.reconcile_conflict_saved(cx))
-                                .ok();
-                        }
-                        Err(e) => {
+                let advance = this
+                    .update(cx, |view, cx| {
+                        view.saving = false;
+                        let ok = result.is_ok();
+                        if let Err(e) = result {
                             view.banner = Some(OutcomeBanner {
                                 text: format!("could not record the resolution: {e}").into(),
                                 tint: BannerTint::Conflict,
                                 undoable: false,
                             });
                         }
-                    }
-                    cx.notify();
-                })
-                .ok();
+                        cx.notify();
+                        ok
+                    })
+                    .unwrap_or(false);
+                if advance {
+                    let _ = cx.update(|cx| {
+                        shell
+                            .update(cx, |shell, cx| shell.reconcile_conflict_saved(cx))
+                            .ok();
+                    });
+                }
             })
             .detach();
             return;

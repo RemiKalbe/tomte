@@ -4,6 +4,22 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.8 — 2026-08-17
+
+Reconcile survives itself.
+
+### Fixed
+
+- **Crash after saving a reconcile resolution.** Advancing to the next
+  conflict re-entered the merge editor's own update and hit a GPUI
+  reentrancy panic — found via the panic now landing in the log with the
+  exact line. The hand-off is unnested.
+- **A merge interrupted mid-reconcile now resumes.** Reconcile detects an
+  in-progress merge and picks up the remaining conflicts (or concludes
+  directly when everything was already resolved) instead of failing
+  against the half-merged state.
+- The Reconcile button no longer wears accent blue on the red banner.
+
 ## 0.1.7 — 2026-08-17
 
 The missing piece: when your dotfiles repo itself diverges, Tomte can

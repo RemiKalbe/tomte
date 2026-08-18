@@ -250,6 +250,16 @@ impl GitClient {
         self.rev_parse("HEAD")
     }
 
+    /// A merge is mid-flight (MERGE_HEAD exists) — e.g. the app died
+    /// between resolving conflicts and concluding.
+    pub fn merge_in_progress(&self) -> bool {
+        self.run(
+            &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            Duration::from_secs(10),
+        )
+        .is_ok()
+    }
+
     /// Best-effort abort of an in-progress merge.
     pub fn merge_abort(&self) {
         let _ = self.run(&["merge", "--abort"], Duration::from_secs(30));

@@ -390,7 +390,9 @@ impl DashboardView {
                         theme,
                         "repo-reconcile",
                         "Reconcile…".into(),
-                        ui::ButtonVariant::Wash(theme.accent),
+                        // On the conflict-tinted banner an accent-blue wash
+                        // clashed (2026-08-18) — stay in the banner's family.
+                        ui::ButtonVariant::Outline(theme.conflict),
                         ui::ButtonSize::Sm,
                         move |_ev, _window, cx| {
                             let _ = shell.update(cx, |shell, cx| shell.start_reconcile(cx));

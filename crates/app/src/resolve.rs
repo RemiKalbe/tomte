@@ -381,6 +381,22 @@ impl ResolveEngine {
     /// EVERY resolve's push was hostage to it). Merge-based: one abortable
     /// state, and stage 2/3 map onto the editor's disk/source vocabulary.
     pub fn start_repo_reconcile(&self) -> Result<RepoReconcile, ResolveError> {
+        // Resume a merge the previous run left mid-flight (a crash between
+        // resolving and concluding, 2026-08-18): pick up the remaining
+        // conflicts — or conclude directly when everything was resolved.
+        if self.git.merge_in_progress() {
+            let leftover = self.git.conflicted_files()?;
+            tomte_core::log_info!(
+                "reconcile",
+                "resuming in-progress merge ({} conflict(s) left)",
+                leftover.len()
+            );
+            if leftover.is_empty() {
+                let (pushed, note) = self.finish_repo_reconcile()?;
+                return Ok(RepoReconcile::Done { pushed, note });
+            }
+            return Ok(RepoReconcile::Conflicts(self.conflict_inputs(leftover)?));
+        }
         tomte_core::log_info!("reconcile", "start: fetching + merging origin");
         // git merge refuses on a dirty tree; stray source edits become a
         // commit first (same policy as commit_phase after a resolve).
@@ -413,42 +429,53 @@ impl ResolveEngine {
                     "merge conflicts in {} file(s): {rels:?}",
                     rels.len()
                 );
-                let source_dir = self.chezmoi.source_dir()?;
-                let mut conflicts = Vec::new();
-                for rel in rels {
-                    let read = |stage: u8| -> String {
-                        self.git
-                            .stage_blob(stage, &rel)
-                            .ok()
-                            .flatten()
-                            .map(|b| String::from_utf8_lossy(&b).into_owned())
-                            .unwrap_or_default()
-                    };
-                    let abs = source_dir.join(&rel);
-                    // Display identity: the chezmoi target when resolvable,
-                    // else the repo-relative path (e.g. .chezmoiignore).
-                    let target = self
-                        .chezmoi
-                        .target_paths(std::slice::from_ref(&abs))
-                        .ok()
-                        .and_then(|mut t| t.pop())
-                        .unwrap_or_else(|| rel.clone());
-                    conflicts.push(std::sync::Arc::new(MergeInputs {
-                        target,
-                        ours: read(2),   // our local commits ("on disk" side)
-                        theirs: read(3), // origin's commits ("source" side)
-                        base: Some(read(1)),
-                        source_path: abs,
-                        // Repo-level resolution edits SOURCE TEXT directly —
-                        // template text merges as text; no span protection.
-                        templated: false,
-                        template: None,
-                        span_map: None,
-                    }));
-                }
-                Ok(RepoReconcile::Conflicts(conflicts))
+                Ok(RepoReconcile::Conflicts(self.conflict_inputs(rels)?))
             }
         }
+    }
+
+    /// Build merge-editor inputs for mid-merge conflicted paths from the
+    /// index stages (1 = ancestor, 2 = local commits, 3 = origin).
+    fn conflict_inputs(
+        &self,
+        rels: Vec<PathBuf>,
+    ) -> Result<Vec<std::sync::Arc<MergeInputs>>, ResolveError> {
+        let source_dir = self.chezmoi.source_dir()?;
+        let mut conflicts = Vec::new();
+        {
+            for rel in rels {
+                let read = |stage: u8| -> String {
+                    self.git
+                        .stage_blob(stage, &rel)
+                        .ok()
+                        .flatten()
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default()
+                };
+                let abs = source_dir.join(&rel);
+                // Display identity: the chezmoi target when resolvable,
+                // else the repo-relative path (e.g. .chezmoiignore).
+                let target = self
+                    .chezmoi
+                    .target_paths(std::slice::from_ref(&abs))
+                    .ok()
+                    .and_then(|mut t| t.pop())
+                    .unwrap_or_else(|| rel.clone());
+                conflicts.push(std::sync::Arc::new(MergeInputs {
+                    target,
+                    ours: read(2),   // our local commits ("on disk" side)
+                    theirs: read(3), // origin's commits ("source" side)
+                    base: Some(read(1)),
+                    source_path: abs,
+                    // Repo-level resolution edits SOURCE TEXT directly —
+                    // template text merges as text; no span protection.
+                    templated: false,
+                    template: None,
+                    span_map: None,
+                }));
+            }
+        }
+        Ok(conflicts)
     }
 
     /// Persist one resolved repo conflict: write the source file, mark it

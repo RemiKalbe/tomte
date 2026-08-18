@@ -146,11 +146,16 @@ fn conflicted_merge_resolves_through_stages_and_pushes() {
     assert_eq!(String::from_utf8_lossy(&ours), "a=local\n");
     assert_eq!(String::from_utf8_lossy(&theirs), "a=remote\n");
 
+    // Mid-merge is detectable (crash-resume relies on it) and persists
+    // through resolution until the concluding commit.
+    assert!(git.merge_in_progress());
     // Resolve, conclude, push: both histories land.
     write(&scratch.source.join("dot_testrc"), "a=resolved\n");
     git.add_path(rel).unwrap();
     assert!(git.conflicted_files().unwrap().is_empty());
+    assert!(git.merge_in_progress());
     git.merge_commit().unwrap();
+    assert!(!git.merge_in_progress());
     git.push("origin").unwrap();
     let div = git.divergence("origin/main").unwrap();
     assert_eq!((div.behind, div.ahead), (0, 0));
@@ -179,4 +184,5 @@ fn merge_abort_restores_the_branch() {
     git.merge_abort();
     assert_eq!(git.head_sha().unwrap(), sha);
     assert!(git.conflicted_files().unwrap().is_empty());
+    assert!(!git.merge_in_progress());
 }
