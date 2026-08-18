@@ -378,8 +378,11 @@ struct DiffLine {
     /// Display text: the source line minus its trailing newline.
     text: SharedString,
     tint: LineTint,
-    /// Gutter marker: " " context, "●" on the owning side's tint. Never
-    /// +/− — those mean add/delete in every diff tool, not sides.
+    /// Gutter marker: " " context, "−" source-only, "+" disk-only — the
+    /// operators keep their universal add/remove meaning (a 2-way diff
+    /// read source → disk); the TINT carries the side. 2026-08-18: dots
+    /// alone lost the added/removed signal, operators alone read as side
+    /// labels — both, color-coded, is the answer.
     marker: &'static str,
     /// Word-diff byte ranges into `text` to emphasize within changed pairs.
     highlights: Vec<Range<usize>>,
@@ -433,7 +436,7 @@ fn flatten_document(doc: &MergeDocument) -> Vec<DiffLine> {
                     out.push(DiffLine {
                         text: display_text(line).to_owned().into(),
                         tint: LineTint::Rendered,
-                        marker: "●",
+                        marker: "−",
                         highlights,
                     });
                 }
@@ -441,7 +444,7 @@ fn flatten_document(doc: &MergeDocument) -> Vec<DiffLine> {
                     out.push(DiffLine {
                         text: display_text(line).to_owned().into(),
                         tint: LineTint::Destination,
-                        marker: "●",
+                        marker: "+",
                         highlights,
                     });
                 }
@@ -1199,22 +1202,8 @@ fn diff_preview(doc: &MergeDocument, theme: Theme) -> AnyElement {
                 .items_center()
                 .gap_3()
                 .text_xs()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(div().w_1p5().h_1p5().rounded_full().bg(theme.accent))
-                        .child(div().text_color(theme.accent).child("source would write")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(div().w_1p5().h_1p5().rounded_full().bg(theme.drift))
-                        .child(div().text_color(theme.drift).child("on disk now")),
-                ),
+                .child(div().text_color(theme.accent).child("− source only"))
+                .child(div().text_color(theme.drift).child("+ disk only")),
         )
         .into_any_element()
 }
@@ -1393,8 +1382,8 @@ mod tests {
             shape(&lines),
             [
                 ("a", LineTint::Context, " "),
-                ("v = 1", LineTint::Rendered, "●"),
-                ("v = 2", LineTint::Destination, "●"),
+                ("v = 1", LineTint::Rendered, "−"),
+                ("v = 2", LineTint::Destination, "+"),
                 ("z", LineTint::Context, " "),
             ]
         );
@@ -1413,7 +1402,7 @@ mod tests {
             shape(&lines),
             [
                 ("a", LineTint::Context, " "),
-                ("x", LineTint::Destination, "●"),
+                ("x", LineTint::Destination, "+"),
                 ("b", LineTint::Context, " "),
             ]
         );
@@ -1425,7 +1414,7 @@ mod tests {
     fn flatten_deleted_on_disk_shows_rendered_only() {
         let doc = two_way("only\n", "");
         let lines = flatten_document(&doc);
-        assert_eq!(shape(&lines), [("only", LineTint::Rendered, "●")]);
+        assert_eq!(shape(&lines), [("only", LineTint::Rendered, "−")]);
     }
 
     fn done(committed: bool, pushed: bool, note: Option<&str>) -> ResolveOutcome {

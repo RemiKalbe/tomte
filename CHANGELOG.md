@@ -4,6 +4,15 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.10 — 2026-08-18
+
+### Changed
+
+- Third time's the charm for the review diff: `+`/`−` are back meaning
+  what they always mean — present/absent — and COLOR carries the side
+  (blue = source's line, amber = disk's). Legend reads "− source only ·
+  + disk only", color-matched.
+
 ## 0.1.9 — 2026-08-17
 
 ### Changed
