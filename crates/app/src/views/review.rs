@@ -378,7 +378,8 @@ struct DiffLine {
     /// Display text: the source line minus its trailing newline.
     text: SharedString,
     tint: LineTint,
-    /// Gutter marker: " " context, "−" rendered-only, "+" on-disk-only.
+    /// Gutter marker: " " context, "●" on the owning side's tint. Never
+    /// +/− — those mean add/delete in every diff tool, not sides.
     marker: &'static str,
     /// Word-diff byte ranges into `text` to emphasize within changed pairs.
     highlights: Vec<Range<usize>>,
@@ -394,8 +395,8 @@ pub(super) fn display_text(line: &str) -> &str {
 /// destination-vs-rendered:
 ///   - `Unchanged` → disk == rendered → muted context lines;
 ///   - `OursOnly`  → disk differs → `region.base` holds the lines chezmoi
-///     would render ("−", accent) and `region.ours` the lines on disk
-///     ("+", drift), with word-diff emphasis where cheap.
+///     would render (accent) and `region.ours` the lines on disk
+///     (drift), with word-diff emphasis where cheap.
 ///
 /// `TheirsOnly`, `BothSame`, and `Conflict` are unreachable while
 /// theirs == base; they are still handled (context / context / changed pair)
@@ -432,7 +433,7 @@ fn flatten_document(doc: &MergeDocument) -> Vec<DiffLine> {
                     out.push(DiffLine {
                         text: display_text(line).to_owned().into(),
                         tint: LineTint::Rendered,
-                        marker: "−",
+                        marker: "●",
                         highlights,
                     });
                 }
@@ -440,7 +441,7 @@ fn flatten_document(doc: &MergeDocument) -> Vec<DiffLine> {
                     out.push(DiffLine {
                         text: display_text(line).to_owned().into(),
                         tint: LineTint::Destination,
-                        marker: "+",
+                        marker: "●",
                         highlights,
                     });
                 }
@@ -1198,8 +1199,22 @@ fn diff_preview(doc: &MergeDocument, theme: Theme) -> AnyElement {
                 .items_center()
                 .gap_3()
                 .text_xs()
-                .child(div().text_color(theme.accent).child("− source would write"))
-                .child(div().text_color(theme.drift).child("+ on disk now")),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(div().w_1p5().h_1p5().rounded_full().bg(theme.accent))
+                        .child(div().text_color(theme.accent).child("source would write")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(div().w_1p5().h_1p5().rounded_full().bg(theme.drift))
+                        .child(div().text_color(theme.drift).child("on disk now")),
+                ),
         )
         .into_any_element()
 }
@@ -1378,8 +1393,8 @@ mod tests {
             shape(&lines),
             [
                 ("a", LineTint::Context, " "),
-                ("v = 1", LineTint::Rendered, "−"),
-                ("v = 2", LineTint::Destination, "+"),
+                ("v = 1", LineTint::Rendered, "●"),
+                ("v = 2", LineTint::Destination, "●"),
                 ("z", LineTint::Context, " "),
             ]
         );
@@ -1398,7 +1413,7 @@ mod tests {
             shape(&lines),
             [
                 ("a", LineTint::Context, " "),
-                ("x", LineTint::Destination, "+"),
+                ("x", LineTint::Destination, "●"),
                 ("b", LineTint::Context, " "),
             ]
         );
@@ -1410,7 +1425,7 @@ mod tests {
     fn flatten_deleted_on_disk_shows_rendered_only() {
         let doc = two_way("only\n", "");
         let lines = flatten_document(&doc);
-        assert_eq!(shape(&lines), [("only", LineTint::Rendered, "−")]);
+        assert_eq!(shape(&lines), [("only", LineTint::Rendered, "●")]);
     }
 
     fn done(committed: bool, pushed: bool, note: Option<&str>) -> ResolveOutcome {

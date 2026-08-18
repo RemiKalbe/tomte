@@ -4,6 +4,14 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.9 — 2026-08-17
+
+### Changed
+
+- The review diff stops abusing git's vocabulary: `+`/`−` meant sides
+  here (source vs disk), not add/delete — replaced with the app's tinted
+  side dots, in the gutter and the legend.
+
 ## 0.1.8 — 2026-08-17
 
 Reconcile survives itself.
