@@ -9,3 +9,4 @@ name = "tomte_ui"
 
 [dependencies]
 gpui.workspace = true
+unicode-segmentation.workspace = true

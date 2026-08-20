@@ -2,8 +2,9 @@
 //!
 //! Full-window takeover routed via [`Route::Merge`]: theirs (chezmoi's
 //! rendered source state) / base (last-written snapshot) / ours (disk) over a
-//! result pane assembled from per-region choices. Choice-based only — free
-//! text editing is deferred (the "open in editor" escape hatch covers it).
+//! result pane assembled from per-region choices. Each strip's "edit" opens
+//! a free-text region editor ([`tomte_ui::components::text_area`]) whose
+//! Apply lands as `Choice::Edited` — one document-undo step per session.
 //!
 //! Everything blocking — `merge_inputs::load` and the engine's
 //! `resolve_merged` — runs on the background executor and lands back in the
@@ -17,8 +18,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, KeyBinding, Rgba,
-    ScrollStrategy, SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, KeyBinding, Rgba,
+    ScrollStrategy, SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, px,
     uniform_list,
 };
 use tomte_app::merge_inputs::{self, MergeInputs};
@@ -203,7 +204,9 @@ actions!(
         PickBoth,
         NextConflict,
         UndoChoice,
-        RedoChoice
+        RedoChoice,
+        ApplyEdit,
+        CancelEdit
     ]
 );
 
@@ -219,7 +222,13 @@ pub fn register_keys(cx: &mut App) {
         KeyBinding::new("n", NextConflict, Some("MergeEditor")),
         KeyBinding::new("cmd-z", UndoChoice, Some("MergeEditor")),
         KeyBinding::new("cmd-shift-z", RedoChoice, Some("MergeEditor")),
+        // Region editor session (the root swaps its context to
+        // MergeEditorEditing while one is open, so the single-letter picks
+        // above can't shadow typing).
+        KeyBinding::new("escape", CancelEdit, Some("RegionEditor")),
+        KeyBinding::new("cmd-enter", ApplyEdit, Some("RegionEditor")),
     ]);
+    cx.bind_keys(tomte_ui::components::text_area::bindings());
 }
 
 /// What one region renders as (merge-editor-v2 spec step 3). Pure and
@@ -320,6 +329,40 @@ fn auto_choice(kind: RegionKind) -> Option<Choice> {
         RegionKind::TheirsOnly => Some(Choice::Theirs),
         RegionKind::Unchanged | RegionKind::Conflict => None,
     }
+}
+
+/// What the region editor opens with: the region's CURRENT resolution text
+/// (raw, `\n`-terminated lines — exactly what `assemble` would emit). An
+/// undecided conflict seeds disk-then-source, the `Both` order, so the user
+/// starts from all the material instead of a blank box.
+fn region_seed_text(state: &MergeState, idx: usize) -> String {
+    let doc = &state.doc;
+    let region = &doc.regions[idx];
+    let ours = || doc.ours_lines()[region.ours.clone()].concat();
+    let theirs = || doc.theirs_lines()[region.theirs.clone()].concat();
+    let effective = state
+        .resolution
+        .get(idx)
+        .cloned()
+        .or_else(|| auto_choice(region.kind));
+    match effective {
+        Some(Choice::Edited(text)) => text,
+        Some(Choice::Ours) => ours(),
+        Some(Choice::Theirs) => theirs(),
+        Some(Choice::Base) => doc.base_lines()[region.base.clone()].concat(),
+        Some(Choice::Both) => ours() + &theirs(),
+        None => ours() + &theirs(),
+    }
+}
+
+/// Regions assemble by concatenation, so a non-final region must end with a
+/// newline or it would fuse with the next region's first line. The final
+/// region stays as typed (its end is the end of the file).
+fn normalize_edited_text(mut text: String, last_region: bool) -> String {
+    if !text.is_empty() && !text.ends_with('\n') && !last_region {
+        text.push('\n');
+    }
+    text
 }
 
 /// Compute the display for region `idx` from the single source of truth.
@@ -513,7 +556,20 @@ pub struct MergeView {
     result_row_starts: Rc<Vec<usize>>,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
+    /// Open free-text edit of one region (merge-editor-v2 steps 4–7). The
+    /// panel replaces the result list; Apply funnels through [`apply`] as
+    /// `Choice::Edited`, so the whole session is ONE document-undo step.
+    editing: Option<EditSession>,
     focus_handle: FocusHandle,
+}
+
+/// One region-edit session: which region, its editor entity, and whether the
+/// region touches template-protected lines (advisory — the save-time
+/// write-back verification remains the authority).
+struct EditSession {
+    region: usize,
+    editor: Entity<ui::TextArea>,
+    protected: bool,
 }
 
 /// One document-level undo step: a choice change on one region, with the
@@ -544,6 +600,7 @@ impl MergeView {
             result_row_starts: Rc::new(Vec::new()),
             undo: Vec::new(),
             redo: Vec::new(),
+            editing: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -562,6 +619,7 @@ impl MergeView {
         self.repo_reconcile = true;
         self.banner = None;
         self.saving = false;
+        self.editing = None;
         self.loaded = Some(LoadedMerge::new(inputs));
         self.rebuild_display();
         cx.notify();
@@ -575,6 +633,7 @@ impl MergeView {
         self.loaded = None;
         self.saving = false;
         self.banner = None;
+        self.editing = None;
         cx.notify();
 
         let journal = journal_path();
@@ -686,6 +745,54 @@ impl MergeView {
         }
         self.rebuild_display();
         cx.notify();
+    }
+
+    /// Open the free-text editor for `region`, seeded with its current
+    /// resolution text. Render focuses the editor (and hands focus back on
+    /// close) — no Window needed here, so gallery poses work too.
+    pub(super) fn start_edit(&mut self, region: usize, cx: &mut Context<Self>) {
+        let Some(loaded) = &mut self.loaded else {
+            return;
+        };
+        if region >= loaded.state.doc.regions.len() {
+            return;
+        }
+        loaded.state.cursor = Some(region);
+        let seed = region_seed_text(&loaded.state, region);
+        let protected = {
+            let theirs = &loaded.state.doc.regions[region].theirs;
+            loaded.protected.keys().any(|gix| theirs.contains(gix))
+        };
+        let editor = cx.new(|cx| ui::TextArea::new(seed, cx));
+        self.editing = Some(EditSession {
+            region,
+            editor,
+            protected,
+        });
+        self.rebuild_display();
+        cx.notify();
+    }
+
+    /// Apply the edit session: normalize the trailing newline and funnel
+    /// through [`apply`] as `Choice::Edited` — one document-undo entry.
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.editing.take() else {
+            return;
+        };
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let last_region = session.region + 1 == loaded.state.doc.regions.len();
+        let text = normalize_edited_text(session.editor.read(cx).text().to_owned(), last_region);
+        self.apply(session.region, Choice::Edited(text), cx);
+    }
+
+    /// Discard the edit session; the region's prior resolution stands.
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            self.rebuild_display();
+            cx.notify();
+        }
     }
 
     /// Pick at the cursor (keybindings route here).
@@ -1102,8 +1209,9 @@ impl MergeView {
                         theme,
                     )),
             )
-            .child(
-                div()
+            .child(match &self.editing {
+                Some(session) => self.editor_panel(session, theme, cx),
+                None => div()
                     .id("merge-result-wrap")
                     .flex_1()
                     .min_h_0()
@@ -1131,7 +1239,88 @@ impl MergeView {
                         })
                         .track_scroll(self.result_scroll.clone())
                         .flex_1()
-                    }),
+                    })
+                    .into_any_element(),
+            })
+            .into_any_element()
+    }
+
+    /// The region-edit panel: replaces the result list while a session is
+    /// open (the input panes above stay for reference). Esc cancels,
+    /// ⌘↵ or the Apply button commits.
+    fn editor_panel(
+        &self,
+        session: &EditSession,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let header = div()
+            .h_7()
+            .px_2()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(Theme::wash(theme.accent, 0.06))
+            .child(
+                div()
+                    .text_color(theme.text)
+                    .child(SharedString::from(format!(
+                        "editing region {}",
+                        session.region + 1
+                    ))),
+            )
+            .child(
+                div()
+                    .text_color(theme.text_muted)
+                    .child("esc cancels · ⌘↵ applies"),
+            )
+            .when(session.protected, |el| {
+                el.child(div().text_color(theme.drift).child(
+                    "contains template-generated text — edits touching it are rejected at save",
+                ))
+            })
+            .child(div().flex_1())
+            .child(ui::button(
+                theme,
+                "edit-cancel",
+                "Cancel".into(),
+                ui::ButtonVariant::Ghost,
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.cancel_edit(cx)),
+            ))
+            .child(ui::button(
+                theme,
+                "edit-apply",
+                "Apply".into(),
+                ui::ButtonVariant::Outline(theme.accent),
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.commit_edit(cx)),
+            ));
+        div()
+            .key_context("RegionEditor")
+            .on_action(cx.listener(|view, _: &ApplyEdit, _w, cx| view.commit_edit(cx)))
+            .on_action(cx.listener(|view, _: &CancelEdit, _w, cx| view.cancel_edit(cx)))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("region-editor-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .py_1()
+                    .font_family("Menlo")
+                    .text_xs()
+                    .line_height(px(PANE_ROW_H))
+                    .child(session.editor.clone()),
             )
             .into_any_element()
     }
@@ -1156,13 +1345,27 @@ impl MergeView {
         if self.display_cache.len() != regions {
             self.rebuild_display();
         }
-        // Claim focus on arrival so the keybindings work immediately.
-        if self.loaded.is_some() && !self.focus_handle.is_focused(window) {
+        // Claim focus on arrival so the keybindings work immediately; while
+        // an edit session is open, the editor owns focus instead (and gets
+        // it back if anything steals it).
+        if let Some(session) = &self.editing {
+            let editor_focus = session.editor.read(cx).focus_handle();
+            if !editor_focus.is_focused(window) {
+                editor_focus.focus(window);
+            }
+        } else if self.loaded.is_some() && !self.focus_handle.is_focused(window) {
             self.focus_handle.focus(window);
         }
         div()
             .track_focus(&self.focus_handle)
-            .key_context("MergeEditor")
+            // While a region editor is open the root drops the MergeEditor
+            // context, so its single-letter picks (1/2/3/b/n) can't shadow
+            // typing those characters into the editor.
+            .key_context(if self.editing.is_some() {
+                "MergeEditorEditing"
+            } else {
+                "MergeEditor"
+            })
             .on_action(
                 cx.listener(|this, _: &PickDisk, _w, cx| this.pick_at_cursor(Choice::Ours, cx)),
             )
@@ -1508,8 +1711,12 @@ fn flat_row_el(
                         .ok();
                 }
             };
-            // Hand-editing lands with the TextArea integration (spec step 7).
-            let on_edit = |_: &ClickEvent, _: &mut Window, _: &mut App| {};
+            let on_edit = {
+                let view = view.clone();
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    view.update(cx, |merge, cx| merge.start_edit(idx, cx)).ok();
+                }
+            };
             let on_revisit = {
                 let view = view.clone();
                 move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -1537,8 +1744,9 @@ mod tests {
     #[allow(unused_imports)]
     use super::{};
     use super::{
-        LoadedMerge, PaneSide, RegionDisplay, line_at, merge_banner, next_target, pane_lines,
-        protected_line_info, region_at, region_display, row_bg,
+        LoadedMerge, PaneSide, RegionDisplay, line_at, merge_banner, next_target,
+        normalize_edited_text, pane_lines, protected_line_info, region_at, region_display,
+        region_seed_text, row_bg,
     };
     use gpui::SharedString;
     use std::collections::HashMap;
@@ -1585,6 +1793,57 @@ mod tests {
         }
         let ours = pane_lines(&state.doc, PaneSide::Ours, &none);
         assert_eq!(ours[1].text.as_ref(), "v = 2", "newline stripped");
+    }
+
+    #[test]
+    fn region_seed_text_reflects_the_current_resolution() {
+        let mut state = conflict_state();
+        let region = state.conflicts()[0];
+
+        // Undecided conflict: disk then source (the Both order).
+        assert_eq!(region_seed_text(&state, region), "v = 2\nv = 3\n");
+
+        state.pick(region, Choice::Theirs);
+        assert_eq!(region_seed_text(&state, region), "v = 3\n");
+
+        state.pick(region, Choice::Both);
+        assert_eq!(region_seed_text(&state, region), "v = 2\nv = 3\n");
+
+        state.pick(region, Choice::Edited("v = 9\n".into()));
+        assert_eq!(region_seed_text(&state, region), "v = 9\n");
+
+        // Auto-resolved region (no explicit pick): the engine default.
+        let auto = MergeState::new(&inputs(Some("a\nz\n"), "a\nnew\nz\n", "a\nz\n"));
+        let ours_only = auto
+            .doc
+            .regions
+            .iter()
+            .position(|r| r.kind == RegionKind::OursOnly)
+            .unwrap();
+        assert_eq!(region_seed_text(&auto, ours_only), "new\n");
+    }
+
+    #[test]
+    fn normalize_edited_text_terminates_non_final_regions() {
+        assert_eq!(normalize_edited_text("x".into(), false), "x\n");
+        assert_eq!(normalize_edited_text("x\n".into(), false), "x\n");
+        assert_eq!(
+            normalize_edited_text("x".into(), true),
+            "x",
+            "the final region may end the file without a newline"
+        );
+        assert_eq!(normalize_edited_text(String::new(), false), "");
+    }
+
+    #[test]
+    fn edited_choice_assembles_verbatim_between_regions() {
+        let mut state = conflict_state();
+        let region = state.conflicts()[0];
+        state.pick(region, Choice::Edited("v = merged by hand\n".into()));
+        assert_eq!(
+            state.assembled().as_deref(),
+            Some("a\nv = merged by hand\nz\n")
+        );
     }
 
     #[test]

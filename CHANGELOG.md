@@ -4,6 +4,21 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.12 — 2026-08-19
+
+### Added
+
+- The merge editor's "edit" button now does something: it opens a real
+  text editor for that region, seeded with the region's current
+  resolution (an undecided conflict starts as disk-then-source so all
+  the material is in front of you). Type freely — cursor keys,
+  selection, mouse, copy/paste, undo/redo (⌘Z, grouped like a real
+  editor), and IME/accent input all work. Esc cancels, ⌘↵ or Apply
+  commits the text as that region's decision; one ⌘Z at the document
+  level undoes the whole edit.
+- Regions containing template-generated text say so in the editor
+  header — the save-time verification still has the final word.
+
 ## 0.1.11 — 2026-08-18
 
 ### Changed

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/app", "crates/core", "crates/daemon", "crates/journal", "crates/proto", "crates/ui"]
 
 [workspace.package]
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 license = "MIT"
 
@@ -19,6 +19,7 @@ toml = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
 thiserror = "2"
+unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -17,6 +17,7 @@ pub mod mono;
 pub mod section;
 pub mod status;
 pub mod stepper;
+pub mod text_area;
 pub mod toolbar;
 pub mod tooltip;
 
@@ -36,5 +37,6 @@ pub use mono::*;
 pub use section::*;
 pub use status::*;
 pub use stepper::*;
+pub use text_area::TextArea;
 pub use toolbar::*;
 pub use tooltip::*;

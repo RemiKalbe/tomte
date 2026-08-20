@@ -54,6 +54,10 @@ pub const STATES: &[(&str, &str)] = &[
     ),
     ("merge-templated", "templated file with protected 🔒 spans"),
     ("merge-resolved", "all regions decided, Save enabled"),
+    (
+        "merge-editing",
+        "region editor open: free-text edit of a conflict",
+    ),
     ("merge-loading", "inputs loading"),
     ("settings", "live settings view (reads real settings/op)"),
     ("settings-menu", "settings with the account dropdown open"),
@@ -418,6 +422,22 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "merge" => {
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, conflict_inputs(), false));
+            s
+        }
+        "merge-editing" => {
+            let mut s = shell(Route::Merge, rich_model());
+            let shell_weak = cx.weak_entity();
+            let merge = cx.new(|cx| {
+                let inputs = conflict_inputs();
+                let mut view = MergeView::new(shell_weak, cx);
+                view.target = Some(inputs.target.clone());
+                let loaded = LoadedMerge::new(Arc::new(inputs));
+                let region = loaded.state.conflicts()[0];
+                view.loaded = Some(loaded);
+                view.start_edit(region, cx);
+                view
+            });
+            s.merge = Some(merge);
             s
         }
         "merge-big" => {
