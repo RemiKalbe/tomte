@@ -331,10 +331,10 @@ fn auto_choice(kind: RegionKind) -> Option<Choice> {
     }
 }
 
-/// What the region editor opens with: the region's CURRENT resolution text
-/// (raw, `\n`-terminated lines — exactly what `assemble` would emit). An
-/// undecided conflict seeds disk-then-source, the `Both` order, so the user
-/// starts from all the material instead of a blank box.
+/// One region's contribution to the editor seed: its CURRENT resolution
+/// text (raw, `\n`-terminated lines — exactly what `assemble` would emit).
+/// An undecided conflict seeds disk-then-source, the `Both` order, so the
+/// user edits from all the material instead of a blank.
 fn region_seed_text(state: &MergeState, idx: usize) -> String {
     let doc = &state.doc;
     let region = &doc.regions[idx];
@@ -351,18 +351,76 @@ fn region_seed_text(state: &MergeState, idx: usize) -> String {
         Some(Choice::Theirs) => theirs(),
         Some(Choice::Base) => doc.base_lines()[region.base.clone()].concat(),
         Some(Choice::Both) => ours() + &theirs(),
-        None => ours() + &theirs(),
+        None => match region.kind {
+            RegionKind::Conflict => ours() + &theirs(),
+            // Unchanged (and anything else undecided): one copy, not both.
+            _ => ours(),
+        },
     }
 }
 
-/// Regions assemble by concatenation, so a non-final region must end with a
-/// newline or it would fuse with the next region's first line. The final
-/// region stays as typed (its end is the end of the file).
-fn normalize_edited_text(mut text: String, last_region: bool) -> String {
-    if !text.is_empty() && !text.ends_with('\n') && !last_region {
-        text.push('\n');
+/// The whole-document editor seed: every region's current text, in order.
+/// Concatenated it IS the result as it currently stands (unresolved
+/// conflicts inlined disk-then-source).
+fn document_seed(state: &MergeState) -> Vec<String> {
+    (0..state.doc.regions.len())
+        .map(|idx| region_seed_text(state, idx))
+        .collect()
+}
+
+/// Project seed-line boundary `b` into the edited text: shift by the net
+/// line delta of every hunk strictly before it; a boundary inside a
+/// replaced hunk clamps to the hunk's start (the replacement lands in the
+/// later region — the concatenation is identical either way). An insertion
+/// exactly AT a boundary belongs to the later region too.
+fn map_line(b: usize, hunks: &[(std::ops::Range<usize>, std::ops::Range<usize>)]) -> usize {
+    let mut delta = 0isize;
+    for (before, after) in hunks {
+        if before.end <= b && before.start < b {
+            delta += after.len() as isize - before.len() as isize;
+        } else if before.start >= b {
+            break;
+        } else {
+            // before.start < b < before.end: inside the hunk.
+            return after.start;
+        }
     }
-    text
+    (b as isize + delta).max(0) as usize
+}
+
+/// Map a free-form edit of the seeded document back onto regions: line-diff
+/// seed → edited, project each region boundary through the hunks, and emit
+/// an `Edited` pick for every region whose projected text changed. The
+/// projected boundaries tile the edited text exactly, so assembling the
+/// picks reproduces what the user saw byte for byte. Untouched regions keep
+/// their state — in particular an untouched conflict stays undecided.
+fn edited_region_picks(
+    seed: &str,
+    seed_line_starts: &[usize],
+    edited: &str,
+) -> Vec<(usize, Choice)> {
+    let hunks = tomte_core::merge::line_hunks(seed, edited);
+    let seed_lines = tomte_core::merge::split_lines(seed);
+    let edited_lines = tomte_core::merge::split_lines(edited);
+    let regions = seed_line_starts.len().saturating_sub(1);
+    let mut mapped: Vec<usize> = seed_line_starts
+        .iter()
+        .map(|&b| map_line(b, &hunks).min(edited_lines.len()))
+        .collect();
+    // The sentinel is the end of the file, wherever the edit moved it —
+    // lines appended at EOF belong to the last region.
+    if let Some(last) = mapped.last_mut() {
+        *last = edited_lines.len();
+    }
+    let mut picks = Vec::new();
+    for region in 0..regions {
+        let old = seed_lines[seed_line_starts[region]..seed_line_starts[region + 1]].concat();
+        let new = edited_lines[mapped[region]..mapped[region + 1]].concat();
+        if old != new {
+            picks.push((region, Choice::Edited(new)));
+        }
+    }
+    picks
 }
 
 /// Compute the display for region `idx` from the single source of truth.
@@ -556,28 +614,35 @@ pub struct MergeView {
     result_row_starts: Rc<Vec<usize>>,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
-    /// Open free-text edit of one region (merge-editor-v2 steps 4–7). The
-    /// panel replaces the result list; Apply funnels through [`apply`] as
-    /// `Choice::Edited`, so the whole session is ONE document-undo step.
+    /// Open free-text edit of the WHOLE result (2026-08-19 feedback: "I
+    /// should be able to edit anywhere within the file"). The panel replaces
+    /// the result list; Apply diffs the text against the seed and lands the
+    /// changes on the regions they touched — one document-undo step total.
     editing: Option<EditSession>,
+    /// Scroll handle for the editor panel, so opening a session can jump the
+    /// viewport to the region whose strip was clicked.
+    editor_scroll: gpui::ScrollHandle,
     focus_handle: FocusHandle,
 }
 
-/// One region-edit session: which region, its editor entity, and whether the
-/// region touches template-protected lines (advisory — the save-time
-/// write-back verification remains the authority).
+/// One whole-document edit session: the editor entity, the text it was
+/// seeded with, per-region first-line indices into that seed (+ sentinel)
+/// for mapping the edit back onto regions, and whether the document has
+/// template-protected lines (advisory — the save-time write-back
+/// verification remains the authority).
 struct EditSession {
-    region: usize,
     editor: Entity<ui::TextArea>,
+    seed: String,
+    seed_line_starts: Vec<usize>,
     protected: bool,
 }
 
-/// One document-level undo step: a choice change on one region, with the
-/// cursor restored so undo never "jumps" (merge-editor-v2 spec).
+/// One document-level undo step: choice changes applied together (a strip
+/// pick is one; an editor Apply may touch several regions), with the cursor
+/// restored so undo never "jumps" (merge-editor-v2 spec).
 struct UndoEntry {
-    region: usize,
-    prev: Option<Choice>,
-    next: Choice,
+    /// `(region, before, after)` in application order.
+    changes: Vec<(usize, Option<Choice>, Choice)>,
     prev_cursor: Option<usize>,
 }
 
@@ -601,6 +666,7 @@ impl MergeView {
             undo: Vec::new(),
             redo: Vec::new(),
             editing: None,
+            editor_scroll: gpui::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -687,17 +753,28 @@ impl MergeView {
     /// entry, apply the choice, close any revisit, advance the cursor.
     /// Every pick path — click, keybinding, redo — lands here.
     fn apply(&mut self, region: usize, choice: Choice, cx: &mut Context<Self>) {
+        self.apply_many(vec![(region, choice)], cx);
+    }
+
+    /// Apply several picks as ONE undo step (an editor Apply can touch
+    /// many regions; a strip pick is the one-element case).
+    fn apply_many(&mut self, picks: Vec<(usize, Choice)>, cx: &mut Context<Self>) {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        let prev = loaded.state.resolution.get(region).cloned();
+        if picks.is_empty() {
+            return;
+        }
         let prev_cursor = loaded.state.cursor;
-        loaded.state.pick(region, choice.clone());
-        self.revisiting.remove(&region);
+        let mut changes = Vec::with_capacity(picks.len());
+        for (region, choice) in picks {
+            let prev = loaded.state.resolution.get(region).cloned();
+            loaded.state.pick(region, choice.clone());
+            self.revisiting.remove(&region);
+            changes.push((region, prev, choice));
+        }
         self.undo.push(UndoEntry {
-            region,
-            prev,
-            next: choice,
+            changes,
             prev_cursor,
         });
         self.redo.clear();
@@ -712,9 +789,11 @@ impl MergeView {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        match &entry.prev {
-            Some(choice) => loaded.state.resolution.set(entry.region, choice.clone()),
-            None => loaded.state.resolution.unset(entry.region),
+        for (region, prev, _next) in entry.changes.iter().rev() {
+            match prev {
+                Some(choice) => loaded.state.resolution.set(*region, choice.clone()),
+                None => loaded.state.resolution.unset(*region),
+            }
         }
         loaded.state.cursor = entry.prev_cursor;
         self.redo.push(entry);
@@ -729,7 +808,9 @@ impl MergeView {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        loaded.state.pick(entry.region, entry.next.clone());
+        for (region, _prev, next) in &entry.changes {
+            loaded.state.pick(*region, next.clone());
+        }
         self.undo.push(entry);
         self.rebuild_display();
         cx.notify();
@@ -747,9 +828,10 @@ impl MergeView {
         cx.notify();
     }
 
-    /// Open the free-text editor for `region`, seeded with its current
-    /// resolution text. Render focuses the editor (and hands focus back on
-    /// close) — no Window needed here, so gallery poses work too.
+    /// Open the free-text editor over the WHOLE document, cursor and
+    /// viewport at `region` (the strip the user clicked). Render focuses the
+    /// editor (and hands focus back on close) — no Window needed here, so
+    /// gallery poses work too.
     pub(super) fn start_edit(&mut self, region: usize, cx: &mut Context<Self>) {
         let Some(loaded) = &mut self.loaded else {
             return;
@@ -758,36 +840,58 @@ impl MergeView {
             return;
         }
         loaded.state.cursor = Some(region);
-        let seed = region_seed_text(&loaded.state, region);
-        let protected = {
-            let theirs = &loaded.state.doc.regions[region].theirs;
-            loaded.protected.keys().any(|gix| theirs.contains(gix))
-        };
-        let editor = cx.new(|cx| ui::TextArea::new(seed, cx));
+        let texts = document_seed(&loaded.state);
+        let mut seed = String::new();
+        let mut seed_line_starts = Vec::with_capacity(texts.len() + 1);
+        let mut line = 0usize;
+        let mut cursor_byte = 0usize;
+        for (idx, text) in texts.iter().enumerate() {
+            seed_line_starts.push(line);
+            if idx == region {
+                cursor_byte = seed.len();
+            }
+            line += text.split_inclusive('\n').count();
+            seed.push_str(text);
+        }
+        seed_line_starts.push(line);
+        let protected = !loaded.protected.is_empty();
+        let editor = cx.new(|cx| {
+            let mut area = ui::TextArea::new(seed.clone(), cx);
+            area.place_cursor(cursor_byte);
+            area
+        });
+        // Jump the panel viewport to the clicked region (2 context lines).
+        let y = seed_line_starts[region].saturating_sub(2) as f32 * PANE_ROW_H;
+        self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
         self.editing = Some(EditSession {
-            region,
             editor,
+            seed,
+            seed_line_starts,
             protected,
         });
         self.rebuild_display();
         cx.notify();
     }
 
-    /// Apply the edit session: normalize the trailing newline and funnel
-    /// through [`apply`] as `Choice::Edited` — one document-undo entry.
+    /// Apply the edit session: map the edited document back onto regions
+    /// (line-diff against the seed) and land every changed region as
+    /// `Choice::Edited` — one document-undo entry for the whole session.
     fn commit_edit(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.editing.take() else {
             return;
         };
-        let Some(loaded) = &self.loaded else {
+        let edited = session.editor.read(cx).text().to_owned();
+        let picks = edited_region_picks(&session.seed, &session.seed_line_starts, &edited);
+        if picks.is_empty() {
+            // Nothing changed — same as cancel.
+            self.rebuild_display();
+            cx.notify();
             return;
-        };
-        let last_region = session.region + 1 == loaded.state.doc.regions.len();
-        let text = normalize_edited_text(session.editor.read(cx).text().to_owned(), last_region);
-        self.apply(session.region, Choice::Edited(text), cx);
+        }
+        self.apply_many(picks, cx);
     }
 
-    /// Discard the edit session; the region's prior resolution stands.
+    /// Discard the edit session; every region's prior resolution stands.
     fn cancel_edit(&mut self, cx: &mut Context<Self>) {
         if self.editing.take().is_some() {
             self.rebuild_display();
@@ -1057,7 +1161,7 @@ impl MergeView {
                 .regions
                 .iter()
                 .any(|r| r.kind != RegionKind::Unchanged);
-            if changed {
+            if changed && self.editing.is_none() {
                 // Conflict-red while decisions are owed; neutral afterwards
                 // (it then walks decided/auto regions for revisiting).
                 let tint = if open > 0 { theme.conflict } else { theme.text };
@@ -1068,6 +1172,25 @@ impl MergeView {
                     ui::ButtonVariant::Outline(tint),
                     ui::ButtonSize::Sm,
                     cx.listener(|view, _ev, _window, cx| view.next(cx)),
+                ));
+            }
+            // Whole-file editing entry point that doesn't depend on any
+            // strip: opens at the focused region (or the top).
+            if self.editing.is_none() {
+                bar = bar.child(ui::button(
+                    theme,
+                    "merge-edit",
+                    "Edit".into(),
+                    ui::ButtonVariant::Outline(theme.text),
+                    ui::ButtonSize::Sm,
+                    cx.listener(|view, _ev, _window, cx| {
+                        let region = view
+                            .loaded
+                            .as_ref()
+                            .and_then(|l| l.state.cursor)
+                            .unwrap_or(0);
+                        view.start_edit(region, cx);
+                    }),
                 ));
             }
         }
@@ -1091,19 +1214,28 @@ impl MergeView {
                     .child("saving…")
                     .into_any_element()
             } else {
-                self.save_button(loaded.state.assembled().is_some(), unresolved, theme, cx)
-                    .into_any_element()
+                let editing = self.editing.is_some();
+                self.save_button(
+                    loaded.state.assembled().is_some() && !editing,
+                    unresolved,
+                    editing,
+                    theme,
+                    cx,
+                )
+                .into_any_element()
             });
         }
         bar
     }
 
-    /// Save is enabled exactly when the document is fully resolved and no
-    /// save is in flight (the plan's contract).
+    /// Save is enabled exactly when the document is fully resolved, no save
+    /// is in flight, and no edit session is pending (an open editor holds
+    /// text the resolution doesn't have yet — saving under it would lie).
     fn save_button(
         &self,
         enabled: bool,
         unresolved: usize,
+        editing: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -1117,13 +1249,18 @@ impl MergeView {
                 cx.listener(|view, _ev, _window, cx| view.save(cx)),
             )
         } else {
-            let s = if unresolved == 1 { "" } else { "s" };
+            let reason = if editing {
+                "apply or cancel the edit first".to_string()
+            } else {
+                let s = if unresolved == 1 { "" } else { "s" };
+                format!("{unresolved} conflict{s} left")
+            };
             ui::disabled_button(
                 theme,
                 "merge-save",
                 "Save".into(),
                 ui::ButtonSize::Sm,
-                Some(format!("{unresolved} conflict{s} left").into()),
+                Some(reason.into()),
             )
         }
     }
@@ -1245,9 +1382,10 @@ impl MergeView {
             .into_any_element()
     }
 
-    /// The region-edit panel: replaces the result list while a session is
-    /// open (the input panes above stay for reference). Esc cancels,
-    /// ⌘↵ or the Apply button commits.
+    /// The edit panel: the WHOLE result as one editable document, replacing
+    /// the result list while a session is open (the input panes above stay
+    /// for reference). Esc cancels, ⌘↵ or the Apply button commits; Apply
+    /// maps the edit back onto the regions it touched.
     fn editor_panel(
         &self,
         session: &EditSession,
@@ -1265,18 +1403,11 @@ impl MergeView {
             .border_b_1()
             .border_color(theme.border)
             .bg(Theme::wash(theme.accent, 0.06))
-            .child(
-                div()
-                    .text_color(theme.text)
-                    .child(SharedString::from(format!(
-                        "editing region {}",
-                        session.region + 1
-                    ))),
-            )
+            .child(div().text_color(theme.text).child("editing result"))
             .child(
                 div()
                     .text_color(theme.text_muted)
-                    .child("esc cancels · ⌘↵ applies"),
+                    .child("edit anywhere — esc cancels · ⌘↵ applies"),
             )
             .when(session.protected, |el| {
                 el.child(div().text_color(theme.drift).child(
@@ -1315,6 +1446,7 @@ impl MergeView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.editor_scroll)
                     .px_2()
                     .py_1()
                     .font_family("Menlo")
@@ -1744,9 +1876,9 @@ mod tests {
     #[allow(unused_imports)]
     use super::{};
     use super::{
-        LoadedMerge, PaneSide, RegionDisplay, line_at, merge_banner, next_target,
-        normalize_edited_text, pane_lines, protected_line_info, region_at, region_display,
-        region_seed_text, row_bg,
+        LoadedMerge, PaneSide, RegionDisplay, document_seed, edited_region_picks, line_at,
+        map_line, merge_banner, next_target, pane_lines, protected_line_info, region_at,
+        region_display, region_seed_text, row_bg,
     };
     use gpui::SharedString;
     use std::collections::HashMap;
@@ -1821,18 +1953,111 @@ mod tests {
             .position(|r| r.kind == RegionKind::OursOnly)
             .unwrap();
         assert_eq!(region_seed_text(&auto, ours_only), "new\n");
+
+        // Unchanged context seeds ONE copy, never ours+theirs.
+        let state = conflict_state();
+        let unchanged = state
+            .doc
+            .regions
+            .iter()
+            .position(|r| r.kind == RegionKind::Unchanged)
+            .unwrap();
+        assert_eq!(region_seed_text(&state, unchanged), "a\n");
+    }
+
+    /// Build the whole-document seed + per-region line starts the way
+    /// `start_edit` does.
+    fn seeded(state: &MergeState) -> (String, Vec<usize>) {
+        let texts = document_seed(state);
+        let mut seed = String::new();
+        let mut starts = Vec::with_capacity(texts.len() + 1);
+        let mut line = 0usize;
+        for text in &texts {
+            starts.push(line);
+            line += text.split_inclusive('\n').count();
+            seed.push_str(text);
+        }
+        starts.push(line);
+        (seed, starts)
     }
 
     #[test]
-    fn normalize_edited_text_terminates_non_final_regions() {
-        assert_eq!(normalize_edited_text("x".into(), false), "x\n");
-        assert_eq!(normalize_edited_text("x\n".into(), false), "x\n");
+    fn document_seed_concatenates_to_the_current_result() {
+        let state = conflict_state();
+        let (seed, starts) = seeded(&state);
+        // Context + inlined conflict (disk then source) + context.
+        assert_eq!(seed, "a\nv = 2\nv = 3\nz\n");
+        assert_eq!(starts, vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn map_line_shifts_clamps_and_pins() {
+        // One replacement hunk: seed lines 1..2 became edited lines 1..3.
+        let hunks = vec![(1..2, 1..3)];
+        assert_eq!(map_line(0, &hunks), 0);
+        assert_eq!(map_line(1, &hunks), 1, "boundary at hunk start stays");
+        assert_eq!(map_line(2, &hunks), 3, "boundary after hunk shifts");
+        // A boundary inside a replaced hunk clamps to the hunk start.
+        let hunks = vec![(1..4, 1..2)];
+        assert_eq!(map_line(2, &hunks), 1);
+        assert_eq!(map_line(3, &hunks), 1);
+        assert_eq!(map_line(4, &hunks), 2);
+        // Insertion exactly AT a boundary belongs to the later region:
+        // the boundary itself does not shift.
+        let hunks = vec![(2..2, 2..4)];
+        assert_eq!(map_line(2, &hunks), 2);
+        assert_eq!(map_line(3, &hunks), 5);
+    }
+
+    #[test]
+    fn edited_picks_land_on_the_touched_regions_only() {
+        // Two separated edits (an unchanged line between keeps the hunks
+        // distinct): a context rewrite and a conflict resolution.
+        let mut state = MergeState::new(&inputs(
+            Some("a\nb\nv = 1\nz\n"),
+            "a\nb\nv = 2\nz\n",
+            "a\nb\nv = 3\nz\n",
+        ));
+        let (seed, starts) = seeded(&state);
+        assert_eq!(seed, "a\nb\nv = 2\nv = 3\nz\n");
+        let edited = "a = 0\nb\nv = merged\nz\n";
+        let picks = edited_region_picks(&seed, &starts, edited);
         assert_eq!(
-            normalize_edited_text("x".into(), true),
-            "x",
-            "the final region may end the file without a newline"
+            picks,
+            vec![
+                (0, Choice::Edited("a = 0\nb\n".into())),
+                (1, Choice::Edited("v = merged\n".into())),
+            ]
         );
-        assert_eq!(normalize_edited_text(String::new(), false), "");
+        // Applying the picks assembles EXACTLY what the user saw.
+        for (region, choice) in picks {
+            state.pick(region, choice);
+        }
+        assert_eq!(state.assembled().as_deref(), Some(edited));
+    }
+
+    #[test]
+    fn untouched_conflict_stays_undecided_after_an_edit_elsewhere() {
+        let state = conflict_state();
+        let (seed, starts) = seeded(&state);
+        let edited = "a changed\nv = 2\nv = 3\nz\n";
+        let picks = edited_region_picks(&seed, &starts, edited);
+        assert_eq!(picks, vec![(0, Choice::Edited("a changed\n".into()))]);
+        // Region 1 (the conflict) got no pick — Save stays gated on it.
+    }
+
+    #[test]
+    fn edited_picks_round_trip_appends_deletions_and_boundary_joins() {
+        // Appending at EOF lands in the last region; deleting a whole
+        // region empties it; the total always reassembles byte-exact.
+        let mut state = conflict_state();
+        let (seed, starts) = seeded(&state);
+        let edited = "v = merged\nz\nz2\ntail\n";
+        let picks = edited_region_picks(&seed, &starts, edited);
+        for (region, choice) in picks {
+            state.pick(region, choice);
+        }
+        assert_eq!(state.assembled().as_deref(), Some(edited));
     }
 
     #[test]

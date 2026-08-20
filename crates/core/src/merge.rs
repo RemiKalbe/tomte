@@ -63,6 +63,24 @@ fn side_hunks(base: &[&str], side: &[&str]) -> Vec<Hunk> {
     diff.hunks().collect()
 }
 
+/// Line-index hunks between two texts (`before` → `after`), for callers
+/// that must project positions across a free-form edit — the merge editor's
+/// whole-document Apply maps region boundaries through these.
+pub fn line_hunks(before: &str, after: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let b = split_lines(before);
+    let a = split_lines(after);
+    let input = InternedInput::new(SliceTokens(&b), SliceTokens(&a));
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.hunks()
+        .map(|h| {
+            (
+                h.before.start as usize..h.before.end as usize,
+                h.after.start as usize..h.after.end as usize,
+            )
+        })
+        .collect()
+}
+
 /// Ranges "touch" if they overlap or are adjacent — adjacency clusters
 /// same-point insertions from both sides into a conflict (conservative).
 fn touches(a: &Range<u32>, b: &Range<u32>) -> bool {

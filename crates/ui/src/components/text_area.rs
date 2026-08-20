@@ -212,6 +212,14 @@ impl TextArea {
         self.focus_handle.clone()
     }
 
+    /// Collapse the selection to a caret at byte `offset` (clamped). Callers
+    /// pass char-boundary offsets — region starts are line starts.
+    pub fn place_cursor(&mut self, offset: usize) {
+        let offset = offset.min(self.content.len());
+        self.selected_range = offset..offset;
+        self.selection_reversed = false;
+    }
+
     // ---- movement ------------------------------------------------------
 
     fn cursor_offset(&self) -> usize {

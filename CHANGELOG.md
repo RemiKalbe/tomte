@@ -4,6 +4,21 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.13 — 2026-08-20
+
+### Changed
+
+- Editing in the merge editor is now whole-file, not per-region
+  (yesterday's version was too narrow): "edit" — on any strip, or the
+  new header button — opens the ENTIRE result as one editable
+  document, cursor on the region you came from. Edit any line
+  anywhere. On Apply your changes are mapped back to the regions they
+  touched, so the decision strips, revisiting, and per-step undo keep
+  working — and a conflict you didn't touch still asks for its
+  decision. One ⌘Z undoes the whole apply.
+- Save is disabled while an edit is open ("apply or cancel the edit
+  first") so it can never silently ignore text you're still typing.
+
 ## 0.1.12 — 2026-08-19
 
 ### Added
