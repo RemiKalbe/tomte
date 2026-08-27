@@ -46,7 +46,7 @@ pub const STATES: &[(&str, &str)] = &[
     ("merge", "three-pane editor with unresolved conflicts"),
     (
         "merge-auto",
-        "no conflicts: auto-merged regions, overridable strips",
+        "no conflicts: auto-resolved regions, overridable strips",
     ),
     (
         "merge-big",
@@ -59,6 +59,7 @@ pub const STATES: &[(&str, &str)] = &[
         "region editor open: free-text edit of a conflict",
     ),
     ("merge-loading", "inputs loading"),
+    ("changelog", "the changelog window body, markdown-rendered"),
     ("settings", "live settings view (reads real settings/op)"),
     ("settings-menu", "settings with the account dropdown open"),
     (
@@ -92,7 +93,10 @@ pub fn states() -> Vec<(String, &'static str)> {
 /// so the screenshot is mostly component.
 pub fn window_size(name: &str) -> gpui::Size<gpui::Pixels> {
     use gpui::{px, size};
-    if name.starts_with("comp:") {
+    if name == "comp:buttons" {
+        // The lab is a tall page of scenes — give it a real window.
+        size(px(1100.), px(900.))
+    } else if name.starts_with("comp:") {
         size(px(560.), px(640.))
     } else {
         size(px(980.), px(640.))
@@ -334,6 +338,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         expanded_scans: HashSet::new(),
         dashboard_action_in_flight: false,
         unlock_in_flight: false,
+        changelog: None,
     };
 
     // Component previews: bare Shell routed at the preview (no posed data).
@@ -447,6 +452,15 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             let mut ours = String::new();
             let mut theirs = String::new();
             let mut template = String::new();
+            // One deliberately over-long line so horizontal scrolling has
+            // something to scroll (2026-08-26).
+            {
+                let long = format!("long_line = \"{}\"\n", "x".repeat(400));
+                base.push_str(&long);
+                ours.push_str(&long);
+                theirs.push_str(&long);
+                template.push_str(&long);
+            }
             for i in 0..100 {
                 // 4 context lines per stanza
                 for j in 0..4 {
@@ -530,6 +544,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             s.merge = Some(posed_merge(cx, conflict_inputs(), true));
             s
         }
+        "changelog" => shell(Route::Changelog, rich_model()),
         "merge-loading" => {
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge_loading(cx));

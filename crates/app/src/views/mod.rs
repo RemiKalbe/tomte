@@ -1,6 +1,7 @@
 //! Shell: left sidebar navigation (Zed settings-window shape — fixed-width
 //! panel, bordered, compact nav rows) over a routed content pane.
 
+pub mod changelog;
 pub mod dashboard;
 pub mod fixtures;
 pub mod merge;
@@ -33,6 +34,8 @@ pub enum Route {
     /// Full-window merge editor (plan 7 Task 3). Not a sidebar item — entered
     /// via Review's "Open merge editor", left via Cancel/Save.
     Merge,
+    /// Gallery-only: the changelog window's body, so it can be screenshot.
+    Changelog,
     /// Gallery-only: one isolated component preview (`--gallery comp:<name>`),
     /// rendered without the sidebar in a small window. Never reachable from
     /// the app's own navigation.
@@ -73,6 +76,8 @@ pub struct Shell {
     /// The 1Password unlock probe (degraded-banner button) is waiting on the
     /// user's approval.
     pub unlock_in_flight: bool,
+    /// Gallery-only changelog view, kept so its scroll position survives.
+    pub changelog: Option<Entity<changelog::ChangelogView>>,
 }
 
 impl Shell {
@@ -387,6 +392,17 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        // The changelog is a popup: no sidebar, no chrome, just the document.
+        // Created ONCE and kept — building the view per frame reset the
+        // scroll position every frame, so the page could not be scrolled.
+        if self.route == Route::Changelog {
+            let view = self.changelog.get_or_insert_with(|| {
+                cx.new(|_| {
+                    changelog::ChangelogView::new("Tomte — changelog", changelog::BUNDLED_CHANGELOG)
+                })
+            });
+            return view.clone().into_any_element();
+        }
         if let Route::Component(name) = self.route {
             return div()
                 .size_full()
@@ -416,6 +432,14 @@ impl Render for Shell {
                     .flex()
                     .flex_col()
                     .child(match self.route {
+                        Route::Changelog => cx
+                            .new(|_| {
+                                changelog::ChangelogView::new(
+                                    "Tomte — changelog",
+                                    changelog::BUNDLED_CHANGELOG,
+                                )
+                            })
+                            .into_any_element(),
                         Route::Dashboard => DashboardView {
                             state: self.state.clone(),
                             now_ts: dashboard::system_now,
@@ -554,6 +578,7 @@ mod render_smoke {
                     expanded_scans,
                     dashboard_action_in_flight: false,
                     unlock_in_flight: false,
+                    changelog: None,
                 }
             });
             vis.run_until_parked();
@@ -613,6 +638,7 @@ mod render_smoke {
                     // shell flag is up (the drifted row is in the timeline)
                     dashboard_action_in_flight: in_flight,
                     unlock_in_flight: false,
+                    changelog: None,
                 }
             });
             vis.run_until_parked();
@@ -633,6 +659,7 @@ mod render_smoke {
                 expanded_scans: HashSet::new(),
                 dashboard_action_in_flight: true,
                 unlock_in_flight: false,
+                changelog: None,
             }
         });
         vis.run_until_parked();
@@ -659,6 +686,7 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     dashboard_action_in_flight: false,
                     unlock_in_flight: false,
+                    changelog: None,
                 }
             });
             vis.run_until_parked();
@@ -771,6 +799,7 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     dashboard_action_in_flight: false,
                     unlock_in_flight: false,
+                    changelog: None,
                 }
             });
             vis.run_until_parked();

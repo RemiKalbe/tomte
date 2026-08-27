@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, Context, Corner, Div, ElementId, FontWeight, SharedString, Stateful, Window,
-    anchored, deferred, div, point, prelude::*, px,
+    AnyElement, Context, Corner, Div, ElementId, SharedString, Stateful, Window, anchored,
+    deferred, div, point, prelude::*, px,
 };
 use tomte_app::theme::Theme;
 use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
@@ -431,7 +431,7 @@ impl SettingsView {
                 theme,
                 "save-settings",
                 "Save".into(),
-                ui::ButtonVariant::Outline(theme.accent),
+                ui::ButtonVariant::Ring(theme.accent),
                 ui::ButtonSize::Md,
                 cx.listener(|view, _ev, _window, cx| view.write_settings(cx)),
             )
@@ -811,7 +811,6 @@ impl SettingsView {
     fn updates_row(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
         use tomte_app::update::{BUILT_TEAM_ID, CURRENT_VERSION, running_bundle};
         let ready = self.state.read(cx).update_ready.clone();
-        let notes = ready.as_ref().and_then(|u| u.notes.clone());
         let enabled = BUILT_TEAM_ID.is_some()
             && std::env::current_exe()
                 .ok()
@@ -831,13 +830,13 @@ impl SettingsView {
                 (None, None) => SharedString::from(format!("Tomte {CURRENT_VERSION}")),
             })
             .into_any_element();
-        let control: AnyElement = if let Some(u) = ready {
+        let control: AnyElement = if let Some(u) = ready.clone() {
             let staged = u.staged.clone();
             ui::button(
                 theme,
                 "update-restart",
                 format!("Restart to update to {}", u.version).into(),
-                ui::ButtonVariant::Wash(theme.accent),
+                ui::ButtonVariant::Tonal(theme.accent),
                 ui::ButtonSize::Sm,
                 move |_ev, _window, cx| crate::restart_to_update(staged.clone(), cx),
             )
@@ -863,59 +862,61 @@ impl SettingsView {
                 theme,
                 "update-check",
                 "Check for updates".into(),
-                ui::ButtonVariant::Outline(theme.text),
+                ui::ButtonVariant::Tonal(theme.text_muted),
                 ui::ButtonSize::Sm,
                 cx.listener(|view, _ev, _window, cx| view.run_update_check(cx)),
             )
             .into_any_element()
         };
-        let row = setting_row(
+        // No release notes inline (2026-08-27): a wall of half-rendered
+        // markdown in a settings row helped nobody. The button opens the
+        // whole thing, properly rendered, in a window of its own.
+        let control = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(self.changelog_button(ready.as_ref(), theme))
+            .child(control)
+            .into_any_element();
+        setting_row(
             theme,
             "Application updates",
             Some(description),
             control,
             false,
-        );
-        // Release notes for the staged version: what you get by restarting,
-        // readable BEFORE committing to it. Plain text (the GitHub release
-        // body), quiet block, capped — the release page has the full story.
-        let Some(notes) = notes else { return row };
-        const MAX_LINES: usize = 14;
-        let lines: Vec<&str> = notes.lines().collect();
-        let clipped = lines.len() > MAX_LINES;
-        div().flex().flex_col().child(row).child(
-            div()
-                .mb_3()
-                .p_3()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .bg(Theme::wash(theme.text_muted, 0.04))
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .text_xs()
-                .text_color(theme.text)
-                .children(lines.into_iter().take(MAX_LINES).map(|l| {
-                    // Markdown-lite: #/### headings render medium-weight,
-                    // "- " bullets become "• ", **markers** are stripped
-                    // (weight-per-span isn't worth a markdown engine here).
-                    let heading = l.starts_with('#');
-                    let mut text = l.trim_start_matches('#').trim().replace("**", "");
-                    if let Some(rest) = text.strip_prefix("- ") {
-                        text = format!("•  {rest}");
-                    }
-                    div()
-                        .when(heading, |el| el.font_weight(FontWeight::MEDIUM))
-                        .child(SharedString::from(text))
-                }))
-                .when(clipped, |el| {
-                    el.child(
-                        div()
-                            .text_color(theme.text_muted)
-                            .child("… full notes on the GitHub release"),
-                    )
-                }),
+        )
+    }
+
+    /// "Changelog" — the staged release's notes when an update is waiting,
+    /// otherwise this build's own bundled history.
+    fn changelog_button(
+        &self,
+        ready: Option<&tomte_app::update::StagedUpdate>,
+        theme: Theme,
+    ) -> impl IntoElement + use<> {
+        let (label, title, source) = match ready {
+            Some(u) if u.notes.as_ref().is_some_and(|n| !n.trim().is_empty()) => (
+                // No version in the label: the row's description and the
+                // restart button next to it both already name it.
+                "What's new".into(),
+                SharedString::from(format!("Tomte {} — release notes", u.version)),
+                u.notes.clone().unwrap_or_default(),
+            ),
+            _ => (
+                "Changelog".into(),
+                "Tomte — changelog".into(),
+                super::changelog::BUNDLED_CHANGELOG.to_string(),
+            ),
+        };
+        ui::button(
+            theme,
+            "open-changelog",
+            label,
+            ui::ButtonVariant::Tonal(theme.text_muted),
+            ui::ButtonSize::Sm,
+            move |_ev, _window, cx| {
+                super::changelog::open_changelog(title.clone(), source.clone(), cx);
+            },
         )
     }
 

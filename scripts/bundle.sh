@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a release Tomte.app (LSUIElement) containing the app and the daemon.
+# Build a release Tomte.app containing the app and the daemon.
 #
 # Signing (env):
 #   SIGN_IDENTITY  "Developer ID Application: …"  — real signing + hardened

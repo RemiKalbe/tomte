@@ -58,7 +58,7 @@ pub(super) fn degraded_remedy(hint: &str) -> Option<DegradedRemedy> {
 }
 
 /// Moved to tomte-ui; re-exported so sibling views keep their import paths.
-pub(super) use tomte_ui::components::{TextTooltip, shorten_home};
+pub(super) use tomte_ui::components::shorten_home;
 
 /// One flattened display line for the uniform list.
 enum Line {
@@ -325,7 +325,7 @@ impl DashboardView {
                             theme,
                             "degraded-unlock-1p",
                             "Unlock 1Password".into(),
-                            ui::ButtonVariant::Outline(theme.drift),
+                            ui::ButtonVariant::Solid(theme.drift),
                             ui::ButtonSize::Micro,
                             {
                                 let shell = shell.clone();
@@ -342,7 +342,7 @@ impl DashboardView {
                             theme,
                             "degraded-open-settings",
                             "Open Settings".into(),
-                            ui::ButtonVariant::Outline(theme.drift),
+                            ui::ButtonVariant::Solid(theme.drift),
                             ui::ButtonSize::Micro,
                             move |_event, _window, cx| {
                                 let _ = shell.update(cx, |shell, cx| {
@@ -392,7 +392,7 @@ impl DashboardView {
                         "Reconcile…".into(),
                         // On the conflict-tinted banner an accent-blue wash
                         // clashed (2026-08-18) — stay in the banner's family.
-                        ui::ButtonVariant::Outline(theme.conflict),
+                        ui::ButtonVariant::Solid(theme.conflict),
                         ui::ButtonSize::Sm,
                         move |_ev, _window, cx| {
                             let _ = shell.update(cx, |shell, cx| shell.start_reconcile(cx));
@@ -612,7 +612,7 @@ fn fetch_now_button(
             theme,
             "tile-fetch-now",
             label,
-            ui::ButtonVariant::Wash(theme.accent),
+            ui::ButtonVariant::Ring(theme.accent),
             ui::ButtonSize::Sm,
             move |_event, _window, cx| {
                 let engine = engine.clone();
@@ -701,7 +701,7 @@ fn review_link(theme: Theme, drifted: usize, shell: WeakEntity<Shell>) -> gpui::
         theme,
         "tile-review",
         format!("Review {drifted} →").into(),
-        ui::ButtonVariant::Wash(theme.accent),
+        ui::ButtonVariant::Ring(theme.accent),
         ui::ButtonSize::Sm,
         move |_event, _window, cx| {
             let _ = shell.update(cx, |shell, cx| {
@@ -959,7 +959,7 @@ fn quick_action_button(
         theme,
         id,
         action.label().into(),
-        ui::ButtonVariant::Outline(theme.accent),
+        ui::ButtonVariant::Tonal(theme.accent),
         ui::ButtonSize::Micro,
         move |_event, _window, cx| {
             // The row underneath opens Review on click — quick actions must

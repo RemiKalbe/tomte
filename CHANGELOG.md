@@ -4,6 +4,87 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.14 — 2026-08-27
+
+The merge editor became a real editor, every code surface became selectable
+and scrollable, and the buttons stopped looking like 2009.
+
+### Added
+
+- **Select and copy text anywhere.** The three merge panes, the merge
+  result, and the review diff are all real editors now (read-only where
+  they should be), so you can select a line and copy it instead of
+  retyping it.
+- **Horizontal scrolling** in every code surface. Long lines no longer
+  vanish past the right edge with no way to reach them.
+- **Draggable panels.** Every structural divider is a grab handle: the two
+  dividers between the merge editor's three panes, the split between the
+  panes and the result, the review file queue, and the review History
+  section. Each keeps a sane minimum so nothing collapses out of reach.
+- **A changelog window.** Settings → Updates has a Changelog button that
+  opens the whole document in its own window, rendered as markdown —
+  headings, nested lists, code, quotes, links. It reads the changelog
+  compiled into the app, so it works offline. When an update is staged the
+  button becomes "What's new" and shows that release's notes instead.
+- **Template provenance on hover** in the merge editor: the `{}` marker
+  says a line is generated, and hovering says by which template
+  expression — now in the result pane as well as the source pane.
+
+### Changed
+
+- **The merge result IS the editor.** It used to be a read-only list that
+  a separate editor replaced when you pressed "edit". Now there is one
+  surface: read-only by default with the decision strips riding inside it,
+  and "edit" flips that same surface editable in place. Nothing swaps,
+  nothing jumps — toggling edit keeps the line you were looking at exactly
+  where it was.
+- **Decision strips** are inset cards (after Zed's multibuffer headers): a
+  state dot and label on the left, actions on the trailing edge, a hairline
+  border that turns red on the conflict you owe a decision on. A region
+  that needed no decision now reads "auto-resolved" rather than
+  "auto-merged" — nothing was merged, it was resolved for you.
+- **Buttons, everywhere.** Hard full-strength 1px borders are gone. The
+  variant is now chosen by the surface a button sits on: a tonal field on
+  the plain background, a faint same-tint ring inside a bordered container,
+  a solid fill on a tinted banner, and quiet for tertiary actions. Neutral
+  actions are muted rather than foreground-strength — "Open merge editor"
+  in particular was shouting.
+- **The review diff** uses the merge editor's vocabulary: each changed row
+  sits on its side's tinted field with a rail down its edge, context is
+  dimmed, and the side dots are gone (the field and rail already say which
+  side a row is). The footer legend now shows miniatures of the row
+  treatment instead of dots.
+- **Review header actions** carry their side's colour — Keep disk amber,
+  Keep source blue — while "Open merge editor" is deliberately uncoloured,
+  since it doesn't act on a side.
+- **Tomte is a regular macOS app.** It was configured as a menu-bar
+  accessory, which is why it never appeared in ⌘-Tab or the Dock — and why
+  a full menu bar could hide the status icon and leave no way in at all.
+  It now appears in both; the status item stays, it just isn't the only
+  door. Clicking the Dock icon brings the window back, and the menu items
+  raise the existing window instead of opening another one.
+- Settings no longer prints a truncated slab of release notes with "… full
+  notes on the GitHub release" underneath. Nothing shows by default; the
+  button opens the real thing.
+
+### Fixed
+
+- Horizontal scrolling did not work at all — the editor always asked for
+  exactly its container's width, so there was never anything to scroll.
+- Decision strips and state pills drifted thousands of pixels off-screen
+  once a document was wider than the pane; both now pin to the visible
+  area.
+- The "auto · disk" style pills were translucent, so code showed through
+  and the label was unreadable.
+- Strip buttons sat flush against the card's border with no breathing room.
+- The merge editor's text fell back to the UI font instead of Menlo.
+- Scroll sync between the input panes and the result stopped working when
+  the result became an editor; it is rebuilt through region geometry, which
+  the decision-strip blocks made necessary.
+- The border between the sidebar and the content had doubled in width.
+- The changelog window could not be scrolled, carried the app sidebar, and
+  printed its title twice.
+
 ## 0.1.13 — 2026-08-20
 
 ### Changed

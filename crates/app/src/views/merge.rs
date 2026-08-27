@@ -2,9 +2,12 @@
 //!
 //! Full-window takeover routed via [`Route::Merge`]: theirs (chezmoi's
 //! rendered source state) / base (last-written snapshot) / ours (disk) over a
-//! result pane assembled from per-region choices. Each strip's "edit" opens
-//! a free-text region editor ([`tomte_ui::components::text_area`]) whose
-//! Apply lands as `Choice::Edited` — one document-undo step per session.
+//! result pane. The result IS a persistent [`tomte_ui::TextArea`]
+//! (2026-08-22, Zed's conflict-view model): read-only by default so every
+//! line is selectable, with the decision strips riding INSIDE it as blocks
+//! above each changed region. "edit" flips the same editor editable in
+//! place — no view swap; Apply line-diffs the text back onto the regions it
+//! touched as `Choice::Edited` (one document-undo step).
 //!
 //! Everything blocking — `merge_inputs::load` and the engine's
 //! `resolve_merged` — runs on the background executor and lands back in the
@@ -19,8 +22,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, KeyBinding, Rgba,
-    ScrollStrategy, SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, px,
-    uniform_list,
+    SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, px,
 };
 use tomte_app::merge_inputs::{self, MergeInputs};
 use tomte_app::merge_state::MergeState;
@@ -388,6 +390,145 @@ fn map_line(b: usize, hunks: &[(std::ops::Range<usize>, std::ops::Range<usize>)]
     (b as isize + delta).max(0) as usize
 }
 
+/// Project every region boundary of the seed into `edited` (identity when
+/// the text is untouched, else through the line diff), with the sentinel
+/// pinned to the end so appended lines belong to the last region.
+fn mapped_boundaries(seed: &str, seed_line_starts: &[usize], edited: &str) -> Vec<usize> {
+    if edited == seed {
+        return seed_line_starts.to_vec();
+    }
+    let hunks = tomte_core::merge::line_hunks(seed, edited);
+    let edited_len = tomte_core::merge::split_lines(edited).len();
+    let mut mapped: Vec<usize> = seed_line_starts
+        .iter()
+        .map(|&b| map_line(b, &hunks).min(edited_len))
+        .collect();
+    if let Some(last) = mapped.last_mut() {
+        *last = edited_len;
+    }
+    mapped
+}
+
+/// The editor's per-line decorations (Zed's conflict-view idiom: provenance
+/// washes and rails live IN the buffer and follow it as it changes). Each
+/// region shows its result-pane pattern while its text matches the seed;
+/// the moment it diverges the whole region reads as "edited" (ok-green).
+fn editor_decors(
+    theme: Theme,
+    seed: &str,
+    seed_line_starts: &[usize],
+    patterns: &[Vec<ui::text_area::LineDecor>],
+    content: &str,
+) -> Vec<ui::text_area::LineDecor> {
+    let seed_lines = tomte_core::merge::split_lines(seed);
+    let edited_lines = tomte_core::merge::split_lines(content);
+    let mapped = mapped_boundaries(seed, seed_line_starts, content);
+    let mut out = vec![ui::text_area::LineDecor::default(); edited_lines.len()];
+    for region in 0..seed_line_starts.len().saturating_sub(1) {
+        let old = seed_lines[seed_line_starts[region]..seed_line_starts[region + 1]].concat();
+        let new = edited_lines[mapped[region]..mapped[region + 1]].concat();
+        let untouched = old == new;
+        for (k, row) in (mapped[region]..mapped[region + 1]).enumerate() {
+            out[row] = if untouched {
+                patterns
+                    .get(region)
+                    .and_then(|p| p.get(k))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                ui::text_area::LineDecor {
+                    bg: Some(Theme::wash(theme.ok, 0.07)),
+                    label: (k == 0).then(|| ("edited".into(), theme.ok)),
+                    ..Default::default()
+                }
+            };
+        }
+    }
+    out
+}
+
+/// One region's untouched decoration pattern, mirroring the result pane
+/// exactly: muted context, tinted+railed provenance blocks for open
+/// conflicts (with the protected `{}` gutter), side washes for decided and
+/// auto regions with a pill naming the current state.
+fn region_pattern(
+    state: &MergeState,
+    protected: &HashMap<usize, SharedString>,
+    theme: Theme,
+    idx: usize,
+) -> Vec<ui::text_area::LineDecor> {
+    use ui::text_area::LineDecor;
+    let doc = &state.doc;
+    let region = &doc.regions[idx];
+    let explicit = state.resolution.get(idx).cloned();
+    let auto = explicit.is_none();
+    let effective = explicit.or_else(|| auto_choice(region.kind));
+    match effective {
+        None if region.kind == RegionKind::Conflict => {
+            let mut rows = Vec::new();
+            for k in 0..region.ours.len() {
+                rows.push(LineDecor {
+                    bg: Some(Theme::wash(theme.drift, 0.07)),
+                    rail: Some(theme.drift),
+                    label: (k == 0).then(|| ("on disk".into(), theme.drift)),
+                    ..Default::default()
+                });
+            }
+            for k in 0..region.theirs.len() {
+                let prot = protected.contains_key(&(region.theirs.start + k));
+                let tip = protected.get(&(region.theirs.start + k)).cloned();
+                rows.push(LineDecor {
+                    bg: Some(if prot {
+                        Theme::wash(theme.drift, 0.15)
+                    } else {
+                        Theme::wash(theme.accent, 0.07)
+                    }),
+                    rail: Some(theme.accent),
+                    gutter: prot.then(|| ("{}".into(), theme.drift)),
+                    tooltip: tip,
+                    label: (k == 0).then(|| ("source".into(), theme.accent)),
+                    ..Default::default()
+                });
+            }
+            rows
+        }
+        // Unchanged context: muted, undecorated — plain surroundings.
+        None => vec![
+            LineDecor {
+                text_color: Some(theme.text_muted),
+                ..Default::default()
+            };
+            region.base.len()
+        ],
+        Some(choice) => {
+            let (label, tint): (SharedString, gpui::Rgba) = match &choice {
+                Choice::Ours => ("disk".into(), theme.drift),
+                Choice::Theirs => ("source".into(), theme.accent),
+                Choice::Base => ("last written".into(), theme.text_muted),
+                Choice::Both => ("both".into(), theme.ok),
+                Choice::Edited(_) => ("edited".into(), theme.ok),
+            };
+            let label: SharedString = if auto {
+                format!("auto · {label}").into()
+            } else {
+                label
+            };
+            choice_lines(doc, region, &choice)
+                .into_iter()
+                .enumerate()
+                .map(|(k, (_, side))| LineDecor {
+                    bg: Some(Theme::wash(
+                        side.map(|s| s.tint(theme)).unwrap_or(theme.ok),
+                        0.07,
+                    )),
+                    label: (k == 0).then(|| (label.clone(), tint)),
+                    ..Default::default()
+                })
+                .collect()
+        }
+    }
+}
+
 /// Map a free-form edit of the seeded document back onto regions: line-diff
 /// seed → edited, project each region boundary through the hunks, and emit
 /// an `Edited` pick for every region whose projected text changed. The
@@ -399,19 +540,10 @@ fn edited_region_picks(
     seed_line_starts: &[usize],
     edited: &str,
 ) -> Vec<(usize, Choice)> {
-    let hunks = tomte_core::merge::line_hunks(seed, edited);
     let seed_lines = tomte_core::merge::split_lines(seed);
     let edited_lines = tomte_core::merge::split_lines(edited);
     let regions = seed_line_starts.len().saturating_sub(1);
-    let mut mapped: Vec<usize> = seed_line_starts
-        .iter()
-        .map(|&b| map_line(b, &hunks).min(edited_lines.len()))
-        .collect();
-    // The sentinel is the end of the file, wherever the edit moved it —
-    // lines appended at EOF belong to the last region.
-    if let Some(last) = mapped.last_mut() {
-        *last = edited_lines.len();
-    }
+    let mapped = mapped_boundaries(seed, seed_line_starts, edited);
     let mut picks = Vec::new();
     for region in 0..regions {
         let old = seed_lines[seed_line_starts[region]..seed_line_starts[region + 1]].concat();
@@ -541,6 +673,41 @@ pub(super) struct LoadedMerge {
     /// Per-region first-line index per column [theirs, base, ours], plus a
     /// totals sentinel row — the basis for region-aligned scroll sync.
     region_line_starts: Rc<Vec<[usize; 3]>>,
+    /// One read-only editor per input pane [theirs, base, ours] so their
+    /// text is selectable and horizontally scrollable like the result
+    /// (2026-08-26 feedback). Built lazily in render, which owns the theme.
+    pane_editors: Option<[Entity<ui::TextArea>; 3]>,
+    pane_appearance: Option<gpui::WindowAppearance>,
+}
+
+/// Per-line decorations for one input pane, in the same vocabulary the
+/// result editor uses: the region wash for that side, the amber
+/// protected-template underlay, and the `{}` marker.
+fn pane_decors(rows: &[PaneLine], side: PaneSide, theme: Theme) -> Vec<ui::text_area::LineDecor> {
+    rows.iter()
+        .map(|line| {
+            // Protected spans get the amber underlay regardless of region
+            // kind — the write-back rejection is the stronger fact.
+            let bg = if line.protected.is_some() {
+                Some(Theme::wash(theme.drift, 0.15))
+            } else {
+                row_bg(line.kind, side, &theme)
+            };
+            ui::text_area::LineDecor {
+                bg,
+                // Text darkens only when THIS pane is washed, i.e. this side
+                // actually changed (2026-08-08: a side with no change
+                // deserves no emphasis at all).
+                text_color: Some(if bg.is_some() {
+                    theme.text
+                } else {
+                    theme.text_muted
+                }),
+                gutter: line.protected.is_some().then(|| ("{}".into(), theme.drift)),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 impl LoadedMerge {
@@ -569,6 +736,8 @@ impl LoadedMerge {
             base_rows: Rc::new(pane_lines(&state.doc, PaneSide::Base, &none)),
             ours_rows: Rc::new(pane_lines(&state.doc, PaneSide::Ours, &none)),
             protected: Rc::new(protected),
+            pane_editors: None,
+            pane_appearance: None,
             inputs,
             state,
         }
@@ -596,45 +765,46 @@ pub struct MergeView {
     /// Banner for saves that STAY here (protected span, errors); successful
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
-    result_scroll: gpui::UniformListScrollHandle,
     /// One scroll handle per input pane (theirs/base/ours); wheel on any
     /// pane mirrors its offset to the others so the three columns compare
     /// without independent scrolling.
-    pane_scrolls: [gpui::UniformListScrollHandle; 3],
+    pane_scrolls: [gpui::ScrollHandle; 3],
     /// Decided regions whose strip the user reopened (non-destructive).
     revisiting: std::collections::HashSet<usize>,
-    /// Region displays + analytic block geometry, rebuilt ONLY on state
-    /// mutations (pick/undo/revisit/load) — never per frame. Scrolling at
-    /// 120Hz re-renders the window every tick (gpui refresh-on-wheel), so
-    /// per-frame recomputation of every line was the 2026-08-08 lag.
-    display_cache: Rc<Vec<RegionDisplay>>,
-    /// Fixed-height rows backing the result uniform_list, plus per-region
-    /// start indices (parallel geometry for Next and scroll sync).
-    flat_rows: Rc<Vec<FlatRow>>,
-    result_row_starts: Rc<Vec<usize>>,
-    undo: Vec<UndoEntry>,
-    redo: Vec<UndoEntry>,
-    /// Open free-text edit of the WHOLE result (2026-08-19 feedback: "I
-    /// should be able to edit anywhere within the file"). The panel replaces
-    /// the result list; Apply diffs the text against the seed and lands the
-    /// changes on the regions they touched — one document-undo step total.
-    editing: Option<EditSession>,
-    /// Scroll handle for the editor panel, so opening a session can jump the
-    /// viewport to the region whose strip was clicked.
-    editor_scroll: gpui::ScrollHandle,
-    focus_handle: FocusHandle,
-}
-
-/// One whole-document edit session: the editor entity, the text it was
-/// seeded with, per-region first-line indices into that seed (+ sentinel)
-/// for mapping the edit back onto regions, and whether the document has
-/// template-protected lines (advisory — the save-time write-back
-/// verification remains the authority).
-struct EditSession {
-    editor: Entity<ui::TextArea>,
+    /// The result IS the editor (2026-08-22): one persistent `TextArea`,
+    /// read-only by default so every line is selectable and the decision
+    /// strips ride inside it as blocks; `edit` flips it editable in place.
+    /// Created lazily (needs a `Window` for nothing, but `cx.new`), re-seeded
+    /// from the resolution on every pick/undo.
+    result_editor: Option<Entity<ui::TextArea>>,
+    /// Whether the result editor is currently editable (vs read-only).
+    editing: bool,
+    /// The text the editor was last seeded with (== the assembled result of
+    /// the current resolution) and per-region first-line indices into it —
+    /// the basis for mapping a free edit back onto regions.
     seed: String,
     seed_line_starts: Vec<usize>,
-    protected: bool,
+    /// The decorator must be (re)installed on the editor: set on seed, mode
+    /// toggle, or appearance change. Render owns installation (it has the
+    /// window appearance).
+    decor_dirty: bool,
+    decor_appearance: Option<gpui::WindowAppearance>,
+    undo: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
+    /// Scrolls the result editor (Next ↓ jumps it to a region).
+    editor_scroll: gpui::ScrollHandle,
+    /// Draggable layout: px widths of the first two input panes (the third
+    /// flexes) and the height of the panes row. `None` until the first
+    /// render sizes them from the viewport.
+    pane_widths: Option<[f32; 2]>,
+    panes_height: Option<f32>,
+    /// The divider currently under the pointer's button, if any.
+    dragging: Option<ui::DragState<Divider>>,
+    /// Last known body height/width, captured at render — the drag handlers
+    /// run outside render and still need to clamp against the window.
+    viewport_h: f32,
+    viewport_w: f32,
+    focus_handle: FocusHandle,
 }
 
 /// One document-level undo step: choice changes applied together (a strip
@@ -657,16 +827,22 @@ impl MergeView {
             loaded: None,
             saving: false,
             banner: None,
-            result_scroll: gpui::UniformListScrollHandle::new(),
-            pane_scrolls: std::array::from_fn(|_| gpui::UniformListScrollHandle::new()),
+            pane_scrolls: std::array::from_fn(|_| gpui::ScrollHandle::new()),
             revisiting: std::collections::HashSet::new(),
-            display_cache: Rc::new(Vec::new()),
-            flat_rows: Rc::new(Vec::new()),
-            result_row_starts: Rc::new(Vec::new()),
+            result_editor: None,
+            editing: false,
+            seed: String::new(),
+            seed_line_starts: Vec::new(),
+            decor_dirty: true,
+            decor_appearance: None,
             undo: Vec::new(),
             redo: Vec::new(),
-            editing: None,
             editor_scroll: gpui::ScrollHandle::new(),
+            pane_widths: None,
+            panes_height: None,
+            dragging: None,
+            viewport_h: 0.,
+            viewport_w: 0.,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -685,9 +861,9 @@ impl MergeView {
         self.repo_reconcile = true;
         self.banner = None;
         self.saving = false;
-        self.editing = None;
+        self.editing = false;
         self.loaded = Some(LoadedMerge::new(inputs));
-        self.rebuild_display();
+        self.seed_editor(cx);
         cx.notify();
     }
 
@@ -699,7 +875,8 @@ impl MergeView {
         self.loaded = None;
         self.saving = false;
         self.banner = None;
-        self.editing = None;
+        self.editing = false;
+        self.result_editor = None;
         cx.notify();
 
         let journal = journal_path();
@@ -723,7 +900,7 @@ impl MergeView {
                     Ok(inputs) => view.loaded = Some(LoadedMerge::new(Arc::new(inputs))),
                     Err(e) => view.error = Some(e.to_string()),
                 }
-                view.rebuild_display();
+                view.seed_editor(cx);
                 cx.notify();
             })
             .ok();
@@ -731,22 +908,117 @@ impl MergeView {
         .detach();
     }
 
-    /// Recompute the display cache + analytic geometry from the current
-    /// resolution. Called on every state mutation; render only reads.
-    fn rebuild_display(&mut self) {
+    /// (Re)seed the result editor from the current resolution: the editor's
+    /// text becomes the assembled result (unresolved conflicts inlined
+    /// disk-then-source), and `seed`/`seed_line_starts` record the per-region
+    /// line geometry for mapping a free edit back onto regions. Creates the
+    /// editor entity on first use; marks the decorator for reinstall.
+    fn seed_editor(&mut self, cx: &mut Context<Self>) {
         let Some(loaded) = &self.loaded else {
-            self.display_cache = Rc::new(Vec::new());
-            self.flat_rows = Rc::new(Vec::new());
-            self.result_row_starts = Rc::new(Vec::new());
+            self.result_editor = None;
+            self.seed = String::new();
+            self.seed_line_starts = Vec::new();
             return;
         };
-        let displays: Vec<RegionDisplay> = (0..loaded.state.doc.regions.len())
-            .map(|idx| region_display(&loaded.state, idx, &self.revisiting, &loaded.protected))
+        let texts = document_seed(&loaded.state);
+        let mut seed = String::new();
+        let mut starts = Vec::with_capacity(texts.len() + 1);
+        let mut line = 0usize;
+        for text in &texts {
+            starts.push(line);
+            line += text.split_inclusive('\n').count();
+            seed.push_str(text);
+        }
+        starts.push(line);
+        self.seed = seed.clone();
+        self.seed_line_starts = starts;
+        let editing = self.editing;
+        match &self.result_editor {
+            Some(editor) => editor.update(cx, |area, _| {
+                area.set_read_only(!editing);
+                area.set_content(seed);
+            }),
+            None => {
+                let editor = cx.new(|cx| {
+                    let mut area = ui::TextArea::read_only(seed, cx);
+                    // Text column lines up with the input panes' rows (px_2 +
+                    // w_4 gutter + gap_1 = 28px); rail/gutter render inside it.
+                    area.set_left_inset(px(28.));
+                    area
+                });
+                self.result_editor = Some(editor);
+            }
+        }
+        self.decor_dirty = true;
+    }
+
+    /// Row (in editor line-height units) of region `region`'s first text
+    /// line, accounting for the decision-strip block above each changed
+    /// region at or before it. Used by Next ↓ to scroll the editor.
+    /// Number of decision-strip blocks that sit above text line `line`.
+    /// A strip is placed above its region's FIRST line, so a strip counts as
+    /// soon as its region starts at or before `line`. Strips only exist in
+    /// read-only mode.
+    fn strips_above(&self, line: usize) -> usize {
+        let Some(loaded) = &self.loaded else {
+            return 0;
+        };
+        let changed: Vec<bool> = (0..loaded.state.doc.regions.len())
+            .map(|idx| region_has_strip(&loaded.state, idx))
             .collect();
-        let (rows, starts) = flatten_displays(&displays);
-        self.display_cache = Rc::new(displays);
-        self.flat_rows = Rc::new(rows);
-        self.result_row_starts = Rc::new(starts);
+        strips_above_line(line, &self.seed_line_starts, &changed)
+    }
+
+    /// The editor row that text line `line` renders on. `with_strips` is the
+    /// read-only geometry (each changed region carries a two-row strip above
+    /// its first line); editing has no blocks, so row == line.
+    fn row_of_line(&self, line: usize, with_strips: bool) -> usize {
+        if with_strips {
+            line + self.strips_above(line) * STRIP_ROWS
+        } else {
+            line
+        }
+    }
+
+    /// First row of `region` in the CURRENT mode's geometry.
+    fn region_row(&self, region: usize) -> usize {
+        let line = self.seed_line_starts.get(region).copied().unwrap_or(0);
+        self.row_of_line(line, !self.editing)
+    }
+
+    /// Apply an in-flight divider drag. Called from the root's mouse-move,
+    /// because a drag that leaves the 7px strip must keep tracking.
+    fn drag_divider(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.dragging else {
+            return;
+        };
+        match drag.id {
+            Divider::Pane(i) => {
+                let delta = drag.delta(event, ui::ResizeAxis::X);
+                if let Some(widths) = &mut self.pane_widths {
+                    widths[i] = (drag.start + delta).max(MIN_PANE_W);
+                }
+            }
+            Divider::Result => {
+                let delta = drag.delta(event, ui::ResizeAxis::Y);
+                let max = (self.viewport_h - MIN_RESULT_H).max(MIN_PANES_H);
+                self.panes_height = Some((drag.start + delta).clamp(MIN_PANES_H, max));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Toggling edit mode adds/removes every strip block, which moves the
+    /// text under the viewport. Shift the scroll by exactly the row delta at
+    /// `anchor_line` so that line stays put on screen — otherwise clicking
+    /// `edit` visibly jumps the document (2026-08-25 report: "the editor is
+    /// not at all on the same line as you were before").
+    fn rescroll_anchored(&mut self, anchor_line: usize, was_editing: bool) {
+        let old_row = self.row_of_line(anchor_line, !was_editing) as f32;
+        let new_row = self.row_of_line(anchor_line, !self.editing) as f32;
+        let y = f32::from(self.editor_scroll.offset().y) - (new_row - old_row) * PANE_ROW_H;
+        self.editor_scroll
+            .set_offset(gpui::point(px(0.), px(y.min(0.))));
     }
 
     /// The single mutation funnel (merge-editor-v2 spec): record the undo
@@ -778,7 +1050,7 @@ impl MergeView {
             prev_cursor,
         });
         self.redo.clear();
-        self.rebuild_display();
+        self.seed_editor(cx);
         cx.notify();
     }
 
@@ -797,7 +1069,7 @@ impl MergeView {
         }
         loaded.state.cursor = entry.prev_cursor;
         self.redo.push(entry);
-        self.rebuild_display();
+        self.seed_editor(cx);
         cx.notify();
     }
 
@@ -812,7 +1084,7 @@ impl MergeView {
             loaded.state.pick(*region, next.clone());
         }
         self.undo.push(entry);
-        self.rebuild_display();
+        self.seed_editor(cx);
         cx.notify();
     }
 
@@ -824,79 +1096,89 @@ impl MergeView {
         if let Some(loaded) = &mut self.loaded {
             loaded.state.cursor = Some(region);
         }
-        self.rebuild_display();
+        self.decor_dirty = true;
         cx.notify();
     }
 
-    /// Open the free-text editor over the WHOLE document, cursor and
-    /// viewport at `region` (the strip the user clicked). Render focuses the
-    /// editor (and hands focus back on close) — no Window needed here, so
-    /// gallery poses work too.
+    /// Flip the result editor editable, cursor and viewport at `region`
+    /// (the strip the user clicked, or the header Edit button's target). The
+    /// strips vanish (edit is free-form); Apply/Cancel land in the header.
     pub(super) fn start_edit(&mut self, region: usize, cx: &mut Context<Self>) {
-        let Some(loaded) = &mut self.loaded else {
+        let Some(loaded) = &self.loaded else {
             return;
         };
         if region >= loaded.state.doc.regions.len() {
             return;
         }
-        loaded.state.cursor = Some(region);
-        let texts = document_seed(&loaded.state);
-        let mut seed = String::new();
-        let mut seed_line_starts = Vec::with_capacity(texts.len() + 1);
-        let mut line = 0usize;
-        let mut cursor_byte = 0usize;
-        for (idx, text) in texts.iter().enumerate() {
-            seed_line_starts.push(line);
-            if idx == region {
-                cursor_byte = seed.len();
-            }
-            line += text.split_inclusive('\n').count();
-            seed.push_str(text);
+        self.editing = true;
+        let cursor_byte = self.seed_line_starts.get(region).map_or(0, |&line| {
+            self.seed
+                .split_inclusive('\n')
+                .take(line)
+                .map(|l| l.len())
+                .sum()
+        });
+        if let Some(editor) = &self.result_editor {
+            editor.update(cx, |area, _| {
+                area.set_read_only(false);
+                area.place_cursor(cursor_byte);
+            });
         }
-        seed_line_starts.push(line);
-        let protected = !loaded.protected.is_empty();
-        let editor = cx.new(|cx| {
-            let mut area = ui::TextArea::new(seed.clone(), cx);
-            area.place_cursor(cursor_byte);
-            area
-        });
-        // Jump the panel viewport to the clicked region (2 context lines).
-        let y = seed_line_starts[region].saturating_sub(2) as f32 * PANE_ROW_H;
-        self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
-        self.editing = Some(EditSession {
-            editor,
-            seed,
-            seed_line_starts,
-            protected,
-        });
-        self.rebuild_display();
+        // Keep the clicked region exactly where it is on screen while its
+        // strip (and every other) disappears.
+        let anchor = self.seed_line_starts.get(region).copied().unwrap_or(0);
+        self.rescroll_anchored(anchor, false);
+        self.decor_dirty = true;
         cx.notify();
     }
 
-    /// Apply the edit session: map the edited document back onto regions
-    /// (line-diff against the seed) and land every changed region as
-    /// `Choice::Edited` — one document-undo entry for the whole session.
+    /// Apply the edit: map the edited document back onto regions (line-diff
+    /// against the seed) and land every changed region as `Choice::Edited` —
+    /// one document-undo entry — then return to read-only.
     fn commit_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.editing.take() else {
+        if !self.editing {
             return;
-        };
-        let edited = session.editor.read(cx).text().to_owned();
-        let picks = edited_region_picks(&session.seed, &session.seed_line_starts, &edited);
+        }
+        let edited = self
+            .result_editor
+            .as_ref()
+            .map(|e| e.read(cx).text().to_owned())
+            .unwrap_or_default();
+        let picks = edited_region_picks(&self.seed, &self.seed_line_starts, &edited);
+        self.editing = false;
+        let anchor = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.state.cursor)
+            .and_then(|r| self.seed_line_starts.get(r).copied())
+            .unwrap_or(0);
+        self.rescroll_anchored(anchor, true);
         if picks.is_empty() {
-            // Nothing changed — same as cancel.
-            self.rebuild_display();
+            // Nothing changed — same as cancel: re-seed read-only.
+            self.seed_editor(cx);
             cx.notify();
             return;
         }
         self.apply_many(picks, cx);
     }
 
-    /// Discard the edit session; every region's prior resolution stands.
+    /// Discard the edit; every region's prior resolution stands.
     fn cancel_edit(&mut self, cx: &mut Context<Self>) {
-        if self.editing.take().is_some() {
-            self.rebuild_display();
-            cx.notify();
+        if !self.editing {
+            return;
         }
+        self.editing = false;
+        // The strips come back: anchor on the region the user was working in
+        // so the document doesn't jump the other way either.
+        let anchor = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.state.cursor)
+            .and_then(|r| self.seed_line_starts.get(r).copied())
+            .unwrap_or(0);
+        self.rescroll_anchored(anchor, true);
+        self.seed_editor(cx);
+        cx.notify();
     }
 
     /// Pick at the cursor (keybindings route here).
@@ -907,13 +1189,14 @@ impl MergeView {
         self.apply(region, choice, cx);
     }
 
-    /// Region-aligned scroll sync: `leader` is 0..=2 for the input panes or
-    /// 3 for the result view. Maps the leader's viewport-top to (region,
-    /// fraction) and positions every other surface at ITS version of that
+    /// Region-aligned scroll sync across the three read-only input panes:
+    /// `leader` is 0..=2. Maps the leader's viewport-top to (region,
+    /// fraction) and positions the other two panes at THEIR version of that
     /// point. Pure offset math over the cached analytic geometry — no
     /// notify, no layout reads: the wheel's own refresh paints the new
     /// offsets in the same frame (2026-08-08: notifying per wheel tick was
-    /// part of the lag).
+    /// part of the lag). The result editor scrolls independently (blocks
+    /// make its rows non-uniform with the panes).
     fn sync_from(&mut self, leader: usize) {
         // Perf bisection switch: TOMTE_NOSYNC=1 disables follower updates so
         // frame-rate cost can be attributed (tree vs per-event sync work).
@@ -924,34 +1207,18 @@ impl MergeView {
             return;
         };
         let starts = &loaded.region_line_starts;
-        if starts.len() < 2 || self.result_row_starts.len() != starts.len() {
+        // The result editor's per-region geometry must line up with the
+        // panes' or the mapping is meaningless.
+        if starts.len() < 2 || self.seed_line_starts.len() != starts.len() {
             return;
         }
 
-        let (k, f) = if leader == 3 {
-            let row = -f32::from(self.result_scroll.0.borrow().base_handle.offset().y) / PANE_ROW_H;
-            let rs = &self.result_row_starts;
-            let regions = rs.len().saturating_sub(1);
-            if regions == 0 {
-                return;
-            }
-            let mut k = regions - 1;
-            for i in 0..regions {
-                if (rs[i] as f32) <= row && row < (rs[i + 1] as f32) {
-                    k = i;
-                    break;
-                }
-            }
-            let len = (rs[k + 1] - rs[k]) as f32;
-            let f = if len > 0.0 {
-                ((row - rs[k] as f32) / len).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            (k, f)
+        // Where is the leader looking, as (region, fraction through it)?
+        let (k, f) = if leader == RESULT_LEADER {
+            let row = -f32::from(self.editor_scroll.offset().y) / PANE_ROW_H;
+            self.result_region_at_row(row)
         } else {
-            let line = -f32::from(self.pane_scrolls[leader].0.borrow().base_handle.offset().y)
-                / PANE_ROW_H;
+            let line = -f32::from(self.pane_scrolls[leader].offset().y) / PANE_ROW_H;
             region_at(starts, leader, line)
         };
 
@@ -960,20 +1227,60 @@ impl MergeView {
                 continue;
             }
             let y = gpui::px(-(line_at(starts, col, k, f) * PANE_ROW_H));
-            let handle = self.pane_scrolls[col].0.borrow();
-            let mut offset = handle.base_handle.offset();
+            let mut offset = self.pane_scrolls[col].offset();
             offset.y = y;
-            handle.base_handle.set_offset(offset);
+            self.pane_scrolls[col].set_offset(offset);
         }
-        if leader != 3 {
-            let rs = &self.result_row_starts;
-            let len = (rs[k + 1] - rs[k]) as f32;
-            let row = rs[k] as f32 + f * len;
-            let handle = self.result_scroll.0.borrow();
-            let mut offset = handle.base_handle.offset();
-            offset.y = gpui::px(-(row * PANE_ROW_H));
-            handle.base_handle.set_offset(offset);
+        if leader != RESULT_LEADER {
+            // Follow into the result editor's OWN geometry — its rows carry
+            // the decision-strip blocks, so it is not line-for-line with the
+            // panes (that mismatch is why sync had to be rebuilt after the
+            // 2026-08-22 editor rework).
+            let row = self.result_row_for(k, f);
+            self.editor_scroll
+                .set_offset(gpui::point(px(0.), px(-(row * PANE_ROW_H))));
         }
+    }
+
+    /// Which region the result editor's `row` sits in, and how far through
+    /// it. A row inside a region's strip block reads as the top of that
+    /// region (fraction 0) — the strip belongs to the region below it.
+    fn result_region_at_row(&self, row: f32) -> (usize, f32) {
+        let regions = self.seed_line_starts.len().saturating_sub(1);
+        if regions == 0 {
+            return (0, 0.0);
+        }
+        let with_strips = !self.editing;
+        let mut k = regions - 1;
+        for r in 0..regions {
+            let start = self.row_of_line(self.seed_line_starts[r], with_strips) as f32;
+            let len = (self.seed_line_starts[r + 1] - self.seed_line_starts[r]) as f32;
+            if row < start + len {
+                k = r;
+                break;
+            }
+        }
+        let start = self.row_of_line(self.seed_line_starts[k], with_strips) as f32;
+        let len = (self.seed_line_starts[k + 1] - self.seed_line_starts[k]) as f32;
+        let f = if len > 0.0 {
+            ((row - start) / len).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (k, f)
+    }
+
+    /// The inverse: the result editor row for `fraction` through region `k`.
+    fn result_row_for(&self, k: usize, f: f32) -> f32 {
+        let Some(&start_line) = self.seed_line_starts.get(k) else {
+            return 0.0;
+        };
+        let len = self
+            .seed_line_starts
+            .get(k + 1)
+            .map(|&e| (e - start_line) as f32)
+            .unwrap_or(0.0);
+        self.row_of_line(start_line, !self.editing) as f32 + f * len
     }
 
     /// `Next ↓`: advance the cursor to the next unresolved conflict — or,
@@ -981,15 +1288,16 @@ impl MergeView {
     /// decision point stays reachable for revisiting (2026-08-08 feedback).
     /// Target selection lives in [`next_target`] (pure, tested).
     fn next(&mut self, cx: &mut Context<Self>) {
-        let Some(loaded) = &mut self.loaded else {
-            return;
+        let region = {
+            let Some(loaded) = &mut self.loaded else {
+                return;
+            };
+            next_target(&mut loaded.state)
         };
-        if let Some(region) = next_target(&mut loaded.state) {
-            if let Some(&row) = self.result_row_starts.get(region) {
-                self.result_scroll.scroll_to_item(row, ScrollStrategy::Top);
-            }
-            // Bring the input panes along to the same region.
-            self.sync_from(3);
+        if let Some(region) = region {
+            let y = self.region_row(region).saturating_sub(1) as f32 * PANE_ROW_H;
+            self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
+            self.decor_dirty = true;
         }
         cx.notify();
     }
@@ -1146,7 +1454,7 @@ impl MergeView {
                             "Nothing to merge".to_string()
                         } else {
                             format!(
-                                "auto-merged · {changed} changed region{} — review below",
+                                "auto-resolved · {changed} changed region{} — review below",
                                 if changed == 1 { "" } else { "s" }
                             )
                         }
@@ -1161,27 +1469,49 @@ impl MergeView {
                 .regions
                 .iter()
                 .any(|r| r.kind != RegionKind::Unchanged);
-            if changed && self.editing.is_none() {
+            if changed && !self.editing {
                 // Conflict-red while decisions are owed; neutral afterwards
                 // (it then walks decided/auto regions for revisiting).
-                let tint = if open > 0 { theme.conflict } else { theme.text };
+                let tint = if open > 0 {
+                    theme.conflict
+                } else {
+                    theme.text_muted
+                };
                 bar = bar.child(ui::button(
                     theme,
                     "merge-next",
                     "Next ↓".into(),
-                    ui::ButtonVariant::Outline(tint),
+                    ui::ButtonVariant::Tonal(tint),
                     ui::ButtonSize::Sm,
                     cx.listener(|view, _ev, _window, cx| view.next(cx)),
                 ));
             }
-            // Whole-file editing entry point that doesn't depend on any
-            // strip: opens at the focused region (or the top).
-            if self.editing.is_none() {
+            if self.editing {
+                // Editing: apply/cancel the free edit (⌘↵ / esc mirror these).
+                bar = bar.child(ui::button(
+                    theme,
+                    "merge-edit-apply",
+                    "Apply edit".into(),
+                    ui::ButtonVariant::Tonal(theme.accent),
+                    ui::ButtonSize::Sm,
+                    cx.listener(|view, _ev, _window, cx| view.commit_edit(cx)),
+                ));
+                bar = bar.child(ui::button(
+                    theme,
+                    "merge-edit-cancel",
+                    "Discard edit".into(),
+                    ui::ButtonVariant::Ghost,
+                    ui::ButtonSize::Sm,
+                    cx.listener(|view, _ev, _window, cx| view.cancel_edit(cx)),
+                ));
+            } else {
+                // Whole-file editing entry point that doesn't depend on any
+                // strip: opens at the focused region (or the top).
                 bar = bar.child(ui::button(
                     theme,
                     "merge-edit",
                     "Edit".into(),
-                    ui::ButtonVariant::Outline(theme.text),
+                    ui::ButtonVariant::Tonal(theme.text_muted),
                     ui::ButtonSize::Sm,
                     cx.listener(|view, _ev, _window, cx| {
                         let region = view
@@ -1198,7 +1528,7 @@ impl MergeView {
             theme,
             "merge-cancel",
             "Cancel".into(),
-            ui::ButtonVariant::Outline(theme.text),
+            ui::ButtonVariant::Tonal(theme.text_muted),
             ui::ButtonSize::Sm,
             cx.listener(|view, _ev, _window, cx| view.cancel(cx)),
         ));
@@ -1214,7 +1544,7 @@ impl MergeView {
                     .child("saving…")
                     .into_any_element()
             } else {
-                let editing = self.editing.is_some();
+                let editing = self.editing;
                 self.save_button(
                     loaded.state.assembled().is_some() && !editing,
                     unresolved,
@@ -1244,7 +1574,7 @@ impl MergeView {
                 theme,
                 "merge-save",
                 "Save".into(),
-                ui::ButtonVariant::Outline(theme.accent),
+                ui::ButtonVariant::Tonal(theme.accent),
                 ui::ButtonSize::Sm,
                 cx.listener(|view, _ev, _window, cx| view.save(cx)),
             )
@@ -1265,7 +1595,7 @@ impl MergeView {
         }
     }
 
-    fn body(&self, viewport_h: f32, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn body(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
         if self.loading {
             return centered_note(theme, "loading merge inputs…".into(), theme.text_muted);
         }
@@ -1285,14 +1615,33 @@ impl MergeView {
             );
         };
 
-        let state = &loaded.state;
-        let degraded = state.degraded_base;
-        let cursor = state.cursor;
+        let degraded = loaded.state.degraded_base;
         let view = cx.weak_entity();
-        let _ = viewport_h;
+        let widths = self.pane_widths.unwrap_or([0.; 2]);
+        let dragging = self.dragging.map(|d| d.id);
+        // Vertical divider between input pane `i` and `i + 1`.
+        let pane_divider = |i: usize| {
+            let view = view.clone();
+            ui::resize_handle(
+                ElementId::named_usize("merge-pane-divider", i),
+                ui::ResizeAxis::X,
+                dragging == Some(Divider::Pane(i)),
+                theme,
+                move |event, _window, cx| {
+                    let event = event.clone();
+                    view.update(cx, |merge, cx| {
+                        let start = merge.pane_widths.map(|w| w[i]).unwrap_or(0.);
+                        merge.dragging = Some(ui::DragState::new(Divider::Pane(i), &event, start));
+                        cx.notify();
+                    })
+                    .ok();
+                },
+            )
+        };
         // One shared grid of hairlines (2026-08-08 feedback): three input
         // columns split by vertical dividers, one horizontal rule, then the
-        // result flowing as the pane's own content — no floating boxes.
+        // result flowing as the pane's own content — no floating boxes. Every
+        // one of those rules is now a grab handle (2026-08-27).
         div()
             .flex_1()
             .min_h_0()
@@ -1300,161 +1649,177 @@ impl MergeView {
             .flex_col()
             .child(
                 div()
-                    .h_2_5()
+                    .h(px(self.panes_height.unwrap_or(0.)))
                     .flex_none()
                     .flex()
-                    .border_b_1()
-                    .border_color(theme.border)
                     .child(pane_col(
-                        "merge-pane-theirs",
                         "source (rendered)",
                         theme.accent,
-                        &loaded.theirs_rows,
-                        PaneSide::Theirs,
-                        false,
+                        loaded.pane_editors.as_ref().map(|e| &e[0]),
+                        Some(widths[0]),
                         0,
                         &self.pane_scrolls,
                         &view,
                         theme,
                     ))
+                    .child(pane_divider(0))
                     .child(if degraded {
-                        degraded_base_col(theme)
+                        degraded_base_col(theme, widths[1])
                     } else {
                         pane_col(
-                            "merge-pane-base",
                             "last written",
                             theme.text_muted,
-                            &loaded.base_rows,
-                            PaneSide::Base,
-                            true,
+                            loaded.pane_editors.as_ref().map(|e| &e[1]),
+                            Some(widths[1]),
                             1,
                             &self.pane_scrolls,
                             &view,
                             theme,
                         )
                     })
+                    .child(pane_divider(1))
                     .child(pane_col(
-                        "merge-pane-ours",
                         "on disk",
                         theme.drift,
-                        &loaded.ours_rows,
-                        PaneSide::Ours,
-                        true,
+                        loaded.pane_editors.as_ref().map(|e| &e[2]),
+                        None,
                         2,
                         &self.pane_scrolls,
                         &view,
                         theme,
                     )),
             )
-            .child(match &self.editing {
-                Some(session) => self.editor_panel(session, theme, cx),
-                None => div()
-                    .id("merge-result-wrap")
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .on_scroll_wheel({
-                        let view = view.clone();
-                        move |_event, _window, cx| {
-                            view.update(cx, |merge, _cx| merge.sync_from(3)).ok();
-                        }
-                    })
-                    .child({
-                        let rows = self.flat_rows.clone();
-                        let displays = self.display_cache.clone();
-                        let has_base = !degraded;
-                        let view = view.clone();
-                        uniform_list("merge-result", rows.len(), move |range, _window, _cx| {
-                            range
-                                .map(|ix| {
-                                    flat_row_el(
-                                        ix, &rows[ix], &displays, cursor, has_base, theme, &view,
-                                    )
-                                })
-                                .collect()
+            .child({
+                let view = view.clone();
+                ui::resize_handle(
+                    "merge-result-divider",
+                    ui::ResizeAxis::Y,
+                    dragging == Some(Divider::Result),
+                    theme,
+                    move |event, _window, cx| {
+                        let event = event.clone();
+                        view.update(cx, |merge, cx| {
+                            let start = merge.panes_height.unwrap_or(0.);
+                            merge.dragging =
+                                Some(ui::DragState::new(Divider::Result, &event, start));
+                            cx.notify();
                         })
-                        .track_scroll(self.result_scroll.clone())
-                        .flex_1()
-                    })
-                    .into_any_element(),
+                        .ok();
+                    },
+                )
             })
+            .child(self.result_pane(theme, &view))
             .into_any_element()
     }
 
-    /// The edit panel: the WHOLE result as one editable document, replacing
-    /// the result list while a session is open (the input panes above stay
-    /// for reference). Esc cancels, ⌘↵ or the Apply button commits; Apply
-    /// maps the edit back onto the regions it touched.
-    fn editor_panel(
-        &self,
-        session: &EditSession,
-        theme: Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let header = div()
-            .h_7()
-            .px_2()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_xs()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(Theme::wash(theme.accent, 0.06))
-            .child(div().text_color(theme.text).child("editing result"))
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child("edit anywhere — esc cancels · ⌘↵ applies"),
-            )
-            .when(session.protected, |el| {
-                el.child(div().text_color(theme.drift).child(
-                    "contains template-generated text — edits touching it are rejected at save",
-                ))
-            })
-            .child(div().flex_1())
-            .child(ui::button(
-                theme,
-                "edit-cancel",
-                "Cancel".into(),
-                ui::ButtonVariant::Ghost,
-                ui::ButtonSize::Sm,
-                cx.listener(|view, _ev, _window, cx| view.cancel_edit(cx)),
-            ))
-            .child(ui::button(
-                theme,
-                "edit-apply",
-                "Apply".into(),
-                ui::ButtonVariant::Outline(theme.accent),
-                ui::ButtonSize::Sm,
-                cx.listener(|view, _ev, _window, cx| view.commit_edit(cx)),
-            ));
-        div()
-            .key_context("RegionEditor")
-            .on_action(cx.listener(|view, _: &ApplyEdit, _w, cx| view.commit_edit(cx)))
-            .on_action(cx.listener(|view, _: &CancelEdit, _w, cx| view.cancel_edit(cx)))
+    /// The result pane: the persistent editor (read-only default, editable
+    /// while `editing`) inside one scroll container. The decision strips
+    /// live INSIDE it as blocks — no separate view, so the text is always
+    /// selectable and switching to edit never swaps the surface.
+    fn result_pane(&self, theme: Theme, view: &WeakEntity<MergeView>) -> AnyElement {
+        let container = div()
+            .id("merge-result-scroll")
             .flex_1()
             .min_h_0()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(
-                div()
-                    .id("region-editor-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.editor_scroll)
-                    .px_2()
-                    .py_1()
-                    .font_family("Menlo")
-                    .text_xs()
-                    .line_height(px(PANE_ROW_H))
-                    .child(session.editor.clone()),
-            )
-            .into_any_element()
+            .overflow_y_scroll()
+            // Long lines run past the pane; let them be reached.
+            .overflow_x_scroll()
+            .track_scroll(&self.editor_scroll)
+            .py_1()
+            // The editor shapes its glyphs from the inherited text style —
+            // same Menlo/11px as the input panes' `mono_line` rows, so the
+            // result reads as code, not UI text (2026-08-22 regression).
+            .font_family("Menlo")
+            .text_xs()
+            .line_height(px(PANE_ROW_H));
+        // The wheel reaches this wrapper AFTER the inner scroll container has
+        // applied it, so the leader's fresh offset drives the mapping.
+        let container = {
+            let view = view.clone();
+            container.on_scroll_wheel(move |_event, _window, cx| {
+                view.update(cx, |merge, _cx| merge.sync_from(RESULT_LEADER))
+                    .ok();
+            })
+        };
+        match &self.result_editor {
+            Some(editor) => container.child(editor.clone()).into_any_element(),
+            None => container
+                .child(
+                    div()
+                        .px_2()
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child("preparing result…"),
+                )
+                .into_any_element(),
+        }
+    }
+
+    /// Build and install the result editor's decorator: per-line provenance
+    /// (via [`editor_decors`], which flips edited regions to the ok wash) and
+    /// — in read-only mode only — a decision-strip block above every changed
+    /// region. Rebuilt on every resolution/mode/appearance change so the
+    /// captured strip states stay current.
+    fn install_result_decorator(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let Some(editor) = &self.result_editor else {
+            return;
+        };
+        let n = loaded.state.doc.regions.len();
+        let patterns: Vec<Vec<ui::text_area::LineDecor>> = (0..n)
+            .map(|idx| region_pattern(&loaded.state, &loaded.protected, theme, idx))
+            .collect();
+        let has_base = !loaded.state.degraded_base;
+        // Strip specs for changed regions (read-only mode only).
+        let mut specs: Vec<StripSpec> = Vec::new();
+        if !self.editing {
+            for idx in 0..n {
+                let above = self.seed_line_starts.get(idx).copied().unwrap_or(0);
+                match region_display(&loaded.state, idx, &self.revisiting, &loaded.protected) {
+                    RegionDisplay::Deciding {
+                        current, focused, ..
+                    } => specs.push(StripSpec {
+                        region: idx,
+                        above_line: above,
+                        kind: StripKind::Deciding {
+                            has_base,
+                            current,
+                            focused,
+                        },
+                    }),
+                    RegionDisplay::Decided {
+                        choice, focused, ..
+                    } => specs.push(StripSpec {
+                        region: idx,
+                        above_line: above,
+                        kind: StripKind::Decided { choice, focused },
+                    }),
+                    RegionDisplay::Context { .. } => {}
+                }
+            }
+        }
+        let specs = Rc::new(specs);
+        let seed = self.seed.clone();
+        let starts = self.seed_line_starts.clone();
+        let patterns = Rc::new(patterns);
+        let editing = self.editing;
+        let view = cx.weak_entity();
+        editor.update(cx, |area, _| {
+            area.set_decorator(Box::new(move |content| {
+                let lines = editor_decors(theme, &seed, &starts, &patterns, content);
+                let blocks = if editing {
+                    Vec::new()
+                } else {
+                    specs
+                        .iter()
+                        .map(|spec| strip_block(spec, theme, view.clone()))
+                        .collect()
+                };
+                ui::text_area::Decoration { lines, blocks }
+            }));
+        });
     }
 }
 
@@ -1467,21 +1832,66 @@ impl Render for MergeView {
 impl MergeView {
     fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
-        // Cache safety net: poses (gallery/tests) set `loaded` directly
-        // without going through load(); rebuild lazily when stale.
-        let regions = self
-            .loaded
-            .as_ref()
-            .map(|l| l.state.doc.regions.len())
-            .unwrap_or(0);
-        if self.display_cache.len() != regions {
-            self.rebuild_display();
+        // Remember the frame the drag handlers will clamp against, and give
+        // the panels their first sizes: equal thirds, 40% tall.
+        let viewport = window.viewport_size();
+        self.viewport_w = f32::from(viewport.width);
+        self.viewport_h = f32::from(viewport.height);
+        if self.pane_widths.is_none() {
+            let each = ((self.viewport_w - super::SIDEBAR_WIDTH) / 3.).max(MIN_PANE_W);
+            self.pane_widths = Some([each, each]);
         }
-        // Claim focus on arrival so the keybindings work immediately; while
-        // an edit session is open, the editor owns focus instead (and gets
-        // it back if anything steals it).
-        if let Some(session) = &self.editing {
-            let editor_focus = session.editor.read(cx).focus_handle();
+        if self.panes_height.is_none() {
+            self.panes_height = Some((self.viewport_h * 0.4).max(MIN_PANES_H));
+        }
+        // Poses (gallery/tests) set `loaded` directly without going through
+        // load(); seed the editor lazily so it exists before body().
+        if self.loaded.is_some() && self.result_editor.is_none() {
+            self.seed_editor(cx);
+        }
+        // Build the input panes' read-only editors once per load (and again
+        // on a theme flip): render is where the appearance is known.
+        if let Some(loaded) = &mut self.loaded
+            && loaded.pane_appearance != Some(window.appearance())
+        {
+            let sides = [
+                (loaded.theirs_rows.clone(), PaneSide::Theirs),
+                (loaded.base_rows.clone(), PaneSide::Base),
+                (loaded.ours_rows.clone(), PaneSide::Ours),
+            ];
+            let editors = sides.map(|(rows, side)| {
+                let text: String = rows
+                    .iter()
+                    .map(|r| r.text.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let decors = Rc::new(pane_decors(&rows, side, theme));
+                cx.new(|cx| {
+                    let mut area = ui::TextArea::read_only(text, cx);
+                    area.set_left_inset(px(28.));
+                    area.set_decorator(Box::new(move |_| ui::text_area::Decoration {
+                        lines: decors.as_ref().clone(),
+                        blocks: Vec::new(),
+                    }));
+                    area
+                })
+            });
+            loaded.pane_editors = Some(editors);
+            loaded.pane_appearance = Some(window.appearance());
+        }
+        // (Re)install the decorator when the resolution, mode, or appearance
+        // changed — render owns it because it needs the window appearance.
+        if self.decor_dirty || self.decor_appearance != Some(window.appearance()) {
+            self.install_result_decorator(theme, cx);
+            self.decor_dirty = false;
+            self.decor_appearance = Some(window.appearance());
+        }
+        // The result editor holds focus whenever loaded: read-only, single
+        // keys (1/2/3/b/n) still reach the root's MergeEditor context via
+        // the ancestor chain; editable, the root drops that context so the
+        // keys type instead.
+        if let Some(editor) = &self.result_editor {
+            let editor_focus = editor.read(cx).focus_handle();
             if !editor_focus.is_focused(window) {
                 editor_focus.focus(window);
             }
@@ -1490,10 +1900,9 @@ impl MergeView {
         }
         div()
             .track_focus(&self.focus_handle)
-            // While a region editor is open the root drops the MergeEditor
-            // context, so its single-letter picks (1/2/3/b/n) can't shadow
-            // typing those characters into the editor.
-            .key_context(if self.editing.is_some() {
+            // While editing the root drops the MergeEditor context, so its
+            // single-letter picks (1/2/3/b/n) can't shadow typing.
+            .key_context(if self.editing {
                 "MergeEditorEditing"
             } else {
                 "MergeEditor"
@@ -1515,6 +1924,30 @@ impl MergeView {
             .on_action(cx.listener(|this, _: &NextConflict, _w, cx| this.next(cx)))
             .on_action(cx.listener(|this, _: &UndoChoice, _w, cx| this.undo(cx)))
             .on_action(cx.listener(|this, _: &RedoChoice, _w, cx| this.redo(cx)))
+            .on_action(cx.listener(|this, _: &ApplyEdit, _w, cx| this.commit_edit(cx)))
+            .on_action(cx.listener(|this, _: &CancelEdit, _w, cx| this.cancel_edit(cx)))
+            // Divider drags are tracked HERE, not on the handle: gpui only
+            // delivers `on_mouse_move` while the pointer is over the element,
+            // and a resize drag routinely runs past a 7px strip.
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _w, cx| {
+                this.drag_divider(event, cx)
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| {
+                    if this.dragging.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| {
+                    if this.dragging.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .flex_1()
             .min_h_0()
             .flex()
@@ -1523,7 +1956,7 @@ impl MergeView {
             .when_some(self.banner.clone(), |el, banner| {
                 el.child(banner_el(&banner, theme))
             })
-            .child(self.body(f32::from(window.viewport_size().height), theme, cx))
+            .child(self.body(theme, cx))
     }
 }
 
@@ -1535,42 +1968,47 @@ fn banner_el(banner: &OutcomeBanner, theme: Theme) -> Div {
 
 /// One read-only pane column: an attached label header (the user should
 /// never have to map floating toolbar chips onto panes by position) over a
-/// bordered `uniform_list` of its lines.
+/// read-only [`ui::TextArea`] over its lines — selectable and horizontally
+/// scrollable, decorated with the same washes the result editor uses.
 #[allow(clippy::too_many_arguments)]
 fn pane_col(
-    id: &'static str,
     label: &'static str,
     tint: Rgba,
-    rows: &Rc<Vec<PaneLine>>,
-    side: PaneSide,
-    divider: bool,
+    editor: Option<&Entity<ui::TextArea>>,
+    // Fixed px width, or `None` to take the leftover space.
+    width: Option<f32>,
     me: usize,
-    scrolls: &[gpui::UniformListScrollHandle; 3],
+    scrolls: &[gpui::ScrollHandle; 3],
     view: &WeakEntity<MergeView>,
     theme: Theme,
 ) -> AnyElement {
-    let rows = rows.clone();
     let view = view.clone();
     div()
         .id(ElementId::named_usize("merge-pane-wrap", me))
-        .flex_1()
+        .map(|el| match width {
+            Some(w) => el.w(px(w)).flex_none(),
+            None => el.flex_1(),
+        })
         .min_w_0()
         .h_full()
         .flex()
         .flex_col()
-        .when(divider, |el| el.border_l_1().border_color(theme.border))
         .child(ui::pane_label(theme, label, tint))
         .child(
-            uniform_list(id, rows.len(), move |range, _window, _cx| {
-                range
-                    .map(|ix| pane_row(ix, &rows[ix], side, theme))
-                    .collect()
-            })
-            .track_scroll(scrolls[me].clone())
-            .flex_1(),
+            div()
+                .id(ElementId::named_usize("merge-pane-scroll", me))
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .overflow_x_scroll()
+                .track_scroll(&scrolls[me])
+                .font_family("Menlo")
+                .text_xs()
+                .line_height(px(PANE_ROW_H))
+                .children(editor.cloned()),
         )
         // Scroll sync: this wrapper's wheel handler runs AFTER the inner
-        // list already applied the wheel (children dispatch first), so the
+        // surface already applied the wheel (children dispatch first), so the
         // leader's fresh position drives the region-aligned mapping.
         .on_scroll_wheel(move |_event, _window, cx| {
             view.update(cx, |merge, _cx| merge.sync_from(me)).ok();
@@ -1580,15 +2018,14 @@ fn pane_col(
 
 /// The base column when no last-written snapshot exists: the merge degraded
 /// to 2-way, and the pane says so instead of duplicating theirs (spec §10).
-fn degraded_base_col(theme: Theme) -> AnyElement {
+fn degraded_base_col(theme: Theme, width: f32) -> AnyElement {
     div()
-        .flex_1()
+        .w(px(width))
+        .flex_none()
         .min_w_0()
         .h_full()
         .flex()
         .flex_col()
-        .border_l_1()
-        .border_color(theme.border)
         .child(ui::pane_label(theme, "last written", theme.text_muted))
         .child(
             div()
@@ -1616,84 +2053,58 @@ fn next_target(state: &mut MergeState) -> Option<usize> {
     }
 }
 
-/// One fixed-height (20px) row of the result uniform_list. The result
-/// column rides the same virtualization as the input panes — a plain
-/// scrollable column measured ~10fps slower under a 120Hz wheel stream
-/// (2026-08-08 perf bisection).
-#[derive(Debug)]
-enum FlatRow {
-    /// Unchanged context line (muted).
-    Context(SharedString),
-    /// Materialized decision line, tinted by its provenance side
-    /// (None = edited text).
-    Line {
-        text: SharedString,
-        side: Option<ui::Side>,
-    },
-    /// Decision strip for `region` (state derived at render).
-    Strip { region: usize },
-    /// Provenance block header for an open conflict.
-    ProvLabel(ui::Side),
-    /// Read-only provenance line; `tip` = template hover text.
-    ProvLine {
-        side: ui::Side,
-        text: SharedString,
-        tip: Option<SharedString>,
-    },
-}
-
-/// Flatten region displays into uniform rows + per-region start indices
-/// (regions+1 entries; the sentinel is the total row count).
-fn flatten_displays(displays: &[RegionDisplay]) -> (Vec<FlatRow>, Vec<usize>) {
-    let mut rows = Vec::new();
-    let mut starts = Vec::with_capacity(displays.len() + 1);
-    for (region, display) in displays.iter().enumerate() {
-        starts.push(rows.len());
-        match display {
-            RegionDisplay::Context { lines } => {
-                rows.extend(lines.iter().map(|l| FlatRow::Context(l.clone())));
-            }
-            RegionDisplay::Deciding {
-                provenance, lines, ..
-            } => {
-                rows.push(FlatRow::Strip { region });
-                match provenance {
-                    Some((ours, theirs, theirs_protected)) => {
-                        rows.push(FlatRow::ProvLabel(ui::Side::Ours));
-                        rows.extend(ours.iter().map(|l| FlatRow::ProvLine {
-                            side: ui::Side::Ours,
-                            text: l.clone(),
-                            tip: None,
-                        }));
-                        rows.push(FlatRow::ProvLabel(ui::Side::Theirs));
-                        rows.extend(theirs.iter().enumerate().map(|(ix, l)| FlatRow::ProvLine {
-                            side: ui::Side::Theirs,
-                            text: l.clone(),
-                            tip: theirs_protected.get(&ix).cloned(),
-                        }));
-                    }
-                    None => rows.extend(lines.iter().map(|(l, side)| FlatRow::Line {
-                        text: l.clone(),
-                        side: *side,
-                    })),
-                }
-            }
-            RegionDisplay::Decided { lines, .. } => {
-                rows.push(FlatRow::Strip { region });
-                rows.extend(lines.iter().map(|(l, side)| FlatRow::Line {
-                    text: l.clone(),
-                    side: *side,
-                }));
-            }
-        }
-    }
-    starts.push(rows.len());
-    (rows, starts)
-}
-
 /// Fixed mono row height (`h_5` = 20px) — the unit converting pane scroll
 /// offsets to line positions for region-aligned sync.
 const PANE_ROW_H: f32 = 20.;
+
+/// Rows a decision-strip block occupies (Zed's FILE_HEADER_HEIGHT).
+const STRIP_ROWS: usize = 2;
+
+/// `sync_from` leader id for the result editor (0..=2 are the input panes).
+const RESULT_LEADER: usize = 3;
+
+/// Which draggable divider a gesture belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Divider {
+    /// Between input pane `i` and pane `i + 1`.
+    Pane(usize),
+    /// Between the input panes and the result.
+    Result,
+}
+
+/// Panels never collapse to nothing — you have to be able to grab the
+/// divider again.
+const MIN_PANE_W: f32 = 120.;
+const MIN_PANES_H: f32 = 80.;
+const MIN_RESULT_H: f32 = 120.;
+
+/// Does region `idx` render a decision strip? Exactly the regions whose
+/// [`region_display`] is not `Context` — i.e. anything changed, PLUS an
+/// unchanged region the user has since given a choice (a free-text edit can
+/// land `Choice::Edited` on context). The row geometry and the decorator
+/// MUST agree on this or the two disagree about where every line sits.
+fn region_has_strip(state: &MergeState, idx: usize) -> bool {
+    state.resolution.get(idx).is_some()
+        || state
+            .doc
+            .regions
+            .get(idx)
+            .is_some_and(|r| r.kind != RegionKind::Unchanged)
+}
+
+/// How many decision strips sit above text line `line`. A strip renders
+/// above its region's FIRST line, so it counts as soon as that region starts
+/// at or before `line`. Pure so the row geometry is testable without a
+/// window (this is what keeps the viewport still across an edit toggle).
+fn strips_above_line(line: usize, seed_line_starts: &[usize], changed: &[bool]) -> usize {
+    changed
+        .iter()
+        .enumerate()
+        .filter(|&(idx, &is_changed)| {
+            is_changed && seed_line_starts.get(idx).is_some_and(|&s| s <= line)
+        })
+        .count()
+}
 
 /// Region-aligned scroll mapping (2026-08-08 feedback: raw offset mirroring
 /// is not 1:1 across panes). `starts` has one row per region plus a totals
@@ -1727,107 +2138,58 @@ fn line_at(starts: &[[usize; 3]], col: usize, k: usize, f: f32) -> f32 {
     starts[k][col] as f32 + f * len
 }
 
-fn pane_row(ix: usize, line: &PaneLine, side: PaneSide, theme: Theme) -> AnyElement {
-    // Protected spans get the amber underlay regardless of region kind — the
-    // write-back rejection is the stronger fact.
-    let bg = if line.protected.is_some() {
-        Some(Theme::wash(theme.drift, 0.15))
-    } else {
-        row_bg(line.kind, side, &theme)
-    };
-    // Compact template marker (2026-08-08: a wide chip column shifted the
-    // panes' root indentation apart): EVERY mono row in the merge editor
-    // carries the same 16px gutter, protected lines fill it with an amber
-    // {} and the hover tooltip tells the full story.
-    //
-    // Text darkens only when THIS pane is washed, i.e. this side actually
-    // changed (2026-08-08: counterpart spans of one-sided changes rendered
-    // black-on-white — an unwashed "changed" line reads as a rendering
-    // glitch, and a side with no change deserves no emphasis at all).
-    let row = ui::mono_line(theme)
-        .text_color(if bg.is_some() {
-            theme.text
-        } else {
-            theme.text_muted
-        })
-        .when_some(bg, |el, bg| el.bg(bg))
-        .child(ui::line_gutter(
-            theme.drift,
-            if line.protected.is_some() { "{}" } else { "" },
-        ))
-        .child(ui::line_text(line.text.clone()));
-    match &line.protected {
-        Some(tip) => row
-            .id(ElementId::named_usize("tmpl-line", ix))
-            .tooltip(ui::text_tooltip(tip.clone()))
-            .into_any_element(),
-        None => row.into_any_element(),
-    }
+/// A decision-strip block spec, captured when the decorator is (re)built.
+#[derive(Clone, Copy)]
+struct StripSpec {
+    region: usize,
+    /// Seed line the strip sits above (read-only mode → content == seed).
+    above_line: usize,
+    kind: StripKind,
 }
 
-/// Render one fixed-height row of the result list. Strips derive their
-/// state from the cached display of their region; everything else is plain
-/// row composition (uniform_list keeps this O(viewport) — the plain scroll
-/// column measured ~10fps slower under a 120Hz wheel stream).
-fn flat_row_el(
-    ix: usize,
-    row: &FlatRow,
-    displays: &Rc<Vec<RegionDisplay>>,
-    cursor: Option<usize>,
-    has_base: bool,
+#[derive(Clone, Copy)]
+enum StripKind {
+    Deciding {
+        has_base: bool,
+        current: Option<ui::ChoiceKind>,
+        focused: bool,
+    },
+    Decided {
+        choice: ui::ChoiceKind,
+        focused: bool,
+    },
+}
+
+/// Build the block that renders one region's decision strip inside the
+/// result editor (Zed's `BlockPlacement::Above`). Buttons route back through
+/// the `MergeView` weak handle — pick applies + re-seeds, edit flips the
+/// editor editable, revisit reopens a decided strip.
+fn strip_block(
+    spec: &StripSpec,
     theme: Theme,
-    view: &WeakEntity<MergeView>,
-) -> AnyElement {
-    match row {
-        FlatRow::Context(text) => ui::mono_line(theme)
-            .text_color(theme.text_muted)
-            .child(ui::line_gutter(theme.text_muted, ""))
-            .child(ui::line_text(text.clone()))
-            .into_any_element(),
-        FlatRow::Line { text, side } => {
-            let row = ui::mono_line(theme)
-                .child(ui::line_gutter(theme.text_muted, ""))
-                .child(ui::line_text(text.clone()));
-            match side {
-                Some(side) => row.bg(Theme::wash(side.tint(theme), 0.07)),
-                None => row.bg(Theme::wash(theme.ok, 0.07)),
-            }
-            .into_any_element()
-        }
-        FlatRow::ProvLabel(side) => ui::provenance_label(theme, *side).into_any_element(),
-        FlatRow::ProvLine { side, text, tip } => {
-            let tint = side.tint(theme);
-            let row = ui::mono_line(theme)
-                .bg(Theme::wash(tint, 0.07))
-                .when(tip.is_some(), |el| el.bg(Theme::wash(theme.drift, 0.15)))
-                .child(div().w_0p5().h_full().flex_none().bg(tint))
-                .child(ui::line_gutter(
-                    theme.drift,
-                    if tip.is_some() { "{}" } else { "" },
-                ))
-                .child(ui::line_text(text.clone()));
-            match tip {
-                Some(tip) => row
-                    .id(ElementId::named_usize("flat-prov-tmpl", ix))
-                    .tooltip(ui::text_tooltip(tip.clone()))
-                    .into_any_element(),
-                None => row.into_any_element(),
-            }
-        }
-        FlatRow::Strip { region } => {
-            let idx = *region;
-            let cursor_here = cursor == Some(idx);
-            let state = match displays.get(idx) {
-                Some(RegionDisplay::Deciding { current, .. }) => ui::StripState::Deciding {
+    view: WeakEntity<MergeView>,
+) -> ui::text_area::Block {
+    let region = spec.region;
+    let state_kind = spec.kind;
+    ui::text_area::Block {
+        above_line: spec.above_line,
+        // Zed's FILE_HEADER_HEIGHT: room for the inset card without
+        // crowding the code above and below.
+        height: STRIP_ROWS as u32,
+        render: Rc::new(move |_window, _cx| {
+            let state = match state_kind {
+                StripKind::Deciding {
                     has_base,
-                    current: *current,
-                    focused: cursor_here,
+                    current,
+                    focused,
+                } => ui::StripState::Deciding {
+                    has_base,
+                    current,
+                    focused,
                 },
-                Some(RegionDisplay::Decided { choice, .. }) => ui::StripState::Decided {
-                    choice: *choice,
-                    focused: cursor_here,
-                },
-                _ => return div().into_any_element(),
+                StripKind::Decided { choice, focused } => {
+                    ui::StripState::Decided { choice, focused }
+                }
             };
             let on_pick = {
                 let view = view.clone();
@@ -1839,24 +2201,36 @@ fn flat_row_el(
                         ui::ChoiceKind::Both => Choice::Both,
                         ui::ChoiceKind::Edited => return,
                     };
-                    view.update(cx, |merge, cx| merge.apply(idx, choice, cx))
+                    view.update(cx, |merge, cx| merge.apply(region, choice, cx))
                         .ok();
                 }
             };
             let on_edit = {
                 let view = view.clone();
                 move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    view.update(cx, |merge, cx| merge.start_edit(idx, cx)).ok();
+                    view.update(cx, |merge, cx| merge.start_edit(region, cx))
+                        .ok();
                 }
             };
             let on_revisit = {
                 let view = view.clone();
                 move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    view.update(cx, |merge, cx| merge.revisit(idx, cx)).ok();
+                    view.update(cx, |merge, cx| merge.revisit(region, cx)).ok();
                 }
             };
-            ui::decision_strip(theme, idx, state, on_pick, on_edit, on_revisit).into_any_element()
-        }
+            // Blocks inherit the editor's mono text style; strips are UI
+            // chrome, so they reset to the system UI font.
+            div()
+                .font_family(".SystemUIFont")
+                // Pass the block's height through, or the strip's own
+                // layout has nothing to centre itself in.
+                .h_full()
+                .w_full()
+                .child(ui::decision_strip(
+                    theme, region, state, on_pick, on_edit, on_revisit,
+                ))
+                .into_any_element()
+        }),
     }
 }
 
@@ -1876,9 +2250,9 @@ mod tests {
     #[allow(unused_imports)]
     use super::{};
     use super::{
-        LoadedMerge, PaneSide, RegionDisplay, document_seed, edited_region_picks, line_at,
-        map_line, merge_banner, next_target, pane_lines, protected_line_info, region_at,
-        region_display, region_seed_text, row_bg,
+        LoadedMerge, PaneSide, RegionDisplay, STRIP_ROWS, document_seed, edited_region_picks,
+        line_at, map_line, merge_banner, next_target, pane_lines, protected_line_info, region_at,
+        region_display, region_has_strip, region_seed_text, row_bg, strips_above_line,
     };
     use gpui::SharedString;
     use std::collections::HashMap;
@@ -2044,6 +2418,79 @@ mod tests {
         let picks = edited_region_picks(&seed, &starts, edited);
         assert_eq!(picks, vec![(0, Choice::Edited("a changed\n".into()))]);
         // Region 1 (the conflict) got no pick — Save stays gated on it.
+    }
+
+    #[test]
+    fn editor_decors_mirror_the_result_pane_until_touched() {
+        let theme = Theme::dark();
+        let state = conflict_state();
+        let (seed, starts) = seeded(&state);
+        let patterns: Vec<_> = (0..state.doc.regions.len())
+            .map(|idx| super::region_pattern(&state, &HashMap::new(), theme, idx))
+            .collect();
+
+        // Untouched: context muted, conflict rows tinted+railed by side
+        // with "on disk"/"source" labels on the block's first rows.
+        let decors = super::editor_decors(theme, &seed, &starts, &patterns, &seed);
+        assert_eq!(decors[0].text_color, Some(theme.text_muted));
+        assert_eq!(decors[0].bg, None);
+        assert_eq!(decors[1].rail, Some(theme.drift));
+        assert_eq!(decors[1].bg, Some(Theme::wash(theme.drift, 0.07)));
+        assert_eq!(
+            decors[1].label.as_ref().map(|(t, _)| t.as_ref()),
+            Some("on disk")
+        );
+        assert_eq!(decors[2].rail, Some(theme.accent));
+        assert_eq!(
+            decors[2].label.as_ref().map(|(t, _)| t.as_ref()),
+            Some("source")
+        );
+
+        // Touch the conflict block: its rows flip to the edited (ok) wash
+        // with one "edited" pill; the context rows keep their pattern.
+        let edited = "a\nv = merged\nz\n";
+        let decors = super::editor_decors(theme, &seed, &starts, &patterns, edited);
+        assert_eq!(decors[0].text_color, Some(theme.text_muted));
+        assert_eq!(decors[1].bg, Some(Theme::wash(theme.ok, 0.07)));
+        assert_eq!(decors[1].rail, None);
+        assert_eq!(
+            decors[1].label.as_ref().map(|(t, _)| t.as_ref()),
+            Some("edited")
+        );
+        assert_eq!(
+            decors[2].text_color,
+            Some(theme.text_muted),
+            "trailing context intact"
+        );
+    }
+
+    #[test]
+    fn region_pattern_names_decided_and_auto_choices() {
+        let theme = Theme::dark();
+        let mut state = conflict_state();
+        let region = state.conflicts()[0];
+        state.pick(region, Choice::Theirs);
+        let pattern = super::region_pattern(&state, &HashMap::new(), theme, region);
+        assert_eq!(pattern.len(), 1);
+        assert_eq!(pattern[0].bg, Some(Theme::wash(theme.accent, 0.07)));
+        assert_eq!(
+            pattern[0].label.as_ref().map(|(t, _)| t.as_ref()),
+            Some("source")
+        );
+
+        // Auto-resolved disk-only region: labeled as auto.
+        let auto = MergeState::new(&inputs(Some("a\nz\n"), "a\nnew\nz\n", "a\nz\n"));
+        let ours_only = auto
+            .doc
+            .regions
+            .iter()
+            .position(|r| r.kind == RegionKind::OursOnly)
+            .unwrap();
+        let pattern = super::region_pattern(&auto, &HashMap::new(), theme, ours_only);
+        assert_eq!(
+            pattern[0].label.as_ref().map(|(t, _)| t.as_ref()),
+            Some("auto · disk")
+        );
     }
 
     #[test]
@@ -2345,5 +2792,86 @@ mod tests {
         assert_eq!(b.text.as_ref(), "save failed: daemon gone");
         assert_eq!(b.tint, BannerTint::Conflict);
         assert!(!b.undoable);
+    }
+
+    #[test]
+    fn strips_above_line_counts_each_changed_region_at_or_before_the_line() {
+        // 3 regions starting at lines 0, 1, 3; the middle one is changed.
+        let starts = [0usize, 1, 3];
+        let changed = [false, true, false];
+        assert_eq!(
+            strips_above_line(0, &starts, &changed),
+            0,
+            "before the region"
+        );
+        assert_eq!(
+            strips_above_line(1, &starts, &changed),
+            1,
+            "the strip sits ABOVE the region's first line, so it counts there"
+        );
+        assert_eq!(strips_above_line(9, &starts, &changed), 1);
+
+        // Two changed regions: both count once the line is past them.
+        let changed = [true, true, false];
+        assert_eq!(strips_above_line(0, &starts, &changed), 1);
+        assert_eq!(strips_above_line(1, &starts, &changed), 2);
+        assert_eq!(strips_above_line(3, &starts, &changed), 2);
+    }
+
+    /// The anchor arithmetic `rescroll_anchored` performs: entering edit mode
+    /// removes every strip, so a line's row drops by 2 per strip above it —
+    /// and the scroll offset must move by exactly that much to compensate.
+    #[test]
+    fn edit_toggle_row_delta_is_the_strips_above_the_anchor() {
+        let starts = [0usize, 1, 3];
+        let changed = [false, true, false];
+        let row_of = |line: usize, with_strips: bool| {
+            if with_strips {
+                line + strips_above_line(line, &starts, &changed) * STRIP_ROWS
+            } else {
+                line
+            }
+        };
+        // A line before any strip doesn't move at all.
+        assert_eq!(row_of(0, true), row_of(0, false));
+        // The changed region's own first line moves up by exactly one strip.
+        assert_eq!(row_of(1, true) - row_of(1, false), STRIP_ROWS);
+        // …and so does everything after it.
+        assert_eq!(row_of(9, true) - row_of(9, false), STRIP_ROWS);
+    }
+
+    #[test]
+    fn a_context_region_gains_a_strip_once_it_is_edited() {
+        use std::collections::HashSet;
+
+        // The row geometry and the decorator must agree on which regions
+        // carry a strip: a free-text edit can land `Choice::Edited` on an
+        // UNCHANGED region, which then renders one. Counting only
+        // `kind != Unchanged` under-counted and skewed every row mapping.
+        let mut state = conflict_state();
+        let unchanged = state
+            .doc
+            .regions
+            .iter()
+            .position(|r| r.kind == RegionKind::Unchanged)
+            .unwrap();
+        assert!(!region_has_strip(&state, unchanged));
+        assert!(
+            matches!(
+                region_display(&state, unchanged, &HashSet::new(), &HashMap::new()),
+                RegionDisplay::Context { .. }
+            ),
+            "…and the decorator agrees there is no strip"
+        );
+
+        state.pick(unchanged, Choice::Edited("edited\n".into()));
+        assert!(region_has_strip(&state, unchanged));
+        assert!(
+            !matches!(
+                region_display(&state, unchanged, &HashSet::new(), &HashMap::new()),
+                RegionDisplay::Context { .. }
+            ),
+            "…and now the decorator renders one"
+        );
     }
 }

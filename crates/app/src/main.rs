@@ -28,7 +28,7 @@ use tomte_journal::Journal;
 use tomte_proto::{Event, Request, Response};
 
 use notify_osa::{drift_body, notify, remote_advanced_body};
-use platform_mac::{MenuCommand, MenuSpec, StatusItem, set_accessory_policy};
+use platform_mac::{MenuCommand, MenuSpec, StatusItem, set_regular_policy};
 use views::settings::SettingsPaths;
 use views::{Route, Shell};
 
@@ -382,7 +382,7 @@ fn run_live(route: Route, paths: Paths) -> ExitCode {
         .run(move |cx: &mut App| {
             views::merge::register_keys(cx);
             let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
-            set_accessory_policy(mtm);
+            set_regular_policy(mtm);
 
             let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
             cx.observe(&state, {
@@ -415,8 +415,25 @@ fn run_live(route: Route, paths: Paths) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Show the main window on `route`. If one is already open it is routed and
+/// raised rather than duplicated — every menu-bar item and the Dock icon all
+/// land here, and each used to open ANOTHER window.
 fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: SettingsPaths) {
     cx.activate(true);
+    for handle in cx.windows() {
+        if let Some(shell) = handle.downcast::<Shell>() {
+            let raised = shell
+                .update(cx, |shell, window, cx| {
+                    shell.route = route;
+                    window.activate_window();
+                    cx.notify();
+                })
+                .is_ok();
+            if raised {
+                return;
+            }
+        }
+    }
     let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
     cx.open_window(
         WindowOptions {
@@ -449,6 +466,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     expanded_scans: Default::default(),
                     dashboard_action_in_flight: false,
                     unlock_in_flight: false,
+                    changelog: None,
                 }
             })
         },
@@ -948,40 +966,59 @@ fn main() -> ExitCode {
         return run_gallery(state, dark, paths.view_paths());
     }
 
-    Application::new()
-        .with_assets(tomte_ui::Assets)
-        .run(move |cx: &mut App| {
-            views::merge::register_keys(cx);
-            let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
-            set_accessory_policy(mtm);
-            let (status, menu_rx) = StatusItem::install(mtm);
-            let status = Rc::new(status);
-            // The status item must live for the app's lifetime, but this closure
-            // is `on_finish_launching` — it returns right after launch (gpui
-            // app.rs:180), so leak one strong ref (plan Task 1 implementer note):
-            // one item for the process lifetime.
-            std::mem::forget(Rc::clone(&status));
+    // Clicking the Dock icon of a running app with no open window must bring
+    // one back. `on_reopen` is registered on the Application BEFORE `run`,
+    // where the model doesn't exist yet — so the run closure publishes what
+    // it needs here.
+    type ReopenSeed = Rc<std::cell::RefCell<Option<(Entity<SyncModel>, SettingsPaths)>>>;
+    let reopen_seed: ReopenSeed = Rc::new(std::cell::RefCell::new(None));
+    let app = Application::new().with_assets(tomte_ui::Assets);
+    app.on_reopen({
+        let seed = Rc::clone(&reopen_seed);
+        move |cx| {
+            let seeded = seed.borrow().clone();
+            if let Some((state, paths)) = seeded {
+                open_shell(cx, Route::Dashboard, state, paths);
+            }
+        }
+    });
+    let run_seed = Rc::clone(&reopen_seed);
+    app.run(move |cx: &mut App| {
+        let reopen_seed = &run_seed;
+        views::merge::register_keys(cx);
+        let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
+        set_regular_policy(mtm);
+        let (status, menu_rx) = StatusItem::install(mtm);
+        let status = Rc::new(status);
+        // The status item must live for the app's lifetime, but this closure
+        // is `on_finish_launching` — it returns right after launch (gpui
+        // app.rs:180), so leak one strong ref (plan Task 1 implementer note):
+        // one item for the process lifetime.
+        std::mem::forget(Rc::clone(&status));
 
-            let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
+        let state: Entity<SyncModel> = cx.new(|_| SyncModel::default());
 
-            // Initial (disconnected) title + menu straight from the default
-            // model: header reads "tomted not connected" until hello lands.
-            refresh_status_item(&status, state.read(cx));
+        // Publish what `on_reopen` needs to rebuild a window (see below).
+        *reopen_seed.borrow_mut() = Some((state.clone(), paths.view_paths()));
 
-            // Single choke point for "after every model change, update AppKit":
-            // everything else just updates the entity and notifies.
-            cx.observe(&state, {
-                let status = Rc::clone(&status);
-                move |state, cx| refresh_status_item(&status, state.read(cx))
-            })
-            .detach();
+        // Initial (disconnected) title + menu straight from the default
+        // model: header reads "tomted not connected" until hello lands.
+        refresh_status_item(&status, state.read(cx));
 
-            spawn_menu_command_loop(cx, menu_rx, state.clone(), paths.view_paths());
-            spawn_boot_and_event_loop(cx, state.clone(), paths);
-            spawn_update_loop(cx, state.clone());
-            spawn_divergence_loop(cx, state.clone());
-            spawn_freshness_loop(cx, state, status);
-        });
+        // Single choke point for "after every model change, update AppKit":
+        // everything else just updates the entity and notifies.
+        cx.observe(&state, {
+            let status = Rc::clone(&status);
+            move |state, cx| refresh_status_item(&status, state.read(cx))
+        })
+        .detach();
+
+        spawn_menu_command_loop(cx, menu_rx, state.clone(), paths.view_paths());
+        spawn_boot_and_event_loop(cx, state.clone(), paths);
+        spawn_update_loop(cx, state.clone());
+        spawn_divergence_loop(cx, state.clone());
+        spawn_freshness_loop(cx, state, status);
+    });
     ExitCode::SUCCESS
 }
 

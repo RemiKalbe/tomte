@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Div, ElementId, Entity, FontWeight, HighlightStyle, Rgba, SharedString,
-    Stateful, StyledText, WeakEntity, Window, div, prelude::*, px, uniform_list,
+    AnyElement, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful,
+    WeakEntity, Window, div, prelude::*, px,
 };
 use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
 use tomte_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
@@ -30,10 +30,19 @@ use tomte_proto::DriftSummary;
 use tomte_ui::components as ui;
 
 use super::Shell;
-use super::dashboard::{TextTooltip, system_now};
+use super::dashboard::system_now;
 
 /// Fixed sidebar width per the approved mockup A (~260px).
 const SIDEBAR_WIDTH: f32 = 260.;
+/// The queue must stay wide enough to read a filename, and never swallow
+/// the diff it exists to introduce.
+const MIN_SIDEBAR_W: f32 = 180.;
+const MAX_SIDEBAR_W: f32 = 520.;
+/// History: tall enough for ~3 rows by default, and it must never grow so
+/// far that the diff it introduces disappears.
+const HISTORY_HEIGHT: f32 = 96.;
+const MIN_HISTORY_H: f32 = 40.;
+const MAX_HISTORY_H: f32 = 400.;
 
 /// Provenance rows shown for the selected target (newest first).
 const PROVENANCE_LIMIT: u32 = 8;
@@ -521,6 +530,20 @@ pub struct ReviewView {
     /// A resolve/undo action is running on the background executor: buttons
     /// disable and the header shows "working…". `pub(super)` for smoke tests.
     pub(super) action_in_flight: bool,
+    /// The diff is a read-only [`ui::TextArea`] (2026-08-23 feedback: "diffs
+    /// should be selectable"): same editor as the merge result, minus the
+    /// decision strips — so a diff can be selected and copied like text.
+    preview_editor: Option<Entity<ui::TextArea>>,
+    /// Rebuild the editor's content + decorations on the next render (the
+    /// preview changed, or the theme flipped).
+    preview_dirty: bool,
+    preview_appearance: Option<gpui::WindowAppearance>,
+    /// Draggable sidebar width (2026-08-27); `None` until first render.
+    sidebar_width: Option<f32>,
+    sidebar_drag: Option<ui::DragState<()>>,
+    /// Draggable History height, and its in-flight drag.
+    history_height: Option<f32>,
+    history_drag: Option<ui::DragState<()>>,
 }
 
 impl ReviewView {
@@ -537,6 +560,13 @@ impl ReviewView {
             auto_merge: None,
             last_outcome: None,
             action_in_flight: false,
+            preview_editor: None,
+            preview_dirty: true,
+            preview_appearance: None,
+            sidebar_width: None,
+            sidebar_drag: None,
+            history_height: None,
+            history_drag: None,
         }
     }
 
@@ -551,6 +581,7 @@ impl ReviewView {
         }
         self.selected = Some(target.clone());
         self.preview = PreviewState::Loading;
+        self.preview_dirty = true;
         self.provenance.clear();
         self.auto_merge = None;
         cx.notify();
@@ -569,6 +600,7 @@ impl ReviewView {
                     view.provenance = loaded.provenance;
                     view.auto_merge = loaded.auto_merge;
                     view.preview = loaded.preview;
+                    view.preview_dirty = true;
                     cx.notify();
                 }
             })
@@ -733,7 +765,10 @@ impl ReviewView {
     }
 
     /// "Open merge editor" — live when the engine global exists (`detail()`
-    /// already implies a selection).
+    /// already implies a selection). Goes through the shared button so it
+    /// obeys the surface rule like everything else; it was hand-rolled with
+    /// a full-strength `theme.text` outline, which read far louder than the
+    /// secondary action it is (2026-08-25).
     fn merge_editor_button(
         &self,
         enabled: bool,
@@ -741,41 +776,27 @@ impl ReviewView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let base = div()
-            .id("open-merge-editor")
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .border_1()
-            .text_xs()
-            .child("Open merge editor");
-        if enabled {
-            // Accent only when merging is this file's real resolution path
-            // (a conflict); for one-click drifts it's a secondary option.
-            let color = if is_conflict {
-                theme.accent
-            } else {
-                theme.text
-            };
-            base.border_color(if is_conflict {
-                theme.accent
-            } else {
-                theme.border
-            })
-            .text_color(color)
-            .cursor_pointer()
-            .hover(|el| el.bg(Theme::wash(color, 0.12)))
-            .on_click(cx.listener(|view, _ev, _window, cx| view.open_merge_editor(cx)))
-        } else {
-            base.border_color(theme.border)
-                .text_color(theme.text_muted)
-                .tooltip(|_window, cx| {
-                    cx.new(|_| TextTooltip {
-                        text: "daemon not connected".into(),
-                    })
-                    .into()
-                })
+        if !enabled {
+            return ui::disabled_button(
+                theme,
+                "open-merge-editor",
+                "Open merge editor".into(),
+                ui::ButtonSize::Sm,
+                Some("daemon not connected".into()),
+            );
         }
+        // Deliberately UNcoloured: "Keep disk" and "Keep source" own the
+        // amber/blue side vocabulary, so tinting this one too would imply it
+        // acts on a side. It opens a surface instead — neutral says that.
+        let _ = is_conflict;
+        ui::button(
+            theme,
+            "open-merge-editor",
+            "Open merge editor".into(),
+            ui::ButtonVariant::Tonal(theme.text_muted),
+            ui::ButtonSize::Sm,
+            cx.listener(|view, _ev, _window, cx| view.open_merge_editor(cx)),
+        )
     }
 
     /// One header action button. Enabled needs a live engine (daemon
@@ -793,7 +814,12 @@ impl ReviewView {
                 theme,
                 id,
                 action.label().into(),
-                ui::ButtonVariant::Outline(theme.accent),
+                // The quick actions carry the side they act on, exactly as
+                // the diff rows and the merge strips do.
+                ui::ButtonVariant::Tonal(match action {
+                    ResolveAction::KeepDisk => theme.drift,
+                    ResolveAction::KeepSource => theme.accent,
+                }),
                 ui::ButtonSize::Sm,
                 cx.listener(move |view, _ev, _window, cx| view.run_action(action, cx)),
             )
@@ -817,7 +843,7 @@ impl ReviewView {
                 theme,
                 "outcome-undo",
                 "Undo".into(),
-                ui::ButtonVariant::Outline(color),
+                ui::ButtonVariant::Solid(color),
                 ui::ButtonSize::Micro,
                 cx.listener(|view, _ev, _window, cx| view.run_undo(cx)),
             )
@@ -865,11 +891,9 @@ impl ReviewView {
         }
         div()
             .id("review-sidebar")
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width.unwrap_or(SIDEBAR_WIDTH)))
             .flex_shrink_0()
             .h_full()
-            .border_r_1()
-            .border_color(theme.border)
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -976,7 +1000,7 @@ impl ReviewView {
                 Some("Fix this, then re-select the file to reload the preview."),
             ),
             PreviewState::Error(msg) => message_box(theme, "preview failed", msg.clone(), None),
-            PreviewState::Ready(doc) => diff_preview(doc, theme),
+            PreviewState::Ready(_) => self.diff_preview(theme),
         };
 
         div()
@@ -1016,7 +1040,7 @@ impl ReviewView {
                                         theme,
                                         "keep-both",
                                         "Keep both".into(),
-                                        ui::ButtonVariant::Outline(theme.ok),
+                                        ui::ButtonVariant::Tonal(theme.ok),
                                         ui::ButtonSize::Sm,
                                         cx.listener(|view, _ev, _window, cx| {
                                             view.run_keep_both(cx)
@@ -1057,7 +1081,24 @@ impl ReviewView {
                 el.child(self.banner_el(&banner, theme, cx))
             })
             .when(!self.provenance.is_empty(), |el| {
-                el.child(provenance_section(&self.provenance, now, theme))
+                let dragging = self.history_drag.is_some();
+                el.child(provenance_section(
+                    &self.provenance,
+                    now,
+                    self.history_height.unwrap_or(HISTORY_HEIGHT),
+                    theme,
+                ))
+                .child(ui::resize_handle(
+                    "review-history-divider",
+                    ui::ResizeAxis::Y,
+                    dragging,
+                    theme,
+                    cx.listener(|this, event: &gpui::MouseDownEvent, _w, cx| {
+                        let start = this.history_height.unwrap_or(HISTORY_HEIGHT);
+                        this.history_drag = Some(ui::DragState::new((), event, start));
+                        cx.notify();
+                    }),
+                ))
             })
             .child(body)
             .into_any_element()
@@ -1071,19 +1112,158 @@ impl Render for ReviewView {
 }
 
 impl ReviewView {
+    /// (Re)build the preview editor when the diff or the theme changed:
+    /// the document text is the flattened diff, the decorations carry the
+    /// tints/dots/word-diff spans. Read-only — this is a viewer that happens
+    /// to be selectable, not an editing surface.
+    fn sync_preview_editor(&mut self, theme: Theme, window: &Window, cx: &mut Context<Self>) {
+        let appearance_changed = self.preview_appearance != Some(window.appearance());
+        if !self.preview_dirty && !appearance_changed {
+            return;
+        }
+        self.preview_dirty = false;
+        self.preview_appearance = Some(window.appearance());
+        let PreviewState::Ready(doc) = &self.preview else {
+            self.preview_editor = None;
+            return;
+        };
+        let lines = flatten_document(doc);
+        if lines.is_empty() {
+            // Nothing differs: the pane shows the "matches" note instead.
+            self.preview_editor = None;
+            return;
+        }
+        let text: String = lines
+            .iter()
+            .map(|l| l.text.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let decors = Rc::new(preview_decors(&lines, theme));
+        let decorator = move |_: &str| ui::text_area::Decoration {
+            lines: decors.as_ref().clone(),
+            blocks: Vec::new(),
+        };
+        match &self.preview_editor {
+            Some(editor) => editor.update(cx, |area, _| {
+                area.set_content(text);
+                area.set_decorator(Box::new(decorator));
+            }),
+            None => {
+                let editor = cx.new(|cx| {
+                    let mut area = ui::TextArea::read_only(text, cx);
+                    // Same 28px text column as the merge panes' mono rows
+                    // (px_2 + w_4 gutter + gap_1), so the dot gutter lines up.
+                    area.set_left_inset(px(28.));
+                    area.set_decorator(Box::new(decorator));
+                    area
+                });
+                self.preview_editor = Some(editor);
+            }
+        }
+    }
+
+    /// The diff pane: the read-only editor over a thin legend footer. The
+    /// diff IS the pane content — no bordered sub-container (2026-08-08
+    /// feedback).
+    fn diff_preview(&self, theme: Theme) -> AnyElement {
+        let Some(editor) = &self.preview_editor else {
+            return centered_note(
+                theme,
+                "destination matches the rendered source".into(),
+                theme.ok,
+            );
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("review-diff-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .overflow_x_scroll()
+                    .pt_1()
+                    .font_family("Menlo")
+                    .text_xs()
+                    .line_height(px(20.))
+                    .child(editor.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h_6()
+                    .px_3()
+                    .border_t_1()
+                    .border_color(Theme::wash(theme.border, 0.7))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_xs()
+                    .child(legend_swatch(theme.accent, "source would write"))
+                    .child(legend_swatch(theme.drift, "on disk now")),
+            )
+            .into_any_element()
+    }
+
     fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        self.sync_preview_editor(theme, window, cx);
         let now = system_now();
         let model = self.state.read(cx);
         let drifted = model.drifted.clone();
         let in_sync = model.in_sync;
         let (needs_you, one_click) = severity_groups(&drifted);
 
+        let dragging = self.sidebar_drag.is_some();
         div()
             .flex_1()
             .min_h_0()
             .flex()
+            // A drag that leaves the 7px strip still has to track (see
+            // `ui::resize_handle`), so the root owns move/up.
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _w, cx| {
+                if let Some(drag) = this.sidebar_drag {
+                    let w = drag.start + drag.delta(event, ui::ResizeAxis::X);
+                    this.sidebar_width = Some(w.clamp(MIN_SIDEBAR_W, MAX_SIDEBAR_W));
+                    cx.notify();
+                }
+                if let Some(drag) = this.history_drag {
+                    let h = drag.start + drag.delta(event, ui::ResizeAxis::Y);
+                    this.history_height = Some(h.clamp(MIN_HISTORY_H, MAX_HISTORY_H));
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| {
+                    if this.sidebar_drag.take().is_some() || this.history_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| {
+                    if this.sidebar_drag.take().is_some() || this.history_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(self.sidebar(&needs_you, &one_click, in_sync, now, theme, cx))
+            .child(ui::resize_handle(
+                "review-sidebar-divider",
+                ui::ResizeAxis::X,
+                dragging,
+                theme,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _w, cx| {
+                    let start = this.sidebar_width.unwrap_or(SIDEBAR_WIDTH);
+                    this.sidebar_drag = Some(ui::DragState::new((), event, start));
+                    cx.notify();
+                }),
+            ))
             .child(self.detail(now, theme, cx))
     }
 }
@@ -1114,15 +1294,17 @@ pub(super) fn message_box(
     ui::message_box(theme, title, detail.into(), followup).into_any_element()
 }
 
-fn provenance_section(rows: &[ProvRow], now: u64, theme: Theme) -> Div {
+fn provenance_section(rows: &[ProvRow], now: u64, height: f32, theme: Theme) -> Stateful<Div> {
     div()
+        .id("review-history")
+        .h(px(height))
+        .flex_none()
         .flex()
         .flex_col()
         .gap_1()
         .px_3()
         .py_2()
-        .border_b_1()
-        .border_color(theme.border)
+        .overflow_y_scroll()
         .child(
             div()
                 .text_xs()
@@ -1165,83 +1347,69 @@ fn provenance_row(row: &ProvRow, now: u64, theme: Theme) -> Div {
     )
 }
 
-fn diff_preview(doc: &MergeDocument, theme: Theme) -> AnyElement {
-    let lines: Rc<Vec<DiffLine>> = Rc::new(flatten_document(doc));
-    if lines.is_empty() {
-        return centered_note(
-            theme,
-            "destination matches the rendered source".into(),
-            theme.ok,
-        );
-    }
-    // The diff IS the pane content — no bordered sub-container (2026-08-08
-    // feedback); the +/− legend sits in a thin footer line under it.
+/// Per-line decorations for the preview diff. Same vocabulary as the merge
+/// editor's result rows (2026-08-26 feedback: "the diff coloring should be
+/// the same as the one on the editor"): a wash of the owning side's tint
+/// with a 2px rail down its edge, context muted and undecorated. No gutter
+/// dot: the field and the rail already say which side a row belongs to, so
+/// the dot was one signal too many (2026-08-27).
+/// One legend entry: a miniature of the row treatment itself (rail + field)
+/// rather than an unrelated dot, so the key matches what's above it.
+fn legend_swatch(tint: Rgba, label: &'static str) -> Div {
     div()
-        .flex_1()
-        .min_h_0()
         .flex()
-        .flex_col()
+        .items_center()
+        .gap_1p5()
         .child(
-            uniform_list("review-diff", lines.len(), move |range, _window, _cx| {
-                range.map(|ix| diff_row(&lines[ix], theme)).collect()
-            })
-            .flex_1()
-            .pt_1(),
-        )
-        .child(
+            // A miniature of the row treatment, not a dot: rail + field. The
+            // field is carried at a higher alpha than the rows use — at
+            // 12×12 the row's 7% wash is invisible and the swatch reads as a
+            // stray bracket.
             div()
-                .flex_none()
-                .h_6()
-                .px_3()
-                .border_t_1()
-                .border_color(Theme::wash(theme.border, 0.7))
-                .flex()
-                .items_center()
-                .gap_3()
-                .text_xs()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(div().w_1p5().h_1p5().rounded_full().bg(theme.accent))
-                        .child(div().text_color(theme.accent).child("source would write")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(div().w_1p5().h_1p5().rounded_full().bg(theme.drift))
-                        .child(div().text_color(theme.drift).child("on disk now")),
-                ),
+                .w_5()
+                .h_3()
+                .rounded_r_sm()
+                .bg(Theme::wash(tint, 0.22))
+                .border_l_2()
+                .border_color(tint),
         )
-        .into_any_element()
+        .child(div().text_color(tint).child(label))
 }
 
-fn diff_row(line: &DiffLine, theme: Theme) -> Div {
-    let color = match line.tint {
-        LineTint::Context => theme.text_muted,
-        LineTint::Rendered => theme.accent,
-        LineTint::Destination => theme.drift,
-    };
-    let text: AnyElement = if line.highlights.is_empty() {
-        line.text.clone().into_any_element()
-    } else {
-        // Word-diff emphasis: translucent wash of the line's own tint, so no
-        // color outside the Theme tokens enters the view.
-        let style = HighlightStyle {
-            background_color: Some(Rgba { a: 0.25, ..color }.into()),
-            ..Default::default()
-        };
-        StyledText::new(line.text.clone())
-            .with_highlights(line.highlights.iter().map(|r| (r.clone(), style)))
-            .into_any_element()
-    };
-    ui::mono_line(theme)
-        .text_color(color)
-        .child(ui::line_gutter(color, line.marker))
-        .child(ui::line_text(text))
+fn preview_decors(lines: &[DiffLine], theme: Theme) -> Vec<ui::text_area::LineDecor> {
+    lines
+        .iter()
+        .map(|line| {
+            let tint = match line.tint {
+                LineTint::Context => theme.text_muted,
+                LineTint::Rendered => theme.accent,
+                LineTint::Destination => theme.drift,
+            };
+            let changed = line.tint != LineTint::Context;
+            ui::text_area::LineDecor {
+                // Changed rows sit on their side's field, exactly like the
+                // provenance blocks in the merge result.
+                bg: changed.then(|| Theme::wash(tint, 0.07)),
+                rail: changed.then_some(tint),
+                // Text stays readable rather than tinted: the field carries
+                // the side, so the glyphs don't have to (matching the editor,
+                // where only unchanged context is dimmed).
+                text_color: Some(if changed {
+                    theme.text
+                } else {
+                    theme.text_muted
+                }),
+                // Word-diff emphasis: a translucent wash of the line's own
+                // tint, so no colour outside the Theme tokens enters the view.
+                spans: line
+                    .highlights
+                    .iter()
+                    .map(|r| (r.clone(), Rgba { a: 0.22, ..tint }))
+                    .collect(),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1254,8 +1422,9 @@ mod tests {
 
     use super::{
         BannerTint, DiffLine, LineTint, ResolveAction, flatten_document, outcome_banner,
-        per_line_ranges, severity_groups, undo_banner,
+        per_line_ranges, preview_decors, severity_groups, undo_banner,
     };
+    use tomte_app::theme::Theme;
 
     fn s(target: &str, class: &str) -> DriftSummary {
         DriftSummary {
@@ -1524,5 +1693,66 @@ mod tests {
         // a range entirely inside the trailing newline vanishes
         let out = per_line_ranges(&lines, std::slice::from_ref(&(2..3)));
         assert_eq!(out, vec![Vec::<std::ops::Range<usize>>::new(), Vec::new()]);
+    }
+
+    #[test]
+    fn preview_decors_match_the_merge_editor_vocabulary() {
+        let theme = Theme::dark();
+        // rendered "font = 14" vs disk "font = 15": one changed pair with a
+        // word-diff span on the differing digits.
+        let doc = MergeDocument::compute(
+            "a\nfont = 14\n",
+            "a\nfont = 15\n",
+            "a\nfont = 14\n",
+            MergeOptions::default(),
+        );
+        let lines = flatten_document(&doc);
+        let decors = preview_decors(&lines, theme);
+        assert_eq!(decors.len(), lines.len());
+
+        // Context: muted text, no field, no rail, no dot.
+        let ctx = lines
+            .iter()
+            .position(|l| l.tint == LineTint::Context)
+            .unwrap();
+        assert_eq!(decors[ctx].text_color, Some(theme.text_muted));
+        assert_eq!(decors[ctx].bg, None);
+        assert_eq!(decors[ctx].rail, None);
+        assert!(decors[ctx].gutter.is_none());
+
+        // Changed rows sit on their side's field with a rail — the same
+        // treatment the merge result gives its provenance blocks.
+        for (tint, side) in [
+            (LineTint::Rendered, theme.accent),
+            (LineTint::Destination, theme.drift),
+        ] {
+            let ix = lines.iter().position(|l| l.tint == tint).unwrap();
+            assert_eq!(
+                decors[ix].bg,
+                Some(Theme::wash(side, 0.07)),
+                "{tint:?} field"
+            );
+            assert_eq!(decors[ix].rail, Some(side), "{tint:?} rail");
+            assert_eq!(
+                decors[ix].text_color,
+                Some(theme.text),
+                "{tint:?} glyphs stay readable; the field carries the side"
+            );
+            assert!(
+                decors[ix].gutter.is_none(),
+                "{tint:?} carries no dot: the field and rail already name the side"
+            );
+        }
+
+        // Word-diff emphasis survives as translucent spans of the line tint.
+        let disk = lines
+            .iter()
+            .position(|l| l.tint == LineTint::Destination)
+            .unwrap();
+        assert_eq!(decors[disk].spans.len(), lines[disk].highlights.len());
+        if let Some((range, color)) = decors[disk].spans.first() {
+            assert_eq!(*range, lines[disk].highlights[0]);
+            assert!((color.a - 0.22).abs() < f32::EPSILON);
+        }
     }
 }

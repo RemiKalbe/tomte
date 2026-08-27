@@ -87,9 +87,16 @@ pub struct StatusItem {
     target: Retained<MenuTarget>,
 }
 
-pub fn set_accessory_policy(mtm: MainThreadMarker) {
+/// Tomte is a REGULAR app, not a menu-bar accessory.
+///
+/// `Accessory` (with `LSUIElement` in Info.plist) is what a pure menu-bar
+/// utility uses — and it is why Tomte never appeared in ⌘-Tab or the Dock,
+/// leaving no way in at all when the menu bar is full and the status icon
+/// gets hidden (2026-08-27 report). The status item stays; a regular app is
+/// free to have one, it just isn't the ONLY door any more.
+pub fn set_regular_policy(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
 }
 
 impl StatusItem {

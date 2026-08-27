@@ -4,6 +4,8 @@
 
 use gpui::{AnyElement, App, ClickEvent, Div, Window, div, prelude::*};
 
+pub mod buttons;
+
 use crate::components::*;
 use crate::theme::Theme;
 
@@ -16,6 +18,7 @@ pub const COMPONENTS: &[(&str, &str)] = &[
     ("toolbar", "floating Save/Revert toolbar"),
     ("merge-region", "decision strip states + provenance rows"),
     ("spinner", "indeterminate scan/load spinner"),
+    ("buttons", "BUTTON LAB: 12 candidate designs in real scenes"),
 ];
 
 fn noop(_: &ClickEvent, _: &mut Window, _: &mut App) {}
@@ -185,7 +188,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                     theme,
                     "prev-save",
                     "Save".into(),
-                    ButtonVariant::Outline(theme.accent),
+                    ButtonVariant::Ring(theme.accent),
                     ButtonSize::Md,
                     noop,
                 ))
@@ -302,6 +305,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 .into_any_element(),
         )
         .into_any_element(),
+        "buttons" => buttons::render(theme).into_any_element(),
         _ => return None,
     };
     Some(el)
