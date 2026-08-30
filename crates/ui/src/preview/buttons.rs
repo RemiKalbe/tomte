@@ -810,6 +810,14 @@ fn shipped(theme: Theme) -> Div {
                 ButtonSize::Sm,
                 noop,
             ))
+            .child(button(
+                theme,
+                ElementId::from(SharedString::from(format!("{prefix}-remote"))),
+                "origin".into(),
+                variant(theme.remote),
+                ButtonSize::Sm,
+                noop,
+            ))
     };
     div()
         .w_full()

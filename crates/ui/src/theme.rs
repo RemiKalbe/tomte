@@ -13,6 +13,10 @@ pub struct Theme {
     pub ok: Rgba,
     pub drift: Rgba,
     pub conflict: Rgba,
+    /// Origin's version of a source file — the fourth content state.
+    /// Pastel purple: a member of no existing family, because origin is
+    /// neither disk (amber) nor local source (blue).
+    pub remote: Rgba,
 }
 
 impl Theme {
@@ -27,6 +31,7 @@ impl Theme {
             ok: rgb(0x3fb950),
             drift: rgb(0xd29922),
             conflict: rgb(0xf85149),
+            remote: rgb(0xd2a8ff),
         }
     }
 
@@ -41,6 +46,7 @@ impl Theme {
             ok: rgb(0x1a7f37),
             drift: rgb(0x9a6700),
             conflict: rgb(0xcf222e),
+            remote: rgb(0x8250df),
         }
     }
 
@@ -78,5 +84,20 @@ mod tests {
         assert_eq!(t.class_color("destination_drift"), t.drift);
         assert_eq!(t.class_color("remote_ahead"), t.accent);
         assert_eq!(t.class_color("in_sync"), t.ok);
+    }
+
+    #[test]
+    fn remote_is_distinct_from_every_other_class_tint() {
+        // Origin is its own provenance and must never be confused with the
+        // local source (accent), disk (drift), or a resolved region (ok).
+        for t in [Theme::dark(), Theme::light()] {
+            for other in [t.accent, t.drift, t.ok, t.conflict, t.text_muted] {
+                assert_ne!(
+                    (t.remote.r, t.remote.g, t.remote.b),
+                    (other.r, other.g, other.b),
+                    "remote must be visually distinct from every other tint"
+                );
+            }
+        }
     }
 }
