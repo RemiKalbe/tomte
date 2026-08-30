@@ -162,52 +162,56 @@ config, which hangs headless):
 ```rust
 #[test]
 fn merge_tree_reports_clean_and_conflicting_merges_without_touching_the_tree() {
-    let s = Scratch::new();
-    unsigned(&s.repo);
+    let scratch = Scratch::new();
+    unsigned(&scratch.source);
+    let git = GitClient::new(Arc::new(SystemRunner), scratch.source.clone());
 
     // Two branches touching DIFFERENT files: a clean merge.
-    write(&s.repo, "a.txt", "one\n");
-    git(&s.repo, &["add", "."]);
-    git(&s.repo, &["commit", "-m", "a"]);
-    git(&s.repo, &["branch", "other"]);
-    write(&s.repo, "b.txt", "local\n");
-    git(&s.repo, &["add", "."]);
-    git(&s.repo, &["commit", "-m", "local b"]);
-    git(&s.repo, &["checkout", "other"]);
-    write(&s.repo, "c.txt", "remote\n");
-    git(&s.repo, &["add", "."]);
-    git(&s.repo, &["commit", "-m", "remote c"]);
-    git(&s.repo, &["checkout", "main"]);
+    sh(&scratch.source, "git", &["checkout", "-b", "other"]);
+    write(&scratch.source.join("only-other"), "remote\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "other"]);
+    sh(&scratch.source, "git", &["checkout", "main"]);
+    write(&scratch.source.join("only-main"), "local\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "main"]);
 
-    let client = GitClient::new(Arc::new(SystemRunner), s.repo.clone());
-    let head_before = client.head_sha().unwrap();
+    let head_before = git.head_sha().unwrap();
     assert_eq!(
-        client.merge_tree_conflicts("other").unwrap(),
+        git.merge_tree_conflicts("other").unwrap(),
         Some(vec![]),
         "different files merge cleanly"
     );
     assert_eq!(
-        client.head_sha().unwrap(),
+        git.head_sha().unwrap(),
         head_before,
         "a virtual merge must not move HEAD"
     );
-    assert!(!client.merge_in_progress(), "and must not start a merge");
+    assert!(!git.merge_in_progress(), "and must not start a merge");
 
-    // Now make the SAME file conflict.
-    git(&s.repo, &["checkout", "other"]);
-    write(&s.repo, "a.txt", "remote edit\n");
-    git(&s.repo, &["add", "."]);
-    git(&s.repo, &["commit", "-m", "remote a"]);
-    git(&s.repo, &["checkout", "main"]);
-    write(&s.repo, "a.txt", "local edit\n");
-    git(&s.repo, &["add", "."]);
-    git(&s.repo, &["commit", "-m", "local a"]);
+    // Now make the SAME file conflict on both branches.
+    sh(&scratch.source, "git", &["checkout", "other"]);
+    write(&scratch.source.join("dot_testrc"), "a=other\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "other testrc"]);
+    sh(&scratch.source, "git", &["checkout", "main"]);
+    write(&scratch.source.join("dot_testrc"), "a=main\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "main testrc"]);
 
-    let conflicts = client.merge_tree_conflicts("other").unwrap().unwrap();
-    assert_eq!(conflicts, vec![PathBuf::from("a.txt")]);
-    assert!(!client.merge_in_progress(), "still no real merge started");
+    let conflicts = git.merge_tree_conflicts("other").unwrap().unwrap();
+    assert_eq!(conflicts, vec![PathBuf::from("dot_testrc")]);
+    assert!(!git.merge_in_progress(), "still no real merge started");
 }
 ```
+
+`git_sync.rs` today imports `use std::path::Path;` — add `PathBuf` to that
+import. Its local helpers are `write(full_path, text)` (TWO args, a full
+path — not `(repo, name)`), `unsigned(repo)`, `other_clone(&scratch)`, and
+`sh(cwd, program, args)` from `support`. `Scratch` exposes `root`, `home`,
+`source`, and `bare` — there is **no** `repo` field and **no**
+`new_with_origin()`; `Scratch::new()` already creates the bare origin and
+pushes `main` to it.
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -277,24 +281,40 @@ git commit -m "feat(core): virtual merge conflict probe via git merge-tree"
 ```rust
 #[test]
 fn a_diverged_but_non_conflicting_repo_joins_automatically() {
-    // Both sides moved, different files: today this is left alone and the
-    // user gets a red banner. It must merge itself.
-    let s = Scratch::new_with_origin();
-    unsigned(&s.repo);
-    // (build: origin commits x.txt, local commits y.txt — see
-    //  `rejected_push_recovers_by_rebasing` in this file for the shape)
-    let client = GitClient::new(Arc::new(SystemRunner), s.repo.clone());
-    let d = client.divergence("origin/main").unwrap();
-    assert!(d.ahead > 0 && d.behind > 0, "precondition: diverged");
+    // Both sides moved, on different files. Today this is left alone and the
+    // user gets a red banner; it must now join itself.
+    let scratch = Scratch::new();
+    unsigned(&scratch.source);
+    let git = GitClient::new(Arc::new(SystemRunner), scratch.source.clone());
 
-    assert_eq!(client.merge_tree_conflicts("origin/main").unwrap(), Some(vec![]));
-    client.merge("origin/main").unwrap();
+    // Origin moves…
+    let other = other_clone(&scratch);
+    write(&other.join("remote-only"), "x\n");
+    sh(&other, "git", &["add", "-A"]);
+    sh(&other, "git", &["commit", "-m", "remote"]);
+    sh(&other, "git", &["push", "origin", "main"]);
+    // …while we commit a DIFFERENT file locally.
+    write(&scratch.source.join("local-only"), "y\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "local"]);
 
-    let after = client.divergence("origin/main").unwrap();
+    git.fetch("origin").unwrap();
+    let div = git.divergence("origin/main").unwrap();
+    assert!(div.ahead > 0 && div.behind > 0, "precondition: diverged");
+
+    // The virtual merge proves it clean BEFORE anything is written.
+    assert_eq!(git.merge_tree_conflicts("origin/main").unwrap(), Some(vec![]));
+    assert!(matches!(git.merge("origin/main").unwrap(), MergeStart::Clean));
+
+    let after = git.divergence("origin/main").unwrap();
     assert_eq!(after.behind, 0, "origin's commits are now local");
-    assert!(!client.merge_in_progress());
+    assert!(!git.merge_in_progress());
 }
 ```
+
+`other_clone(&scratch)` already exists in `git_sync.rs` (it clones
+`scratch.bare` and sets repo-local unsigned identity) — use it rather than
+writing a new clone helper.
 
 - [ ] **Step 2: Run it and watch it fail (or pass trivially — then fix the assertions to bite)**
 
