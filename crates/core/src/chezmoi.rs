@@ -117,6 +117,12 @@ pub struct EvalFailure {
 pub enum ChezmoiError {
     #[error("template/secret evaluation failed: {}", .0.hint)]
     Eval(EvalFailure),
+    /// The target is managed, but it is not a regular file — a directory or
+    /// an entry type this app doesn't probe. Chezmoi is the authority on
+    /// that, and it says so by failing `cat`; a caller walking managed
+    /// entries must treat this as "skip", not as breakage.
+    #[error("not a regular file: {target}")]
+    NotAFile { target: PathBuf },
     #[error(transparent)]
     Command(#[from] CommandError),
     #[error("chezmoi exited with code {code}: {stderr}")]
@@ -191,6 +197,32 @@ impl ChezmoiClient {
         self.run_ok_with_timeout(args, stdin, self.opts.timeout)
     }
 
+    /// Like [`Self::cat`], but for a target that MIGHT not be a file — the
+    /// scanner probes candidates before knowing what they are. The failure is
+    /// expected and handled, so it is logged as such instead of as an error.
+    pub fn cat_probe(&self, target: &Path) -> Result<Vec<u8>, ChezmoiError> {
+        let req = self
+            .request(&["cat", &target.to_string_lossy()])
+            .failure_is_expected();
+        let out = self.runner.run(req)?;
+        if out.success() {
+            return Ok(out.stdout);
+        }
+        let stderr = out.stderr_utf8();
+        if Self::is_not_a_file_stderr(&stderr) {
+            return Err(ChezmoiError::NotAFile {
+                target: target.to_path_buf(),
+            });
+        }
+        if let Some(eval) = classify_eval_stderr(&stderr) {
+            return Err(ChezmoiError::Eval(eval));
+        }
+        Err(ChezmoiError::Exit {
+            code: out.exit_code,
+            stderr,
+        })
+    }
+
     fn run_ok_with_timeout(
         &self,
         args: &[&str],
@@ -258,6 +290,17 @@ impl ChezmoiClient {
 
     pub fn cat(&self, target: &Path) -> Result<Vec<u8>, ChezmoiError> {
         self.run_ok(&["cat", &target.to_string_lossy()], None)
+            .map_err(|e| match &e {
+                // A managed DIRECTORY (or other non-file entry) — chezmoi
+                // reports it by failing `cat`. Typed here so callers can skip
+                // it instead of matching on stderr text.
+                ChezmoiError::Exit { stderr, .. } if Self::is_not_a_file_stderr(stderr) => {
+                    ChezmoiError::NotAFile {
+                        target: target.to_path_buf(),
+                    }
+                }
+                _ => e,
+            })
     }
 
     pub fn source_path(&self, target: &Path) -> Result<PathBuf, ChezmoiError> {
@@ -279,6 +322,12 @@ impl ChezmoiClient {
             .lines()
             .map(PathBuf::from)
             .collect())
+    }
+
+    /// True when a failed `chezmoi cat` means "this target isn't a file"
+    /// rather than a real failure. Chezmoi phrases it exactly this way.
+    pub(crate) fn is_not_a_file_stderr(stderr: &str) -> bool {
+        stderr.contains("not a file, script, or symlink")
     }
 
     pub fn state_dump(&self) -> Result<StateDump, ChezmoiError> {

@@ -31,6 +31,11 @@ pub struct CommandRequest {
     pub cwd: Option<PathBuf>,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
+    /// This call is speculative: a non-zero exit is an ANSWER, not a fault,
+    /// and the chokepoint logs it at info rather than error. Only for probes
+    /// whose failure the caller fully handles — an expected ERROR line every
+    /// scan is how you teach someone to stop reading the log.
+    pub failure_is_expected: bool,
 }
 
 impl CommandRequest {
@@ -42,7 +47,14 @@ impl CommandRequest {
             cwd: None,
             stdin: None,
             timeout: DEFAULT_TIMEOUT,
+            failure_is_expected: false,
         }
+    }
+
+    /// See [`CommandRequest::failure_is_expected`].
+    pub fn failure_is_expected(mut self) -> Self {
+        self.failure_is_expected = true;
+        self
     }
     pub fn arg(mut self, a: impl Into<String>) -> Self {
         self.args.push(a.into());
@@ -128,6 +140,7 @@ impl CommandRunner for SystemRunner {
         // questions are "what exactly did chezmoi/git/op say" (2026-08-10).
         let t0 = std::time::Instant::now();
         let described = format!("{} {}", req.program, req.args.join(" "));
+        let expected = req.failure_is_expected;
         let result = self.run_inner(req);
         match &result {
             Ok(out) if out.success() => {
@@ -136,12 +149,21 @@ impl CommandRunner for SystemRunner {
             Ok(out) => {
                 let stderr = out.stderr_utf8();
                 let brief: String = stderr.chars().take(600).collect();
-                crate::log_error!(
-                    "cmd",
-                    "{described} → exit {} in {:?}: {brief}",
-                    out.exit_code,
-                    t0.elapsed()
-                );
+                if expected {
+                    crate::log_info!(
+                        "cmd",
+                        "{described} → exit {} (expected, handled) in {:?}: {brief}",
+                        out.exit_code,
+                        t0.elapsed()
+                    );
+                } else {
+                    crate::log_error!(
+                        "cmd",
+                        "{described} → exit {} in {:?}: {brief}",
+                        out.exit_code,
+                        t0.elapsed()
+                    );
+                }
             }
             Err(e) => {
                 crate::log_error!("cmd", "{described} → {e} in {:?}", t0.elapsed());

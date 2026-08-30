@@ -448,6 +448,20 @@ impl DaemonCore {
         let report = self.scanner.scan()?;
         self.degraded = report.degraded.as_ref().map(|f| f.hint.clone());
         self.in_sync_count = report.in_sync_count as u64;
+        // Targets the scan skipped. Never silent: one of these used to abort
+        // the whole scan, and the status then sat at "0 in sync" forever
+        // (2026-08-27). They are excluded from `in_sync_count`, so the tally
+        // never claims an unchecked file is fine.
+        if !report.unprobed.is_empty() {
+            tomte_core::log_warn!(
+                "scan",
+                "{} target(s) could not be checked",
+                report.unprobed.len()
+            );
+            for u in &report.unprobed {
+                tomte_core::log_warn!("scan", "  {}: {}", u.target.display(), u.reason);
+            }
+        }
         let fresh_targets: BTreeSet<PathBuf> =
             report.drifted.iter().map(|d| d.target.clone()).collect();
         let stale: Vec<PathBuf> = self

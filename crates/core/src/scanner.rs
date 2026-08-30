@@ -32,9 +32,20 @@ pub struct FileDrift {
 pub struct ScanReport {
     pub drifted: Vec<FileDrift>,
     pub in_sync_count: usize,
-    /// Set when `chezmoi status` could not run (e.g. secret manager locked);
-    /// the scan still covers destination- and git-side drift.
     pub degraded: Option<EvalFailure>,
+    /// Targets the scan could not check, and why. A probe that fails used to
+    /// abort the WHOLE scan through `?`, which froze the daemon's status at
+    /// its initial "0 drifted, 0 in sync" indefinitely (2026-08-27). A single
+    /// bad target is now skipped and recorded — never silently: these are
+    /// logged by the daemon and excluded from `in_sync_count`, so the count
+    /// never claims a file is fine when it was never looked at.
+    pub unprobed: Vec<UnprobedTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnprobedTarget {
+    pub target: PathBuf,
+    pub reason: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +82,10 @@ impl DriftScanner {
 
         let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
         let mut managed_file_count = 0usize;
+        // The targets behind `managed_file_count`, so an unprobed one can be
+        // taken back out of the in-sync tally.
+        let mut counted: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut unprobed: Vec<UnprobedTarget> = Vec::new();
 
         // (a) destination side, render-free
         for (target, entry) in &dump.entry_state {
@@ -78,12 +93,21 @@ impl DriftScanner {
                 continue;
             }
             managed_file_count += 1;
+            counted.insert(target.clone());
             let expected = entry
                 .contents_sha256
                 .as_deref()
                 .and_then(ContentHash::from_hex);
-            if hash_file(target)? != expected {
-                candidates.insert(target.clone());
+            match hash_file(target) {
+                Ok(actual) => {
+                    if actual != expected {
+                        candidates.insert(target.clone());
+                    }
+                }
+                Err(e) => unprobed.push(UnprobedTarget {
+                    target: target.clone(),
+                    reason: e.to_string(),
+                }),
             }
         }
 
@@ -121,31 +145,59 @@ impl DriftScanner {
 
         let mut drifted = Vec::new();
         for target in candidates {
-            let Some(entry) = dump.entry_state.get(&target) else {
-                // Managed but never written by chezmoi (fresh from remote, or
-                // ignored entry type) — probe with last_written = None.
-                if let Some(d) = self.probe_file(&source_dir, &target, None)? {
-                    drifted.push(d);
-                }
+            // Already known unreadable from the pass above — don't spend a
+            // subprocess re-confirming it, and don't record it twice.
+            if unprobed.iter().any(|u| u.target == target) {
                 continue;
-            };
-            if entry.kind != "file" {
-                continue; // symlink/dir probing: Plan 3
             }
-            let last = entry
-                .contents_sha256
-                .as_deref()
-                .and_then(ContentHash::from_hex);
-            if let Some(d) = self.probe_file(&source_dir, &target, last)? {
-                drifted.push(d);
+            let last_written = match dump.entry_state.get(&target) {
+                // A recorded entry that isn't a file: symlink/dir probing is
+                // out of scope, so skip without ceremony.
+                Some(entry) if entry.kind != "file" => continue,
+                Some(entry) => entry
+                    .contents_sha256
+                    .as_deref()
+                    .and_then(ContentHash::from_hex),
+                // Managed but never written by chezmoi (fresh from remote, or
+                // an ignored entry type) — probe with last_written = None.
+                // Nothing here says it IS a file: a managed directory that was
+                // never applied lands in this branch, and probing it ran
+                // `chezmoi cat` on a directory. That failure used to travel
+                // out through `?` and kill the entire scan.
+                None => None,
+            };
+            match self.probe_file(&source_dir, &target, last_written) {
+                Ok(Some(d)) => drifted.push(d),
+                Ok(None) => {}
+                // Chezmoi's own verdict that the target is not a regular
+                // file. Expected, and out of scope — not a failure.
+                Err(ScanError::Chezmoi(ChezmoiError::NotAFile { .. })) => {}
+                Err(e) => unprobed.push(UnprobedTarget {
+                    target: target.clone(),
+                    reason: e.to_string(),
+                }),
             }
         }
 
-        let in_sync_count = managed_file_count.saturating_sub(drifted.len());
+        // "In sync" = managed files chezmoi has written that were CHECKED and
+        // found clean. Only subtract targets that were actually counted:
+        // a drifted candidate can come from git or status without ever being
+        // in the managed-file tally (a source file not yet applied), and
+        // subtracting those under-reported the count. Unchecked targets are
+        // unknown, not fine, so they come out too.
+        let counted_out = drifted
+            .iter()
+            .map(|d| &d.target)
+            .chain(unprobed.iter().map(|u| &u.target))
+            .filter(|t| counted.contains(*t))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let in_sync_count = managed_file_count.saturating_sub(counted_out);
         Ok(ScanReport {
             drifted,
             in_sync_count,
             degraded,
+            unprobed,
         })
     }
 
@@ -168,7 +220,7 @@ impl DriftScanner {
         last_written: Option<ContentHash>,
     ) -> Result<Option<FileDrift>, ScanError> {
         let destination = hash_file(target)?;
-        let rendered = match self.chezmoi.cat(target) {
+        let rendered = match self.chezmoi.cat_probe(target) {
             Ok(bytes) => Ok(Some(ContentHash::of(&bytes))),
             Err(ChezmoiError::Eval(f)) => Err(f),
             Err(other) => return Err(other.into()),
