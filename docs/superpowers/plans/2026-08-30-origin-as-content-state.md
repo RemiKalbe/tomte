@@ -549,6 +549,19 @@ the core alongside `in_sync_count` so `status_snapshot` can read it.
 `crates/app/src/model.rs`: carry the flag through `hydrate_status` onto
 whatever per-row struct the views read.
 
+**`handle_fetch` must update it too** (found in review, 2026-08-31).
+`handle_fetch` runs on the ~15-minute fetch cadence and already calls
+`changed_files("HEAD", &self.remote_ref)`. Wiring only `full_rescan` leaves a
+live-event row asserting `origin_differs: false` for up to an hour — until the
+hourly full-rescan safety net — while the daemon had the correct answer in
+hand. Update the retained set from `handle_fetch` as well.
+
+Mind the ordering trap: `changed` there is computed *before* the Task 3
+auto-join, and after a join HEAD contains origin's commits, so those files no
+longer differ. Populating `origin_differs` from the pre-join set marks files
+as differing exactly when they were merged in. The set must reflect
+post-integration state.
+
 - [ ] **Step 5: Run everything**
 
 Run: `cargo test --workspace`
