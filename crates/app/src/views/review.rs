@@ -1026,6 +1026,11 @@ impl ReviewView {
                 if let Some(target) = view.selected.clone() {
                     view.select(target, cx);
                 }
+                // "Keep both" writes through `resolve_merged`, which reaches
+                // `ensure_merge_started` — so it can strand a merge too.
+                view.shell
+                    .update(cx, |shell, cx| shell.refresh_pending_merge(cx))
+                    .ok();
                 cx.notify();
             })
             .ok();

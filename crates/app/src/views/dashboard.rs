@@ -1016,15 +1016,24 @@ fn run_quick_action(
             .await;
         let _ = cx.update(|cx| {
             flag(cx, &shell, false);
-            if resolved {
-                let _ = shell.update(cx, |shell, cx| {
+            let _ = shell.update(cx, |shell, cx| {
+                if resolved {
                     shell.state.update(cx, |model, cx| {
                         model.confirm_resolved(&resolved_target);
                         cx.notify();
                     });
-                    cx.notify();
-                });
-            }
+                }
+                // `keep_disk` reaches `ensure_merge_started`, so a quick
+                // action can strand a merge exactly like a review row can —
+                // and its notification says "finish it from the dashboard",
+                // which is THIS surface. Without the probe that sentence
+                // points at a screen showing nothing. Unconditional: the
+                // strand arrives as `Done { committed: false, note }`, which
+                // is not distinguishable here, and the probe is one
+                // `rev-parse` when no merge is running.
+                shell.refresh_pending_merge(cx);
+                cx.notify();
+            });
         });
     })
     .detach();

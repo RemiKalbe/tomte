@@ -717,25 +717,46 @@ fn region_display(
     }
 }
 
+/// How much an abort would roll back, as far as we could actually tell.
+///
+/// A separate `Unknown` rather than a `0` fallback: the size of a roll-back we
+/// failed to measure is not zero, and rendering it as one would assert that
+/// nothing is at stake at the exact moment we know least. Only `Files` ever
+/// reaches the user as a number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Rollback {
+    Files(usize),
+    /// `merge_rollback_files` failed (the reason). The abort's semantics are
+    /// unchanged; only its size is unknown.
+    Unknown(String),
+}
+
+impl Rollback {
+    /// The size as prose. `pub(super)` because the Shell's post-abort banner
+    /// has to name the same thing the confirmation named.
+    pub(super) fn phrase(&self) -> String {
+        match self {
+            Self::Files(n) => format!("{n} source file(s)"),
+            Self::Unknown(_) => "an unknown number of source files".to_string(),
+        }
+    }
+}
+
 /// What Cancel is about to discard, said before it happens.
 ///
 /// Names the blast radius the user cannot see: the merge spans files they
 /// answered on OTHER review rows and were told were done, and an abort takes
 /// those source resolutions with it while their applied destinations and
-/// journal entries stay. `detail` is set only when the count could not be
-/// established — the semantics still hold, and saying so beats quoting a
-/// zero we did not measure.
-pub(super) fn cancel_warning(rollback: usize, detail: Option<&str>) -> String {
-    let mut text = match detail {
-        Some(detail) => format!(
-            "Cancel rolls back the WHOLE merge with origin, including files you already \
-             resolved in it (their count could not be read: {detail})."
-        ),
-        None => format!(
-            "Cancel rolls back the WHOLE merge with origin: {rollback} source file(s) return \
-             to their pre-merge content, including any you already resolved in it."
-        ),
-    };
+/// journal entries stay.
+pub(super) fn cancel_warning(rollback: &Rollback) -> String {
+    let mut text = format!(
+        "Cancel rolls back the WHOLE merge with origin: {} return to their pre-merge content, \
+         including any you already resolved in it.",
+        rollback.phrase()
+    );
+    if let Rollback::Unknown(detail) = rollback {
+        text.push_str(&format!(" (the count could not be read: {detail})"));
+    }
     text.push_str(
         " Destination files and journal entries stay as they are. \
          Keep merge open leaves it untouched — its remaining conflicts are ordinary review rows.",
@@ -969,10 +990,10 @@ pub struct MergeView {
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
     /// Cancel has been pressed once in repo-conflict mode and is waiting for
-    /// a named confirmation; the count is how many source files an abort
-    /// would roll back, as `merge_rollback_files` reported them. `pub(super)`
-    /// so the render-smoke tests can pose the armed bar.
-    pub(super) cancel_armed: Option<usize>,
+    /// a named confirmation; the payload is how much an abort would roll
+    /// back, as `merge_rollback_files` could tell it. `pub(super)` so the
+    /// render-smoke tests can pose the armed bar.
+    pub(super) cancel_armed: Option<Rollback>,
     /// One scroll handle per input pane column (see the `*_COL` constants);
     /// wheel on any pane mirrors its offset to the others so the columns
     /// compare without independent scrolling. The origin handle exists even
@@ -1597,21 +1618,21 @@ impl MergeView {
                 .spawn(async move { engine.merge_rollback_files() })
                 .await;
             this.update(cx, |view, cx| {
-                let (count, detail) = match files {
-                    Ok(files) => (files.len(), None),
+                let rollback = match files {
+                    Ok(files) => Rollback::Files(files.len()),
                     // Arm anyway: the semantics are what the user has to
-                    // agree to, and the count is the part we could not get.
+                    // agree to, and only the size is what we could not get.
                     Err(e) => {
                         tomte_core::log_error!("reconcile", "rollback count failed: {e}");
-                        (0, Some(e.to_string()))
+                        Rollback::Unknown(e.to_string())
                     }
                 };
-                view.cancel_armed = Some(count);
                 view.banner = Some(OutcomeBanner {
-                    text: cancel_warning(count, detail.as_deref()).into(),
+                    text: cancel_warning(&rollback).into(),
                     tint: BannerTint::Conflict,
                     undoable: false,
                 });
+                view.cancel_armed = Some(rollback);
                 cx.notify();
             })
             .ok();
@@ -1633,12 +1654,16 @@ impl MergeView {
             .ok();
     }
 
-    /// Confirmed: bail the whole merge.
-    fn discard_merge(&mut self, rolled_back: usize, cx: &mut Context<Self>) {
-        self.cancel_armed = None;
+    /// Confirmed: bail the whole merge. The roll-back size travels with the
+    /// abort so the banner afterwards names exactly what the confirmation
+    /// named — including when what it named was "unknown".
+    fn discard_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(rollback) = self.cancel_armed.take() else {
+            return;
+        };
         self.banner = None;
         self.shell
-            .update(cx, |shell, cx| shell.abort_origin_merge(rolled_back, cx))
+            .update(cx, |shell, cx| shell.abort_origin_merge(rollback, cx))
             .ok();
     }
 
@@ -1732,10 +1757,18 @@ impl MergeView {
                                 cx.notify();
                             });
                             shell.merge_done(banner, cx);
+                            // An ordinary Save also goes through
+                            // `resolve_merged` → `ensure_merge_started`, so
+                            // it can strand a merge as readily as a review
+                            // row can.
+                            shell.refresh_pending_merge(cx);
                         })
                         .ok();
                 } else {
                     view.banner = Some(banner);
+                    view.shell
+                        .update(cx, |shell, cx| shell.refresh_pending_merge(cx))
+                        .ok();
                 }
                 cx.notify();
             })
@@ -1854,7 +1887,7 @@ impl MergeView {
         // the merge open, its remaining conflicts are ordinary review rows —
         // sits beside it, because in this mode "Cancel" is the destructive
         // choice and must not be the only one.
-        if let Some(rollback) = self.cancel_armed {
+        if self.cancel_armed.is_some() {
             bar = bar.child(ui::button(
                 theme,
                 "merge-keep-open",
@@ -1869,7 +1902,7 @@ impl MergeView {
                 "Discard merge".into(),
                 ui::ButtonVariant::Solid(theme.conflict),
                 ui::ButtonSize::Sm,
-                cx.listener(move |view, _ev, _window, cx| view.discard_merge(rollback, cx)),
+                cx.listener(|view, _ev, _window, cx| view.discard_merge(cx)),
             ));
         } else {
             bar = bar.child(ui::button(
@@ -3527,7 +3560,7 @@ mod tests {
     /// unannounced abort look like a kept decision.
     #[test]
     fn cancel_warning_names_the_whole_merge_and_the_surviving_destinations() {
-        let text = super::cancel_warning(3, None);
+        let text = super::cancel_warning(&super::Rollback::Files(3));
         assert!(text.contains("WHOLE merge"), "{text}");
         assert!(text.contains("3 source file(s)"), "{text}");
         assert!(
@@ -3547,8 +3580,12 @@ mod tests {
     /// An unreadable count must not become a confident "0 files".
     #[test]
     fn cancel_warning_admits_an_unknown_count_instead_of_claiming_zero() {
-        let text = super::cancel_warning(0, Some("git exploded"));
+        let text = super::cancel_warning(&super::Rollback::Unknown("git exploded".into()));
         assert!(!text.contains("0 source file"), "{text}");
+        assert!(
+            text.contains("unknown number"),
+            "an unmeasured size must be named as unknown: {text}"
+        );
         assert!(text.contains("could not be read"), "{text}");
         assert!(text.contains("git exploded"), "{text}");
         assert!(

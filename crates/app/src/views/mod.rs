@@ -228,7 +228,7 @@ impl Shell {
     /// the daemon's last scan saw in their merged form, and a review list
     /// describing a repo state that no longer exists is how the user came to
     /// believe an undone decision had stuck.
-    pub fn abort_origin_merge(&mut self, rolled_back: usize, cx: &mut Context<Self>) {
+    pub fn abort_origin_merge(&mut self, rolled_back: merge::Rollback, cx: &mut Context<Self>) {
         self.route = Route::Review;
         cx.notify();
         let Some(engine) = cx
@@ -247,9 +247,9 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 let mut text = format!(
-                    "Merge with origin rolled back — {rolled_back} source file(s) returned to \
-                     their pre-merge content. Destination files and journal entries were not \
-                     touched."
+                    "Merge with origin rolled back — {} returned to their pre-merge content. \
+                     Destination files and journal entries were not touched.",
+                    rolled_back.phrase()
                 );
                 if let Err(e) = rescanned {
                     // The list on screen still describes the merged repo.
@@ -890,6 +890,71 @@ mod render_smoke {
         assert_eq!(actions, vec![ResolveAction::KeepSourceLocal]);
     }
 
+    /// Every surface that can start a merge must also be able to report one
+    /// it stranded. Twice now an action path reached `ensure_merge_started`
+    /// with no matching probe, and the second time it was the DASHBOARD —
+    /// the very surface the failure note tells the user to go to.
+    ///
+    /// So this walks the view sources rather than trusting a memory: any
+    /// function that runs a resolve action must also mention
+    /// `refresh_pending_merge`. A crude split on `fn` boundaries, not a
+    /// parser — it exists to fail loudly when a new action path is added
+    /// without its probe, and the fix is always the same one line.
+    #[test]
+    fn every_resolve_action_path_also_probes_for_a_stranded_merge() {
+        // Reaching either of these reaches `ensure_merge_started`:
+        // `action.run` dispatches keep_disk / keep_source_origin, and
+        // `resolve_merged` is the merge editor's and "Keep both"'s write.
+        const STARTS_A_MERGE: [&str; 2] = ["action.run(", ".resolve_merged("];
+        const PROBE: &str = "refresh_pending_merge";
+        let sources = [
+            ("views/mod.rs", include_str!("mod.rs")),
+            ("views/review.rs", include_str!("review.rs")),
+            ("views/merge.rs", include_str!("merge.rs")),
+            ("views/dashboard.rs", include_str!("dashboard.rs")),
+        ];
+        let mut checked = 0;
+        for (name, src) in sources {
+            // Function boundaries: `fn f(`, `pub fn f(`, `pub(super) fn f(`,
+            // at top level or one indent in.
+            let mut chunks: Vec<&str> = Vec::new();
+            let mut start = 0;
+            for (idx, _) in src.match_indices("fn ") {
+                let head = src[..idx].rsplit('\n').next().unwrap_or("");
+                let head = head.trim_start_matches(' ');
+                if head.is_empty() || head.starts_with("pub ") || head.starts_with("pub(") {
+                    if idx > start {
+                        chunks.push(&src[start..idx]);
+                    }
+                    start = idx;
+                }
+            }
+            chunks.push(&src[start..]);
+            for chunk in chunks {
+                // The test's own body names these strings; skip it.
+                if chunk.contains("STARTS_A_MERGE") {
+                    continue;
+                }
+                if STARTS_A_MERGE.iter().any(|needle| chunk.contains(needle)) {
+                    checked += 1;
+                    let head = chunk.lines().next().unwrap_or("").trim();
+                    assert!(
+                        chunk.contains(PROBE),
+                        "{name}: `{head}` starts a merge but never calls `{PROBE}` — \
+                         a merge it strands would have no surface to recover from"
+                    );
+                }
+            }
+        }
+        // Guards the guard: if the call sites are renamed out from under the
+        // needles, this finds nothing and would pass vacuously.
+        assert!(
+            checked >= 4,
+            "expected at least the four known action paths, found {checked} — \
+             have `action.run` / `resolve_merged` been renamed?"
+        );
+    }
+
     /// The stranded-merge banner and its in-flight state must render. This
     /// banner is the ONLY surface a resolved-but-uncommitted merge has —
     /// every file in it is answered, so no drifted row exists to carry it —
@@ -946,9 +1011,9 @@ mod render_smoke {
                     span_map: None,
                     origin: None,
                 })));
-                view.cancel_armed = Some(2);
+                view.cancel_armed = Some(merge::Rollback::Files(2));
                 view.banner = Some(review::OutcomeBanner {
-                    text: merge::cancel_warning(2, None).into(),
+                    text: merge::cancel_warning(&merge::Rollback::Files(2)).into(),
                     tint: review::BannerTint::Conflict,
                     undoable: false,
                 });
@@ -981,8 +1046,9 @@ mod render_smoke {
                 .expect("merge view posed")
                 .read(cx)
                 .cancel_armed
+                .clone()
         });
-        assert_eq!(armed, Some(2));
+        assert_eq!(armed, Some(merge::Rollback::Files(2)));
     }
 
     #[gpui::test]

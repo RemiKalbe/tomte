@@ -1459,3 +1459,49 @@ fn aborting_rolls_back_recorded_resolutions_but_not_their_destinations() {
         "no merge, nothing left to roll back"
     );
 }
+
+/// The dashboard's quick action is `keep_disk`, and `keep_disk` reaches
+/// `ensure_merge_started` — so the dashboard can strand a merge exactly like
+/// a review row can. That matters more there than anywhere else: the failure
+/// note tells the user to "finish it from the dashboard", so if that surface
+/// does not probe, the sentence points at a screen showing nothing.
+#[test]
+fn the_dashboards_own_action_can_strand_a_merge() {
+    let lab = DriftLab::new();
+    diverge_on_the_managed_file(&lab);
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+    unsignable(&lab.s.source);
+
+    // Exactly what `run_quick_action` runs on that surface.
+    let outcome = lab.engine.keep_disk(&lab.target).unwrap();
+    let ResolveOutcome::Done {
+        committed, note, ..
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(!committed);
+    let note = note.expect("a merge that could not be committed must say so");
+    assert!(
+        note.contains("finish it from the dashboard"),
+        "the note points the user at the dashboard: {note}"
+    );
+
+    // …and the state that note promises a way out of is exactly the one the
+    // dashboard banner is driven by.
+    assert!(
+        lab.engine.pending_merge_commit().unwrap(),
+        "the dashboard's own action must be able to raise its own banner"
+    );
+
+    signable(&lab.s.source);
+    match lab.engine.finish_merge_if_resolved().unwrap() {
+        MergeConclusion::Committed { pushed, note } => assert!(pushed, "note: {note:?}"),
+        other => panic!("expected Committed, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        DRIFTED,
+        "the disk content the quick action chose is what got committed"
+    );
+}
