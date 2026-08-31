@@ -1023,7 +1023,27 @@ in progress, and call `finish_repo_reconcile` when
 
 Delete `reconcile_queue` / `reconcile_in_flight` from `Shell` and the
 `start_reconcile` / `present_next_reconcile` / `cancel_reconcile` plumbing;
-the engine calls now hang off ordinary queue rows.
+the engine calls now hang off ordinary queue rows. Note the five construction
+sites for those two fields in `views/mod.rs` (~611, 669, 692, 719, 834), and
+that `start_reconcile` currently carries an `#[allow(dead_code)]` added by
+Task 4 — that allow must be gone by the end of this task.
+
+**Do NOT delete the merge editor's `repo_reconcile` mode.** It looks like part
+of the flow being removed, but it is not just pane labels — it encodes two
+load-bearing behaviours (`merge.rs:922`, set at `:1034`/`:1044`, branched at
+`:1487`/`:1534`):
+
+1. **Cancel bails the entire merge**, with the comment "a half-resolved merge
+   state would be worse than none".
+2. **Save writes the SOURCE file + `git add`, and the Shell hand-off happens
+   OUTSIDE the view's update** — carrying an explicit comment that nesting it
+   panicked gpui ("already being updated", the 2026-08-18 crash).
+
+(2) is a fixed crash. This task changes how a file *enters* that state — from
+a separate reconcile queue with its own entry button, to ordinary review rows
+plus `ensure_merge_started` — but the mid-merge save/cancel semantics and the
+outside-the-update hand-off must survive. If you conclude the mode should go
+entirely, stop and report rather than removing it unilaterally.
 
 - [ ] **Step 4: Full gate**
 
