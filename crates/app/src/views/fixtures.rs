@@ -422,9 +422,15 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             let origin = name.starts_with("review-origin");
             if origin {
                 // The scan's hint, kept honest alongside the loaded content
-                // the view actually gates on.
+                // the view actually gates on. TWO rows carry it: the selected
+                // file, whose detail pane also has origin content loaded, and
+                // an UNSELECTED one that has none — the list hint is the only
+                // thing origin-shaped that row will ever show, which is the
+                // whole reason it exists.
                 for entry in &mut model.drifted {
-                    if entry.target == home(".config/zed/settings.json") {
+                    if entry.target == home(".config/zed/settings.json")
+                        || entry.target == home(".gitconfig")
+                    {
                         entry.origin_differs = true;
                     }
                 }

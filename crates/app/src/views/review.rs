@@ -1266,7 +1266,42 @@ impl ReviewView {
                     .child(format!("In sync ({in_sync})")),
             )
     }
+}
 
+/// The wording the origin hint carries. A HINT, deliberately: it says only
+/// what the scan measured — this path is in `git diff HEAD..origin/<branch>`
+/// — and promises nothing about what the file will offer once opened. A file
+/// added locally and never pushed differs from origin and yet has no origin
+/// blob at all, so it is flagged here and then correctly offers no origin
+/// action; anything stronger ("origin has its own version", "compare with
+/// origin") would be a promise this flag cannot keep.
+const ORIGIN_HINT: &str = "differs from origin";
+
+/// The list row's origin affordance: a small [`Theme::remote`] dot, the tint
+/// origin owns everywhere else in the app.
+///
+/// This is the ONLY place `DriftSummary::origin_differs` is allowed to
+/// decide anything, and it is allowed here precisely BECAUSE the list holds
+/// no content: nothing has been loaded for these rows, so there is nothing
+/// more truthful to gate on, and without it the user must select a file and
+/// wait for a background load to discover origin is even in play. The moment
+/// content exists — the diff, the comparison selector, the action buttons,
+/// the merge editor's fourth pane — `inputs.origin.is_some()` is
+/// authoritative and this flag has no vote.
+fn origin_hint(ix: usize, entry: &DriftSummary, theme: Theme) -> Option<Stateful<Div>> {
+    entry.origin_differs.then(|| {
+        div()
+            .id(ElementId::named_usize("review-origin-hint", ix))
+            .w(px(6.))
+            .h(px(6.))
+            .rounded_full()
+            .flex_shrink_0()
+            .bg(theme.remote)
+            .tooltip(ui::text_tooltip(ORIGIN_HINT))
+    })
+}
+
+impl ReviewView {
     fn target_row(
         &self,
         ix: usize,
@@ -1308,6 +1343,9 @@ impl ReviewView {
                     .truncate()
                     .child(name),
             )
+            // The ONE surface where `DriftSummary::origin_differs` is
+            // authoritative — see `origin_hint`.
+            .children(origin_hint(ix, entry, theme))
             .child(
                 div()
                     .flex_shrink_0()
@@ -1809,9 +1847,9 @@ mod tests {
     use tomte_proto::DriftSummary;
 
     use super::{
-        BannerTint, DiffLine, DiffPair, LineTint, ResolveAction, flatten_document, origin_diffs,
-        outcome_banner, per_line_ranges, preview_decors, severity_groups, source_actions,
-        undo_banner,
+        BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, ResolveAction, flatten_document,
+        origin_diffs, origin_hint, outcome_banner, per_line_ranges, preview_decors,
+        severity_groups, source_actions, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -1842,6 +1880,40 @@ mod tests {
                 ResolveAction::KeepSourceOrigin
             ]
         );
+    }
+
+    /// The list row is the one place the scan flag decides anything, and it
+    /// must decide exactly that: flag on → hint, flag off → nothing. Nothing
+    /// here loads content, so there is no more truthful signal to gate on.
+    #[test]
+    fn the_row_hint_follows_the_scan_flag_and_nothing_else() {
+        let theme = Theme::dark();
+        let mut entry = s("/tmp/.zshrc", "destination_drift");
+        assert!(
+            origin_hint(0, &entry, theme).is_none(),
+            "no flag, no hint on the row"
+        );
+        entry.origin_differs = true;
+        assert!(origin_hint(0, &entry, theme).is_some());
+    }
+
+    /// …and the hint stays a hint. A file added locally and never pushed is
+    /// flagged and has NO origin blob, so the row hints while every
+    /// content-bearing surface correctly offers nothing origin-shaped. The
+    /// wording has to survive that pairing without reading like a promise.
+    #[test]
+    fn the_row_hint_only_claims_what_the_scan_measured() {
+        assert_eq!(ORIGIN_HINT, "differs from origin");
+        for promise in ["compare", "version", "available", "open"] {
+            assert!(
+                !ORIGIN_HINT.contains(promise),
+                "the row hint must not promise {promise:?}: the flagged file may \
+                 have no origin blob at all"
+            );
+        }
+        // The surface that DOES hold content is unmoved by the flag: with no
+        // origin content loaded there is one source action, flag or no flag.
+        assert_eq!(source_actions(false), vec![ResolveAction::KeepSourceLocal]);
     }
 
     #[test]

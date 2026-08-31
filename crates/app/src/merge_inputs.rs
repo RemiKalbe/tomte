@@ -117,9 +117,11 @@ pub fn load(
 /// `unwrap_or_default` would be: every subprocess call here (`chezmoi
 /// source-path`/`source-dir`, `git cat-file`, `chezmoi execute-template`)
 /// already logs its own failure through the command chokepoint
-/// (`SystemRunner::run` in `tomte_core::cmd`), so a genuine problem still
-/// lands in the logs even though the return type here degrades to `None`
-/// — the same reasoning that already justifies `load_base`'s misses.
+/// (`SystemRunner::run` in `tomte_core::cmd`), and the one step that has no
+/// subprocess behind it — the UTF-8 decode — logs for itself below. So a
+/// genuine problem still lands in the logs even though the return type here
+/// degrades to `None` — the same reasoning that already justifies
+/// `load_base`'s misses.
 fn load_origin(
     chezmoi: &ChezmoiClient,
     git: &GitClient,
@@ -138,7 +140,20 @@ fn load_origin(
     } else {
         raw
     };
-    let text = String::from_utf8(rendered).ok()?;
+    // The one step here with no subprocess behind it, so the chokepoint
+    // cannot speak for it: a non-UTF-8 origin blob would otherwise vanish
+    // into `None` with nothing anywhere saying why the origin pane is gone.
+    let text = match String::from_utf8(rendered) {
+        Ok(text) => text,
+        Err(e) => {
+            tomte_core::log_info!(
+                "merge",
+                "origin pane skipped: {} at {remote_ref} is not UTF-8 ({e})",
+                source_rel.display()
+            );
+            return None;
+        }
+    };
     (text != theirs).then_some(text)
 }
 
