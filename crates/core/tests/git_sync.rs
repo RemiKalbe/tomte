@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use support::{Scratch, sh};
 use tomte_core::cmd::SystemRunner;
-use tomte_core::git::GitClient;
+use tomte_core::git::{GitClient, MergeTreeOutcome};
 
 mod support;
 
@@ -180,7 +180,7 @@ fn merge_tree_reports_clean_and_conflicting_merges_without_touching_the_tree() {
     let head_before = git.head_sha().unwrap();
     assert_eq!(
         git.merge_tree_conflicts("other").unwrap(),
-        Some(vec![]),
+        MergeTreeOutcome::Clean,
         "different files merge cleanly"
     );
     assert_eq!(
@@ -200,8 +200,10 @@ fn merge_tree_reports_clean_and_conflicting_merges_without_touching_the_tree() {
     sh(&scratch.source, "git", &["add", "-A"]);
     sh(&scratch.source, "git", &["commit", "-m", "main testrc"]);
 
-    let conflicts = git.merge_tree_conflicts("other").unwrap().unwrap();
-    assert_eq!(conflicts, vec![PathBuf::from("dot_testrc")]);
+    assert_eq!(
+        git.merge_tree_conflicts("other").unwrap(),
+        MergeTreeOutcome::Conflicts(vec![PathBuf::from("dot_testrc")])
+    );
     assert!(!git.merge_in_progress(), "still no real merge started");
 }
 

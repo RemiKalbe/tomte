@@ -32,6 +32,28 @@ pub enum MergeStart {
     Conflicts(Vec<PathBuf>),
 }
 
+/// Outcome of the virtual merge probe [`GitClient::merge_tree_conflicts`].
+/// The working tree, the index, and HEAD are never touched producing this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeTreeOutcome {
+    /// The merge would be clean (git exited 0).
+    Clean,
+    /// The merge would conflict (git exited 1). `paths` lists every
+    /// individual file git could name — but per `git-merge-tree(1)`'s
+    /// MISTAKES TO AVOID, an EMPTY list here does NOT mean clean: some
+    /// conflicts (directory rename conflicts, and others git may add in
+    /// the future) don't reduce to a single file. The exit status alone
+    /// is what makes this `Conflicts`, never the length of `paths` — treat
+    /// `Conflicts(vec![])` as "conflicted, no individually-listed file".
+    Conflicts(Vec<PathBuf>),
+    /// merge-tree could not produce an answer at all: git predates
+    /// `--write-tree` (added 2.38), or it refused outright (e.g. unrelated
+    /// histories — both surface as the same non-0/1 exit status git itself
+    /// does not further distinguish). The caller must fall back to not
+    /// auto-joining rather than guessing which case it was.
+    Unknown,
+}
+
 #[derive(Clone)]
 pub struct GitClient {
     runner: Arc<dyn CommandRunner>,
@@ -281,14 +303,13 @@ impl GitClient {
         let _ = self.run(&["merge", "--abort"], Duration::from_secs(30));
     }
 
-    /// Conflicting paths a merge with `upstream` WOULD produce, computed
+    /// Probe whether a merge with `upstream` would conflict, computed
     /// entirely in the object database via `git merge-tree --write-tree` —
-    /// the working tree, the index, and HEAD are never touched. `Some(vec![])`
-    /// means the merge is clean. `None` means merge-tree could not produce an
-    /// answer at all (git predates `--write-tree`, added in 2.38, or refuses
-    /// outright — e.g. unrelated histories): the caller must fall back to
-    /// not auto-joining rather than guessing.
-    pub fn merge_tree_conflicts(&self, upstream: &str) -> Result<Option<Vec<PathBuf>>, GitError> {
+    /// the working tree, the index, and HEAD are never touched. See
+    /// [`MergeTreeOutcome`] for how to read the result; in particular, the
+    /// exit status decides `Clean` vs `Conflicts`, NOT whether any path was
+    /// parsed out of stdout.
+    pub fn merge_tree_conflicts(&self, upstream: &str) -> Result<MergeTreeOutcome, GitError> {
         let out = self.run_raw(
             &[
                 "merge-tree",
@@ -300,21 +321,25 @@ impl GitClient {
             Duration::from_secs(30),
         )?;
         match out.exit_code {
-            0 => Ok(Some(Vec::new())),
+            0 => Ok(MergeTreeOutcome::Clean),
             1 if !out.stdout.is_empty() => {
                 // Documented layout (verified against git 2.50.1):
                 //   <tree-oid>\n<conflicted path>\n...\n\n<free-form messages>
                 // The blank line is the real separator between the path list
                 // and human-readable prose ("Auto-merging x", "CONFLICT
-                // ...") — that prose must NOT be parsed as more paths.
+                // ...") — that prose must NOT be parsed as more paths. The
+                // path list itself may legitimately be empty (see
+                // `MergeTreeOutcome::Conflicts` doc) — exit 1 alone is what
+                // makes this a conflict, so it is never treated as clean
+                // regardless of how many paths came out of parsing.
                 let text = out.stdout_utf8();
-                Ok(Some(
-                    text.lines()
-                        .skip(1)
-                        .take_while(|l| !l.is_empty())
-                        .map(PathBuf::from)
-                        .collect(),
-                ))
+                let paths = text
+                    .lines()
+                    .skip(1)
+                    .take_while(|l| !l.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
+                Ok(MergeTreeOutcome::Conflicts(paths))
             }
             1 => {
                 // Exit 1 normally means "conflicts, see stdout" — but git
@@ -327,7 +352,7 @@ impl GitClient {
                     stderr: out.stderr_utf8(),
                 })
             }
-            _ => Ok(None),
+            _ => Ok(MergeTreeOutcome::Unknown),
         }
     }
 
@@ -348,6 +373,7 @@ impl GitClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::fake::FakeRunner;
     use crate::cmd::{CommandRequest, CommandRunner, SystemRunner};
     use std::path::Path;
     use std::sync::Arc;
@@ -522,6 +548,31 @@ mod tests {
             .merge_tree_conflicts("no-such-branch")
             .unwrap_err();
         assert!(matches!(err, GitError::Exit { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn merge_tree_exit_status_is_authoritative_over_an_empty_parsed_path_list() {
+        // git-merge-tree(1), MISTAKES TO AVOID (verbatim): "Do NOT interpret
+        // an empty Conflicted file info list as a clean merge; check the
+        // exit status. A merge can have conflicts without having individual
+        // files conflict (directory rename conflicts fall into this
+        // category, and others may be added in the future)." Real git
+        // 2.50.1 would not reproduce this from three tried directory-rename
+        // shapes, so exercise the decision logic directly: fake exit 1 with
+        // stdout that carries a tree oid and the messages section but NO
+        // conflicted-path line at all.
+        let fake = FakeRunner::new();
+        fake.push_ok(
+            1,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n\nAuto-merging x\nCONFLICT (rename/rename): x renamed on both sides\n",
+            "",
+        );
+        let git = GitClient::new(Arc::new(fake), PathBuf::from("/does-not-matter"));
+        assert_eq!(
+            git.merge_tree_conflicts("upstream").unwrap(),
+            MergeTreeOutcome::Conflicts(vec![]),
+            "exit 1 must report Conflicts, never Clean, regardless of the parsed path list"
+        );
     }
 
     #[test]
