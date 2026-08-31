@@ -791,7 +791,32 @@ fn origin_region_texts(
 }
 ```
 
-- [ ] **Step 4: Render the pane and the pick**
+- [ ] **Step 4: Widen the pane geometry from 3 to 4**
+
+The merge view hardcodes **three** input panes in its geometry, not just its
+layout, and the result pane occupies index 3:
+
+```
+merge.rs:675   region_line_starts: Rc<Vec<[usize; 3]>>
+merge.rs:771   pane_scrolls: [gpui::ScrollHandle; 3]
+merge.rs:2119  fn region_at(starts: &[[usize; 3]], col, line)
+merge.rs:2142  fn line_at(starts: &[[usize; 3]], col, k, f)
+merge.rs:2070  const RESULT_LEADER: usize = 3
+merge.rs:1233  for col in 0..3   (inside sync_from)
+```
+
+**Keep the indices static.** Widen the arrays to 4, move `RESULT_LEADER` to 4,
+and when origin is absent simply do not render column 3 — while keeping its
+geometry well-defined by mirroring column 2's line starts into slot 3, so
+`region_at`/`line_at` never see a zero-length region. A hidden pane's scroll
+handle syncing is harmless.
+
+Do **not** make the pane count dynamic. `RESULT_LEADER`, `region_at`,
+`line_at` and the divider indices would all become variable, and scroll sync
+in this file was already rebuilt once after the 2026-08-22 editor rework —
+making its indices dynamic invites that regression back.
+
+- [ ] **Step 5: Render the pane and the pick**
 
 - `pane_col` gains a fourth column when `loaded.inputs.origin.is_some()`,
   labelled `"source · origin"` tinted `theme.remote`, built exactly like the
@@ -802,7 +827,7 @@ fn origin_region_texts(
 - The existing three panes keep their labels; the local source pane is
   relabelled `"source · this machine"` when the origin pane is present.
 
-- [ ] **Step 5: Gallery state + screenshot**
+- [ ] **Step 6: Gallery state + screenshot**
 
 Add a `merge-origin` fixture: `conflict_inputs()` plus an `origin` differing
 on one region. Run:
@@ -814,7 +839,7 @@ on one region. Run:
 READ both. Confirm four columns are legible at the 840px minimum and the
 purple reads as its own provenance.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add -A
