@@ -255,3 +255,215 @@ fn paused_core_ignores_changes() {
         .unwrap();
     assert!(kinds(&core, &target).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The unattended auto-join and the commit signer (final review, Critical).
+// ---------------------------------------------------------------------------
+
+/// Stage a clean divergence: origin and this machine each moved, on DIFFERENT
+/// files, so `merge-tree` proves the join clean and the auto-join is offered.
+fn stage_a_clean_divergence(s: &Scratch) {
+    let other = s.root.path().join("other");
+    sh(
+        s.root.path(),
+        "git",
+        &["clone", s.bare.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    std::fs::write(other.join("remote-only"), "x\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "remote"]);
+    git(&other, &["push"]);
+    std::fs::write(s.source.join("local-only"), "y\n").unwrap();
+    git(&s.source, &["add", "."]);
+    git(&s.source, &["commit", "-m", "local"]);
+}
+
+fn behind_count(repo: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD..origin/main"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Signing ON with a signer that cannot sign — a locked 1Password agent,
+/// reproduced without 1Password. `Scratch::new` writes repo-local
+/// `commit.gpgsign=false`, so this path only exists if a test turns signing
+/// back ON deliberately; that is the whole point of this fixture.
+fn unsignable(repo: &std::path::Path) {
+    git(repo, &["config", "commit.gpgsign", "true"]);
+    git(repo, &["config", "gpg.format", "ssh"]);
+    git(repo, &["config", "gpg.ssh.program", "/bin/false"]);
+    git(repo, &["config", "user.signingkey", "ssh-ed25519 AAAAfake"]);
+}
+
+/// Signing ON with a real key generated for the test: the `gpg.format = ssh`
+/// shape a 1Password setup uses, minus the agent that can be locked.
+fn signable_for_real(repo: &std::path::Path) {
+    let key = repo.join("../signing-key");
+    sh(
+        repo,
+        "ssh-keygen",
+        &["-q", "-t", "ed25519", "-N", "", "-f", key.to_str().unwrap()],
+    );
+    git(repo, &["config", "commit.gpgsign", "true"]);
+    git(repo, &["config", "gpg.format", "ssh"]);
+    git(repo, &["config", "user.signingkey", key.to_str().unwrap()]);
+    // This machine's GLOBAL config points the signer at 1Password's helper,
+    // which rejects a key it does not hold — pin it so the test does not
+    // depend on whose laptop runs it.
+    git(repo, &["config", "gpg.ssh.program", "ssh-keygen"]);
+}
+
+/// The daemon's auto-join is the one commit-creating operation Tomte performs
+/// with nobody watching, on the fetch timer, holding the core lock. When the
+/// commit signer cannot sign, `git merge` gets as far as staging everything
+/// and then dies on the commit — leaving MERGE_HEAD set with NOTHING
+/// conflicted (verified against git 2.50.1). That is the stranded-merge shape,
+/// created on Tomte's own initiative, and on a locked 1Password it arrives
+/// only after the agent's GUI prompt times out — during which every non-Status
+/// IPC bounces as "daemon busy".
+///
+/// So the signer is probed BEFORE the join: no signer, no join, and the repo
+/// is left exactly where it was for the next fetch to try again.
+#[test]
+fn an_unsignable_signer_skips_the_auto_join_instead_of_stranding_the_repo() {
+    let s = Scratch::new();
+    stage_a_clean_divergence(&s);
+    unsignable(&s.source);
+    let head_before = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&s.source)
+        .output()
+        .unwrap()
+        .stdout;
+
+    let mut core = core_for(&s);
+    let rx = core.subscribe();
+    let t0 = std::time::Instant::now();
+    core.handle_fetch(400).unwrap();
+    let elapsed = t0.elapsed();
+
+    assert!(
+        !GitClient::new(std::sync::Arc::new(SystemRunner), s.source.clone()).merge_in_progress(),
+        "an unsignable join must never be STARTED — Tomte does not leave the \
+         repo mid-merge on its own initiative"
+    );
+    assert_eq!(
+        behind_count(&s.source),
+        "1",
+        "the divergence is left intact for the next fetch"
+    );
+    assert_eq!(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&s.source)
+            .output()
+            .unwrap()
+            .stdout,
+        head_before,
+        "HEAD must not have moved"
+    );
+    // The fetch itself still succeeded and still reports what it found — a
+    // skipped join is not a failed fetch.
+    let events: Vec<Event> = rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::FetchDone { behind: 1, .. })),
+        "{events:?}"
+    );
+    // The whole point is that this does not sit on the core lock: the IPC
+    // server bounces non-Status calls as "daemon busy" after 20s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the fetch must not stall the daemon: took {elapsed:?}"
+    );
+}
+
+/// The pre-flight is a gate, not a ban: with signing on and a signer that
+/// actually answers, the auto-join goes through exactly as before — and the
+/// commit it makes is signed.
+#[test]
+fn a_live_signer_lets_the_auto_join_through_and_signs_it() {
+    let s = Scratch::new();
+    stage_a_clean_divergence(&s);
+    signable_for_real(&s.source);
+
+    let mut core = core_for(&s);
+    core.handle_fetch(400).unwrap();
+
+    assert_eq!(
+        behind_count(&s.source),
+        "0",
+        "a clean divergence with a live signer must still be joined"
+    );
+    assert!(
+        !GitClient::new(std::sync::Arc::new(SystemRunner), s.source.clone()).merge_in_progress()
+    );
+    let sig = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%G?"])
+        .current_dir(&s.source)
+        .output()
+        .unwrap();
+    // %G? is 'U' for "signed, no trusted key on file" — this repo has no
+    // allowed-signers list, so U is the good answer: a signature exists. 'N'
+    // would mean the join committed UNSIGNED, which must never happen.
+    assert_ne!(
+        String::from_utf8_lossy(&sig.stdout).trim(),
+        "N",
+        "the auto-join's merge commit must carry a signature"
+    );
+}
+
+/// A repo that does not sign its commits is never probed — there is nothing
+/// that could block, and an unnecessary `commit-tree` per fetch would be pure
+/// cost. (`Scratch::new` leaves signing off, so this is the default shape.)
+#[test]
+fn an_unsigned_repo_auto_joins_without_a_signer_probe() {
+    let s = Scratch::new();
+    stage_a_clean_divergence(&s);
+    let mut core = core_for(&s);
+    core.handle_fetch(400).unwrap();
+    assert_eq!(behind_count(&s.source), "0");
+}
+
+/// The pre-flight narrows the window; it cannot close it. A signer that
+/// answers the probe and then dies on the real commit — or any other reason
+/// the merge commit fails after `git merge` has already staged everything —
+/// leaves MERGE_HEAD set with NOTHING conflicted. Reproduced here with a
+/// failing `commit-msg` hook, which is that exact shape and needs no signer
+/// at all (verified against git 2.50.1).
+///
+/// No user decision is inside that merge, so the daemon backs it out: Tomte
+/// does not leave the repo mid-merge on its own initiative, and "we probed
+/// first" is not a licence to leave one behind when the probe was wrong.
+#[test]
+fn a_join_that_fails_after_starting_is_backed_out_not_left_mid_merge() {
+    let s = Scratch::new();
+    stage_a_clean_divergence(&s);
+    let hooks = s.source.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("commit-msg");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    sh(&s.source, "chmod", &["+x", hook.to_str().unwrap()]);
+
+    let mut core = core_for(&s);
+    core.handle_fetch(400).unwrap();
+
+    let git_c = GitClient::new(std::sync::Arc::new(SystemRunner), s.source.clone());
+    assert!(
+        !git_c.merge_in_progress(),
+        "a join that died mid-flight must be aborted, not left for the user to find"
+    );
+    assert!(
+        git_c.staged_files().unwrap().is_empty(),
+        "the abort must also unstage what the failed merge staged"
+    );
+    assert_eq!(
+        behind_count(&s.source),
+        "1",
+        "and the divergence is back to where it was"
+    );
+}

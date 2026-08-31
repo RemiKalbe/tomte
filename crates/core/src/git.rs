@@ -173,12 +173,17 @@ impl GitClient {
             .collect())
     }
 
+    /// The blob at `rev`, or `None` when the path simply is not there — a
+    /// file added locally and never pushed is the everyday case, so this
+    /// goes through [`Self::run_raw`]: "absent at rev" is an ANSWER and must
+    /// log at info, not as an ERROR line every scan.
     pub fn blob_at(&self, rev: &str, rel_path: &Path) -> Result<Option<Vec<u8>>, GitError> {
         let spec = format!("{rev}:{}", rel_path.to_string_lossy());
-        match self.run(&["cat-file", "blob", &spec], Duration::from_secs(30)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(GitError::Exit { .. }) => Ok(None), // path absent at rev
-            Err(e) => Err(e),
+        let out = self.run_raw(&["cat-file", "blob", &spec], Duration::from_secs(30))?;
+        if out.success() {
+            Ok(Some(out.stdout))
+        } else {
+            Ok(None) // path absent at rev
         }
     }
 
@@ -208,6 +213,53 @@ impl GitClient {
     pub fn commit(&self, message: &str) -> Result<String, GitError> {
         self.run(&["commit", "-m", message], Duration::from_secs(30))?;
         self.rev_parse("HEAD")
+    }
+
+    /// Whether the commits this repo creates will be signed, read from the
+    /// same merged config git itself would consult (so the user's GLOBAL
+    /// `commit.gpgsign` counts, which is where a 1Password SSH setup lives).
+    /// A config read cannot hang on the agent, so this is always safe to ask.
+    pub fn commit_signing_configured(&self) -> bool {
+        // Absent key → exit 1, the ordinary answer on an unsigned repo.
+        self.run_raw(
+            &["config", "--bool", "--get", "commit.gpgsign"],
+            Duration::from_secs(10),
+        )
+        .map(|out| out.success() && out.stdout_utf8().trim() == "true")
+        .unwrap_or(false)
+    }
+
+    /// Ask the user's ACTUAL configured signer to sign one object, bounded by
+    /// `timeout`. `Ok(())` means the signer answered — a locked 1Password
+    /// agent, a missing key, or a signer that never returns all come back as
+    /// `Err`.
+    ///
+    /// `git commit-tree` writes ONE dangling commit object and nothing else:
+    /// HEAD, the index, the working tree, and the reflog are untouched, and
+    /// an unreferenced object is what `git gc` collects. That is what makes
+    /// this usable from the daemon, which must never leave the repo in a
+    /// state the user did not ask for.
+    pub fn signer_probe(&self, timeout: Duration) -> Result<(), GitError> {
+        let out = self.run_raw(
+            &[
+                "commit-tree",
+                "-S",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "tomte-signer-probe",
+            ],
+            timeout,
+        )?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(GitError::Exit {
+                code: out.exit_code,
+                stderr: out.stderr_utf8(),
+            })
+        }
     }
 
     pub fn push(&self, remote: &str) -> Result<(), GitError> {
@@ -240,7 +292,21 @@ impl GitClient {
     /// mid-merge and reports the conflicted paths — the caller resolves
     /// them (or [`Self::merge_abort`]s).
     pub fn merge(&self, upstream: &str) -> Result<MergeStart, GitError> {
-        match self.run(&["merge", "--no-edit", upstream], Duration::from_secs(60)) {
+        self.merge_within(upstream, Duration::from_secs(60))
+    }
+
+    /// [`Self::merge`] bounded by `timeout` instead of the default 60s.
+    ///
+    /// `git merge` creates a COMMIT, so it runs the user's configured commit
+    /// signer — for a 1Password SSH setup that means waiting on the agent,
+    /// which can sit on a GUI prompt for the whole timeout. A user-initiated
+    /// merge SHOULD wait (the user is right there, and can unlock); an
+    /// unattended one must not, because it burns that time holding the
+    /// daemon's core lock. The daemon passes a short timeout here on top of
+    /// its signer pre-flight ([`Self::signer_probe`]) — belt and braces, so
+    /// even a probe that passes and then stalls cannot wedge the daemon.
+    pub fn merge_within(&self, upstream: &str, timeout: Duration) -> Result<MergeStart, GitError> {
+        match self.run(&["merge", "--no-edit", upstream], timeout) {
             Ok(_) => Ok(MergeStart::Clean),
             Err(e) => {
                 let conflicts = self.conflicted_files()?;
@@ -290,12 +356,17 @@ impl GitClient {
 
     /// A merge is mid-flight (MERGE_HEAD exists) — e.g. the app died
     /// between resolving conflicts and concluding.
+    ///
+    /// "No MERGE_HEAD" is the answer on every healthy repo, so this asks
+    /// through [`Self::run_raw`]: the overwhelmingly common outcome must not
+    /// write an ERROR line each time it is probed.
     pub fn merge_in_progress(&self) -> bool {
-        self.run(
+        self.run_raw(
             &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
             Duration::from_secs(10),
         )
-        .is_ok()
+        .map(|out| out.success())
+        .unwrap_or(false)
     }
 
     /// Best-effort abort of an in-progress merge.
@@ -586,6 +657,125 @@ mod tests {
             MergeTreeOutcome::Conflicts(vec![]),
             "exit 1 must report Conflicts, never Clean, regardless of the parsed path list"
         );
+    }
+
+    /// Everything `signer_probe` could conceivably disturb, in one string.
+    fn repo_state(cwd: &Path) -> String {
+        let out = |args: &[&str]| {
+            let out = SystemRunner
+                .run(
+                    CommandRequest::new("git")
+                        .args(args.iter().copied())
+                        .cwd(cwd),
+                )
+                .unwrap();
+            format!("{}|{}", out.exit_code, out.stdout_utf8())
+        };
+        [
+            out(&["rev-parse", "HEAD"]),
+            out(&["rev-parse", "--abbrev-ref", "HEAD"]),
+            out(&["show-ref"]),
+            out(&["reflog", "--format=%H %gs"]),
+            out(&["status", "--porcelain"]),
+            out(&["diff", "--cached"]),
+            out(&["rev-parse", "-q", "--verify", "MERGE_HEAD"]),
+            out(&["stash", "list"]),
+        ]
+        .join("\n--\n")
+    }
+
+    /// Turn on real SSH commit signing with a key generated for the test —
+    /// the same `gpg.format = ssh` shape a 1Password setup uses, minus the
+    /// agent. Returns nothing; the repo is configured in place.
+    fn sign_with_a_local_ssh_key(work: &Path) {
+        let key = work.join("signing-key");
+        sh(
+            work,
+            "ssh-keygen",
+            &["-q", "-t", "ed25519", "-N", "", "-f", key.to_str().unwrap()],
+        );
+        git(work, &["config", "commit.gpgsign", "true"]);
+        git(work, &["config", "gpg.format", "ssh"]);
+        git(work, &["config", "user.signingkey", key.to_str().unwrap()]);
+        // Pin the signer program too: this machine's GLOBAL config points it
+        // at 1Password's helper, which rejects a key it does not hold — so
+        // without this line the test would pass or fail per laptop.
+        git(work, &["config", "gpg.ssh.program", "ssh-keygen"]);
+        // the generated pair sits in the worktree; don't let it be "dirty"
+        std::fs::write(work.join(".gitignore"), "signing-key*\n").unwrap();
+        git(work, &["add", ".gitignore"]);
+        git(work, &["commit", "-m", "ignore the test key"]);
+    }
+
+    /// The daemon skips its unattended auto-join unless this probe says the
+    /// signer is live — which is only safe because the probe leaves the repo
+    /// exactly as it found it. Prove that: HEAD, the branch, every ref, the
+    /// reflog, the index, the working tree, MERGE_HEAD and the stash are all
+    /// byte-identical afterwards, and the object the probe DID write is
+    /// unreachable (so `git gc` collects it and no ref ever names it).
+    #[test]
+    fn signer_probe_writes_only_a_dangling_object_and_touches_nothing_else() {
+        let (_g, work) = scratch();
+        sign_with_a_local_ssh_key(&work);
+        let c = client(&work);
+        assert!(
+            c.commit_signing_configured(),
+            "the fixture must actually have signing on"
+        );
+
+        let before = repo_state(&work);
+        c.signer_probe(Duration::from_secs(30))
+            .expect("a live local signer must answer");
+        assert_eq!(
+            repo_state(&work),
+            before,
+            "signer_probe must not move HEAD, any ref, the reflog, the index, \
+             the working tree, MERGE_HEAD or the stash"
+        );
+
+        // The probe's commit exists, and nothing points at it.
+        let unreachable = SystemRunner
+            .run(
+                CommandRequest::new("git")
+                    .args(["fsck", "--unreachable", "--no-reflogs"])
+                    .cwd(&work),
+            )
+            .unwrap()
+            .stdout_utf8();
+        assert!(
+            unreachable.contains("unreachable commit"),
+            "the probe's object must be dangling, not referenced: {unreachable}"
+        );
+    }
+
+    /// The failure that motivates the probe: a signer that cannot sign. It
+    /// must come back as an error the caller can act on — and, just as
+    /// importantly, still leave the repo untouched.
+    #[test]
+    fn signer_probe_fails_when_the_signer_cannot_sign_and_still_touches_nothing() {
+        let (_g, work) = scratch();
+        sign_with_a_local_ssh_key(&work);
+        // …then break the signer, exactly as a locked 1Password agent does.
+        git(&work, &["config", "gpg.ssh.program", "/bin/false"]);
+        let c = client(&work);
+
+        let before = repo_state(&work);
+        let err = c
+            .signer_probe(Duration::from_secs(30))
+            .expect_err("an unsignable repo must not report a live signer");
+        assert!(matches!(err, GitError::Exit { .. }), "{err:?}");
+        assert_eq!(repo_state(&work), before, "a failed probe changes nothing");
+    }
+
+    #[test]
+    fn commit_signing_configured_reads_the_repo_config() {
+        let (_g, work) = scratch();
+        let c = client(&work);
+        // `scratch()` writes commit.gpgsign=false, so the machine's global
+        // config cannot make this flap.
+        assert!(!c.commit_signing_configured());
+        git(&work, &["config", "commit.gpgsign", "true"]);
+        assert!(c.commit_signing_configured());
     }
 
     #[test]

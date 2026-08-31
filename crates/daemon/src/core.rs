@@ -15,6 +15,18 @@ use tomte_proto::{DriftSummary, Event};
 
 const BLOB_CAP: usize = 4 * 1024 * 1024;
 
+/// How long the unattended auto-join may wait for the commit signer to prove
+/// it is awake. Long enough for a signer that is merely slow, far short of
+/// the IPC "daemon busy" cutoff (20s) that a stalled fetch would trip.
+const SIGNER_PROBE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ceiling on the auto-join's own `git merge`. The signer pre-flight should
+/// already have kept us out of any wait, but a signer that answers the probe
+/// and then stalls on the real commit must still not hold the core lock long
+/// enough for the app to read the daemon as stuck (2026-08-02). User-driven
+/// merges keep [`GitClient::merge`]'s full 60s — there, waiting is correct.
+const AUTO_JOIN_MERGE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
     #[error(transparent)]
@@ -504,6 +516,36 @@ impl DaemonCore {
         Ok(drifted)
     }
 
+    /// May the UNATTENDED auto-join create a commit right now? `Err` carries
+    /// the reason it may not, for the log.
+    ///
+    /// `git merge` commits, and committing runs the user's configured signer.
+    /// With 1Password SSH signing a locked vault leaves that signer sitting
+    /// on a GUI prompt — and this path runs on the fetch timer while HOLDING
+    /// THE DAEMON CORE LOCK, so the wait is not one user's merge going slow:
+    /// every non-Status IPC bounces as "daemon busy" for its duration, and
+    /// the join then fails anyway. Same class of outage as the 2026-08-02
+    /// sleep/wake incident that [`GitClient::fetch`]'s env guard exists to
+    /// prevent, reached through a different command.
+    ///
+    /// So ask the REAL signer first, bounded, with an operation that writes
+    /// only a dangling object and never touches HEAD, the index or the
+    /// working tree ([`GitClient::signer_probe`]) — nothing here may leave
+    /// the repo in a state the user did not ask for. A repo that does not
+    /// sign its commits is never asked: there is nothing that could block.
+    ///
+    /// This gate is for the daemon's unattended join ONLY. User-initiated
+    /// merges go through the app and SHOULD wait on the agent — the user is
+    /// right there and can unlock it.
+    fn signer_ready(&self) -> Result<(), String> {
+        if !self.git.commit_signing_configured() {
+            return Ok(());
+        }
+        self.git
+            .signer_probe(SIGNER_PROBE)
+            .map_err(|e| format!("commit signer did not sign within {SIGNER_PROBE:?}: {e}"))
+    }
+
     pub fn handle_fetch(&mut self, now_ts: u64) -> Result<(), DaemonError> {
         match self.git.fetch("origin") {
             Ok(()) => {}
@@ -544,23 +586,50 @@ impl DaemonCore {
             }
         }
         self.last_fetch_ts = Some(now_ts);
-        let div = self.git.divergence(&self.remote_ref).ok();
-        let behind = div.as_ref().map(|d| d.behind).unwrap_or(0);
-        let ahead = div.as_ref().map(|d| d.ahead).unwrap_or(0);
+        // "How far apart are we" gates every integration below, so a failure
+        // to ANSWER it must not read as "level" in the logs or the journal.
+        // The numbers still degrade to 0 — that is the direction that leaves
+        // the repo alone — but nothing downstream gets to call it a measured
+        // zero.
+        let div = match self.git.divergence(&self.remote_ref) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tomte_core::log_warn!(
+                    "fetch",
+                    "could not measure divergence from {} ({e}) — no integration this round",
+                    self.remote_ref
+                );
+                None
+            }
+        };
+        let behind = div.map(|d| d.behind).unwrap_or(0);
+        let ahead = div.map(|d| d.ahead).unwrap_or(0);
         self.journal.record_event(NewEvent {
             target: None,
             ts: now_ts,
             kind: EventKind::Fetch,
             from_hash: None,
             to_hash: None,
-            meta: Some(serde_json::json!({"behind": behind})),
+            meta: Some(match div {
+                Some(d) => serde_json::json!({"behind": d.behind}),
+                None => serde_json::json!({"behind_unknown": true}),
+            }),
         })?;
         // The paths fetch brought in — computed BEFORE integration so the
-        // probe below still knows what moved once HEAD catches up.
-        let changed = self
-            .git
-            .changed_files("HEAD", &self.remote_ref)
-            .unwrap_or_default();
+        // probe below still knows what moved once HEAD catches up. An empty
+        // list here silently skips the whole per-target loop, so a failure
+        // says so rather than passing for "fetch brought nothing".
+        let changed = match self.git.changed_files("HEAD", &self.remote_ref) {
+            Ok(v) => v,
+            Err(e) => {
+                tomte_core::log_warn!(
+                    "fetch",
+                    "could not list what {} brought in ({e}) — no targets re-probed this round",
+                    self.remote_ref
+                );
+                Vec::new()
+            }
+        };
         // Integrate, don't just observe: with no local commits and a clean
         // tree, fast-forwarding is lossless — and NOT doing it left every
         // later push non-fast-forward ("I literally clicked fetch",
@@ -591,25 +660,65 @@ impl DaemonCore {
                 // Tomte never leaves the repo mid-merge on its own initiative.
                 match self.git.merge_tree_conflicts(&self.remote_ref) {
                     Ok(MergeTreeOutcome::Clean) => {
-                        // `merge` returns `MergeStart`. A `Conflicts` here
-                        // would mean the repo is NOW mid-merge — that must
-                        // never be logged as a success, and must never be
-                        // left for the user to discover.
-                        match self.git.merge(&self.remote_ref) {
-                            Ok(MergeStart::Clean) => tomte_core::log_info!(
+                        if let Err(reason) = self.signer_ready() {
+                            // Nothing is wrong with the repo — the signer is
+                            // simply not available right now (a locked
+                            // 1Password is the everyday case). The join is a
+                            // convenience; the next fetch will offer it again.
+                            tomte_core::log_info!(
                                 "fetch",
-                                "joined {behind} commit(s) from {}",
+                                "clean join with {} available but not taken: {reason}; \
+                                 retrying next fetch",
                                 self.remote_ref
-                            ),
-                            Ok(MergeStart::Conflicts(paths)) => {
-                                tomte_core::log_warn!(
+                            );
+                        } else {
+                            // `merge` returns `MergeStart`. A `Conflicts` here
+                            // would mean the repo is NOW mid-merge — that must
+                            // never be logged as a success, and must never be
+                            // left for the user to discover.
+                            match self.git.merge_within(&self.remote_ref, AUTO_JOIN_MERGE) {
+                                Ok(MergeStart::Clean) => tomte_core::log_info!(
                                     "fetch",
-                                    "merge-tree said clean but {} path(s) conflicted; aborting",
-                                    paths.len()
-                                );
-                                self.git.merge_abort();
+                                    "joined {behind} commit(s) from {}",
+                                    self.remote_ref
+                                ),
+                                Ok(MergeStart::Conflicts(paths)) => {
+                                    tomte_core::log_warn!(
+                                        "fetch",
+                                        "merge-tree said clean but {} path(s) conflicted; aborting",
+                                        paths.len()
+                                    );
+                                    self.git.merge_abort();
+                                }
+                                // A non-conflict failure — the signer passed
+                                // the pre-flight and then died on the real
+                                // commit, or the 10s ceiling hit. `git merge`
+                                // leaves MERGE_HEAD set with everything
+                                // STAGED in that case (verified against git
+                                // 2.50.1): the stranded-merge shape, and
+                                // nobody asked for it. No user decision is in
+                                // it, so back it out.
+                                Err(e) => {
+                                    tomte_core::log_warn!("fetch", "join failed: {e}");
+                                    if self.git.merge_in_progress() {
+                                        self.git.merge_abort();
+                                        if self.git.merge_in_progress() {
+                                            tomte_core::log_warn!(
+                                                "fetch",
+                                                "…and the merge it left open could not be \
+                                                 aborted; the app's Finish/Cancel banner now \
+                                                 owns it"
+                                            );
+                                        } else {
+                                            tomte_core::log_info!(
+                                                "fetch",
+                                                "…and the merge it left open was aborted; the \
+                                                 repo is back where it started"
+                                            );
+                                        }
+                                    }
+                                }
                             }
-                            Err(e) => tomte_core::log_warn!("fetch", "join failed: {e}"),
                         }
                     }
                     // NOTE the empty case: `Conflicts(vec![])` means
