@@ -539,12 +539,24 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             s
         }
         "merge-origin" => {
-            // The remote's copy of the source is one commit behind on the
-            // editor line: a fourth pane, and an origin pick on the one
-            // region where origin has something of its own to offer.
+            // The remote's copy of the source spells the editor flag as a
+            // key of its own instead of inlining it: a fourth pane, and an
+            // origin pick on the one region where origin has something of
+            // its own to offer. Deliberately a DIFFERENT line count from the
+            // other three columns — `merge_scroll_sync_spans_four_panes_and_
+            // the_result` needs genuinely distinct per-column geometry, since
+            // columns that all start a region on the same line cannot catch a
+            // column-index mix-up.
             let mut inputs = conflict_inputs();
             inputs.origin = Some(
-                "editor = \"zed\"\nfont = \"GeistMono\"\ntheme = \"dark\"\nsplits = true\n".into(),
+                concat!(
+                    "editor = \"zed\"\n",
+                    "editor_args = \"--wait\"\n",
+                    "font = \"GeistMono\"\n",
+                    "theme = \"dark\"\n",
+                    "splits = true\n",
+                )
+                .into(),
             );
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, inputs, false));

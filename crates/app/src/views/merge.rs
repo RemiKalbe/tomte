@@ -604,11 +604,22 @@ fn edited_region_picks(
     picks
 }
 
-/// Origin's text for each region, or `None` where origin agrees with the
-/// local source there. Same projection as a free-text edit: line-diff origin
-/// against the anchor — the source pane's text, whose per-region line starts
-/// the merge already owns — map each region boundary through the hunks, and
-/// slice.
+/// Origin projected onto the merge's regions: ONE line-diff yielding both
+/// halves, so the fourth pane's rows and the text its pick applies can never
+/// come from different projections.
+struct OriginProjection {
+    /// Region `k`'s origin lines are `bounds[k]..bounds[k + 1]` — one entry
+    /// per region plus the totals sentinel, i.e. `ORIGIN_COL`'s geometry.
+    bounds: Vec<usize>,
+    /// What each region's origin pick applies, or `None` where there is
+    /// nothing origin can honestly contribute there (see below).
+    texts: Vec<Option<String>>,
+}
+
+/// Project origin onto the regions. Same machinery as a free-text edit:
+/// line-diff origin against the anchor — the source pane's text, whose
+/// per-region line starts the merge already owns — map each region boundary
+/// through the hunks, and slice.
 ///
 /// The anchor is `theirs` (the local source), NOT the editor seed: origin is
 /// the remote's version of that same source, so it is what origin has to be
@@ -617,21 +628,30 @@ fn edited_region_picks(
 /// ours+theirs) even where origin and the source are identical, and would
 /// make the button vanish from the very strip that reads "origin" once the
 /// pick landed.
-fn origin_region_texts(
-    anchor: &str,
-    anchor_line_starts: &[usize],
-    origin: &str,
-) -> Vec<Option<String>> {
+///
+/// A region's text is `None` when origin agrees with the source there — and
+/// ALSO when the projected slice came out empty while the source has lines:
+/// such a pick could only delete. That happens both when origin genuinely
+/// dropped the lines and when its diff straddled a region boundary and
+/// [`map_line`] clamped the content into the neighbour, and the two are
+/// indistinguishable here. Either way a purple button that reads like every
+/// other pick must not silently empty a region; `edit` still shows the
+/// deletion in the text before anyone applies it.
+fn origin_projection(anchor: &str, anchor_line_starts: &[usize], origin: &str) -> OriginProjection {
     let anchor_lines = tomte_core::merge::split_lines(anchor);
     let origin_lines = tomte_core::merge::split_lines(origin);
-    let mapped = mapped_boundaries(anchor, anchor_line_starts, origin);
-    (0..anchor_line_starts.len().saturating_sub(1))
+    let bounds = mapped_boundaries(anchor, anchor_line_starts, origin);
+    let texts = (0..anchor_line_starts.len().saturating_sub(1))
         .map(|r| {
             let old = anchor_lines[anchor_line_starts[r]..anchor_line_starts[r + 1]].concat();
-            let new = origin_lines[mapped[r]..mapped[r + 1]].concat();
+            let new = origin_lines[bounds[r]..bounds[r + 1]].concat();
+            if new.is_empty() && !old.is_empty() {
+                return None;
+            }
             (old != new).then_some(new)
         })
-        .collect()
+        .collect();
+    OriginProjection { bounds, texts }
 }
 
 /// Compute the display for region `idx` from the single source of truth.
@@ -853,13 +873,17 @@ impl LoadedMerge {
         let theirs_starts: Vec<usize> = region_line_starts.iter().map(|s| s[THEIRS_COL]).collect();
         let (origin_rows, origin_texts) = match inputs.origin.as_deref() {
             Some(origin) => {
-                let texts = origin_region_texts(&theirs_text, &theirs_starts, origin);
-                let bounds = mapped_boundaries(&theirs_text, &theirs_starts, origin);
-                let rows = origin_pane_lines(origin, &bounds, &texts, &state.doc.regions);
-                for (starts, &b) in region_line_starts.iter_mut().zip(bounds.iter()) {
+                let projected = origin_projection(&theirs_text, &theirs_starts, origin);
+                let rows = origin_pane_lines(
+                    origin,
+                    &projected.bounds,
+                    &projected.texts,
+                    &state.doc.regions,
+                );
+                for (starts, &b) in region_line_starts.iter_mut().zip(projected.bounds.iter()) {
                     starts[ORIGIN_COL] = b;
                 }
-                (Some(Rc::new(rows)), texts)
+                (Some(Rc::new(rows)), projected.texts)
             }
             None => {
                 // No fourth pane: mirror the disk column so no region is
@@ -1344,10 +1368,11 @@ impl MergeView {
         self.apply(region, choice, cx);
     }
 
-    /// Region-aligned scroll sync across the three read-only input panes:
-    /// `leader` is 0..=2. Maps the leader's viewport-top to (region,
-    /// fraction) and positions the other two panes at THEIR version of that
-    /// point. Pure offset math over the cached analytic geometry — no
+    /// Region-aligned scroll sync across the read-only input panes: `leader`
+    /// is a column (`0..PANE_COLS`, origin included whether or not its pane
+    /// is drawn) or [`RESULT_LEADER`]. Maps the leader's viewport-top to
+    /// (region, fraction) and positions every other column at ITS version of
+    /// that point. Pure offset math over the cached analytic geometry — no
     /// notify, no layout reads: the wheel's own refresh paints the new
     /// offsets in the same frame (2026-08-08: notifying per wheel tick was
     /// part of the lag). The result editor scrolls independently (blocks
@@ -2534,8 +2559,8 @@ mod tests {
     use super::{
         BASE_COL, LoadedMerge, ORIGIN_COL, OURS_COL, PaneSide, RegionDisplay, STRIP_ROWS,
         THEIRS_COL, document_seed, edited_region_picks, line_at, map_line, merge_banner,
-        next_target, origin_region_texts, pane_lines, protected_line_info, region_at,
-        region_display, region_has_strip, region_seed_text, row_bg, strips_above_line,
+        next_target, origin_projection, pane_lines, protected_line_info, region_at, region_display,
+        region_has_strip, region_seed_text, row_bg, strips_above_line,
     };
     use gpui::SharedString;
     use std::collections::HashMap;
@@ -3194,7 +3219,7 @@ mod tests {
         ));
         let origin = "a\nv = 9\nz\n";
         let (theirs, starts) = theirs_anchor(&state);
-        let per_region = origin_region_texts(&theirs, &starts, origin);
+        let per_region = origin_projection(&theirs, &starts, origin).texts;
         let conflict = state.conflicts()[0];
         assert_eq!(per_region[conflict].as_deref(), Some("v = 9\n"));
         // Regions origin agrees on offer nothing — no button, no noise.
@@ -3247,6 +3272,48 @@ mod tests {
             .map(|r| r.text.as_ref())
             .collect();
         assert_eq!(shown, ["v = 9"]);
+    }
+
+    #[test]
+    fn a_boundary_spanning_origin_diff_never_offers_a_deletion() {
+        // Origin changed the conflict line AND the line right after it,
+        // which belongs to the NEXT region. `line_hunks` returns one hunk
+        // spanning both, and `map_line` clamps a boundary interior to a hunk
+        // to that hunk's start — so the conflict's projected slice comes out
+        // empty. Offering it would delete the region behind a button that
+        // reads like any other pick.
+        let mut i = inputs(
+            Some("v = 1\nkeep\ntail\n"),
+            "v = 2\nkeep\ntail\n",
+            "v = 3\nkeep\ntail\n",
+        );
+        let origin = "v = 9\nKEEP\ntail\n";
+        i.origin = Some(origin.into());
+        let loaded = LoadedMerge::new(Arc::new(i));
+        let conflict = loaded.state.conflicts()[0];
+
+        // The premise is real, not hand-built: the projection genuinely
+        // collapsed this region to zero origin lines.
+        let (theirs, starts) = theirs_anchor(&loaded.state);
+        let mapped = super::mapped_boundaries(&theirs, &starts, origin);
+        assert_eq!(
+            mapped[conflict],
+            mapped[conflict + 1],
+            "the boundary must clamp for this test to mean anything"
+        );
+        assert!(
+            starts[conflict] < starts[conflict + 1],
+            "…while the source DOES have lines there"
+        );
+
+        // No pick is offered for it…
+        assert_eq!(loaded.origin_texts[conflict], None);
+        // …and no offered pick anywhere can empty a region.
+        assert!(
+            loaded.origin_texts.iter().flatten().all(|t| !t.is_empty()),
+            "an origin pick must never be a pure deletion: {:?}",
+            loaded.origin_texts
+        );
     }
 
     #[test]

@@ -572,6 +572,15 @@ mod render_smoke {
         let merge = cx.update(|cx| shell.read(cx).merge.clone().expect("merge view posed"));
         for leader in 0..=merge::PANE_COLS {
             let probe = cx.update(|cx| merge.update(cx, |view, _| view.sync_probe(leader, 1)));
+            // Binds the fixture's premise: origin carries a line the others
+            // do not, so region 1 starts on a different LINE in each column.
+            // With all four equal, `line_at(starts, leader, …)` written where
+            // `line_at(starts, col, …)` was meant would pass unnoticed.
+            assert!(
+                probe.want_panes.iter().any(|&w| w != probe.want_panes[0]),
+                "fixture columns must differ, got {:?}",
+                probe.want_panes
+            );
             assert_eq!(
                 probe.panes, probe.want_panes,
                 "leader {leader} left a column behind"
