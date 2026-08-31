@@ -145,11 +145,16 @@ git commit -m "feat(ui): add the remote tint for origin's content state"
 **Interfaces:**
 - Produces:
   ```rust
-  /// Conflicting paths a merge with `upstream` WOULD produce, computed
-  /// without touching the working tree or index. `Ok(vec![])` means the
-  /// merge is clean. `Ok(None)` when git is too old for `--write-tree`.
+  /// SHIPPED (Task 2, amended in fix round 1): exit status is authoritative
+  /// over the path list, because a merge can conflict without any individual
+  /// file conflicting (git-merge-tree(1), MISTAKES TO AVOID).
+  pub enum MergeTreeOutcome {
+      Clean,                    // git exited 0
+      Conflicts(Vec<PathBuf>),  // git exited 1; the Vec MAY be empty
+      Unknown,                  // git too old, or refused outright
+  }
   pub fn merge_tree_conflicts(&self, upstream: &str)
-      -> Result<Option<Vec<PathBuf>>, GitError>
+      -> Result<MergeTreeOutcome, GitError>
   ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -303,7 +308,10 @@ fn a_diverged_but_non_conflicting_repo_joins_automatically() {
     assert!(div.ahead > 0 && div.behind > 0, "precondition: diverged");
 
     // The virtual merge proves it clean BEFORE anything is written.
-    assert_eq!(git.merge_tree_conflicts("origin/main").unwrap(), Some(vec![]));
+    assert_eq!(
+        git.merge_tree_conflicts("origin/main").unwrap(),
+        MergeTreeOutcome::Clean
+    );
     assert!(matches!(git.merge("origin/main").unwrap(), MergeStart::Clean));
 
     let after = git.divergence("origin/main").unwrap();
@@ -335,7 +343,7 @@ if behind > 0 && clean_tree {
         // Diverged. Join ONLY if a virtual merge proves it clean —
         // Tomte never leaves the repo mid-merge on its own initiative.
         match self.git.merge_tree_conflicts(&self.remote_ref) {
-            Ok(Some(conflicts)) if conflicts.is_empty() => {
+            Ok(MergeTreeOutcome::Clean) => {
                 // `merge` returns `MergeStart`. A `Conflicts` here would mean
                 // the repo is NOW mid-merge — that must never be logged as a
                 // success, and must never be left for the user to discover.
@@ -354,13 +362,16 @@ if behind > 0 && clean_tree {
                     Err(e) => tomte_core::log_warn!("fetch", "join failed: {e}"),
                 }
             }
-            Ok(Some(conflicts)) => tomte_core::log_info!(
+            // NOTE the empty case: `Conflicts(vec![])` means conflicted with
+            // no individually-listed file (a directory rename conflict, say).
+            // It must NOT be treated as clean — never match on `.is_empty()`.
+            Ok(MergeTreeOutcome::Conflicts(paths)) => tomte_core::log_info!(
                 "fetch",
-                "{} source file(s) conflict with {} — left for review",
-                conflicts.len(), self.remote_ref
+                "{} conflict(s) with {} — left for review",
+                paths.len(), self.remote_ref
             ),
-            Ok(None) => tomte_core::log_warn!(
-                "fetch", "git too old for merge-tree; not auto-joining"
+            Ok(MergeTreeOutcome::Unknown) => tomte_core::log_warn!(
+                "fetch", "merge-tree gave no answer; not auto-joining"
             ),
             Err(e) => tomte_core::log_warn!("fetch", "merge probe failed: {e}"),
         }
@@ -484,9 +495,16 @@ the origin half as it maps. Replace the block at `scanner.rs:114-128`:
 
 ```rust
 // (b) source side via git
-let origin_changed: BTreeSet<PathBuf> =
+//
+// NOTE: changed_files runs `git diff --name-only HEAD..<remote>`, which lists
+// every file whose CONTENT differs between the two — regardless of which side
+// moved. That is deliberately what we want: decision 6.4 is "surface origin
+// whenever its content differs, without distinguishing why", so a file only
+// this machine changed still has an origin version that differs from ours.
+// Do NOT narrow this to an ahead/behind split.
+let differs_from_origin: BTreeSet<PathBuf> =
     self.git.changed_files("HEAD", &self.remote_ref)?.into_iter().collect();
-let mut source_changed: BTreeSet<PathBuf> = origin_changed.clone();
+let mut source_changed: BTreeSet<PathBuf> = differs_from_origin.clone();
 source_changed.extend(self.git.dirty_files()?);
 
 // Which managed TARGETS origin has its own version of. Recorded as the
@@ -502,7 +520,7 @@ for rel in &source_changed {
     };
     for target in targets {
         if managed.contains(&target) {
-            if origin_changed.contains(rel) {
+            if differs_from_origin.contains(rel) {
                 origin_differs.insert(target.clone());
             }
             candidates.insert(target);
@@ -898,6 +916,15 @@ fn resolving_a_diverged_file_starts_and_finishes_the_merge() {
     assert_eq!(s.git().divergence("origin/main").unwrap().behind, 0);
 }
 ```
+
+**Fixture warning (learned in Task 3).** `diverged_scratch_with_conflict()`
+must create a **same-file** conflict. As of Task 3 the daemon auto-joins any
+divergence a virtual merge proves clean, so the old idiom — `other_clone` plus
+commits to *different* files — no longer produces a stuck divergence; it
+produces one that resolves itself. Only a same-file conflict still represents
+a divergence a human must answer. `engine_for()` likewise does not exist yet;
+build both following the idiom already in `crates/core/tests/git_sync.rs`
+(`Scratch` exposes `root`/`home`/`source`/`bare`; `write()` takes a full path).
 
 - [ ] **Step 2: Run and watch it fail**
 
