@@ -276,6 +276,7 @@ fn choice_kind(choice: &Choice) -> ui::ChoiceKind {
         Choice::Base => ui::ChoiceKind::Base,
         Choice::Both => ui::ChoiceKind::Both,
         Choice::Edited(_) => ui::ChoiceKind::Edited,
+        Choice::Origin(_) => ui::ChoiceKind::Origin,
     }
 }
 
@@ -317,7 +318,9 @@ fn choice_lines(
             out.extend(tag(ui::Side::Theirs));
             out
         }
-        Choice::Edited(text) => text
+        // Origin reads the same as Edited here: free-form text, no side tag.
+        // The strip label and result-row tint are where its provenance shows.
+        Choice::Edited(text) | Choice::Origin(text) => text
             .split_inclusive('\n')
             .map(|l| (SharedString::from(display_text(l).to_owned()), None))
             .collect(),
@@ -348,7 +351,7 @@ fn region_seed_text(state: &MergeState, idx: usize) -> String {
         .cloned()
         .or_else(|| auto_choice(region.kind));
     match effective {
-        Some(Choice::Edited(text)) => text,
+        Some(Choice::Edited(text) | Choice::Origin(text)) => text,
         Some(Choice::Ours) => ours(),
         Some(Choice::Theirs) => theirs(),
         Some(Choice::Base) => doc.base_lines()[region.base.clone()].concat(),
@@ -507,6 +510,7 @@ fn region_pattern(
                 Choice::Base => ("last written".into(), theme.text_muted),
                 Choice::Both => ("both".into(), theme.ok),
                 Choice::Edited(_) => ("edited".into(), theme.ok),
+                Choice::Origin(_) => ("origin".into(), theme.remote),
             };
             let label: SharedString = if auto {
                 format!("auto · {label}").into()
@@ -2206,6 +2210,10 @@ fn strip_block(
                         ui::ChoiceKind::Base => Choice::Base,
                         ui::ChoiceKind::Both => Choice::Both,
                         ui::ChoiceKind::Edited => return,
+                        // No origin pick button exists yet (Task 8 wires
+                        // one up with the projected origin text); this arm
+                        // only keeps the match exhaustive.
+                        ui::ChoiceKind::Origin => return,
                     };
                     view.update(cx, |merge, cx| merge.apply(region, choice, cx))
                         .ok();

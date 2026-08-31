@@ -52,6 +52,7 @@ pub enum ChoiceKind {
     Base,
     Both,
     Edited,
+    Origin,
 }
 
 impl ChoiceKind {
@@ -62,6 +63,7 @@ impl ChoiceKind {
             Self::Theirs => theme.accent,
             Self::Base => theme.text_muted,
             Self::Both | Self::Edited => theme.ok,
+            Self::Origin => theme.remote,
         }
     }
 
@@ -72,6 +74,7 @@ impl ChoiceKind {
             Self::Base => "last written",
             Self::Both => "both",
             Self::Edited => "edited",
+            Self::Origin => "origin",
         }
     }
 }

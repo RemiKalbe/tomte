@@ -271,6 +271,10 @@ pub enum Choice {
     /// the decision stays revisitable without loss).
     Both,
     Edited(String),
+    /// Origin's version of this region. Assembles exactly like `Edited`;
+    /// separate so the strip label and result-row tint can say where the
+    /// text came from.
+    Origin(String),
 }
 
 #[derive(Debug, Default)]
@@ -320,6 +324,7 @@ impl MergeDocument {
                     out.push_str(&self.theirs_lines[region.theirs.clone()].concat());
                 }
                 (Some(Choice::Edited(text)), _) => out.push_str(text),
+                (Some(Choice::Origin(text)), _) => out.push_str(text),
                 (None, RegionKind::Unchanged) => {
                     out.push_str(&self.base_lines[region.base.clone()].concat())
                 }
@@ -500,5 +505,15 @@ mod tests {
         let mut res = Resolution::new();
         res.set(0, Choice::Base);
         assert_eq!(doc.assemble(&res).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn origin_choice_assembles_verbatim_and_keeps_its_provenance() {
+        let doc = MergeDocument::compute("x\n", "disk\n", "src\n", MergeOptions::default());
+        let mut res = Resolution::new();
+        res.set(0, Choice::Origin("from origin\n".into()));
+        assert_eq!(doc.assemble(&res).unwrap(), "from origin\n");
+        // Provenance is the whole point: it must not be an `Edited`.
+        assert!(matches!(res.get(0), Some(Choice::Origin(_))));
     }
 }
