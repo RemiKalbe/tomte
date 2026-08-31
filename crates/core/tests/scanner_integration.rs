@@ -158,3 +158,27 @@ fn an_unreadable_target_is_recorded_not_fatal() {
         "an unchecked file is unknown, not in sync"
     );
 }
+
+#[test]
+fn origin_differences_are_detected_per_target() {
+    let s = Scratch::new();
+    // Push a change to origin that the local repo does not have.
+    let other = s.root.path().join("other");
+    support::sh(
+        s.root.path(),
+        "git",
+        &["clone", s.bare.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    std::fs::write(other.join("dot_testrc"), "a=origin\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "origin edit"]);
+    git(&other, &["push"]);
+    support::git(&s.source, &["fetch", "origin"]);
+
+    let report = s.scanner().scan().unwrap();
+    assert!(
+        report.origin_differs.iter().any(|t| t.ends_with(".testrc")),
+        "origin's version of .testrc differs: {:?}",
+        report.origin_differs
+    );
+}

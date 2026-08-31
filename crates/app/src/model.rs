@@ -307,6 +307,10 @@ impl SyncModel {
                     target: target.to_path_buf(),
                     class: class.to_string(),
                     since_ts: Some(ts),
+                    // A per-target push carries no origin data (that comes
+                    // only from a full scan's git diff); the next
+                    // hydrate_status corrects this if it's wrong.
+                    origin_differs: false,
                 });
                 true
             }
@@ -455,6 +459,7 @@ mod tests {
             target: PathBuf::from(target),
             class: class.into(),
             since_ts,
+            origin_differs: false,
         }
     }
 

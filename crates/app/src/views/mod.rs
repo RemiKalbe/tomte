@@ -506,6 +506,7 @@ mod render_smoke {
                 target: PathBuf::from("/tmp/smoke/.zshrc"),
                 class: "destination_drift".into(),
                 since_ts: Some(10),
+                origin_differs: false,
             }],
             42,
             Some("degraded hint".into()),

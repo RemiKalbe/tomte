@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -60,6 +60,9 @@ pub struct DriftSummary {
     pub target: PathBuf,
     pub class: String,
     pub since_ts: Option<u64>,
+    /// Origin's version of this target's source differs from local's,
+    /// regardless of which side moved (decision 6.4).
+    pub origin_differs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

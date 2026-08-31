@@ -58,6 +58,10 @@ pub struct DaemonCore {
     expected: Vec<(PathBuf, u64)>,
     drift_state: BTreeMap<PathBuf, (String, u64)>,
     in_sync_count: u64,
+    /// Managed TARGET paths whose origin source differs from local's, from
+    /// the most recent full scan. Retained between scans exactly like
+    /// `in_sync_count`, so `status_snapshot` can read it between rescans.
+    origin_differs: BTreeSet<PathBuf>,
     degraded: Option<String>,
     paused: bool,
     /// Outcome of the previous full scan — journal scans only on change.
@@ -110,6 +114,7 @@ impl DaemonCore {
             expected: Vec::new(),
             drift_state: BTreeMap::new(),
             in_sync_count: 0,
+            origin_differs: BTreeSet::new(),
             degraded: None,
             paused: false,
             last_scan_drifted: None,
@@ -448,6 +453,7 @@ impl DaemonCore {
         let report = self.scanner.scan()?;
         self.degraded = report.degraded.as_ref().map(|f| f.hint.clone());
         self.in_sync_count = report.in_sync_count as u64;
+        self.origin_differs = report.origin_differs;
         // Targets the scan skipped. Never silent: one of these used to abort
         // the whole scan, and the status then sat at "0 in sync" forever
         // (2026-08-27). They are excluded from `in_sync_count`, so the tally
@@ -661,6 +667,7 @@ impl DaemonCore {
                 target: t.clone(),
                 class: class.clone(),
                 since_ts: Some(*since),
+                origin_differs: self.origin_differs.contains(t),
             })
             .collect();
         (drifted, self.in_sync_count, self.degraded.clone())

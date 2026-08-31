@@ -1431,6 +1431,7 @@ mod tests {
             target: target.into(),
             class: class.into(),
             since_ts: Some(1),
+            origin_differs: false,
         }
     }
 

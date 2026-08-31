@@ -40,6 +40,12 @@ pub struct ScanReport {
     /// logged by the daemon and excluded from `in_sync_count`, so the count
     /// never claims a file is fine when it was never looked at.
     pub unprobed: Vec<UnprobedTarget>,
+    /// Managed TARGET paths (not source paths) whose origin source differs
+    /// from local's, regardless of which side moved: decision 6.4 is
+    /// "surface origin whenever its content differs, without distinguishing
+    /// why". A file only this machine changed still has an origin version
+    /// that differs from ours, and belongs here too.
+    pub origin_differs: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,9 +118,25 @@ impl DriftScanner {
         }
 
         // (b) source side via git
-        let mut source_changed: BTreeSet<PathBuf> = BTreeSet::new();
-        source_changed.extend(self.git.changed_files("HEAD", &self.remote_ref)?);
+        //
+        // NOTE: changed_files runs `git diff --name-only HEAD..<remote>`, which lists
+        // every file whose CONTENT differs between the two — regardless of which side
+        // moved. That is deliberately what we want: decision 6.4 is "surface origin
+        // whenever its content differs, without distinguishing why", so a file only
+        // this machine changed still has an origin version that differs from ours.
+        // Do NOT narrow this to an ahead/behind split.
+        let differs_from_origin: BTreeSet<PathBuf> = self
+            .git
+            .changed_files("HEAD", &self.remote_ref)?
+            .into_iter()
+            .collect();
+        let mut source_changed: BTreeSet<PathBuf> = differs_from_origin.clone();
         source_changed.extend(self.git.dirty_files()?);
+
+        // Which managed TARGETS origin has its own version of. Recorded as the
+        // existing mapping runs, so the scan costs exactly what it did before.
+        let mut origin_differs: BTreeSet<PathBuf> = BTreeSet::new();
+
         // Map one source at a time: non-entry files (.chezmoiignore, README, …)
         // make `chezmoi target-path` fail, and must not kill the scan.
         for rel in &source_changed {
@@ -124,6 +146,9 @@ impl DriftScanner {
             };
             for target in targets {
                 if managed.contains(&target) {
+                    if differs_from_origin.contains(rel) {
+                        origin_differs.insert(target.clone());
+                    }
                     candidates.insert(target);
                 }
             }
@@ -198,6 +223,7 @@ impl DriftScanner {
             in_sync_count,
             degraded,
             unprobed,
+            origin_differs,
         })
     }
 
