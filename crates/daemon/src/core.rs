@@ -630,6 +630,27 @@ impl DaemonCore {
                 }
             }
         }
+        // origin_differs must reflect state AFTER any integration above: a
+        // clean auto-join folds origin's commits into HEAD, so those paths
+        // no longer differ from origin. Reusing the pre-join `changed` set
+        // here would mark files as differing at exactly the moment
+        // auto-join made them agree — so this is a second, independent
+        // `git diff`, taken post-integration, on every fetch (~every 15
+        // min: cheap, and the only way to get this right regardless of
+        // which integration path (ff-merge, merge, conflict, none) ran
+        // above). A failure here must not fail the fetch or guess at the
+        // answer — it just leaves origin_differs at its last-known value
+        // for the targets this fetch touched, logged so it's never silent.
+        let origin_differs_now = match self.git.changed_files("HEAD", &self.remote_ref) {
+            Ok(v) => Some(v.into_iter().collect::<BTreeSet<PathBuf>>()),
+            Err(e) => {
+                tomte_core::log_warn!(
+                    "fetch",
+                    "could not refresh origin_differs after integration: {e}"
+                );
+                None
+            }
+        };
         for rel in changed {
             let abs = self.source_dir.join(&rel);
             let Ok(targets) = self.chezmoi.target_paths(std::slice::from_ref(&abs)) else {
@@ -638,6 +659,13 @@ impl DaemonCore {
             for t in targets {
                 if self.managed.contains(&t) {
                     self.probe_and_journal(&t, now_ts)?;
+                    if let Some(now) = &origin_differs_now {
+                        if now.contains(&rel) {
+                            self.origin_differs.insert(t);
+                        } else {
+                            self.origin_differs.remove(&t);
+                        }
+                    }
                 }
             }
         }

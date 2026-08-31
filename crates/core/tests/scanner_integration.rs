@@ -175,7 +175,25 @@ fn origin_differences_are_detected_per_target() {
     git(&other, &["push"]);
     support::git(&s.source, &["fetch", "origin"]);
 
+    // A second managed file, edited only in the local WORKING TREE
+    // (uncommitted, never pushed). It lands in the scanner's candidate set
+    // via `dirty_files` — exactly like `.testrc` lands via `changed_files`
+    // — but origin's committed version of it is untouched: HEAD already
+    // matches origin for this file, the dirty edit hasn't been committed at
+    // all. An implementation that inserted every mapped candidate into
+    // `origin_differs` (i.e. deleted the `differs_from_origin.contains(rel)`
+    // gate) would wrongly flag this one too; a selective one must not.
+    std::fs::write(s.source.join("dot_otherrc"), "b=uncommitted\n").unwrap();
+
     let report = s.scanner().scan().unwrap();
+    assert!(
+        !report
+            .origin_differs
+            .iter()
+            .any(|t| t.ends_with(".otherrc")),
+        "a dirty but uncommitted local file is not an origin difference: {:?}",
+        report.origin_differs
+    );
     assert!(
         report.origin_differs.iter().any(|t| t.ends_with(".testrc")),
         "origin's version of .testrc differs: {:?}",

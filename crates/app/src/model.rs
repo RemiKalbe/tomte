@@ -308,8 +308,9 @@ impl SyncModel {
                     class: class.to_string(),
                     since_ts: Some(ts),
                     // A per-target push carries no origin data (that comes
-                    // only from a full scan's git diff); the next
-                    // hydrate_status corrects this if it's wrong.
+                    // from a git diff, which the daemon runs on both a full
+                    // scan and every periodic fetch — not just a full
+                    // scan); the next Status poll corrects this if wrong.
                     origin_differs: false,
                 });
                 true
