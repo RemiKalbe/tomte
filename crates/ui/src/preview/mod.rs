@@ -196,7 +196,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
         )
         .into_any_element(),
         "merge-region" => {
-            let noop_pick = |_: ChoiceKind, _: &ClickEvent, _: &mut Window, _: &mut App| {};
+            let noop_pick = |_: Pick, _: &ClickEvent, _: &mut Window, _: &mut App| {};
             let lines: Vec<gpui::SharedString> = vec![
                 "    \"@xberg-io/opencode-xberg\",".into(),
                 "    \"@xberg-io/opencode-crawlberg\",".into(),
@@ -221,6 +221,7 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                             has_base: true,
                             current: None,
                             focused: true,
+                            origin: None,
                         },
                         noop_pick,
                         noop,
@@ -238,6 +239,25 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                             has_base: false,
                             current: Some(ChoiceKind::Theirs),
                             focused: false,
+                            origin: None,
+                        },
+                        noop_pick,
+                        noop,
+                        noop,
+                    )
+                    .into_any_element(),
+                ))
+                .child(variant(
+                    theme,
+                    "deciding (origin has its own version)",
+                    decision_strip(
+                        theme,
+                        3,
+                        StripState::Deciding {
+                            has_base: true,
+                            current: None,
+                            focused: false,
+                            origin: Some("    \"@xberg-io/opencode-xberg\",\n".into()),
                         },
                         noop_pick,
                         noop,

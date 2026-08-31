@@ -45,6 +45,10 @@ pub const STATES: &[(&str, &str)] = &[
         "no conflicts: auto-resolved regions, overridable strips",
     ),
     (
+        "merge-origin",
+        "origin has its own version: fourth pane + origin pick",
+    ),
+    (
         "merge-big",
         "500-line templated file, many regions — scroll/perf testbed",
     ),
@@ -530,6 +534,18 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 span_map: None,
                 origin: None,
             };
+            let mut s = shell(Route::Merge, rich_model());
+            s.merge = Some(posed_merge(cx, inputs, false));
+            s
+        }
+        "merge-origin" => {
+            // The remote's copy of the source is one commit behind on the
+            // editor line: a fourth pane, and an origin pick on the one
+            // region where origin has something of its own to offer.
+            let mut inputs = conflict_inputs();
+            inputs.origin = Some(
+                "editor = \"zed\"\nfont = \"GeistMono\"\ntheme = \"dark\"\nsplits = true\n".into(),
+            );
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, inputs, false));
             s

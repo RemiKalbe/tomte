@@ -2,8 +2,9 @@
 //! (merge-editor-v2 spec, Zed conflict_view.rs pattern — always-visible
 //! labeled buttons above the region; read-only provenance is structural).
 //!
-//! Tint mapping (established app vocabulary, NOT GitHub's purple):
-//! ours/disk = drift amber, theirs/source = accent blue.
+//! Tint mapping (established app vocabulary): ours/disk = drift amber,
+//! theirs/source = accent blue, origin = remote purple. Purple is not a
+//! merge colour here — it means "the remote", and nothing else uses it.
 
 use std::collections::HashMap;
 
@@ -79,6 +80,36 @@ impl ChoiceKind {
     }
 }
 
+/// What a strip button EMITS, as opposed to what a strip displays. The two
+/// differ: `Edited` is a state a region can be in but never a button (free
+/// text arrives through `on_edit`), and `Origin` is only offerable when
+/// origin actually has text for this region — which it carries, so the host
+/// has nothing to look up and no case where a click can do nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    Ours,
+    Theirs,
+    Base,
+    Both,
+    /// Origin's version of this region, verbatim.
+    Origin(SharedString),
+}
+
+impl Pick {
+    /// The choice this pick lands as — what a strip compares against
+    /// `current` to render its button selected, and where its label and tint
+    /// come from.
+    pub fn kind(&self) -> ChoiceKind {
+        match self {
+            Self::Ours => ChoiceKind::Ours,
+            Self::Theirs => ChoiceKind::Theirs,
+            Self::Base => ChoiceKind::Base,
+            Self::Both => ChoiceKind::Both,
+            Self::Origin(_) => ChoiceKind::Origin,
+        }
+    }
+}
+
 /// Strip state drives which buttons show and which reads selected.
 pub enum StripState {
     /// Conflict awaiting a decision (or an auto-resolved region being
@@ -88,6 +119,11 @@ pub enum StripState {
         has_base: bool,
         current: Option<ChoiceKind>,
         focused: bool,
+        /// Origin's text for this region, when origin HAS one that differs
+        /// from the local source. `None` renders no origin button at all —
+        /// most files have no origin version, and most regions of the ones
+        /// that do match it.
+        origin: Option<SharedString>,
     },
     /// A decision exists; collapsed affordance names it and offers revisit.
     /// `focused`: the region cursor sits here (Next ↓ walks decided regions
@@ -109,7 +145,7 @@ pub fn decision_strip(
     theme: Theme,
     region_ix: usize,
     state: StripState,
-    on_pick: impl Fn(ChoiceKind, &ClickEvent, &mut Window, &mut App) + Clone + 'static,
+    on_pick: impl Fn(Pick, &ClickEvent, &mut Window, &mut App) + Clone + 'static,
     on_edit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_revisit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
@@ -152,21 +188,21 @@ pub fn decision_strip(
             has_base,
             current,
             focused,
+            origin,
         } => {
-            let pick_button =
-                |id: &'static str, kind: ChoiceKind, label: &'static str, tint: Rgba| {
-                    let on_pick = on_pick.clone();
-                    let selected = current == Some(kind);
-                    button(
-                        theme,
-                        ElementId::named_usize(id, region_ix),
-                        label.into(),
-                        ButtonVariant::Ring(tint),
-                        ButtonSize::Micro,
-                        move |ev, window, cx| on_pick(kind, ev, window, cx),
-                    )
-                    .when(selected, |el| el.bg(Theme::wash(tint, 0.2)))
-                };
+            let pick_button = |id: &'static str, pick: Pick, label: &'static str, tint: Rgba| {
+                let on_pick = on_pick.clone();
+                let selected = current == Some(pick.kind());
+                button(
+                    theme,
+                    ElementId::named_usize(id, region_ix),
+                    label.into(),
+                    ButtonVariant::Ring(tint),
+                    ButtonSize::Micro,
+                    move |ev, window, cx| on_pick(pick.clone(), ev, window, cx),
+                )
+                .when(selected, |el| el.bg(Theme::wash(tint, 0.2)))
+            };
             card.child(
                 div()
                     .text_color(if focused { accent } else { theme.text_muted })
@@ -180,27 +216,32 @@ pub fn decision_strip(
             )
             // Push the actions to the trailing edge (Zed's justify_between).
             .child(div().flex_1())
-            .child(pick_button(
-                "pick-ours",
-                ChoiceKind::Ours,
-                "disk",
-                theme.drift,
-            ))
+            .child(pick_button("pick-ours", Pick::Ours, "disk", theme.drift))
             .child(pick_button(
                 "pick-theirs",
-                ChoiceKind::Theirs,
+                Pick::Theirs,
                 "source",
                 theme.accent,
             ))
+            // Next to the source it is a variant of: the remote's copy of
+            // the same file, offered only where it has something different.
+            .when_some(origin, |el, text| {
+                el.child(pick_button(
+                    "pick-origin",
+                    Pick::Origin(text),
+                    "origin",
+                    theme.remote,
+                ))
+            })
             .when(has_base, |el| {
                 el.child(pick_button(
                     "pick-base",
-                    ChoiceKind::Base,
+                    Pick::Base,
                     "last written",
                     theme.text_muted,
                 ))
             })
-            .child(pick_button("pick-both", ChoiceKind::Both, "both", theme.ok))
+            .child(pick_button("pick-both", Pick::Both, "both", theme.ok))
             .child(divider(theme))
             .child(button(
                 theme,

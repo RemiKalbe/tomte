@@ -557,6 +557,32 @@ mod render_smoke {
         }
     }
 
+    /// Region-aligned scroll sync must span all FOUR input columns and the
+    /// result editor. The origin column was appended to a mapping that had
+    /// already been rebuilt once (2026-08-22 editor rework), so this drives
+    /// every column as the leader and checks the others land on THEIR first
+    /// line of the same region.
+    #[gpui::test]
+    fn merge_scroll_sync_spans_four_panes_and_the_result(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("merge-origin", smoke_paths(), cx).expect("merge-origin fixture")
+        });
+        // Render once: the seed and the pane geometry are built there.
+        vis.run_until_parked();
+        let merge = cx.update(|cx| shell.read(cx).merge.clone().expect("merge view posed"));
+        for leader in 0..=merge::PANE_COLS {
+            let probe = cx.update(|cx| merge.update(cx, |view, _| view.sync_probe(leader, 1)));
+            assert_eq!(
+                probe.panes, probe.want_panes,
+                "leader {leader} left a column behind"
+            );
+            assert_eq!(
+                probe.result, probe.want_result,
+                "leader {leader} left the result editor behind"
+            );
+        }
+    }
+
     #[gpui::test]
     fn shell_renders_every_route_without_panicking(cx: &mut TestAppContext) {
         for route in [

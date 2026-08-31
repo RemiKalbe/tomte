@@ -1,8 +1,10 @@
-//! Three-pane merge editor (spec §7.3, approved mockup A; plan 7 Task 3).
+//! Multi-pane merge editor (spec §7.3, approved mockup A; plan 7 Task 3).
 //!
-//! Full-window takeover routed via [`Route::Merge`]: theirs (chezmoi's
-//! rendered source state) / base (last-written snapshot) / ours (disk) over a
-//! result pane. The result IS a persistent [`tomte_ui::TextArea`]
+//! Full-window takeover routed via [`Route::Merge`]: origin (the dotfiles
+//! remote's rendered source, only when it HAS its own version) / theirs
+//! (chezmoi's rendered source state) / base (last-written snapshot) / ours
+//! (disk) over a result pane, left to right as one provenance gradient. The
+//! result IS a persistent [`tomte_ui::TextArea`]
 //! (2026-08-22, Zed's conflict-view model): read-only by default so every
 //! line is selectable, with the decision strips riding INSIDE it as blocks
 //! above each changed region. "edit" flips the same editor editable in
@@ -37,8 +39,10 @@ use super::review::{
 };
 use super::{Route, Shell};
 
-/// Which merge pane a line belongs to. Column order in the panes row is
-/// theirs / base / ours, matching the header chips.
+/// Which side of the merge document a pane line belongs to. Origin is NOT
+/// one: it is not an input to the 3-way merge but a fourth text projected
+/// onto its regions, so it has its own row/decor builders
+/// ([`origin_pane_lines`], [`origin_pane_decors`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneSide {
     Theirs,
@@ -59,6 +63,11 @@ struct PaneLine {
     /// only). Payload: the template's own line(s), shown on hover — the
     /// point is "this text is GENERATED, here is the template behind it".
     protected: Option<SharedString>,
+    /// Origin pane only: origin's text for this line's region differs from
+    /// the local source's. `kind` describes ours/theirs/base and says
+    /// nothing about the remote, so that is what the remote wash keys off
+    /// (see [`origin_pane_decors`]). Always false for the other three panes.
+    differs: bool,
 }
 
 /// Per-line region tint. The conflict wash lands on every pane; one-sided
@@ -110,11 +119,44 @@ fn pane_lines(
                 text: display_text(&lines[ix]).to_owned().into(),
                 kind: region.kind,
                 protected: protected.get(&ix).cloned(),
+                differs: false,
             });
         }
     }
     out
 }
+
+/// Flatten origin into pane rows, sliced by its projected per-region
+/// boundaries (`bounds[k]..bounds[k + 1]` are region `k`'s origin lines) so
+/// the fourth column shares the other three's region geometry. `texts` is
+/// [`origin_region_texts`] for the same projection: a region with text is one
+/// where origin differs from the local source, and that — not the merge's
+/// region kind — is what the remote wash means in this pane.
+fn origin_pane_lines(
+    origin: &str,
+    bounds: &[usize],
+    texts: &[Option<String>],
+    regions: &[tomte_core::merge::MergeRegion],
+) -> Vec<PaneLine> {
+    let lines = tomte_core::merge::split_lines(origin);
+    let mut out = Vec::with_capacity(lines.len());
+    for (ix, region) in regions.iter().enumerate() {
+        let differs = texts.get(ix).is_some_and(Option::is_some);
+        for line in &lines[bounds[ix]..bounds[ix + 1]] {
+            out.push(PaneLine {
+                text: display_text(line).to_owned().into(),
+                kind: region.kind,
+                protected: None,
+                differs,
+            });
+        }
+    }
+    out
+}
+
+/// One input pane's precomputed content: its rows, and the decorations the
+/// pane's read-only editor hands its decorator closure.
+type PaneContent = (Rc<Vec<PaneLine>>, Rc<Vec<ui::text_area::LineDecor>>);
 
 /// Whether a rendered span is protected from write-back: templated values
 /// (`Action`), unanchored stretches (`Unmapped`), and repeated literals are
@@ -517,12 +559,15 @@ fn region_pattern(
             } else {
                 label
             };
+            // Side-tagged lines wash by their side; untagged ones (edited,
+            // origin) wash by the choice's own tint, so an origin region
+            // does not read as a hand edit.
             choice_lines(doc, region, &choice)
                 .into_iter()
                 .enumerate()
                 .map(|(k, (_, side))| LineDecor {
                     bg: Some(Theme::wash(
-                        side.map(|s| s.tint(theme)).unwrap_or(theme.ok),
+                        side.map(|s| s.tint(theme)).unwrap_or(tint),
                         0.07,
                     )),
                     label: (k == 0).then(|| (label.clone(), tint)),
@@ -557,6 +602,36 @@ fn edited_region_picks(
         }
     }
     picks
+}
+
+/// Origin's text for each region, or `None` where origin agrees with the
+/// local source there. Same projection as a free-text edit: line-diff origin
+/// against the anchor — the source pane's text, whose per-region line starts
+/// the merge already owns — map each region boundary through the hunks, and
+/// slice.
+///
+/// The anchor is `theirs` (the local source), NOT the editor seed: origin is
+/// the remote's version of that same source, so it is what origin has to be
+/// compared against for "differs" to mean anything. Anchoring on the seed
+/// would offer an origin button on every undecided conflict (whose seed is
+/// ours+theirs) even where origin and the source are identical, and would
+/// make the button vanish from the very strip that reads "origin" once the
+/// pick landed.
+fn origin_region_texts(
+    anchor: &str,
+    anchor_line_starts: &[usize],
+    origin: &str,
+) -> Vec<Option<String>> {
+    let anchor_lines = tomte_core::merge::split_lines(anchor);
+    let origin_lines = tomte_core::merge::split_lines(origin);
+    let mapped = mapped_boundaries(anchor, anchor_line_starts, origin);
+    (0..anchor_line_starts.len().saturating_sub(1))
+        .map(|r| {
+            let old = anchor_lines[anchor_line_starts[r]..anchor_line_starts[r + 1]].concat();
+            let new = origin_lines[mapped[r]..mapped[r + 1]].concat();
+            (old != new).then_some(new)
+        })
+        .collect()
 }
 
 /// Compute the display for region `idx` from the single source of truth.
@@ -672,15 +747,29 @@ pub(super) struct LoadedMerge {
     theirs_rows: Rc<Vec<PaneLine>>,
     base_rows: Rc<Vec<PaneLine>>,
     ours_rows: Rc<Vec<PaneLine>>,
+    /// Origin's rows, projected onto the regions — `Some` exactly when this
+    /// file HAS an origin version that differs (`inputs.origin`), which is
+    /// what gates the fourth pane. A file added locally and never pushed has
+    /// no origin blob at all, so rendering an empty pane for it would lie.
+    origin_rows: Option<Rc<Vec<PaneLine>>>,
+    /// Origin's text per region, `None` where origin matches the local
+    /// source there (and empty when there is no origin at all): the origin
+    /// pick's payload, and what washes the origin pane.
+    origin_texts: Vec<Option<String>>,
     /// Theirs-pane line index → template hover text (protected spans).
     protected: Rc<HashMap<usize, SharedString>>,
-    /// Per-region first-line index per column [theirs, base, ours], plus a
-    /// totals sentinel row — the basis for region-aligned scroll sync.
-    region_line_starts: Rc<Vec<[usize; 3]>>,
-    /// One read-only editor per input pane [theirs, base, ours] so their
-    /// text is selectable and horizontally scrollable like the result
-    /// (2026-08-26 feedback). Built lazily in render, which owns the theme.
-    pane_editors: Option<[Entity<ui::TextArea>; 3]>,
+    /// Per-region first-line index per column, indexed by `*_COL`, plus a
+    /// totals sentinel row — the basis for region-aligned scroll sync. With
+    /// no origin, `ORIGIN_COL` mirrors `OURS_COL` so the column stays
+    /// well-defined for [`region_at`] / [`line_at`] (its pane is not drawn,
+    /// and syncing its scroll handle is harmless).
+    region_line_starts: Rc<Vec<[usize; PANE_COLS]>>,
+    /// One read-only editor per input pane, indexed by geometry column — so
+    /// `ORIGIN_COL` is the fourth entry and exists only when origin does.
+    /// Read-only so their text is selectable and horizontally scrollable
+    /// like the result (2026-08-26 feedback). Built lazily in render, which
+    /// owns the theme.
+    pane_editors: Option<Vec<Entity<ui::TextArea>>>,
     pane_appearance: Option<gpui::WindowAppearance>,
 }
 
@@ -714,6 +803,29 @@ fn pane_decors(rows: &[PaneLine], side: PaneSide, theme: Theme) -> Vec<ui::text_
         .collect()
 }
 
+/// Per-line decorations for the origin pane. The merge's region kinds are
+/// statements about ours/theirs/base, so [`row_bg`] has nothing to say here:
+/// the remote wash marks exactly the regions where origin's text differs
+/// from the local source's, and nothing else is emphasized. Origin carries
+/// no span map, so no `{}` gutter either — claiming protection we never
+/// computed would be a lie.
+fn origin_pane_decors(rows: &[PaneLine], theme: Theme) -> Vec<ui::text_area::LineDecor> {
+    rows.iter()
+        .map(|line| {
+            let bg = line.differs.then(|| Theme::wash(theme.remote, 0.16));
+            ui::text_area::LineDecor {
+                bg,
+                text_color: Some(if bg.is_some() {
+                    theme.text
+                } else {
+                    theme.text_muted
+                }),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
 impl LoadedMerge {
     pub(super) fn new(inputs: Arc<MergeInputs>) -> Self {
         let state = MergeState::new(&inputs);
@@ -726,19 +838,45 @@ impl LoadedMerge {
             .unwrap_or_default();
         let none = HashMap::new();
         let mut region_line_starts = Vec::with_capacity(state.doc.regions.len() + 1);
-        let mut acc = [0usize; 3];
+        let mut acc = [0usize; PANE_COLS];
         for region in &state.doc.regions {
             region_line_starts.push(acc);
-            acc[0] += region.theirs.len();
-            acc[1] += region.base.len();
-            acc[2] += region.ours.len();
+            acc[THEIRS_COL] += region.theirs.len();
+            acc[BASE_COL] += region.base.len();
+            acc[OURS_COL] += region.ours.len();
         }
         region_line_starts.push(acc);
+        // Origin is projected onto the regions through the source pane it is
+        // the remote's copy of: one line-diff gives both the fourth column's
+        // geometry and the per-region text the origin pick applies.
+        let theirs_text = state.doc.theirs_lines().concat();
+        let theirs_starts: Vec<usize> = region_line_starts.iter().map(|s| s[THEIRS_COL]).collect();
+        let (origin_rows, origin_texts) = match inputs.origin.as_deref() {
+            Some(origin) => {
+                let texts = origin_region_texts(&theirs_text, &theirs_starts, origin);
+                let bounds = mapped_boundaries(&theirs_text, &theirs_starts, origin);
+                let rows = origin_pane_lines(origin, &bounds, &texts, &state.doc.regions);
+                for (starts, &b) in region_line_starts.iter_mut().zip(bounds.iter()) {
+                    starts[ORIGIN_COL] = b;
+                }
+                (Some(Rc::new(rows)), texts)
+            }
+            None => {
+                // No fourth pane: mirror the disk column so no region is
+                // zero-length in a way the scroll mapping never expects.
+                for starts in region_line_starts.iter_mut() {
+                    starts[ORIGIN_COL] = starts[OURS_COL];
+                }
+                (None, Vec::new())
+            }
+        };
         Self {
             region_line_starts: Rc::new(region_line_starts),
             theirs_rows: Rc::new(pane_lines(&state.doc, PaneSide::Theirs, &protected)),
             base_rows: Rc::new(pane_lines(&state.doc, PaneSide::Base, &none)),
             ours_rows: Rc::new(pane_lines(&state.doc, PaneSide::Ours, &none)),
+            origin_rows,
+            origin_texts,
             protected: Rc::new(protected),
             pane_editors: None,
             pane_appearance: None,
@@ -769,10 +907,11 @@ pub struct MergeView {
     /// Banner for saves that STAY here (protected span, errors); successful
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
-    /// One scroll handle per input pane (theirs/base/ours); wheel on any
-    /// pane mirrors its offset to the others so the three columns compare
-    /// without independent scrolling.
-    pane_scrolls: [gpui::ScrollHandle; 3],
+    /// One scroll handle per input pane column (see the `*_COL` constants);
+    /// wheel on any pane mirrors its offset to the others so the columns
+    /// compare without independent scrolling. The origin handle exists even
+    /// when its pane is not drawn — syncing it is harmless.
+    pane_scrolls: [gpui::ScrollHandle; PANE_COLS],
     /// Decided regions whose strip the user reopened (non-destructive).
     revisiting: std::collections::HashSet<usize>,
     /// The result IS the editor (2026-08-22): one persistent `TextArea`,
@@ -797,10 +936,15 @@ pub struct MergeView {
     redo: Vec<UndoEntry>,
     /// Scrolls the result editor (Next ↓ jumps it to a region).
     editor_scroll: gpui::ScrollHandle,
-    /// Draggable layout: px widths of the first two input panes (the third
-    /// flexes) and the height of the panes row. `None` until the first
-    /// render sizes them from the viewport.
-    pane_widths: Option<[f32; 2]>,
+    /// Draggable layout: px width per input pane column (indexed by the
+    /// `*_COL` constants — the last-rendered column flexes and ignores its
+    /// entry) and the height of the panes row. `None` until the first render
+    /// sizes them from the viewport.
+    pane_widths: Option<[f32; PANE_COLS]>,
+    /// How many panes `pane_widths` was sized for. A load that adds or drops
+    /// the origin pane re-divides the row rather than leaving the flexing
+    /// column squeezed to nothing.
+    pane_cols: usize,
     panes_height: Option<f32>,
     /// The divider currently under the pointer's button, if any.
     dragging: Option<ui::DragState<Divider>>,
@@ -843,6 +987,7 @@ impl MergeView {
             redo: Vec::new(),
             editor_scroll: gpui::ScrollHandle::new(),
             pane_widths: None,
+            pane_cols: 0,
             panes_height: None,
             dragging: None,
             viewport_h: 0.,
@@ -1232,7 +1377,7 @@ impl MergeView {
             region_at(starts, leader, line)
         };
 
-        for col in 0..3 {
+        for col in 0..PANE_COLS {
             if leader == col {
                 continue;
             }
@@ -1627,9 +1772,9 @@ impl MergeView {
 
         let degraded = loaded.state.degraded_base;
         let view = cx.weak_entity();
-        let widths = self.pane_widths.unwrap_or([0.; 2]);
+        let widths = self.pane_widths.unwrap_or([0.; PANE_COLS]);
         let dragging = self.dragging.map(|d| d.id);
-        // Vertical divider between input pane `i` and `i + 1`.
+        // The vertical handle on column `i`'s trailing edge.
         let pane_divider = |i: usize| {
             let view = view.clone();
             ui::resize_handle(
@@ -1648,7 +1793,9 @@ impl MergeView {
                 },
             )
         };
-        // One shared grid of hairlines (2026-08-08 feedback): three input
+        let editor = |col: usize| loaded.pane_editors.as_ref().and_then(|e| e.get(col));
+        let has_origin = loaded.origin_rows.is_some();
+        // One shared grid of hairlines (2026-08-08 feedback): the input
         // columns split by vertical dividers, one horizontal rule, then the
         // result flowing as the pane's own content — no floating boxes. Every
         // one of those rules is now a grab handle (2026-08-27).
@@ -1662,38 +1809,63 @@ impl MergeView {
                     .h(px(self.panes_height.unwrap_or(0.)))
                     .flex_none()
                     .flex()
+                    // Origin leads: remote → this machine's source → last
+                    // written → disk reads as one provenance gradient. It is
+                    // gated on CONTENT, never on the scan's repo-wide
+                    // `origin_differs` hint — a file added locally and never
+                    // pushed differs yet HAS no origin version, and an empty
+                    // fourth pane would be a lie.
+                    .when(has_origin, |el| {
+                        el.child(pane_col(
+                            "source · origin",
+                            theme.remote,
+                            editor(ORIGIN_COL),
+                            Some(widths[ORIGIN_COL]),
+                            ORIGIN_COL,
+                            &self.pane_scrolls,
+                            &view,
+                            theme,
+                        ))
+                        .child(pane_divider(ORIGIN_COL))
+                    })
                     .child(pane_col(
-                        "source (rendered)",
+                        // With origin beside it, "source" alone no longer
+                        // says WHICH source.
+                        if has_origin {
+                            "source · this machine"
+                        } else {
+                            "source (rendered)"
+                        },
                         theme.accent,
-                        loaded.pane_editors.as_ref().map(|e| &e[0]),
-                        Some(widths[0]),
-                        0,
+                        editor(THEIRS_COL),
+                        Some(widths[THEIRS_COL]),
+                        THEIRS_COL,
                         &self.pane_scrolls,
                         &view,
                         theme,
                     ))
-                    .child(pane_divider(0))
+                    .child(pane_divider(THEIRS_COL))
                     .child(if degraded {
-                        degraded_base_col(theme, widths[1])
+                        degraded_base_col(theme, widths[BASE_COL])
                     } else {
                         pane_col(
                             "last written",
                             theme.text_muted,
-                            loaded.pane_editors.as_ref().map(|e| &e[1]),
-                            Some(widths[1]),
-                            1,
+                            editor(BASE_COL),
+                            Some(widths[BASE_COL]),
+                            BASE_COL,
                             &self.pane_scrolls,
                             &view,
                             theme,
                         )
                     })
-                    .child(pane_divider(1))
+                    .child(pane_divider(BASE_COL))
                     .child(pane_col(
                         "on disk",
                         theme.drift,
-                        loaded.pane_editors.as_ref().map(|e| &e[2]),
+                        editor(OURS_COL),
                         None,
-                        2,
+                        OURS_COL,
                         &self.pane_scrolls,
                         &view,
                         theme,
@@ -1765,6 +1937,39 @@ impl MergeView {
         }
     }
 
+    /// Test probe for scroll sync: park `leader` at the first line of region
+    /// `region`, run the sync, and report where every column landed next to
+    /// where it should have. A real wheel event needs a window and layout;
+    /// the mapping this drives is the part that breaks.
+    #[cfg(test)]
+    pub(super) fn sync_probe(&mut self, leader: usize, region: usize) -> SyncProbe {
+        let starts = self
+            .loaded
+            .as_ref()
+            .expect("probe needs loaded inputs")
+            .region_line_starts
+            .clone();
+        // The result editor's rows carry the strip blocks, so its own park
+        // position is a ROW, not a line index.
+        if leader == RESULT_LEADER {
+            let row = self.region_row(region) as f32;
+            self.editor_scroll
+                .set_offset(gpui::point(px(0.), px(-row * PANE_ROW_H)));
+        } else {
+            let line = starts[region][leader] as f32;
+            self.pane_scrolls[leader].set_offset(gpui::point(px(0.), px(-line * PANE_ROW_H)));
+        }
+        self.sync_from(leader);
+        SyncProbe {
+            panes: std::array::from_fn(|c| {
+                -f32::from(self.pane_scrolls[c].offset().y) / PANE_ROW_H
+            }),
+            want_panes: std::array::from_fn(|c| starts[region][c] as f32),
+            result: -f32::from(self.editor_scroll.offset().y) / PANE_ROW_H,
+            want_result: self.region_row(region) as f32,
+        }
+    }
+
     /// Build and install the result editor's decorator: per-line provenance
     /// (via [`editor_decors`], which flips edited regions to the ok wash) and
     /// — in read-only mode only — a decision-strip block above every changed
@@ -1797,6 +2002,12 @@ impl MergeView {
                             has_base,
                             current,
                             focused,
+                            origin: loaded
+                                .origin_texts
+                                .get(idx)
+                                .cloned()
+                                .flatten()
+                                .map(SharedString::from),
                         },
                     }),
                     RegionDisplay::Decided {
@@ -1847,9 +2058,18 @@ impl MergeView {
         let viewport = window.viewport_size();
         self.viewport_w = f32::from(viewport.width);
         self.viewport_h = f32::from(viewport.height);
-        if self.pane_widths.is_none() {
-            let each = ((self.viewport_w - super::SIDEBAR_WIDTH) / 3.).max(MIN_PANE_W);
-            self.pane_widths = Some([each, each]);
+        // Equal shares of the row — recomputed when a load changes how many
+        // panes there are, so the flexing column is never squeezed out by
+        // widths that were divided for a different count.
+        let cols = 3 + usize::from(
+            self.loaded
+                .as_ref()
+                .is_some_and(|l| l.origin_rows.is_some()),
+        );
+        if self.pane_cols != cols {
+            let each = ((self.viewport_w - super::SIDEBAR_WIDTH) / cols as f32).max(MIN_PANE_W);
+            self.pane_widths = Some([each; PANE_COLS]);
+            self.pane_cols = cols;
         }
         if self.panes_height.is_none() {
             self.panes_height = Some((self.viewport_h * 0.4).max(MIN_PANES_H));
@@ -1864,28 +2084,45 @@ impl MergeView {
         if let Some(loaded) = &mut self.loaded
             && loaded.pane_appearance != Some(window.appearance())
         {
-            let sides = [
-                (loaded.theirs_rows.clone(), PaneSide::Theirs),
-                (loaded.base_rows.clone(), PaneSide::Base),
-                (loaded.ours_rows.clone(), PaneSide::Ours),
+            // Geometry-column order, so index == `*_COL`; origin's editor is
+            // built only when origin exists, and carries its own decors (the
+            // merge's region kinds say nothing about the remote).
+            let mut panes: Vec<PaneContent> = vec![
+                (
+                    loaded.theirs_rows.clone(),
+                    Rc::new(pane_decors(&loaded.theirs_rows, PaneSide::Theirs, theme)),
+                ),
+                (
+                    loaded.base_rows.clone(),
+                    Rc::new(pane_decors(&loaded.base_rows, PaneSide::Base, theme)),
+                ),
+                (
+                    loaded.ours_rows.clone(),
+                    Rc::new(pane_decors(&loaded.ours_rows, PaneSide::Ours, theme)),
+                ),
             ];
-            let editors = sides.map(|(rows, side)| {
-                let text: String = rows
-                    .iter()
-                    .map(|r| r.text.as_ref())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let decors = Rc::new(pane_decors(&rows, side, theme));
-                cx.new(|cx| {
-                    let mut area = ui::TextArea::read_only(text, cx);
-                    area.set_left_inset(px(28.));
-                    area.set_decorator(Box::new(move |_| ui::text_area::Decoration {
-                        lines: decors.as_ref().clone(),
-                        blocks: Vec::new(),
-                    }));
-                    area
+            if let Some(rows) = &loaded.origin_rows {
+                panes.push((rows.clone(), Rc::new(origin_pane_decors(rows, theme))));
+            }
+            let editors: Vec<Entity<ui::TextArea>> = panes
+                .into_iter()
+                .map(|(rows, decors)| {
+                    let text: String = rows
+                        .iter()
+                        .map(|r| r.text.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    cx.new(|cx| {
+                        let mut area = ui::TextArea::read_only(text, cx);
+                        area.set_left_inset(px(28.));
+                        area.set_decorator(Box::new(move |_| ui::text_area::Decoration {
+                            lines: decors.as_ref().clone(),
+                            blocks: Vec::new(),
+                        }));
+                        area
+                    })
                 })
-            });
+                .collect();
             loaded.pane_editors = Some(editors);
             loaded.pane_appearance = Some(window.appearance());
         }
@@ -1970,6 +2207,17 @@ impl MergeView {
     }
 }
 
+/// What one [`MergeView::sync_probe`] run observed: where every input column
+/// and the result editor ended up, and where the region-aligned mapping says
+/// they should be.
+#[cfg(test)]
+pub(super) struct SyncProbe {
+    pub(super) panes: [f32; PANE_COLS],
+    pub(super) want_panes: [f32; PANE_COLS],
+    pub(super) result: f32,
+    pub(super) want_result: f32,
+}
+
 /// Merge-local banner: same shape as Review's, minus the Undo button (the
 /// banners that stay here — protected span, errors — are never undoable).
 fn banner_el(banner: &OutcomeBanner, theme: Theme) -> Div {
@@ -1988,7 +2236,7 @@ fn pane_col(
     // Fixed px width, or `None` to take the leftover space.
     width: Option<f32>,
     me: usize,
-    scrolls: &[gpui::ScrollHandle; 3],
+    scrolls: &[gpui::ScrollHandle; PANE_COLS],
     view: &WeakEntity<MergeView>,
     theme: Theme,
 ) -> AnyElement {
@@ -2070,13 +2318,27 @@ const PANE_ROW_H: f32 = 20.;
 /// Rows a decision-strip block occupies (Zed's FILE_HEADER_HEIGHT).
 const STRIP_ROWS: usize = 2;
 
-/// `sync_from` leader id for the result editor (0..=2 are the input panes).
-const RESULT_LEADER: usize = 3;
+/// Geometry columns. These indices are STATIC: the three sides of the merge
+/// document keep the columns they have always had and origin is appended,
+/// so `RESULT_LEADER`, [`region_at`] and [`line_at`] never become variable.
+/// Origin renders LEFTMOST all the same (remote → local source → last
+/// written → disk reads as one provenance gradient); render order and
+/// geometry column are simply two different things.
+const THEIRS_COL: usize = 0;
+const BASE_COL: usize = 1;
+const OURS_COL: usize = 2;
+const ORIGIN_COL: usize = 3;
+pub(super) const PANE_COLS: usize = 4;
+
+/// `sync_from` leader id for the result editor (0..PANE_COLS are the input
+/// panes, whether or not each is currently drawn).
+const RESULT_LEADER: usize = PANE_COLS;
 
 /// Which draggable divider a gesture belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Divider {
-    /// Between input pane `i` and pane `i + 1`.
+    /// The handle that resizes input pane column `i` — drawn on its trailing
+    /// edge, so the rightmost (flexing) column has none.
     Pane(usize),
     /// Between the input panes and the result.
     Result,
@@ -2120,7 +2382,7 @@ fn strips_above_line(line: usize, seed_line_starts: &[usize], changed: &[bool]) 
 /// is not 1:1 across panes). `starts` has one row per region plus a totals
 /// sentinel; `starts[k][col]` is the first line of region k in that column.
 /// Returns which region the given line sits in and the fraction through it.
-fn region_at(starts: &[[usize; 3]], col: usize, line: f32) -> (usize, f32) {
+fn region_at(starts: &[[usize; PANE_COLS]], col: usize, line: f32) -> (usize, f32) {
     let regions = starts.len().saturating_sub(1);
     if regions == 0 {
         return (0, 0.0);
@@ -2143,13 +2405,13 @@ fn region_at(starts: &[[usize; 3]], col: usize, line: f32) -> (usize, f32) {
 
 /// The line position in `col` for region `k` at fraction `f` — zero-length
 /// regions pin at their boundary (the "know when to stop" behavior).
-fn line_at(starts: &[[usize; 3]], col: usize, k: usize, f: f32) -> f32 {
+fn line_at(starts: &[[usize; PANE_COLS]], col: usize, k: usize, f: f32) -> f32 {
     let len = (starts[k + 1][col] - starts[k][col]) as f32;
     starts[k][col] as f32 + f * len
 }
 
 /// A decision-strip block spec, captured when the decorator is (re)built.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StripSpec {
     region: usize,
     /// Seed line the strip sits above (read-only mode → content == seed).
@@ -2157,12 +2419,16 @@ struct StripSpec {
     kind: StripKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum StripKind {
     Deciding {
         has_base: bool,
         current: Option<ui::ChoiceKind>,
         focused: bool,
+        /// Origin's text for this region, when it has one that differs from
+        /// the local source. Carried rather than looked up at click time so
+        /// the button and its payload cannot disagree.
+        origin: Option<SharedString>,
     },
     Decided {
         choice: ui::ChoiceKind,
@@ -2180,40 +2446,42 @@ fn strip_block(
     view: WeakEntity<MergeView>,
 ) -> ui::text_area::Block {
     let region = spec.region;
-    let state_kind = spec.kind;
+    let state_kind = spec.kind.clone();
     ui::text_area::Block {
         above_line: spec.above_line,
         // Zed's FILE_HEADER_HEIGHT: room for the inset card without
         // crowding the code above and below.
         height: STRIP_ROWS as u32,
         render: Rc::new(move |_window, _cx| {
-            let state = match state_kind {
+            let state = match &state_kind {
                 StripKind::Deciding {
                     has_base,
                     current,
                     focused,
+                    origin,
                 } => ui::StripState::Deciding {
-                    has_base,
-                    current,
-                    focused,
+                    has_base: *has_base,
+                    current: *current,
+                    focused: *focused,
+                    origin: origin.clone(),
                 },
-                StripKind::Decided { choice, focused } => {
-                    ui::StripState::Decided { choice, focused }
-                }
+                StripKind::Decided { choice, focused } => ui::StripState::Decided {
+                    choice: *choice,
+                    focused: *focused,
+                },
             };
             let on_pick = {
                 let view = view.clone();
-                move |kind: ui::ChoiceKind, _ev: &ClickEvent, _w: &mut Window, cx: &mut App| {
-                    let choice = match kind {
-                        ui::ChoiceKind::Ours => Choice::Ours,
-                        ui::ChoiceKind::Theirs => Choice::Theirs,
-                        ui::ChoiceKind::Base => Choice::Base,
-                        ui::ChoiceKind::Both => Choice::Both,
-                        ui::ChoiceKind::Edited => return,
-                        // No origin pick button exists yet (Task 8 wires
-                        // one up with the projected origin text); this arm
-                        // only keeps the match exhaustive.
-                        ui::ChoiceKind::Origin => return,
+                move |pick: ui::Pick, _ev: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                    // Every button the strip renders maps to a choice — the
+                    // origin one brings its own text, so no arm can be a
+                    // silent no-op.
+                    let choice = match pick {
+                        ui::Pick::Ours => Choice::Ours,
+                        ui::Pick::Theirs => Choice::Theirs,
+                        ui::Pick::Base => Choice::Base,
+                        ui::Pick::Both => Choice::Both,
+                        ui::Pick::Origin(text) => Choice::Origin(text.to_string()),
                     };
                     view.update(cx, |merge, cx| merge.apply(region, choice, cx))
                         .ok();
@@ -2264,8 +2532,9 @@ mod tests {
     #[allow(unused_imports)]
     use super::{};
     use super::{
-        LoadedMerge, PaneSide, RegionDisplay, STRIP_ROWS, document_seed, edited_region_picks,
-        line_at, map_line, merge_banner, next_target, pane_lines, protected_line_info, region_at,
+        BASE_COL, LoadedMerge, ORIGIN_COL, OURS_COL, PaneSide, RegionDisplay, STRIP_ROWS,
+        THEIRS_COL, document_seed, edited_region_picks, line_at, map_line, merge_banner,
+        next_target, origin_region_texts, pane_lines, protected_line_info, region_at,
         region_display, region_has_strip, region_seed_text, row_bg, strips_above_line,
     };
     use gpui::SharedString;
@@ -2643,28 +2912,36 @@ mod tests {
 
     #[test]
     fn region_scroll_mapping_is_piecewise_and_pins_empty_sides() {
-        // Two regions: region 0 has 4 theirs-lines but 0 ours-lines
-        // (theirs-only insertion); region 1 has 2 lines everywhere.
-        let starts = vec![[0usize, 0, 0], [4, 4, 0], [6, 6, 2]];
+        // Two regions, four columns: region 0 has 4 theirs-lines but 0
+        // ours-lines (theirs-only insertion) and 2 origin lines; region 1 has
+        // 2 lines everywhere but origin, which has 2 as well.
+        let starts = vec![[0usize, 0, 0, 0], [4, 4, 0, 2], [6, 6, 2, 4]];
 
         // Halfway through region 0 in theirs…
-        let (k, f) = region_at(&starts, 0, 2.0);
+        let (k, f) = region_at(&starts, THEIRS_COL, 2.0);
         assert_eq!(k, 0);
         assert!((f - 0.5).abs() < 1e-6);
         // …maps to ours PINNED at its region-0 boundary (empty side).
-        assert_eq!(line_at(&starts, 2, k, f), 0.0);
-        // …and base advances proportionally.
-        assert!((line_at(&starts, 1, k, f) - 2.0).abs() < 1e-6);
+        assert_eq!(line_at(&starts, OURS_COL, k, f), 0.0);
+        // …and base and origin advance proportionally.
+        assert!((line_at(&starts, BASE_COL, k, f) - 2.0).abs() < 1e-6);
+        assert!((line_at(&starts, ORIGIN_COL, k, f) - 1.0).abs() < 1e-6);
 
         // A line inside region 1 of ours maps back to region 1 (the
         // zero-length region 0 is skipped for that column).
-        let (k, f) = region_at(&starts, 2, 1.0);
+        let (k, f) = region_at(&starts, OURS_COL, 1.0);
         assert_eq!(k, 1);
         assert!((f - 0.5).abs() < 1e-6);
-        assert!((line_at(&starts, 0, k, f) - 5.0).abs() < 1e-6);
+        assert!((line_at(&starts, THEIRS_COL, k, f) - 5.0).abs() < 1e-6);
+
+        // Origin leads just like any other column.
+        let (k, f) = region_at(&starts, ORIGIN_COL, 3.0);
+        assert_eq!(k, 1);
+        assert!((f - 0.5).abs() < 1e-6);
+        assert!((line_at(&starts, THEIRS_COL, k, f) - 5.0).abs() < 1e-6);
 
         // Overscroll saturates at the last region, fraction clamped.
-        let (k, f) = region_at(&starts, 0, 99.0);
+        let (k, f) = region_at(&starts, THEIRS_COL, 99.0);
         assert_eq!(k, 1);
         assert!((f - 1.0).abs() < 1e-6);
     }
@@ -2888,6 +3165,123 @@ mod tests {
                 RegionDisplay::Context { .. }
             ),
             "…and now the decorator renders one"
+        );
+    }
+
+    /// The anchor the view projects origin against: the local source's text
+    /// and its per-region line starts — what `LoadedMerge::new` feeds
+    /// `origin_region_texts`.
+    fn theirs_anchor(state: &MergeState) -> (String, Vec<usize>) {
+        let mut starts = Vec::with_capacity(state.doc.regions.len() + 1);
+        let mut line = 0usize;
+        for region in &state.doc.regions {
+            starts.push(line);
+            line += region.theirs.len();
+        }
+        starts.push(line);
+        (state.doc.theirs_lines().concat(), starts)
+    }
+
+    #[test]
+    fn origin_text_projects_onto_merge_regions() {
+        // theirs (local source) vs origin differ on one line; that line sits
+        // inside exactly one region, and the origin pick must offer only that
+        // region's origin text — not the whole file.
+        let state = MergeState::new(&inputs(
+            Some("a\nv = 1\nz\n"),
+            "a\nv = 2\nz\n",
+            "a\nv = 3\nz\n",
+        ));
+        let origin = "a\nv = 9\nz\n";
+        let (theirs, starts) = theirs_anchor(&state);
+        let per_region = origin_region_texts(&theirs, &starts, origin);
+        let conflict = state.conflicts()[0];
+        assert_eq!(per_region[conflict].as_deref(), Some("v = 9\n"));
+        // Regions origin agrees on offer nothing — no button, no noise.
+        assert_eq!(per_region[0], None);
+    }
+
+    /// Inputs whose origin differs from the local source on the middle line.
+    fn origin_inputs() -> MergeInputs {
+        let mut i = inputs(Some("a\nv = 1\nz\n"), "a\nv = 2\nz\n", "a\nv = 3\nz\n");
+        i.origin = Some("a\nv = 9\nz\n".into());
+        i
+    }
+
+    #[test]
+    fn loaded_merge_gives_origin_its_own_column_rows_and_picks() {
+        let loaded = LoadedMerge::new(Arc::new(origin_inputs()));
+        let conflict = loaded.state.conflicts()[0];
+
+        // The pick offers only the differing region's text.
+        assert_eq!(loaded.origin_texts[conflict].as_deref(), Some("v = 9\n"));
+        assert_eq!(loaded.origin_texts[0], None);
+
+        // The pane shows the whole origin file…
+        let rows = loaded.origin_rows.as_ref().expect("fourth pane rows");
+        assert_eq!(
+            rows.iter().map(|r| r.text.as_ref()).collect::<Vec<_>>(),
+            ["a", "v = 9", "z"]
+        );
+        // …with the remote wash on exactly the region that differs.
+        assert_eq!(
+            rows.iter().map(|r| r.differs).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        let theme = Theme::dark();
+        let decors = super::origin_pane_decors(rows, theme);
+        assert_eq!(decors[1].bg, Some(Theme::wash(theme.remote, 0.16)));
+        assert_eq!(decors[0].bg, None);
+        assert_eq!(decors[0].text_color, Some(theme.text_muted));
+
+        // The fourth geometry column is origin's OWN line geometry, so scroll
+        // sync maps into it — and the rows a region shows are exactly the
+        // text its origin pick applies.
+        let starts = &loaded.region_line_starts;
+        assert_eq!(
+            starts.iter().map(|s| s[ORIGIN_COL]).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        let shown: Vec<&str> = rows[starts[conflict][ORIGIN_COL]..starts[conflict + 1][ORIGIN_COL]]
+            .iter()
+            .map(|r| r.text.as_ref())
+            .collect();
+        assert_eq!(shown, ["v = 9"]);
+    }
+
+    #[test]
+    fn without_origin_the_fourth_column_mirrors_the_disk_column() {
+        // Gated on CONTENT: no origin text, no fourth pane — but the column
+        // stays well-defined so `region_at`/`line_at` never see a
+        // zero-length region.
+        let loaded = LoadedMerge::new(Arc::new(inputs(
+            Some("a\nv = 1\nz\n"),
+            "a\nv = 2\nz\n",
+            "a\nv = 3\nz\n",
+        )));
+        assert!(loaded.origin_rows.is_none());
+        assert!(loaded.origin_texts.is_empty());
+        for starts in loaded.region_line_starts.iter() {
+            assert_eq!(starts[ORIGIN_COL], starts[OURS_COL]);
+        }
+    }
+
+    #[test]
+    fn an_origin_pick_assembles_verbatim_and_reads_as_origin() {
+        let loaded = LoadedMerge::new(Arc::new(origin_inputs()));
+        let mut state = loaded.state;
+        let conflict = state.conflicts()[0];
+        let text = loaded.origin_texts[conflict].clone().expect("origin text");
+        state.pick(conflict, Choice::Origin(text));
+        assert_eq!(state.assembled().as_deref(), Some("a\nv = 9\nz\n"));
+
+        // …and the result rows carry the remote tint, not the edited green.
+        let theme = Theme::dark();
+        let pattern = super::region_pattern(&state, &HashMap::new(), theme, conflict);
+        assert_eq!(pattern[0].bg, Some(Theme::wash(theme.remote, 0.07)));
+        assert_eq!(
+            pattern[0].label.as_ref().map(|(t, _)| t.as_ref()),
+            Some("origin")
         );
     }
 }
