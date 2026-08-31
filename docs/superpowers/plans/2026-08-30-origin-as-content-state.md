@@ -890,6 +890,27 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
+**This is not a label change — it needs a real engine action.**
+`ResolveAction::run()` (`review.rs:238`) dispatches to engine methods, and
+`crates/app/src/resolve.rs` has only `keep_disk` (:96), `keep_source` (:127),
+`resolve_merged` (:162) and `resolve_repo_conflict` (:488). There is no origin
+variant.
+
+Reading `keep_source`: it does **not** touch the source file. It snapshots the
+destination and runs `chezmoi apply`, so the *local* source wins. For origin to
+win, origin's content must first become the source content.
+
+Recommended (not mandated — you have the code in front of you): implement
+`KeepSourceOrigin` by loading origin's rendered text and routing it through the
+existing `resolve_merged`, which already writes resolved text into the source —
+verbatim for plain files, write-back plus `execute-template` verification for
+templated ones (spec §6.2) — and then applies. That reuses the tested
+write-after-verify path instead of inventing a second one.
+
+Also note `ResolveAction`'s doc comment: it is "shared with the dashboard's
+inline row actions", so the split lands on **two** surfaces. Check the
+dashboard, not just the review view.
+
 - Rename `ResolveAction::KeepSource` → `KeepSourceLocal`, add
   `KeepSourceOrigin`. Labels: `"Keep source · this machine"`,
   `"Keep source · origin"`; when origin agrees the single button keeps
