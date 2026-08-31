@@ -706,6 +706,64 @@ mod render_smoke {
         vis.run_until_parked();
     }
 
+    /// The scan flag alone must never split the source action. A file added
+    /// locally and never pushed comes back from the scan with
+    /// `origin_differs = true` and yet has NO origin blob — offering
+    /// "Keep source · origin" for it would offer a resolution to nothing.
+    /// The split follows origin's loaded content, which this view has none of.
+    #[gpui::test]
+    fn origin_flag_without_content_keeps_one_source_action(cx: &mut TestAppContext) {
+        use review::{ResolveAction, ReviewView};
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            let mut model = SyncModel {
+                connected: true,
+                ..Default::default()
+            };
+            model.hydrate_status(
+                vec![tomte_proto::DriftSummary {
+                    target: PathBuf::from("/tmp/smoke/.zshrc"),
+                    class: "destination_drift".into(),
+                    since_ts: Some(10),
+                    // flagged by the scan…
+                    origin_differs: true,
+                }],
+                1,
+                None,
+                false,
+                None,
+            );
+            let state = cx.new(|_| model);
+            let shell = cx.weak_entity();
+            let review = cx.new(|cx| {
+                let mut view = ReviewView::new(state.clone(), shell, cx);
+                view.selected = Some(PathBuf::from("/tmp/smoke/.zshrc"));
+                // …but no origin content ever loaded for it.
+                view.origin_diffs = None;
+                view
+            });
+            Shell {
+                reconcile_queue: Vec::new(),
+                reconcile_in_flight: false,
+                route: Route::Review,
+                state,
+                review: Some(review),
+                settings: None,
+                merge: None,
+                paths: smoke_paths(),
+                expanded_scans: HashSet::new(),
+                dashboard_action_in_flight: false,
+                unlock_in_flight: false,
+                changelog: None,
+            }
+        });
+        vis.run_until_parked();
+        let actions = cx.update(|cx| {
+            let review = shell.read(cx).review.clone().expect("review posed");
+            review.read(cx).header_source_actions()
+        });
+        assert_eq!(actions, vec![ResolveAction::KeepSourceLocal]);
+    }
+
     #[gpui::test]
     fn shell_renders_empty_and_scanning_states(cx: &mut TestAppContext) {
         for (connected, scanning) in [(false, false), (true, true)] {

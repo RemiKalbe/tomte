@@ -765,3 +765,207 @@ fn story_h_templated_value_edit_is_rejected_and_touches_nothing() {
     assert_eq!(drifted.len(), 1);
     assert_eq!(drifted[0].target, lab.target);
 }
+
+/// Stories I/J: ORIGIN holds its own version of the managed file.
+/// What another machine pushed…
+const ORIGIN_CONTENT: &[u8] = b"a=origin\n";
+/// …and what this machine's source says on top of it.
+const LOCAL_SOURCE: &[u8] = b"a=this-machine\n";
+
+/// Seed the one state where "keep source · origin" is a decision of its own:
+/// a second machine pushes `ORIGIN_CONTENT`, this machine fetches it,
+/// fast-forwards onto it, and then commits `LOCAL_SOURCE` over the top. Local
+/// `main` ends up AHEAD of `origin/main` with a different blob for the file,
+/// so the two sources genuinely disagree while a resolve's push stays a
+/// fast-forward. The destination is levelled with the local source, so the
+/// only disagreement in play is source-vs-origin.
+fn origin_holds_its_own_version(lab: &DriftLab) {
+    let other = lab.s.root.path().join("other");
+    sh(
+        lab.s.root.path(),
+        "git",
+        &[
+            "clone",
+            lab.s.bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(other.join("dot_testrc"), ORIGIN_CONTENT).unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "origin's version"]);
+    git(&other, &["push"]);
+
+    lab.source_git().fetch("origin").unwrap();
+    git(&lab.s.source, &["merge", "--ff-only", "origin/main"]);
+    std::fs::write(lab.s.source.join("dot_testrc"), LOCAL_SOURCE).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "this machine's version"]);
+    lab.s.chezmoi().apply(None).unwrap();
+    assert_eq!(std::fs::read(&lab.target).unwrap(), LOCAL_SOURCE);
+    // Drain the event stream and leave the core lock free before the action.
+    lab.rescan_and_settle();
+}
+
+#[test]
+fn story_i_keep_source_origin_makes_origins_version_the_source() {
+    let lab = DriftLab::new();
+    origin_holds_its_own_version(&lab);
+    let head_before = lab.source_git().head_sha().unwrap();
+
+    // Premise: the two SOURCES disagree — origin's blob is not what this
+    // machine renders. (`keep_source` would apply the local source and change
+    // nothing about that; only this action can hand the file to origin.)
+    let inputs = lab.load_merge_inputs();
+    assert_eq!(inputs.theirs.as_bytes(), LOCAL_SOURCE);
+    assert_eq!(
+        inputs.origin.as_deref().map(str::as_bytes),
+        Some(ORIGIN_CONTENT),
+        "origin must carry its own version for this story to mean anything"
+    );
+
+    let outcome = lab
+        .engine
+        .keep_source_origin(&lab.target, inputs.origin.as_deref().unwrap())
+        .unwrap();
+    let ResolveOutcome::Done {
+        session,
+        committed,
+        pushed,
+        note,
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert_eq!(
+        session, 1,
+        "the refusals in story J aside, this is session 1"
+    );
+    assert!(
+        committed,
+        "origin's content lands in the source — the fallback commit must fire"
+    );
+    assert!(pushed, "origin exists in the scratch — push must succeed");
+    assert_eq!(note, None);
+
+    // Filesystem truth: BOTH sources now say what origin said, and the
+    // destination was applied from it.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        ORIGIN_CONTENT
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), ORIGIN_CONTENT);
+
+    // Git truth: one new commit on top of this machine's own, pushed.
+    let head_after = lab.source_git().head_sha().unwrap();
+    assert_ne!(
+        head_after, head_before,
+        "the source write must be committed"
+    );
+    assert_eq!(lab.source_git().rev_parse("HEAD~1").unwrap(), head_before);
+    assert_eq!(
+        lab.bare_git().rev_parse("HEAD").unwrap(),
+        head_after,
+        "push must advance the bare origin's HEAD"
+    );
+
+    // Journal truth: the session records what actually happened — a
+    // keep_source_origin, NOT a hand-made merge — with both pre-mutation
+    // snapshot blobs so undo can restore.
+    let journal = lab.journal();
+    let (id, decisions) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(id, session);
+    let arr = decisions.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["action"], "keep_source_origin");
+    assert_eq!(
+        arr[0]["target"].as_str().unwrap(),
+        lab.target.to_str().unwrap()
+    );
+    let dest_blob = arr[0]["dest_blob"].as_str().unwrap();
+    let source_blob = arr[0]["source_blob"].as_str().unwrap();
+    assert_eq!(dest_blob, ContentHash::of(LOCAL_SOURCE).to_hex());
+    assert_eq!(journal.get_blob(dest_blob).unwrap().unwrap(), LOCAL_SOURCE);
+    assert_eq!(
+        journal.get_blob(source_blob).unwrap().unwrap(),
+        LOCAL_SOURCE,
+        "source snapshot must hold this machine's pre-action source"
+    );
+
+    // Daemon truth: the requested rescan settles to in-sync.
+    assert!(
+        lab.probe().is_none(),
+        "probe must report in-sync after keep_source_origin"
+    );
+    lab.wait_scan_done();
+    assert!(lab.settled_status().is_empty());
+}
+
+#[test]
+fn story_j_keep_source_origin_refuses_before_touching_anything() {
+    let lab = DriftLab::new();
+    origin_holds_its_own_version(&lab);
+    let head_before = lab.source_git().head_sha().unwrap();
+
+    // (1) Origin moved since the user looked: the caller's shown text no
+    // longer matches the blob at origin. Writing here would put content into
+    // the source that nobody reviewed — refuse instead.
+    let err = lab
+        .engine
+        .keep_source_origin(&lab.target, "a=what-the-user-saw\n")
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("changed since it was shown"),
+        "stale-origin refusal must say so: {msg}"
+    );
+
+    // (2) The remote ref is DERIVED from the current branch, not hardcoded:
+    // on a branch origin has never seen there is no blob at all, and the
+    // refusal names the ref it actually looked at.
+    git(&lab.s.source, &["branch", "-m", "dotfiles"]);
+    let err = lab
+        .engine
+        .keep_source_origin(&lab.target, str::from_utf8(ORIGIN_CONTENT).unwrap())
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("origin/dotfiles"),
+        "the remote ref must come from the CURRENT branch: {msg}"
+    );
+    assert!(
+        msg.contains("has no version"),
+        "a file origin has never seen must refuse, not resolve to nothing: {msg}"
+    );
+    git(&lab.s.source, &["branch", "-m", "main"]);
+
+    // Neither refusal touched anything: source byte-identical, repo clean,
+    // HEAD unmoved, destination untouched, nothing finished in the journal.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        LOCAL_SOURCE
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), LOCAL_SOURCE);
+    assert!(lab.source_git().dirty_files().unwrap().is_empty());
+    assert_eq!(lab.source_git().head_sha().unwrap(), head_before);
+    assert!(lab.journal().last_finished_session().unwrap().is_none());
+
+    // …and neither even OPENED a session: session ids are the journal's
+    // rowids, so the first real resolution still gets 1. That is what pins
+    // both guards ahead of `session_start` — an unfinished session would be
+    // invisible to `last_finished_session` above.
+    let outcome = lab
+        .engine
+        .keep_source_origin(&lab.target, str::from_utf8(ORIGIN_CONTENT).unwrap())
+        .unwrap();
+    let ResolveOutcome::Done { session, .. } = outcome else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert_eq!(
+        session, 1,
+        "a refusal must return before session_start — two refusals ran first"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        ORIGIN_CONTENT
+    );
+}

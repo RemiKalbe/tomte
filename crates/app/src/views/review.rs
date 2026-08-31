@@ -142,14 +142,24 @@ struct LoadedDetail {
     /// The 3-way merge dry-run assembled cleanly (zero conflicts) AND the
     /// result differs from both sides → "Keep both" is a real third option.
     pub(super) auto_merge: Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)>,
+    /// `Some` only when origin's content actually loaded for this file.
+    pub(super) origin_diffs: Option<OriginDiffs>,
 }
 
-/// Dry-run the 3-way merge; `Some` only when it auto-resolves to something
-/// neither side already is (otherwise Keep disk / Keep source cover it).
-fn auto_merge_blocking(
+/// The merge inputs for one target — the source of BOTH optional affordances
+/// below (the "Keep both" dry-run and everything origin). Loaded once per
+/// selection; the previous shape ran this same load for the dry-run alone.
+///
+/// `None` on any failure: these are optional affordances, and the diff itself
+/// reports its own failures honestly through [`load_preview_blocking`], so a
+/// failed load costs the extra buttons, never the preview. Nothing is
+/// swallowed silently either — every subprocess in the chain logs its own
+/// failure through the command chokepoint (`SystemRunner::run`), the same
+/// reasoning that already justifies `merge_inputs::load_origin`'s misses.
+fn merge_inputs_blocking(
     target: &Path,
     journal: &Path,
-) -> Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)> {
+) -> Option<std::sync::Arc<tomte_app::merge_inputs::MergeInputs>> {
     let chezmoi = crate::app_chezmoi_client();
     let git = crate::app_git_client(&chezmoi).ok()?;
     // Same fallback as the daemon's own derivation (`format!("origin/{branch}")`
@@ -158,9 +168,17 @@ fn auto_merge_blocking(
     // the origin pane is optional, never a hard requirement here.
     let branch = git.head_branch().unwrap_or_else(|_| "main".into());
     let remote_ref = format!("origin/{branch}");
-    let inputs =
-        tomte_app::merge_inputs::load(&chezmoi, &git, &remote_ref, journal, target).ok()?;
-    let state = tomte_app::merge_state::MergeState::new(&inputs);
+    tomte_app::merge_inputs::load(&chezmoi, &git, &remote_ref, journal, target)
+        .ok()
+        .map(std::sync::Arc::new)
+}
+
+/// Dry-run the 3-way merge; `Some` only when it auto-resolves to something
+/// neither side already is (otherwise Keep disk / Keep source cover it).
+fn auto_merge_from(
+    inputs: &std::sync::Arc<tomte_app::merge_inputs::MergeInputs>,
+) -> Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)> {
+    let state = tomte_app::merge_state::MergeState::new(inputs);
     if !state.conflicts().is_empty() {
         return None;
     }
@@ -168,7 +186,7 @@ fn auto_merge_blocking(
     if assembled == inputs.ours || assembled == inputs.theirs {
         return None;
     }
-    Some((std::sync::Arc::new(inputs), assembled))
+    Some((inputs.clone(), assembled))
 }
 
 fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
@@ -179,10 +197,21 @@ fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
         .and_then(|j| j.events_for(target, PROVENANCE_LIMIT))
         .map(|rows| rows.into_iter().map(ProvRow::from).collect())
         .unwrap_or_default();
+    let inputs = merge_inputs_blocking(target, journal);
     LoadedDetail {
         provenance,
         preview: load_preview_blocking(target),
-        auto_merge: auto_merge_blocking(target, journal),
+        auto_merge: inputs.as_ref().and_then(auto_merge_from),
+        // Gated on origin's CONTENT, never on the scan's `origin_differs`
+        // hint: a file added locally and never pushed is flagged as
+        // differing yet has no origin blob (`blob_at` → `Ok(None)`), and a
+        // comparison against nothing would render an empty side as if origin
+        // had deleted the file. Same seam the merge editor's fourth pane hit.
+        origin_diffs: inputs.as_ref().and_then(|i| {
+            i.origin
+                .as_deref()
+                .map(|origin| origin_diffs(origin, &i.ours, &i.theirs))
+        }),
     }
 }
 
@@ -210,20 +239,80 @@ fn load_preview_blocking(target: &Path) -> PreviewState {
     ))
 }
 
-/// The two one-click resolutions (spec §5), shared with the dashboard's
+/// The one-click resolutions (spec §5), shared with the dashboard's
 /// inline row actions.
+///
+/// "Keep source" is TWO actions whenever origin holds its own version of the
+/// file: keeping what this machine's source says is not the same decision as
+/// keeping what the remote says. They stay one button — reading exactly
+/// "Keep source" — whenever origin agrees, which is the common case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The shared "Keep" prefix IS the vocabulary: these are the three things the
+// user can keep, and they read at every call site exactly as they read on the
+// buttons. Dropping it for `ResolveAction::Disk` would make the code say less
+// than the UI does.
+#[allow(clippy::enum_variant_names)]
 pub(super) enum ResolveAction {
     KeepDisk,
-    KeepSource,
+    /// Apply this machine's source over the destination (the source file is
+    /// never touched).
+    KeepSourceLocal,
+    /// Make origin's content the source content, then apply it.
+    KeepSourceOrigin,
+}
+
+/// The source-side actions to offer. `origin_available` must be answered from
+/// origin's LOADED content, never from `DriftSummary::origin_differs`: the
+/// scan flag says the repo differs from origin, which is also true for a file
+/// added locally and never pushed — that file has no origin blob at all, and
+/// an origin action for it could only resolve to nothing.
+pub(super) fn source_actions(origin_available: bool) -> Vec<ResolveAction> {
+    if origin_available {
+        vec![
+            ResolveAction::KeepSourceLocal,
+            ResolveAction::KeepSourceOrigin,
+        ]
+    } else {
+        vec![ResolveAction::KeepSourceLocal]
+    }
 }
 
 impl ResolveAction {
-    /// Short imperative label for buttons and failure messages.
+    /// Short imperative label, used in failure messages and wherever the
+    /// split is not offered.
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::KeepDisk => "Keep disk",
-            Self::KeepSource => "Keep source",
+            Self::KeepSourceLocal => "Keep source",
+            Self::KeepSourceOrigin => "Keep source · origin",
+        }
+    }
+
+    /// Button label. Only the split makes "this machine" worth saying: with
+    /// origin agreeing there is nothing to disambiguate, and the common case
+    /// must not get wordier.
+    pub(super) fn button_label(self, split: bool) -> &'static str {
+        match (self, split) {
+            (Self::KeepSourceLocal, true) => "Keep source · this machine",
+            _ => self.label(),
+        }
+    }
+
+    /// Stable element id for the button on either surface.
+    pub(super) fn button_id(self) -> &'static str {
+        match self {
+            Self::KeepDisk => "keep-disk",
+            Self::KeepSourceLocal => "keep-source",
+            Self::KeepSourceOrigin => "keep-source-origin",
+        }
+    }
+
+    /// Tint: the side the action keeps, same vocabulary as the diff rows.
+    fn tint(self, theme: Theme) -> Rgba {
+        match self {
+            Self::KeepDisk => theme.drift,
+            Self::KeepSourceLocal => theme.accent,
+            Self::KeepSourceOrigin => theme.remote,
         }
     }
 
@@ -231,20 +320,165 @@ impl ResolveAction {
     pub(super) fn verb(self) -> &'static str {
         match self {
             Self::KeepDisk => "Kept disk version",
-            Self::KeepSource => "Restored chezmoi's version",
+            Self::KeepSourceLocal => "Restored chezmoi's version",
+            Self::KeepSourceOrigin => "Restored origin's version",
         }
     }
 
     /// Run the matching engine method. Blocking — background executor only.
+    ///
+    /// `origin_seen` is origin's text as the caller SHOWED it (`None` on
+    /// surfaces that load no content). Only `KeepSourceOrigin` uses it, and it
+    /// refuses without it rather than writing something the user never saw —
+    /// see [`ResolveEngine::keep_source_origin`].
     pub(super) fn run(
         self,
         engine: &ResolveEngine,
         target: &Path,
+        origin_seen: Option<&str>,
     ) -> Result<ResolveOutcome, ResolveError> {
         match self {
             Self::KeepDisk => engine.keep_disk(target),
-            Self::KeepSource => engine.keep_source(target),
+            Self::KeepSourceLocal => engine.keep_source(target),
+            Self::KeepSourceOrigin => match origin_seen {
+                Some(seen) => engine.keep_source_origin(target, seen),
+                None => Err(ResolveError::Failed(
+                    "no origin version was loaded for this file — open it in Review first".into(),
+                )),
+            },
         }
+    }
+}
+
+/// Which two contents the diff compares. Origin is a content state of its
+/// own (plan 7 Task 9), so the pane has to be told which pair to show
+/// instead of always assuming disk-vs-this-machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiffPair {
+    DiskVsLocal,
+    DiskVsOrigin,
+    LocalVsOrigin,
+}
+
+/// Every pair in selector order; `DiskVsLocal` first — it is the default and
+/// the only one that exists for every file.
+const DIFF_PAIRS: [DiffPair; 3] = [
+    DiffPair::DiskVsLocal,
+    DiffPair::DiskVsOrigin,
+    DiffPair::LocalVsOrigin,
+];
+
+/// One side of a comparison: the tint its lines carry, and the legend copy
+/// naming it. The same tint reads differently depending on the pair — the
+/// accent side is "what the source would write" against disk, but "this
+/// machine's source" against origin — so the copy lives here, not on
+/// [`LineTint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiffSide {
+    tint: LineTint,
+    legend: &'static str,
+    /// The side as a noun, for prose about the pair ("X matches Y"). The
+    /// legend is a caption under a swatch and does not read as one.
+    noun: &'static str,
+}
+
+const DISK_SIDE: DiffSide = DiffSide {
+    tint: LineTint::Destination,
+    legend: "on disk now",
+    noun: "the destination",
+};
+const SOURCE_SIDE: DiffSide = DiffSide {
+    tint: LineTint::Rendered,
+    legend: "source would write",
+    noun: "the rendered source",
+};
+const LOCAL_SOURCE_SIDE: DiffSide = DiffSide {
+    tint: LineTint::Rendered,
+    legend: "this machine's source",
+    noun: "this machine's source",
+};
+const ORIGIN_WRITES_SIDE: DiffSide = DiffSide {
+    tint: LineTint::Origin,
+    legend: "origin would write",
+    noun: "origin's version",
+};
+const ORIGIN_SOURCE_SIDE: DiffSide = DiffSide {
+    tint: LineTint::Origin,
+    legend: "origin's source",
+    noun: "origin's version",
+};
+
+impl DiffPair {
+    /// Names BOTH sides: a comparison the user picked between three is only
+    /// unambiguous if the label says what is being held up against what.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::DiskVsLocal => "on disk ↔ source · this machine",
+            Self::DiskVsOrigin => "on disk ↔ source · origin",
+            Self::LocalVsOrigin => "source: this machine ↔ origin",
+        }
+    }
+
+    fn segment_id(self) -> &'static str {
+        match self {
+            Self::DiskVsLocal => "diff-pair-disk-local",
+            Self::DiskVsOrigin => "diff-pair-disk-origin",
+            Self::LocalVsOrigin => "diff-pair-local-origin",
+        }
+    }
+
+    /// Tint of the selected segment: the side that distinguishes this
+    /// comparison from the default one.
+    fn tint(self, theme: Theme) -> Rgba {
+        match self {
+            Self::DiskVsLocal => theme.accent,
+            Self::DiskVsOrigin | Self::LocalVsOrigin => theme.remote,
+        }
+    }
+
+    /// What an empty diff means for THIS pair. Composed from the two sides so
+    /// the note can never describe a comparison other than the one on screen —
+    /// "destination matches the rendered source" was hardcoded, and it is a
+    /// false statement on `DiskVsOrigin` (reachable whenever another machine
+    /// pushed a change this machine's disk already has).
+    fn matches_note(self) -> SharedString {
+        let (base, ours) = self.sides();
+        format!("{} matches {}", ours.noun, base.noun).into()
+    }
+
+    /// `(base-side, ours-side)` exactly as [`MergeDocument::compute`] sees
+    /// them in [`origin_diffs`] and [`load_preview_blocking`].
+    fn sides(self) -> (DiffSide, DiffSide) {
+        match self {
+            Self::DiskVsLocal => (SOURCE_SIDE, DISK_SIDE),
+            Self::DiskVsOrigin => (ORIGIN_WRITES_SIDE, DISK_SIDE),
+            Self::LocalVsOrigin => (LOCAL_SOURCE_SIDE, ORIGIN_SOURCE_SIDE),
+        }
+    }
+}
+
+/// The two comparisons that need origin's content, computed once when a file
+/// is selected. Their existence IS the gate for every origin affordance in
+/// this view — they are built from loaded content, so they cannot exist for a
+/// file that has no origin blob.
+pub(super) struct OriginDiffs {
+    /// Origin's text these documents were built from — i.e. exactly what the
+    /// user is looking at. `keep_source_origin` re-loads origin at click time
+    /// and refuses if it no longer matches this, so a fetch between selecting
+    /// and clicking can never write unreviewed content into the source.
+    seen: String,
+    disk_vs_origin: MergeDocument,
+    local_vs_origin: MergeDocument,
+}
+
+/// Build both origin comparisons. Same 2-way-lite shape as the preview (see
+/// [`flatten_document`]): `compute(x, y, x)` degenerates to a 2-way diff with
+/// `x` on the base side and `y` on the ours side.
+pub(super) fn origin_diffs(origin: &str, disk: &str, local: &str) -> OriginDiffs {
+    OriginDiffs {
+        seen: origin.to_owned(),
+        disk_vs_origin: MergeDocument::compute(origin, disk, origin, MergeOptions::default()),
+        local_vs_origin: MergeDocument::compute(local, origin, local, MergeOptions::default()),
     }
 }
 
@@ -307,8 +541,12 @@ fn keep_both_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBan
 /// Map an action result onto its banner. Tint policy: a `note` means the
 /// resolution succeeded locally but commit/push degraded (drift tint, note
 /// shown); no note is full success (ok tint); engine errors are conflicts.
+/// `split` is whether the source action was split in two when the user
+/// pressed it: with two "Keep source …" buttons on screen, a failure that
+/// says only "Keep source failed" leaves them guessing which one it was.
 fn outcome_banner(
     action: ResolveAction,
+    split: bool,
     result: &Result<ResolveOutcome, ResolveError>,
 ) -> OutcomeBanner {
     match result {
@@ -348,7 +586,7 @@ fn outcome_banner(
             undoable: false,
         },
         Err(e) => OutcomeBanner {
-            text: format!("{} failed: {e}", action.label()).into(),
+            text: format!("{} failed: {e}", action.button_label(split)).into(),
             tint: BannerTint::Conflict,
             undoable: false,
         },
@@ -377,15 +615,28 @@ fn undo_banner(result: &Result<Option<i64>, ResolveError>) -> OutcomeBanner {
     }
 }
 
-/// Which side of the drift a preview line belongs to.
+/// Which side of the comparison a preview line belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineTint {
-    /// Disk and rendered source agree — muted context.
+    /// Both sides agree — muted context.
     Context,
-    /// Line the rendered source would write (absent or different on disk).
+    /// Line this machine's rendered source carries.
     Rendered,
-    /// Line as it exists on disk (absent or different in the rendered source).
+    /// Line as it exists on disk.
     Destination,
+    /// Line origin's rendered source carries.
+    Origin,
+}
+
+impl LineTint {
+    fn color(self, theme: Theme) -> Rgba {
+        match self {
+            Self::Context => theme.text_muted,
+            Self::Rendered => theme.accent,
+            Self::Destination => theme.drift,
+            Self::Origin => theme.remote,
+        }
+    }
 }
 
 /// One uniform-height preview row, precomputed so the `uniform_list` closure
@@ -406,19 +657,19 @@ pub(super) fn display_text(line: &str) -> &str {
     line.strip_suffix('\n').unwrap_or(line)
 }
 
-/// 2-WAY MAPPING. The preview feeds `MergeDocument::compute(base = rendered,
-/// ours = destination, theirs = rendered)`. Because `theirs` is byte-identical
-/// to `base`, the 3-way engine degenerates into a 2-way diff of
-/// destination-vs-rendered:
-///   - `Unchanged` → disk == rendered → muted context lines;
-///   - `OursOnly`  → disk differs → `region.base` holds the lines chezmoi
-///     would render (accent) and `region.ours` the lines on disk
-///     (drift), with word-diff emphasis where cheap.
+/// 2-WAY MAPPING. Every comparison feeds `MergeDocument::compute(base = x,
+/// ours = y, theirs = x)`. Because `theirs` is byte-identical to `base`, the
+/// 3-way engine degenerates into a 2-way diff of y-vs-x:
+///   - `Unchanged` → the two agree → muted context lines;
+///   - `OursOnly`  → they differ → `region.base` holds the base side's lines
+///     and `region.ours` the ours side's, each tinted by `pair.sides()`, with
+///     word-diff emphasis where cheap.
 ///
 /// `TheirsOnly`, `BothSame`, and `Conflict` are unreachable while
 /// theirs == base; they are still handled (context / context / changed pair)
 /// so a future true-3-way upgrade fails soft rather than mis-rendering.
-fn flatten_document(doc: &MergeDocument) -> Vec<DiffLine> {
+fn flatten_document(doc: &MergeDocument, pair: DiffPair) -> Vec<DiffLine> {
+    let (base_side, ours_side) = pair.sides();
     let context = |line: &str| DiffLine {
         text: display_text(line).to_owned().into(),
         tint: LineTint::Context,
@@ -443,21 +694,21 @@ fn flatten_document(doc: &MergeDocument) -> Vec<DiffLine> {
                 );
             }
             RegionKind::OursOnly | RegionKind::Conflict => {
-                let rendered = &doc.base_lines()[region.base.clone()];
-                let destination = &doc.ours_lines()[region.ours.clone()];
-                let (hl_rendered, hl_destination) = region_highlights(rendered, destination);
-                for (line, highlights) in rendered.iter().zip(hl_rendered) {
+                let base = &doc.base_lines()[region.base.clone()];
+                let ours = &doc.ours_lines()[region.ours.clone()];
+                let (hl_base, hl_ours) = region_highlights(base, ours);
+                for (line, highlights) in base.iter().zip(hl_base) {
                     out.push(DiffLine {
                         text: display_text(line).to_owned().into(),
-                        tint: LineTint::Rendered,
+                        tint: base_side.tint,
                         marker: "●",
                         highlights,
                     });
                 }
-                for (line, highlights) in destination.iter().zip(hl_destination) {
+                for (line, highlights) in ours.iter().zip(hl_ours) {
                     out.push(DiffLine {
                         text: display_text(line).to_owned().into(),
-                        tint: LineTint::Destination,
+                        tint: ours_side.tint,
                         marker: "●",
                         highlights,
                     });
@@ -474,25 +725,20 @@ type LineRanges = Vec<Vec<Range<usize>>>;
 /// Word-level changed ranges for one changed region, split per line. Cheap
 /// only: both sides non-empty and under [`WORD_DIFF_CHEAP_BYTES`], otherwise
 /// no intra-line emphasis (the line tints still carry the information).
-fn region_highlights(rendered: &[String], destination: &[String]) -> (LineRanges, LineRanges) {
-    let none = || {
-        (
-            vec![Vec::new(); rendered.len()],
-            vec![Vec::new(); destination.len()],
-        )
-    };
-    if rendered.is_empty() || destination.is_empty() {
+fn region_highlights(base: &[String], ours: &[String]) -> (LineRanges, LineRanges) {
+    let none = || (vec![Vec::new(); base.len()], vec![Vec::new(); ours.len()]);
+    if base.is_empty() || ours.is_empty() {
         return none();
     }
-    let a = rendered.concat();
-    let b = destination.concat();
+    let a = base.concat();
+    let b = ours.concat();
     if a.len() > WORD_DIFF_CHEAP_BYTES || b.len() > WORD_DIFF_CHEAP_BYTES {
         return none();
     }
     let wd = word_diff(&a, &b);
     (
-        per_line_ranges(rendered, &wd.changed_a),
-        per_line_ranges(destination, &wd.changed_b),
+        per_line_ranges(base, &wd.changed_a),
+        per_line_ranges(ours, &wd.changed_b),
     )
 }
 
@@ -526,7 +772,17 @@ pub struct ReviewView {
     /// `pub(super)` so the render-smoke tests can pose a selected target
     /// without spawning the background detail load.
     pub(super) selected: Option<PathBuf>,
+    /// The disk-vs-this-machine comparison — the default pair, and the only
+    /// one that carries the load's own failure states.
     pub(super) preview: PreviewState,
+    /// Which comparison the diff shows. Reset to the default on every
+    /// selection (and on every reload): after a resolution the file's origin
+    /// dimension may be gone entirely.
+    pub(super) diff_pair: DiffPair,
+    /// The two origin comparisons for the selected file, `Some` only when
+    /// origin's content loaded. This — not `DriftSummary::origin_differs` —
+    /// gates the selector, the origin diff, and the origin action.
+    pub(super) origin_diffs: Option<OriginDiffs>,
     /// Provenance for the selected target, newest first (background-loaded
     /// together with the preview).
     pub(super) provenance: Vec<ProvRow>,
@@ -564,6 +820,8 @@ impl ReviewView {
             shell,
             selected: None,
             preview: PreviewState::Empty,
+            diff_pair: DiffPair::DiskVsLocal,
+            origin_diffs: None,
             provenance: Vec::new(),
             auto_merge: None,
             last_outcome: None,
@@ -589,6 +847,8 @@ impl ReviewView {
         }
         self.selected = Some(target.clone());
         self.preview = PreviewState::Loading;
+        self.diff_pair = DiffPair::DiskVsLocal;
+        self.origin_diffs = None;
         self.preview_dirty = true;
         self.provenance.clear();
         self.auto_merge = None;
@@ -607,6 +867,7 @@ impl ReviewView {
                 if view.selected.as_deref() == Some(target.as_path()) {
                     view.provenance = loaded.provenance;
                     view.auto_merge = loaded.auto_merge;
+                    view.origin_diffs = loaded.origin_diffs;
                     view.preview = loaded.preview;
                     view.preview_dirty = true;
                     cx.notify();
@@ -658,6 +919,11 @@ impl ReviewView {
         else {
             return;
         };
+        // Origin's text exactly as this view is showing it, and whether the
+        // split was on screen — both belong to the button the user pressed,
+        // so they are captured at click time rather than read back later.
+        let origin_seen = self.origin_diffs.as_ref().map(|d| d.seen.clone());
+        let split = self.origin_diffs.is_some();
         self.action_in_flight = true;
         self.last_outcome = None;
         cx.notify();
@@ -665,12 +931,12 @@ impl ReviewView {
             let result = {
                 let target = target.clone();
                 cx.background_executor()
-                    .spawn(async move { action.run(&engine, &target) })
+                    .spawn(async move { action.run(&engine, &target, origin_seen.as_deref()) })
                     .await
             };
             this.update(cx, |view, cx| {
                 view.action_in_flight = false;
-                view.last_outcome = Some(outcome_banner(action, &result));
+                view.last_outcome = Some(outcome_banner(action, split, &result));
                 if matches!(result, Ok(ResolveOutcome::Done { .. })) {
                     view.state.update(cx, |model, cx| {
                         model.confirm_resolved(&target);
@@ -807,38 +1073,106 @@ impl ReviewView {
         )
     }
 
+    /// The source-side actions for the selected file: one button, or two when
+    /// origin's content loaded and can therefore be kept.
+    pub(super) fn header_source_actions(&self) -> Vec<ResolveAction> {
+        source_actions(self.origin_diffs.is_some())
+    }
+
     /// One header action button. Enabled needs a live engine (daemon
     /// connected) — `run_action` itself re-checks selection and in-flight.
     fn action_button(
         &self,
-        id: &'static str,
         action: ResolveAction,
+        split: bool,
         enabled: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        if enabled {
+        let label = action.button_label(split);
+        let el = if enabled {
             ui::button(
                 theme,
-                id,
-                action.label().into(),
+                action.button_id(),
+                label.into(),
                 // The quick actions carry the side they act on, exactly as
                 // the diff rows and the merge strips do.
-                ui::ButtonVariant::Tonal(match action {
-                    ResolveAction::KeepDisk => theme.drift,
-                    ResolveAction::KeepSource => theme.accent,
-                }),
+                ui::ButtonVariant::Tonal(action.tint(theme)),
                 ui::ButtonSize::Sm,
                 cx.listener(move |view, _ev, _window, cx| view.run_action(action, cx)),
             )
         } else {
             ui::disabled_button(
                 theme,
-                id,
-                action.label().into(),
+                action.button_id(),
+                label.into(),
                 ui::ButtonSize::Sm,
                 Some("daemon not connected".into()),
             )
+        };
+        // Wrap onto the next header row rather than squash: a squeezed
+        // button overflows its own label (`whitespace_nowrap`).
+        el.flex_shrink_0()
+    }
+
+    /// The comparison selector above the diff — rendered only when origin's
+    /// content loaded (see [`Self::origin_diffs`]). A segmented row: the
+    /// chosen comparison carries its own tint, the others recede.
+    fn comparison_selector(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let segments: Vec<Stateful<Div>> = DIFF_PAIRS
+            .iter()
+            .map(|&pair| {
+                let selected = self.diff_pair == pair;
+                ui::button(
+                    theme,
+                    pair.segment_id(),
+                    pair.label().into(),
+                    if selected {
+                        ui::ButtonVariant::Tonal(pair.tint(theme))
+                    } else {
+                        ui::ButtonVariant::Ghost
+                    },
+                    ui::ButtonSize::Micro,
+                    cx.listener(move |view, _ev, _window, cx| view.set_diff_pair(pair, cx)),
+                )
+                .flex_shrink_0()
+            })
+            .collect();
+        div()
+            .flex_none()
+            .px_3()
+            .py_1()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            // No "Comparing:" prefix: each segment already names both of its
+            // sides, and the prefix cost the row enough width to wrap at the
+            // default window size.
+            .children(segments)
+    }
+
+    /// Switch comparisons. Everything needed is already in memory (the
+    /// documents were computed with the selection), so this is a repaint —
+    /// no reload, no subprocess.
+    fn set_diff_pair(&mut self, pair: DiffPair, cx: &mut Context<Self>) {
+        if self.diff_pair == pair {
+            return;
+        }
+        self.diff_pair = pair;
+        self.preview_dirty = true;
+        cx.notify();
+    }
+
+    /// The document the chosen comparison renders, if it exists.
+    fn current_doc(&self) -> Option<&MergeDocument> {
+        match self.diff_pair {
+            DiffPair::DiskVsLocal => match &self.preview {
+                PreviewState::Ready(doc) => Some(doc),
+                _ => None,
+            },
+            DiffPair::DiskVsOrigin => self.origin_diffs.as_ref().map(|d| &d.disk_vs_origin),
+            DiffPair::LocalVsOrigin => self.origin_diffs.as_ref().map(|d| &d.local_vs_origin),
         }
     }
 
@@ -997,18 +1331,89 @@ impl ReviewView {
             .find(|d| d.target == *selected)
             .is_some_and(|d| matches!(d.class.as_str(), "conflict" | "local_source_diverged"));
 
-        let body = match &self.preview {
-            PreviewState::Empty | PreviewState::Loading => {
-                centered_note(theme, "loading preview…".into(), theme.text_muted)
+        // An origin comparison stands on its own: it comes from the merge
+        // inputs, not from the preview load, so it renders even in the (never
+        // yet observed) case where the two disagreed about the file.
+        // Authoritative: origin's LOADED content, not the scan's hint.
+        let split = self.origin_diffs.is_some();
+        let mut header_actions: Vec<AnyElement> = Vec::new();
+        if self.action_in_flight {
+            header_actions
+                .push(ui::status_text(theme, "working…", ui::StatusTone::Muted).into_any_element());
+        } else {
+            header_actions.push(
+                self.action_button(ResolveAction::KeepDisk, split, engine_ready, theme, cx)
+                    .into_any_element(),
+            );
+            header_actions.extend(self.header_source_actions().into_iter().map(|action| {
+                self.action_button(action, split, engine_ready, theme, cx)
+                    .into_any_element()
+            }));
+            if self.auto_merge.is_some() {
+                header_actions.push(
+                    if engine_ready {
+                        ui::button(
+                            theme,
+                            "keep-both",
+                            "Keep both".into(),
+                            ui::ButtonVariant::Tonal(theme.ok),
+                            ui::ButtonSize::Sm,
+                            cx.listener(|view, _ev, _window, cx| view.run_keep_both(cx)),
+                        )
+                    } else {
+                        ui::disabled_button(
+                            theme,
+                            "keep-both",
+                            "Keep both".into(),
+                            ui::ButtonSize::Sm,
+                            Some("daemon not connected".into()),
+                        )
+                    }
+                    .flex_shrink_0()
+                    .into_any_element(),
+                );
             }
-            PreviewState::EvalFailed(hint) => message_box(
-                theme,
-                "template/secret evaluation failed",
-                hint.clone(),
-                Some("Fix this, then re-select the file to reload the preview."),
-            ),
-            PreviewState::Error(msg) => message_box(theme, "preview failed", msg.clone(), None),
-            PreviewState::Ready(_) => self.diff_preview(theme),
+        }
+        header_actions.push(
+            self.merge_editor_button(engine_ready, is_conflict, theme, cx)
+                .flex_shrink_0()
+                .into_any_element(),
+        );
+        // External editor: real but rare — an icon, not a fourth competing
+        // button.
+        header_actions.push(
+            div()
+                .id("open-in-editor")
+                .flex_shrink_0()
+                .px_1p5()
+                .py_0p5()
+                .rounded_md()
+                .text_sm()
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                .child("↗")
+                .tooltip(ui::text_tooltip("Open in external editor"))
+                .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
+                .into_any_element(),
+        );
+
+        let body = if self.diff_pair != DiffPair::DiskVsLocal && self.origin_diffs.is_some() {
+            self.diff_preview(theme)
+        } else {
+            match &self.preview {
+                PreviewState::Empty | PreviewState::Loading => {
+                    centered_note(theme, "loading preview…".into(), theme.text_muted)
+                }
+                PreviewState::EvalFailed(hint) => message_box(
+                    theme,
+                    "template/secret evaluation failed",
+                    hint.clone(),
+                    Some("Fix this, then re-select the file to reload the preview."),
+                ),
+                PreviewState::Error(msg) => message_box(theme, "preview failed", msg.clone(), None),
+                PreviewState::Ready(_) => self.diff_preview(theme),
+            }
         };
 
         div()
@@ -1020,68 +1425,28 @@ impl ReviewView {
                 theme,
                 name,
                 path,
+                // ONE trailing element, and it wraps: with the source action
+                // split there are four buttons here, and the detail pane is
+                // ~370px at the app's minimum window width. Squeezing them
+                // (the flex default) overlapped the filename; wrapping costs a
+                // header row only when the width genuinely isn't there.
                 vec![
-                    if self.action_in_flight {
-                        ui::status_text(theme, "working…", ui::StatusTone::Muted).into_any_element()
-                    } else {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(self.action_button(
-                                "keep-disk",
-                                ResolveAction::KeepDisk,
-                                engine_ready,
-                                theme,
-                                cx,
-                            ))
-                            .child(self.action_button(
-                                "keep-source",
-                                ResolveAction::KeepSource,
-                                engine_ready,
-                                theme,
-                                cx,
-                            ))
-                            .when(self.auto_merge.is_some(), |el| {
-                                el.child(if engine_ready {
-                                    ui::button(
-                                        theme,
-                                        "keep-both",
-                                        "Keep both".into(),
-                                        ui::ButtonVariant::Tonal(theme.ok),
-                                        ui::ButtonSize::Sm,
-                                        cx.listener(|view, _ev, _window, cx| {
-                                            view.run_keep_both(cx)
-                                        }),
-                                    )
-                                } else {
-                                    ui::disabled_button(
-                                        theme,
-                                        "keep-both",
-                                        "Keep both".into(),
-                                        ui::ButtonSize::Sm,
-                                        Some("daemon not connected".into()),
-                                    )
-                                })
-                            })
-                            .into_any_element()
-                    },
-                    self.merge_editor_button(engine_ready, is_conflict, theme, cx)
-                        .into_any_element(),
-                    // External editor: real but rare — an icon, not a fourth
-                    // competing button.
                     div()
-                        .id("open-in-editor")
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_md()
-                        .text_sm()
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                        .child("↗")
-                        .tooltip(ui::text_tooltip("Open in external editor"))
-                        .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
+                        .flex()
+                        .flex_wrap()
+                        // Capped so the actions cannot eat the whole header:
+                        // the title column has flex-basis 0 and would
+                        // otherwise shrink to nothing, taking the path line
+                        // with it and letting a long filename overlap the
+                        // buttons.
+                        .max_w_2_3()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        // Flat, not nested: siblings pack onto a wrapped row
+                        // together, where a nested cluster would claim a row
+                        // of its own and push the rest down.
+                        .children(header_actions)
                         .into_any_element(),
                 ],
             ))
@@ -1108,6 +1473,11 @@ impl ReviewView {
                     }),
                 ))
             })
+            // Directly above the diff it governs — after History, which
+            // belongs to the file, not to the comparison.
+            .when(self.origin_diffs.is_some(), |el| {
+                el.child(self.comparison_selector(theme, cx))
+            })
             .child(body)
             .into_any_element()
     }
@@ -1131,11 +1501,13 @@ impl ReviewView {
         }
         self.preview_dirty = false;
         self.preview_appearance = Some(window.appearance());
-        let PreviewState::Ready(doc) = &self.preview else {
+        let flattened = self
+            .current_doc()
+            .map(|doc| flatten_document(doc, self.diff_pair));
+        let Some(lines) = flattened else {
             self.preview_editor = None;
             return;
         };
-        let lines = flatten_document(doc);
         if lines.is_empty() {
             // Nothing differs: the pane shows the "matches" note instead.
             self.preview_editor = None;
@@ -1175,11 +1547,7 @@ impl ReviewView {
     /// feedback).
     fn diff_preview(&self, theme: Theme) -> AnyElement {
         let Some(editor) = &self.preview_editor else {
-            return centered_note(
-                theme,
-                "destination matches the rendered source".into(),
-                theme.ok,
-            );
+            return centered_note(theme, self.diff_pair.matches_note(), theme.ok);
         };
         div()
             .flex_1()
@@ -1199,7 +1567,11 @@ impl ReviewView {
                     .line_height(px(20.))
                     .child(editor.clone()),
             )
-            .child(
+            .child({
+                // The legend names THIS comparison's two sides — the accent
+                // side is "what the source would write" against disk, but
+                // "this machine's source" against origin.
+                let (base_side, ours_side) = self.diff_pair.sides();
                 div()
                     .flex_none()
                     .h_6()
@@ -1210,9 +1582,9 @@ impl ReviewView {
                     .items_center()
                     .gap_3()
                     .text_xs()
-                    .child(legend_swatch(theme.accent, "source would write"))
-                    .child(legend_swatch(theme.drift, "on disk now")),
-            )
+                    .child(legend_swatch(base_side.tint.color(theme), base_side.legend))
+                    .child(legend_swatch(ours_side.tint.color(theme), ours_side.legend))
+            })
             .into_any_element()
     }
 
@@ -1388,11 +1760,7 @@ fn preview_decors(lines: &[DiffLine], theme: Theme) -> Vec<ui::text_area::LineDe
     lines
         .iter()
         .map(|line| {
-            let tint = match line.tint {
-                LineTint::Context => theme.text_muted,
-                LineTint::Rendered => theme.accent,
-                LineTint::Destination => theme.drift,
-            };
+            let tint = line.tint.color(theme);
             let changed = line.tint != LineTint::Context;
             ui::text_area::LineDecor {
                 // Changed rows sit on their side's field, exactly like the
@@ -1429,8 +1797,9 @@ mod tests {
     use tomte_proto::DriftSummary;
 
     use super::{
-        BannerTint, DiffLine, LineTint, ResolveAction, flatten_document, outcome_banner,
-        per_line_ranges, preview_decors, severity_groups, undo_banner,
+        BannerTint, DiffLine, DiffPair, LineTint, ResolveAction, flatten_document, origin_diffs,
+        outcome_banner, per_line_ranges, preview_decors, severity_groups, source_actions,
+        undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -1445,6 +1814,125 @@ mod tests {
 
     fn targets(group: &[DriftSummary]) -> Vec<&Path> {
         group.iter().map(|d| d.target.as_path()).collect()
+    }
+
+    #[test]
+    fn source_action_splits_only_when_origin_differs() {
+        assert_eq!(
+            source_actions(false),
+            vec![ResolveAction::KeepSourceLocal],
+            "one action when origin agrees — the common case stays simple"
+        );
+        assert_eq!(
+            source_actions(true),
+            vec![
+                ResolveAction::KeepSourceLocal,
+                ResolveAction::KeepSourceOrigin
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_pair_labels_name_both_sides() {
+        assert_eq!(
+            DiffPair::DiskVsLocal.label(),
+            "on disk ↔ source · this machine"
+        );
+        assert_eq!(DiffPair::DiskVsOrigin.label(), "on disk ↔ source · origin");
+        assert_eq!(
+            DiffPair::LocalVsOrigin.label(),
+            "source: this machine ↔ origin"
+        );
+    }
+
+    #[test]
+    fn button_labels_only_say_this_machine_when_the_split_is_offered() {
+        // Origin agrees: the common case must not get wordier.
+        assert_eq!(
+            ResolveAction::KeepSourceLocal.button_label(false),
+            "Keep source"
+        );
+        assert_eq!(
+            ResolveAction::KeepSourceLocal.button_label(true),
+            "Keep source · this machine"
+        );
+        assert_eq!(
+            ResolveAction::KeepSourceOrigin.button_label(true),
+            "Keep source · origin"
+        );
+        // The neighbouring action never changes shape.
+        assert_eq!(ResolveAction::KeepDisk.button_label(true), "Keep disk");
+        // Failure messages keep the plain name in every case.
+        assert_eq!(ResolveAction::KeepSourceLocal.label(), "Keep source");
+    }
+
+    #[test]
+    fn action_tints_carry_the_side_each_one_keeps() {
+        // The gallery renders these buttons through the DISABLED path (no
+        // daemon), so the tints cannot be read off a screenshot — they are
+        // pinned here instead.
+        let theme = Theme::dark();
+        assert_eq!(ResolveAction::KeepDisk.tint(theme), theme.drift);
+        assert_eq!(ResolveAction::KeepSourceLocal.tint(theme), theme.accent);
+        assert_eq!(ResolveAction::KeepSourceOrigin.tint(theme), theme.remote);
+        // …and the selector's chosen segment matches the pair it shows.
+        assert_eq!(DiffPair::DiskVsLocal.tint(theme), theme.accent);
+        assert_eq!(DiffPair::DiskVsOrigin.tint(theme), theme.remote);
+        assert_eq!(DiffPair::LocalVsOrigin.tint(theme), theme.remote);
+    }
+
+    #[test]
+    fn a_failed_source_action_names_the_button_that_failed() {
+        let gone = || Err(ResolveError::Failed("daemon gone".into()));
+        // Unsplit: one "Keep source" button, so the plain name is unambiguous.
+        assert_eq!(
+            outcome_banner(ResolveAction::KeepSourceLocal, false, &gone())
+                .text
+                .as_ref(),
+            "Keep source failed: daemon gone"
+        );
+        // Split: two "Keep source …" buttons were on screen — the banner has
+        // to say which one the user pressed.
+        assert_eq!(
+            outcome_banner(ResolveAction::KeepSourceLocal, true, &gone())
+                .text
+                .as_ref(),
+            "Keep source · this machine failed: daemon gone"
+        );
+        assert_eq!(
+            outcome_banner(ResolveAction::KeepSourceOrigin, true, &gone())
+                .text
+                .as_ref(),
+            "Keep source · origin failed: daemon gone"
+        );
+    }
+
+    #[test]
+    fn an_empty_diff_names_the_pair_it_is_empty_for() {
+        // The note used to be hardcoded to the default pair, which made it a
+        // false statement on the other two: disk CAN equal origin (another
+        // machine pushed a change this disk already has) while still differing
+        // from this machine's source.
+        assert_eq!(
+            DiffPair::DiskVsLocal.matches_note().as_ref(),
+            "the destination matches the rendered source"
+        );
+        assert_eq!(
+            DiffPair::DiskVsOrigin.matches_note().as_ref(),
+            "the destination matches origin's version"
+        );
+        assert_eq!(
+            DiffPair::LocalVsOrigin.matches_note().as_ref(),
+            "origin's version matches this machine's source"
+        );
+    }
+
+    #[test]
+    fn origin_diffs_remember_the_text_they_were_built_from() {
+        // The click-time guard compares the reloaded origin against this, so
+        // it has to be origin's text verbatim — not a re-derivation.
+        let diffs = origin_diffs("a=origin\n", "a=disk\n", "a=local\n");
+        assert_eq!(diffs.seen, "a=origin\n");
     }
 
     #[test]
@@ -1566,7 +2054,7 @@ mod tests {
     #[test]
     fn flatten_maps_two_way_regions_to_tinted_lines() {
         let doc = two_way("a\nv = 1\nz\n", "a\nv = 2\nz\n");
-        let lines = flatten_document(&doc);
+        let lines = flatten_document(&doc, DiffPair::DiskVsLocal);
         assert_eq!(
             shape(&lines),
             [
@@ -1586,7 +2074,7 @@ mod tests {
     #[test]
     fn flatten_disk_only_addition_has_no_rendered_pair() {
         let doc = two_way("a\nb\n", "a\nx\nb\n");
-        let lines = flatten_document(&doc);
+        let lines = flatten_document(&doc, DiffPair::DiskVsLocal);
         assert_eq!(
             shape(&lines),
             [
@@ -1602,8 +2090,69 @@ mod tests {
     #[test]
     fn flatten_deleted_on_disk_shows_rendered_only() {
         let doc = two_way("only\n", "");
-        let lines = flatten_document(&doc);
+        let lines = flatten_document(&doc, DiffPair::DiskVsLocal);
         assert_eq!(shape(&lines), [("only", LineTint::Rendered, "●")]);
+    }
+
+    #[test]
+    fn origin_pairs_tint_origin_lines_as_the_remote_side() {
+        let local = "a\nv = 1\n";
+        let disk = "a\nv = 2\n";
+        let origin = "a\nv = 3\n";
+        let diffs = origin_diffs(origin, disk, local);
+
+        // disk ↔ origin: origin's line on the remote side, disk's on drift.
+        let lines = flatten_document(&diffs.disk_vs_origin, DiffPair::DiskVsOrigin);
+        assert_eq!(
+            shape(&lines),
+            [
+                ("a", LineTint::Context, " "),
+                ("v = 3", LineTint::Origin, "●"),
+                ("v = 2", LineTint::Destination, "●"),
+            ]
+        );
+
+        // this machine ↔ origin: no disk anywhere — the two SOURCES.
+        let lines = flatten_document(&diffs.local_vs_origin, DiffPair::LocalVsOrigin);
+        assert_eq!(
+            shape(&lines),
+            [
+                ("a", LineTint::Context, " "),
+                ("v = 1", LineTint::Rendered, "●"),
+                ("v = 3", LineTint::Origin, "●"),
+            ]
+        );
+
+        // Origin's field and rail are theme.remote — the tint origin owns
+        // everywhere else in the app (merge pane, origin picks).
+        let theme = Theme::dark();
+        let decors = preview_decors(&lines, theme);
+        let ix = lines
+            .iter()
+            .position(|l| l.tint == LineTint::Origin)
+            .unwrap();
+        assert_eq!(decors[ix].bg, Some(Theme::wash(theme.remote, 0.07)));
+        assert_eq!(decors[ix].rail, Some(theme.remote));
+    }
+
+    #[test]
+    fn origin_pair_legends_name_the_sides_they_show() {
+        let legends = |pair: DiffPair| {
+            let (base, ours) = pair.sides();
+            (base.legend, ours.legend)
+        };
+        assert_eq!(
+            legends(DiffPair::DiskVsLocal),
+            ("source would write", "on disk now")
+        );
+        assert_eq!(
+            legends(DiffPair::DiskVsOrigin),
+            ("origin would write", "on disk now")
+        );
+        assert_eq!(
+            legends(DiffPair::LocalVsOrigin),
+            ("this machine's source", "origin's source")
+        );
     }
 
     fn done(committed: bool, pushed: bool, note: Option<&str>) -> ResolveOutcome {
@@ -1618,22 +2167,60 @@ mod tests {
     #[test]
     fn outcome_banner_full_success_is_ok_tinted_and_undoable() {
         // keep_disk: commit phase ran and fully succeeded
-        let b = outcome_banner(ResolveAction::KeepDisk, &Ok(done(true, true, None)));
+        let b = outcome_banner(ResolveAction::KeepDisk, false, &Ok(done(true, true, None)));
         assert_eq!(b.text.as_ref(), "Kept disk version · committed & pushed");
         assert_eq!(b.tint, BannerTint::Ok);
         assert!(b.undoable);
 
         // keep_source: no commit phase — the banner must not claim one
-        let b = outcome_banner(ResolveAction::KeepSource, &Ok(done(false, false, None)));
+        let b = outcome_banner(
+            ResolveAction::KeepSourceLocal,
+            false,
+            &Ok(done(false, false, None)),
+        );
         assert_eq!(b.text.as_ref(), "Restored chezmoi's version");
         assert_eq!(b.tint, BannerTint::Ok);
         assert!(b.undoable);
     }
 
     #[test]
+    fn outcome_banner_names_origin_when_origin_won() {
+        // keep_source_origin routes through resolve_merged, so it DOES have
+        // a commit phase — unlike its local twin.
+        let b = outcome_banner(
+            ResolveAction::KeepSourceOrigin,
+            true,
+            &Ok(done(true, true, None)),
+        );
+        assert_eq!(
+            b.text.as_ref(),
+            "Restored origin's version · committed & pushed"
+        );
+        assert_eq!(b.tint, BannerTint::Ok);
+        assert!(b.undoable);
+
+        let b = outcome_banner(
+            ResolveAction::KeepSourceOrigin,
+            true,
+            &Err(ResolveError::Failed(
+                ".zshrc has no version at origin/main that differs from this machine's source"
+                    .into(),
+            )),
+        );
+        assert_eq!(
+            b.text.as_ref(),
+            "Keep source · origin failed: .zshrc has no version at origin/main that \
+             differs from this machine's source"
+        );
+        assert_eq!(b.tint, BannerTint::Conflict);
+        assert!(!b.undoable);
+    }
+
+    #[test]
     fn outcome_banner_degraded_commit_shows_note_in_drift_tint() {
         let b = outcome_banner(
             ResolveAction::KeepDisk,
+            false,
             &Ok(done(true, false, Some("push failed: locked"))),
         );
         assert_eq!(b.text.as_ref(), "Kept disk version · push failed: locked");
@@ -1645,6 +2232,7 @@ mod tests {
     fn outcome_banner_templated_and_error_are_not_undoable() {
         let b = outcome_banner(
             ResolveAction::KeepDisk,
+            false,
             &Ok(ResolveOutcome::NeedsMergeEditor),
         );
         assert_eq!(b.text.as_ref(), "Templated file · use the merge editor");
@@ -1652,7 +2240,8 @@ mod tests {
         assert!(!b.undoable);
 
         let b = outcome_banner(
-            ResolveAction::KeepSource,
+            ResolveAction::KeepSourceLocal,
+            false,
             &Err(ResolveError::Failed("daemon gone".into())),
         );
         assert_eq!(b.text.as_ref(), "Keep source failed: daemon gone");
@@ -1664,6 +2253,7 @@ mod tests {
     fn outcome_banner_protected_span_uses_the_plan_copy() {
         let b = outcome_banner(
             ResolveAction::KeepDisk,
+            false,
             &Ok(ResolveOutcome::ProtectedSpan {
                 detail: "edit at rendered bytes 8..13 touches a protected template span".into(),
             }),
@@ -1715,7 +2305,7 @@ mod tests {
             "a\nfont = 14\n",
             MergeOptions::default(),
         );
-        let lines = flatten_document(&doc);
+        let lines = flatten_document(&doc, DiffPair::DiskVsLocal);
         let decors = preview_decors(&lines, theme);
         assert_eq!(decors.len(), lines.len());
 

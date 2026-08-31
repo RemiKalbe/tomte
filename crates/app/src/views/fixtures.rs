@@ -16,7 +16,9 @@ use tomte_core::template::{anchor::anchor, lexer::lex};
 use tomte_proto::DriftSummary;
 
 use super::merge::{LoadedMerge, MergeView};
-use super::review::{BannerTint, OutcomeBanner, PreviewState, ProvRow, ReviewView};
+use super::review::{
+    BannerTint, DiffPair, OutcomeBanner, PreviewState, ProvRow, ReviewView, origin_diffs,
+};
 use super::settings::SettingsPaths;
 use super::{Route, Shell};
 
@@ -38,6 +40,14 @@ pub const STATES: &[(&str, &str)] = &[
     (
         "review-keep-both",
         "clean auto-merge: third quick action offered",
+    ),
+    (
+        "review-origin",
+        "origin has its own version: split source actions + comparison selector",
+    ),
+    (
+        "review-origin-compared",
+        "the origin comparison picked: disk ↔ origin, origin's lines in the remote tint",
     ),
     ("merge", "three-pane editor with unresolved conflicts"),
     (
@@ -209,12 +219,23 @@ fn now() -> u64 {
         .unwrap_or(1_784_700_000)
 }
 
+/// This machine's rendered source for the review preview.
+const PREVIEW_LOCAL: &str =
+    "theme = \"catppuccin\"\nfont_size = 14\nkeymap = \"vim\"\nformat_on_save = true\n";
+/// The same file as it sits on disk: one value edited, one line added.
+const PREVIEW_DISK: &str = "theme = \"catppuccin\"\nfont_size = 15\nkeymap = \"vim\"\nformat_on_save = true\ntelemetry = false\n";
+/// Origin's rendered version: another machine pushed a different font size
+/// and a key this machine's source has never had.
+const PREVIEW_ORIGIN: &str = "theme = \"catppuccin\"\nfont_size = 13\nkeymap = \"vim\"\nsoft_wrap = \"editor_width\"\nformat_on_save = true\n";
+
 /// Small believable config diff for the review preview.
 fn preview_document() -> MergeDocument {
-    let rendered =
-        "theme = \"catppuccin\"\nfont_size = 14\nkeymap = \"vim\"\nformat_on_save = true\n";
-    let disk = "theme = \"catppuccin\"\nfont_size = 15\nkeymap = \"vim\"\nformat_on_save = true\ntelemetry = false\n";
-    MergeDocument::compute(rendered, disk, rendered, MergeOptions::default())
+    MergeDocument::compute(
+        PREVIEW_LOCAL,
+        PREVIEW_DISK,
+        PREVIEW_LOCAL,
+        MergeOptions::default(),
+    )
 }
 
 fn posed_review(
@@ -389,8 +410,24 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             shell(Route::Dashboard, m)
         }
         "dashboard-disconnected" => shell(Route::Dashboard, SyncModel::default()),
-        "review" | "review-empty" | "review-banner" | "review-working" | "review-keep-both" => {
-            let model = rich_model();
+        "review"
+        | "review-empty"
+        | "review-banner"
+        | "review-working"
+        | "review-keep-both"
+        | "review-origin"
+        | "review-origin-compared" => {
+            let mut model = rich_model();
+            let origin = name.starts_with("review-origin");
+            if origin {
+                // The scan's hint, kept honest alongside the loaded content
+                // the view actually gates on.
+                for entry in &mut model.drifted {
+                    if entry.target == home(".config/zed/settings.json") {
+                        entry.origin_differs = true;
+                    }
+                }
+            }
             let mut s = shell(Route::Review, model);
             let (banner, in_flight, selected) = match name {
                 "review-empty" => (None, false, false),
@@ -407,6 +444,19 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 _ => (None, false, true),
             };
             let review = posed_review(cx, s.state.clone(), banner, in_flight, selected);
+            if origin {
+                review.update(cx, |view, _| {
+                    view.origin_diffs =
+                        Some(origin_diffs(PREVIEW_ORIGIN, PREVIEW_DISK, PREVIEW_LOCAL));
+                    // `review-origin` poses the state a user actually lands on
+                    // — the default comparison, with the selector offering the
+                    // others. `review-origin-compared` is one click later: the
+                    // pair where origin's own tint reaches the diff.
+                    if name == "review-origin-compared" {
+                        view.diff_pair = DiffPair::DiskVsOrigin;
+                    }
+                });
+            }
             if name == "review-keep-both" {
                 review.update(cx, |view, _| {
                     let inputs = tomte_app::merge_inputs::MergeInputs {

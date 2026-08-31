@@ -22,7 +22,7 @@ use tomte_journal::{Journal, JournalError};
 use tomte_proto::{Request, Response};
 
 use crate::ipc::{IpcClient, IpcError};
-use crate::merge_inputs::MergeInputs;
+use crate::merge_inputs::{MergeInputs, MergeInputsError};
 
 /// TTL for ExpectChanges pre-announcements: generously covers a slow chezmoi
 /// invocation without leaving stale suppressions around for long.
@@ -44,6 +44,11 @@ pub enum ResolveError {
     Journal(#[from] JournalError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// Loading the merge inputs failed (binary content, a lex failure, a
+    /// chezmoi/journal error) — [`ResolveEngine::keep_source_origin`] needs
+    /// them before it can decide anything.
+    #[error(transparent)]
+    MergeInputs(#[from] MergeInputsError),
     /// Semantic failure: an unexpected IPC reply, a missing undo blob, or
     /// `chezmoi update` failing (its stderr).
     #[error("{0}")]
@@ -148,6 +153,71 @@ impl ResolveEngine {
         })
     }
 
+    /// Keep ORIGIN's version of the source: origin's rendered content becomes
+    /// the source content, then the target is applied from it.
+    ///
+    /// [`Self::keep_source`] cannot serve this — it never touches the source
+    /// file, it applies what the LOCAL source already says. For origin to win,
+    /// origin's content has to become the source content first, which is
+    /// exactly what [`Self::resolve_merged`] does: verbatim for a plain file,
+    /// write-back plus `execute-template` verification for a templated one
+    /// (spec §6.2). So this loads the merge inputs and hands origin's rendered
+    /// text to that already-tested write-after-verify path rather than
+    /// inventing a second one — including its rejection: if origin's version
+    /// disagrees inside a protected template span, the caller gets
+    /// `ProtectedSpan` and nothing is mutated.
+    ///
+    /// The inputs are loaded HERE, at click time, not taken from the caller:
+    /// origin's text the UI loaded when the file was selected may be minutes
+    /// old, and writing a stale blob into the source is not a resolution.
+    /// `origin_seen` is what the caller actually SHOWED the user (the text its
+    /// diff was built from) and the reload must still agree with it — a fetch
+    /// between selecting and clicking would otherwise write content the user
+    /// never reviewed into their dotfiles. On the one path here that rewrites
+    /// a source file, "what you approved is what gets written" outranks
+    /// convenience: a refusal the user retries costs a click, an unreviewed
+    /// write costs trust.
+    ///
+    /// A file with no origin blob at all (added locally, never pushed) is an
+    /// error, not a silent no-op — the UI only offers this action for files
+    /// whose origin content actually loaded, so reaching here means the world
+    /// changed underneath it.
+    ///
+    /// Both refusals happen BEFORE `session_start`: nothing is snapshotted,
+    /// journaled or mutated when either fires.
+    pub fn keep_source_origin(
+        &self,
+        target: &Path,
+        origin_seen: &str,
+    ) -> Result<ResolveOutcome, ResolveError> {
+        tomte_core::log_info!("resolve", "keep_source_origin {}", target.display());
+        // Same derivation as the daemon's and `recover_rejected_push`'s: an
+        // unreadable branch degrades to "main" rather than failing.
+        let branch = self.git.head_branch().unwrap_or_else(|_| "main".into());
+        let remote_ref = format!("origin/{branch}");
+        let inputs = crate::merge_inputs::load(
+            &self.chezmoi,
+            &self.git,
+            &remote_ref,
+            &self.journal_path,
+            target,
+        )?;
+        let Some(origin) = inputs.origin.clone() else {
+            return Err(ResolveError::Failed(format!(
+                "{} has no version at {remote_ref} that differs from this machine's source",
+                display_name(target)
+            )));
+        };
+        if origin != origin_seen {
+            return Err(ResolveError::Failed(format!(
+                "{}'s version at {remote_ref} changed since it was shown — \
+                 reload the file and look at the new one before keeping it",
+                display_name(target)
+            )));
+        }
+        self.resolve_merged_as("keep_source_origin", &inputs, &origin)
+    }
+
     /// Persist a merge-editor resolution: write the resolved text into the
     /// source (plain file: verbatim; templated: write_back + verify), then
     /// apply the target so all states converge. Full session/undo plumbing.
@@ -164,7 +234,20 @@ impl ResolveEngine {
         inputs: &MergeInputs,
         resolved: &str,
     ) -> Result<ResolveOutcome, ResolveError> {
-        tomte_core::log_info!("resolve", "resolve_merged {}", inputs.target.display());
+        self.resolve_merged_as("merge", inputs, resolved)
+    }
+
+    /// [`Self::resolve_merged`] under a caller-chosen action name. The name
+    /// is what the journal decision, the session summary and the fallback
+    /// commit message all say happened, so an origin keep does not have to
+    /// file itself as a hand-made merge (spec §8: the journal is truth).
+    fn resolve_merged_as(
+        &self,
+        action: &str,
+        inputs: &MergeInputs,
+        resolved: &str,
+    ) -> Result<ResolveOutcome, ResolveError> {
+        tomte_core::log_info!("resolve", "{action} {}", inputs.target.display());
         let target = inputs.target.as_path();
         let session = self.session_start()?;
         let hashes =
@@ -175,7 +258,7 @@ impl ResolveEngine {
                 hashes.len()
             )));
         };
-        let decision = build_decision("merge", target, dest_blob, Some(source_blob));
+        let decision = build_decision(action, target, dest_blob, Some(source_blob));
         self.session_decision(session, decision)?;
         self.expect_changes(vec![inputs.target.clone(), inputs.source_path.clone()])?;
 
@@ -197,14 +280,17 @@ impl ResolveEngine {
                     self.session_decision(
                         session,
                         serde_json::json!({
-                            "action": "merge_rejected",
+                            "action": format!("{action}_rejected"),
                             "target": target.to_string_lossy(),
                             "detail": detail,
                         }),
                     )?;
                     self.session_end(
                         session,
-                        &format!("merge rejected (protected span) {}", display_name(target)),
+                        &format!(
+                            "{action} rejected (protected span) {}",
+                            display_name(target)
+                        ),
                     )?;
                     return Ok(ResolveOutcome::ProtectedSpan { detail });
                 }
@@ -214,8 +300,8 @@ impl ResolveEngine {
         }
 
         self.chezmoi.apply(Some(target))?;
-        let (committed, pushed, note) = self.commit_phase("merge", target);
-        self.session_end(session, &format!("merge {}", display_name(target)))?;
+        let (committed, pushed, note) = self.commit_phase(action, target);
+        self.session_end(session, &format!("{action} {}", display_name(target)))?;
         self.rescan()?;
         Ok(ResolveOutcome::Done {
             session,

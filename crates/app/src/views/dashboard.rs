@@ -885,9 +885,14 @@ fn quick_actions(
             engine.clone(),
             shell.clone(),
         ))
+        // Row actions carry no origin split: nothing here has loaded the
+        // file's content, and `DriftSummary::origin_differs` alone cannot
+        // tell a file origin has its own version of from one origin has
+        // never seen (added locally, never pushed). The review view, which
+        // does load the content, is where that decision is offered.
         .child(quick_action_button(
             ix,
-            ResolveAction::KeepSource,
+            ResolveAction::KeepSourceLocal,
             target,
             theme,
             engine,
@@ -903,11 +908,7 @@ fn quick_action_button(
     engine: Option<Arc<ResolveEngine>>,
     shell: WeakEntity<Shell>,
 ) -> Stateful<Div> {
-    let id = match action {
-        ResolveAction::KeepDisk => "row-keep-disk",
-        ResolveAction::KeepSource => "row-keep-source",
-    };
-    let id = ElementId::named_usize(id, ix);
+    let id = ElementId::named_usize(action.button_id(), ix);
     let Some(engine) = engine else {
         return ui::disabled_button(
             theme,
@@ -957,7 +958,9 @@ fn run_quick_action(
         let resolved = cx
             .background_executor()
             .spawn(async move {
-                let result = action.run(&engine, &target);
+                // No origin split on this surface (see `quick_actions`), so
+                // there is no shown-origin text to honour either.
+                let result = action.run(&engine, &target, None);
                 let body = quick_action_body(action, &target, &result);
                 notify(&SystemRunner, "tomte", &body);
                 matches!(result, Ok(ResolveOutcome::Done { .. }))
@@ -1051,7 +1054,11 @@ mod tests {
             "Kept disk version: .zshrc"
         );
         assert_eq!(
-            quick_action_body(ResolveAction::KeepSource, t, &Ok(done(Some("push failed")))),
+            quick_action_body(
+                ResolveAction::KeepSourceLocal,
+                t,
+                &Ok(done(Some("push failed")))
+            ),
             "Restored chezmoi's version: .zshrc · push failed"
         );
         assert_eq!(
