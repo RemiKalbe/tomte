@@ -360,6 +360,19 @@ impl GitClient {
         self.rev_parse("HEAD")
     }
 
+    /// Paths the index holds differently from HEAD. Mid-merge this is
+    /// exactly the set `git merge --abort` would return to its pre-merge
+    /// content — both the conflicts a user answered and the files git
+    /// auto-merged — so it is what an abort's blast radius must be described
+    /// from.
+    pub fn staged_files(&self) -> Result<Vec<PathBuf>, GitError> {
+        Ok(self
+            .run_utf8(&["diff", "--name-only", "--cached"])?
+            .lines()
+            .map(PathBuf::from)
+            .collect())
+    }
+
     pub fn dirty_files(&self) -> Result<Vec<PathBuf>, GitError> {
         Ok(self
             .run_utf8(&["status", "--porcelain"])?

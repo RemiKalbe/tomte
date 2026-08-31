@@ -72,6 +72,18 @@ pub struct Shell {
     /// The 1Password unlock probe (degraded-banner button) is waiting on the
     /// user's approval.
     pub unlock_in_flight: bool,
+    /// A merge with origin is fully resolved but its merge commit did not
+    /// happen (typically an unsignable commit). Nothing is left conflicted,
+    /// so no review row can re-enter it — the dashboard banner this raises is
+    /// the only way back in. Probed on connect and after every decision that
+    /// could have stranded one.
+    pub pending_merge: bool,
+    /// That banner's "Finish merge" is running on the background executor.
+    pub merge_finish_in_flight: bool,
+    /// Whether the pending-merge probe has already run for this connection.
+    /// Cleared on disconnect, so reconnecting (or a daemon restart) asks
+    /// again — a merge can be stranded while the app is not even running.
+    pub pending_merge_probed: bool,
     /// Gallery-only changelog view, kept so its scroll position survives.
     pub changelog: Option<Entity<changelog::ChangelogView>>,
 }
@@ -168,6 +180,9 @@ impl Shell {
                         );
                     }
                 }
+                // A failed conclude is exactly what strands a merge, so ask
+                // right here whether one now needs the dashboard banner.
+                shell.refresh_pending_merge(cx);
                 cx.notify();
             })
             .ok();
@@ -206,20 +221,142 @@ impl Shell {
     /// its pre-merge state. Cancelling ONE mid-merge conflict bails the
     /// WHOLE merge deliberately — a half-resolved merge state would be worse
     /// than none.
-    pub fn abort_origin_merge(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `rolled_back` is what the editor told the user it would discard, so
+    /// the banner afterwards names the same thing the confirmation did. The
+    /// rescan matters as much as the banner: the abort rewrites source files
+    /// the daemon's last scan saw in their merged form, and a review list
+    /// describing a repo state that no longer exists is how the user came to
+    /// believe an undone decision had stuck.
+    pub fn abort_origin_merge(&mut self, rolled_back: usize, cx: &mut Context<Self>) {
         self.route = Route::Review;
         cx.notify();
-        if let Some(engine) = cx
+        let Some(engine) = cx
             .try_global::<crate::EngineSlot>()
             .and_then(|slot| slot.0.clone())
-        {
-            cx.spawn(async move |_this, cx| {
-                cx.background_executor()
-                    .spawn(async move { engine.abort_repo_reconcile() })
-                    .await;
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let rescanned = cx
+                .background_executor()
+                .spawn(async move {
+                    engine.abort_repo_reconcile();
+                    engine.request_rescan()
+                })
+                .await;
+            this.update(cx, |shell, cx| {
+                let mut text = format!(
+                    "Merge with origin rolled back — {rolled_back} source file(s) returned to \
+                     their pre-merge content. Destination files and journal entries were not \
+                     touched."
+                );
+                if let Err(e) = rescanned {
+                    // The list on screen still describes the merged repo.
+                    // Never let that pass silently — it is exactly the
+                    // mismatch that makes a rolled-back decision look kept.
+                    tomte_core::log_error!("reconcile", "rescan after abort failed: {e}");
+                    text.push_str(&format!(
+                        " The daemon could not rescan ({e}), so this list may be stale."
+                    ));
+                }
+                shell.merge_done(
+                    OutcomeBanner {
+                        text: text.into(),
+                        tint: review::BannerTint::Drift,
+                        undoable: false,
+                    },
+                    cx,
+                );
             })
-            .detach();
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Probe whether a merge with origin is resolved but uncommitted, and
+    /// raise (or clear) the dashboard banner accordingly. Cheap and silent
+    /// when there is no merge: one `rev-parse MERGE_HEAD`.
+    pub fn refresh_pending_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let pending = cx
+                .background_executor()
+                .spawn(async move { engine.pending_merge_commit() })
+                .await;
+            this.update(cx, |shell, cx| {
+                match pending {
+                    Ok(pending) => shell.pending_merge = pending,
+                    Err(e) => {
+                        // Leave the flag as it was rather than clearing a
+                        // real warning on a failed probe.
+                        tomte_core::log_error!("reconcile", "pending-merge probe failed: {e}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Commit the merge the banner is reporting. The same
+    /// `finish_merge_if_resolved` a last decision would have run — this just
+    /// asks it without a decision to carry.
+    pub fn finish_pending_merge(&mut self, cx: &mut Context<Self>) {
+        if self.merge_finish_in_flight {
+            return;
         }
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            return;
+        };
+        self.merge_finish_in_flight = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { engine.finish_merge_if_resolved() })
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.merge_finish_in_flight = false;
+                match result {
+                    Ok(MergeConclusion::Committed { pushed, note }) => {
+                        shell.origin_merge_finished(pushed, note, cx);
+                    }
+                    // Conflicts reappeared (the user resolved something in a
+                    // terminal, say): those are review rows again, so the
+                    // banner is simply no longer the right story.
+                    Ok(MergeConclusion::StillConflicted(leftover)) => {
+                        tomte_core::log_info!(
+                            "reconcile",
+                            "finish declined: {} conflict(s) reappeared",
+                            leftover.len()
+                        );
+                    }
+                    Ok(MergeConclusion::NotMerging) => {}
+                    Err(e) => {
+                        tomte_core::log_error!("reconcile", "finish failed: {e}");
+                        crate::notify_osa::notify(
+                            &tomte_core::cmd::SystemRunner,
+                            "tomte",
+                            &format!("merge with origin could not be committed: {e}"),
+                        );
+                    }
+                }
+                shell.refresh_pending_merge(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Land a successful merge save: hand the outcome banner to Review (its
@@ -365,6 +502,21 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        // Connect/reconnect probe. A merge left resolved-but-uncommitted has
+        // no drifted row to announce it — every file in it is answered — so
+        // something has to go and look, and a stranding can well have
+        // happened while the app was not running. Latched: once per
+        // connection epoch, never per frame.
+        if !self.state.read(cx).connected {
+            self.pending_merge_probed = false;
+        } else if !self.pending_merge_probed
+            && cx
+                .try_global::<crate::EngineSlot>()
+                .is_some_and(|slot| slot.0.is_some())
+        {
+            self.pending_merge_probed = true;
+            self.refresh_pending_merge(cx);
+        }
         // The changelog is a popup: no sidebar, no chrome, just the document.
         // Created ONCE and kept — building the view per frame reset the
         // scroll position every frame, so the page could not be scrolled.
@@ -419,6 +571,8 @@ impl Render for Shell {
                             expanded_scans: self.expanded_scans.clone(),
                             action_in_flight: self.dashboard_action_in_flight,
                             unlock_in_flight: self.unlock_in_flight,
+                            pending_merge: self.pending_merge,
+                            merge_finish_in_flight: self.merge_finish_in_flight,
                         }
                         .render(theme, cx)
                         .into_any_element(),
@@ -585,6 +739,9 @@ mod render_smoke {
                     expanded_scans,
                     dashboard_action_in_flight: false,
                     unlock_in_flight: false,
+                    pending_merge: false,
+                    merge_finish_in_flight: false,
+                    pending_merge_probed: false,
                     changelog: None,
                 }
             });
@@ -643,6 +800,9 @@ mod render_smoke {
                     // shell flag is up (the drifted row is in the timeline)
                     dashboard_action_in_flight: in_flight,
                     unlock_in_flight: false,
+                    pending_merge: false,
+                    merge_finish_in_flight: false,
+                    pending_merge_probed: false,
                     changelog: None,
                 }
             });
@@ -662,6 +822,9 @@ mod render_smoke {
                 expanded_scans: HashSet::new(),
                 dashboard_action_in_flight: true,
                 unlock_in_flight: false,
+                pending_merge: false,
+                merge_finish_in_flight: false,
+                pending_merge_probed: false,
                 changelog: None,
             }
         });
@@ -713,6 +876,9 @@ mod render_smoke {
                 expanded_scans: HashSet::new(),
                 dashboard_action_in_flight: false,
                 unlock_in_flight: false,
+                pending_merge: false,
+                merge_finish_in_flight: false,
+                pending_merge_probed: false,
                 changelog: None,
             }
         });
@@ -722,6 +888,101 @@ mod render_smoke {
             review.read(cx).header_source_actions()
         });
         assert_eq!(actions, vec![ResolveAction::KeepSourceLocal]);
+    }
+
+    /// The stranded-merge banner and its in-flight state must render. This
+    /// banner is the ONLY surface a resolved-but-uncommitted merge has —
+    /// every file in it is answered, so no drifted row exists to carry it —
+    /// and a render panic here would take the single way out with it.
+    #[gpui::test]
+    fn dashboard_renders_the_pending_merge_banner(cx: &mut TestAppContext) {
+        for finishing in [false, true] {
+            let (_view, vis) = cx.add_window_view(|_window, cx| {
+                let state = cx.new(|_| model_with_data());
+                Shell {
+                    route: Route::Dashboard,
+                    state,
+                    review: None,
+                    settings: None,
+                    merge: None,
+                    paths: smoke_paths(),
+                    expanded_scans: HashSet::new(),
+                    dashboard_action_in_flight: false,
+                    unlock_in_flight: false,
+                    pending_merge: true,
+                    merge_finish_in_flight: finishing,
+                    pending_merge_probed: true,
+                    changelog: None,
+                }
+            });
+            vis.run_until_parked();
+        }
+    }
+
+    /// The armed Cancel swaps one button for two — "Keep merge open" and the
+    /// destructive "Discard merge" — above a conflict-tinted warning. Posed
+    /// here so the confirmation bar cannot silently stop building.
+    #[gpui::test]
+    fn merge_view_renders_the_armed_cancel_confirmation(cx: &mut TestAppContext) {
+        use merge::{LoadedMerge, MergeView};
+        use std::sync::Arc;
+        use tomte_app::merge_inputs::MergeInputs;
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            let state = cx.new(|_| model_with_data());
+            let shell = cx.weak_entity();
+            let merge = cx.new(|cx| {
+                let mut view = MergeView::new(shell, cx);
+                view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
+                view.repo_reconcile = true;
+                view.loaded = Some(LoadedMerge::new(Arc::new(MergeInputs {
+                    target: PathBuf::from("/tmp/smoke/.testrc"),
+                    ours: "a\nv = 2\nz\n".into(),
+                    theirs: "a\nv = 3\nz\n".into(),
+                    base: Some("a\nv = 1\nz\n".into()),
+                    source_path: PathBuf::from("/tmp/smoke/src/dot_testrc"),
+                    templated: false,
+                    template: None,
+                    span_map: None,
+                    origin: None,
+                })));
+                view.cancel_armed = Some(2);
+                view.banner = Some(review::OutcomeBanner {
+                    text: merge::cancel_warning(2, None).into(),
+                    tint: review::BannerTint::Conflict,
+                    undoable: false,
+                });
+                view
+            });
+            Shell {
+                route: Route::Merge,
+                state,
+                review: None,
+                settings: None,
+                merge: Some(merge),
+                paths: smoke_paths(),
+                expanded_scans: HashSet::new(),
+                dashboard_action_in_flight: false,
+                unlock_in_flight: false,
+                pending_merge: false,
+                merge_finish_in_flight: false,
+                pending_merge_probed: true,
+                changelog: None,
+            }
+        });
+        vis.run_until_parked();
+        // Still armed after a render: the bar is a state, not a one-frame
+        // flash the next repaint would clear.
+        let armed = cx.update(|cx| {
+            shell
+                .read(cx)
+                .merge
+                .clone()
+                .expect("merge view posed")
+                .read(cx)
+                .cancel_armed
+        });
+        assert_eq!(armed, Some(2));
     }
 
     #[gpui::test]
@@ -743,6 +1004,9 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     dashboard_action_in_flight: false,
                     unlock_in_flight: false,
+                    pending_merge: false,
+                    merge_finish_in_flight: false,
+                    pending_merge_probed: false,
                     changelog: None,
                 }
             });
@@ -856,6 +1120,9 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     dashboard_action_in_flight: false,
                     unlock_in_flight: false,
+                    pending_merge: false,
+                    merge_finish_in_flight: false,
+                    pending_merge_probed: false,
                     changelog: None,
                 }
             });

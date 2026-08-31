@@ -168,6 +168,12 @@ pub struct DashboardView {
     /// Copied from `Shell::unlock_in_flight`: the 1Password unlock probe is
     /// waiting on the user's approval.
     pub unlock_in_flight: bool,
+    /// Copied from `Shell::pending_merge`: a merge with origin is resolved
+    /// but uncommitted, and nothing else can surface it — no conflicted file
+    /// is left to be a review row.
+    pub pending_merge: bool,
+    /// Copied from `Shell::merge_finish_in_flight`.
+    pub merge_finish_in_flight: bool,
 }
 
 impl DashboardView {
@@ -226,6 +232,8 @@ impl DashboardView {
             .and_then(|slot| slot.0.clone());
         let busy = self.action_in_flight;
         let unlock_in_flight = self.unlock_in_flight;
+        let pending_merge = self.pending_merge;
+        let merge_finish_in_flight = self.merge_finish_in_flight;
 
         div()
             .flex()
@@ -377,6 +385,46 @@ impl DashboardView {
                         .mx_4()
                         .mb_2()
                         .mt_0(),
+                )
+            })
+            // A merge with origin that is fully resolved but uncommitted has
+            // no drifted row left to speak for it — every file in it is
+            // answered. Without this banner the repo sits mid-merge in
+            // silence until someone opens a terminal.
+            .when(pending_merge, |el| {
+                let shell = shell.clone();
+                let action = Some(if merge_finish_in_flight {
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child("committing…")
+                        .into_any_element()
+                } else {
+                    ui::button(
+                        theme,
+                        "pending-merge-finish",
+                        "Finish merge".into(),
+                        ui::ButtonVariant::Solid(theme.conflict),
+                        ui::ButtonSize::Micro,
+                        move |_event, _window, cx| {
+                            let _ = shell.update(cx, |shell, cx| shell.finish_pending_merge(cx));
+                        },
+                    )
+                    .into_any_element()
+                });
+                el.child(
+                    ui::banner(
+                        theme,
+                        ui::BannerTint::Conflict,
+                        "a merge with origin is resolved but not committed — its commit \
+                         did not go through"
+                            .into(),
+                        action,
+                    )
+                    .mx_4()
+                    .mb_2()
+                    .mt_0(),
                 )
             })
             .when(!lines.is_empty() || scanning, |el| {

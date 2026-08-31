@@ -717,6 +717,32 @@ fn region_display(
     }
 }
 
+/// What Cancel is about to discard, said before it happens.
+///
+/// Names the blast radius the user cannot see: the merge spans files they
+/// answered on OTHER review rows and were told were done, and an abort takes
+/// those source resolutions with it while their applied destinations and
+/// journal entries stay. `detail` is set only when the count could not be
+/// established — the semantics still hold, and saying so beats quoting a
+/// zero we did not measure.
+pub(super) fn cancel_warning(rollback: usize, detail: Option<&str>) -> String {
+    let mut text = match detail {
+        Some(detail) => format!(
+            "Cancel rolls back the WHOLE merge with origin, including files you already \
+             resolved in it (their count could not be read: {detail})."
+        ),
+        None => format!(
+            "Cancel rolls back the WHOLE merge with origin: {rollback} source file(s) return \
+             to their pre-merge content, including any you already resolved in it."
+        ),
+    };
+    text.push_str(
+        " Destination files and journal entries stay as they are. \
+         Keep merge open leaves it untouched — its remaining conflicts are ordinary review rows.",
+    );
+    text
+}
+
 fn merge_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBanner {
     match result {
         Ok(ResolveOutcome::Done {
@@ -942,6 +968,11 @@ pub struct MergeView {
     /// Banner for saves that STAY here (protected span, errors); successful
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
+    /// Cancel has been pressed once in repo-conflict mode and is waiting for
+    /// a named confirmation; the count is how many source files an abort
+    /// would roll back, as `merge_rollback_files` reported them. `pub(super)`
+    /// so the render-smoke tests can pose the armed bar.
+    pub(super) cancel_armed: Option<usize>,
     /// One scroll handle per input pane column (see the `*_COL` constants);
     /// wheel on any pane mirrors its offset to the others so the columns
     /// compare without independent scrolling. The origin handle exists even
@@ -1010,6 +1041,7 @@ impl MergeView {
             loaded: None,
             saving: false,
             banner: None,
+            cancel_armed: None,
             pane_scrolls: std::array::from_fn(|_| gpui::ScrollHandle::new()),
             revisiting: std::collections::HashSet::new(),
             result_editor: None,
@@ -1045,6 +1077,7 @@ impl MergeView {
         self.loading = false;
         self.error = None;
         self.banner = None;
+        self.cancel_armed = None;
         self.saving = false;
         self.editing = false;
         self.loaded = Some(LoadedMerge::new(inputs));
@@ -1067,6 +1100,7 @@ impl MergeView {
         self.loaded = None;
         self.saving = false;
         self.banner = None;
+        self.cancel_armed = None;
         self.editing = false;
         self.result_editor = None;
         cx.notify();
@@ -1525,13 +1559,17 @@ impl MergeView {
     }
 
     /// Cancel: back to Review, discarding in-editor choices.
-    fn cancel(&self, cx: &mut Context<Self>) {
+    ///
+    /// Mid-merge it does NOT cancel yet. Bailing out of ONE conflict bails
+    /// the whole merge — a half-resolved merge state would be worse than
+    /// none — but that merge now spans decisions the user already made on
+    /// OTHER files and was already told were done, and rolling those back on
+    /// an unqualified "Cancel" is a lie about what the button does. So the
+    /// first press only asks git what it would actually discard, then says
+    /// so and waits for a second, named press.
+    fn cancel(&mut self, cx: &mut Context<Self>) {
         if self.repo_reconcile {
-            // Bailing out of ONE conflict bails the whole merge — a
-            // half-resolved merge state would be worse than none.
-            self.shell
-                .update(cx, |shell, cx| shell.abort_origin_merge(cx))
-                .ok();
+            self.arm_cancel(cx);
             return;
         }
         self.shell
@@ -1539,6 +1577,68 @@ impl MergeView {
                 shell.route = Route::Review;
                 cx.notify();
             })
+            .ok();
+    }
+
+    /// Count what an abort would roll back, then arm the confirmation.
+    fn arm_cancel(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            // No engine, no abort to warn about — the editor is all there
+            // is to leave.
+            self.leave_merge_open(cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { engine.merge_rollback_files() })
+                .await;
+            this.update(cx, |view, cx| {
+                let (count, detail) = match files {
+                    Ok(files) => (files.len(), None),
+                    // Arm anyway: the semantics are what the user has to
+                    // agree to, and the count is the part we could not get.
+                    Err(e) => {
+                        tomte_core::log_error!("reconcile", "rollback count failed: {e}");
+                        (0, Some(e.to_string()))
+                    }
+                };
+                view.cancel_armed = Some(count);
+                view.banner = Some(OutcomeBanner {
+                    text: cancel_warning(count, detail.as_deref()).into(),
+                    tint: BannerTint::Conflict,
+                    undoable: false,
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Leave the editor without touching the merge. Its remaining conflicts
+    /// are ordinary review rows — an open merge is a normal state now, not a
+    /// mess to be swept up.
+    fn leave_merge_open(&mut self, cx: &mut Context<Self>) {
+        self.cancel_armed = None;
+        self.banner = None;
+        self.shell
+            .update(cx, |shell, cx| {
+                shell.route = Route::Review;
+                cx.notify();
+            })
+            .ok();
+    }
+
+    /// Confirmed: bail the whole merge.
+    fn discard_merge(&mut self, rolled_back: usize, cx: &mut Context<Self>) {
+        self.cancel_armed = None;
+        self.banner = None;
+        self.shell
+            .update(cx, |shell, cx| shell.abort_origin_merge(rolled_back, cx))
             .ok();
     }
 
@@ -1572,6 +1672,9 @@ impl MergeView {
         };
         self.saving = true;
         self.banner = None;
+        // Saving is the opposite of cancelling: an armed confirmation must
+        // not survive to catch the next Cancel press unwarned.
+        self.cancel_armed = None;
         cx.notify();
         if self.repo_reconcile {
             // Mid-merge conflict: write the SOURCE file + git add; the Shell
@@ -1746,14 +1849,38 @@ impl MergeView {
                 ));
             }
         }
-        bar = bar.child(ui::button(
-            theme,
-            "merge-cancel",
-            "Cancel".into(),
-            ui::ButtonVariant::Tonal(theme.text_muted),
-            ui::ButtonSize::Sm,
-            cx.listener(|view, _ev, _window, cx| view.cancel(cx)),
-        ));
+        // Armed: Cancel's real meaning is spelled out in the banner and the
+        // button now says what it does. The non-destructive way out — leave
+        // the merge open, its remaining conflicts are ordinary review rows —
+        // sits beside it, because in this mode "Cancel" is the destructive
+        // choice and must not be the only one.
+        if let Some(rollback) = self.cancel_armed {
+            bar = bar.child(ui::button(
+                theme,
+                "merge-keep-open",
+                "Keep merge open".into(),
+                ui::ButtonVariant::Tonal(theme.text_muted),
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.leave_merge_open(cx)),
+            ));
+            bar = bar.child(ui::button(
+                theme,
+                "merge-discard",
+                "Discard merge".into(),
+                ui::ButtonVariant::Solid(theme.conflict),
+                ui::ButtonSize::Sm,
+                cx.listener(move |view, _ev, _window, cx| view.discard_merge(rollback, cx)),
+            ));
+        } else {
+            bar = bar.child(ui::button(
+                theme,
+                "merge-cancel",
+                "Cancel".into(),
+                ui::ButtonVariant::Tonal(theme.text_muted),
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.cancel(cx)),
+            ));
+        }
         if let Some(loaded) = &self.loaded {
             let unresolved = {
                 let (decided, total) = loaded.state.progress();
@@ -3391,6 +3518,42 @@ mod tests {
         assert_eq!(
             pattern[0].label.as_ref().map(|(t, _)| t.as_ref()),
             Some("origin")
+        );
+    }
+
+    /// Cancel's confirmation has to name the two things the user cannot see:
+    /// that the roll-back is the WHOLE merge (not just this file), and that
+    /// their destinations survive it — the asymmetry that made an
+    /// unannounced abort look like a kept decision.
+    #[test]
+    fn cancel_warning_names_the_whole_merge_and_the_surviving_destinations() {
+        let text = super::cancel_warning(3, None);
+        assert!(text.contains("WHOLE merge"), "{text}");
+        assert!(text.contains("3 source file(s)"), "{text}");
+        assert!(
+            text.contains("already resolved"),
+            "it must say other files' answers go too: {text}"
+        );
+        assert!(
+            text.contains("Destination files and journal entries stay"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Keep merge open"),
+            "the way out must be named: {text}"
+        );
+    }
+
+    /// An unreadable count must not become a confident "0 files".
+    #[test]
+    fn cancel_warning_admits_an_unknown_count_instead_of_claiming_zero() {
+        let text = super::cancel_warning(0, Some("git exploded"));
+        assert!(!text.contains("0 source file"), "{text}");
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(text.contains("git exploded"), "{text}");
+        assert!(
+            text.contains("WHOLE merge"),
+            "the semantics still hold: {text}"
         );
     }
 }

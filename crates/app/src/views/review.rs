@@ -948,6 +948,13 @@ impl ReviewView {
                 if view.selected.as_deref() == Some(target.as_path()) {
                     view.select(target.clone(), cx);
                 }
+                // A decision can have started a merge with origin and then
+                // failed to commit it (an unsignable merge commit). That
+                // leaves nothing conflicted and so no row to try again from,
+                // so ask the Shell to re-probe and raise its banner.
+                view.shell
+                    .update(cx, |shell, cx| shell.refresh_pending_merge(cx))
+                    .ok();
                 cx.notify();
             })
             .ok();

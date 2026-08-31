@@ -1039,7 +1039,9 @@ fn resolving_a_diverged_file_starts_and_finishes_the_merge() {
     assert!(!git.merge_in_progress(), "no merge before a decision");
 
     assert!(
-        lab.engine.ensure_merge_started().unwrap(),
+        lab.engine
+            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
+            .unwrap(),
         "a diverged repo must enter a real merge"
     );
     assert!(git.merge_in_progress());
@@ -1066,7 +1068,11 @@ fn resolving_a_diverged_file_starts_and_finishes_the_merge() {
 fn ensure_merge_started_leaves_an_undiverged_repo_alone() {
     let lab = DriftLab::new();
     let head_before = lab.source_git().head_sha().unwrap();
-    assert!(!lab.engine.ensure_merge_started().unwrap());
+    assert!(
+        !lab.engine
+            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
+            .unwrap()
+    );
     assert!(!lab.source_git().merge_in_progress());
     assert_eq!(lab.source_git().head_sha().unwrap(), head_before);
 }
@@ -1250,5 +1256,206 @@ fn a_second_conflict_keeps_the_merge_open_until_it_too_is_answered() {
     assert_eq!(
         std::fs::read(lab.s.source.join("dot_other")).unwrap(),
         b"b=resolved\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 10, fix round 1.
+// ---------------------------------------------------------------------------
+
+/// Make every later commit in this repo unsignable. This is the locked
+/// 1Password signing agent, reproduced without 1Password — the everyday
+/// cause of the one merge state nothing else can dig the repo out of.
+fn unsignable(repo: &std::path::Path) {
+    git(repo, &["config", "commit.gpgsign", "true"]);
+    git(repo, &["config", "gpg.format", "ssh"]);
+    git(repo, &["config", "gpg.ssh.program", "/bin/false"]);
+    git(repo, &["config", "user.signingkey", "ssh-ed25519 AAAAfake"]);
+}
+
+fn signable(repo: &std::path::Path) {
+    git(repo, &["config", "commit.gpgsign", "false"]);
+}
+
+/// The stranding case, and the way out of it. When the merge commit fails,
+/// everything is resolved and staged — so NO conflicted file is left to be a
+/// review row, and nothing in the ordinary flow will ever ask again. The repo
+/// must therefore report itself as pending, and be concludable without a
+/// decision to carry.
+#[test]
+fn an_unsignable_merge_commit_strands_the_merge_and_stays_recoverable() {
+    let lab = DriftLab::new();
+    diverge_on_the_managed_file(&lab);
+    let git_c = lab.source_git();
+    let source = lab.s.source.join("dot_testrc");
+
+    assert!(lab.engine.ensure_merge_started(&source).unwrap());
+    lab.engine
+        .resolve_repo_conflict(&source, "a=resolved\n")
+        .unwrap();
+
+    unsignable(&lab.s.source);
+    let err = lab
+        .engine
+        .finish_merge_if_resolved()
+        .expect_err("an unsignable merge commit must fail loudly, not silently succeed");
+
+    // The exact shape that used to strand: open merge, nothing conflicted.
+    assert!(git_c.merge_in_progress(), "the merge is still open");
+    assert!(
+        git_c.conflicted_files().unwrap().is_empty(),
+        "…and nothing is left to answer, so no review row speaks for it"
+    );
+    assert!(
+        lab.engine.pending_merge_commit().unwrap(),
+        "so it MUST report itself pending (the failure was: {err})"
+    );
+
+    // The way out, from inside the app: exactly the call the dashboard
+    // banner's "Finish merge" button makes, with no decision in hand.
+    signable(&lab.s.source);
+    match lab.engine.finish_merge_if_resolved().unwrap() {
+        MergeConclusion::Committed { pushed, note } => assert!(pushed, "note: {note:?}"),
+        other => panic!("expected Committed, got {other:?}"),
+    }
+    assert!(!git_c.merge_in_progress(), "merge committed");
+    assert!(!lab.engine.pending_merge_commit().unwrap());
+    assert_eq!(git_c.divergence("origin/main").unwrap().behind, 0);
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        b"a=resolved\n",
+        "the resolution the user made before the failure must survive it"
+    );
+}
+
+/// A merge with conflicts LEFT is not stranded: those files are still review
+/// rows. Only the all-answered case needs the banner, and saying so here
+/// keeps the banner from crying wolf over ordinary mid-merge progress.
+#[test]
+fn a_merge_with_conflicts_left_is_not_reported_as_pending() {
+    let lab = DriftLab::new();
+    diverge_on_the_managed_file(&lab);
+    assert!(
+        lab.engine
+            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
+            .unwrap()
+    );
+    assert!(
+        !lab.engine.pending_merge_commit().unwrap(),
+        "an unanswered conflict recovers through its own review row"
+    );
+}
+
+/// The narrowed trigger. Origin moved a file this decision is not about, so
+/// answering this one must NOT put the repo into a merge — a merge writes
+/// conflict markers into every disagreeing source, including ones the user
+/// never selected.
+#[test]
+fn a_decision_about_a_file_origin_did_not_touch_starts_no_merge() {
+    let lab = DriftLab::new();
+    // A second managed file, shared with origin.
+    std::fs::write(lab.s.source.join("dot_other"), b"b=1\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(
+        &lab.s.source,
+        &["commit", "-m", "add a second managed file"],
+    );
+    git(&lab.s.source, &["push"]);
+    // Origin conflicts on dot_other ONLY; this machine also edits dot_testrc,
+    // which origin never touched.
+    diverge_with_conflicts(&lab, &[("dot_other", OTHER_ORIGIN, OTHER_LOCAL)]);
+    std::fs::write(lab.s.source.join("dot_testrc"), LOCAL_SOURCE).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "local-only edit"]);
+
+    let git_c = lab.source_git();
+    assert!(
+        git_c.divergence("origin/main").unwrap().behind > 0,
+        "premise: the repo IS behind, so `behind` alone would have merged"
+    );
+    assert!(
+        !lab.engine
+            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
+            .unwrap(),
+        "a decision about a file origin did not touch must not start a merge"
+    );
+    assert!(!git_c.merge_in_progress());
+    assert!(
+        !std::fs::read_to_string(lab.s.source.join("dot_other"))
+            .unwrap()
+            .contains("<<<<<<<"),
+        "the never-selected file's source must be untouched"
+    );
+
+    // …while the file that DOES conflict still starts one.
+    assert!(
+        lab.engine
+            .ensure_merge_started(&lab.s.source.join("dot_other"))
+            .unwrap()
+    );
+    assert!(git_c.merge_in_progress());
+}
+
+/// Cancel's blast radius, measured. An abort rolls back every source file the
+/// merge staged — including one the user already answered and was told was
+/// recorded — while its applied destination stays. That asymmetry is exactly
+/// what the editor now has to warn about, so pin both halves of it.
+#[test]
+fn aborting_rolls_back_recorded_resolutions_but_not_their_destinations() {
+    let lab = DriftLab::new();
+    std::fs::write(lab.s.source.join("dot_other"), b"b=1\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(
+        &lab.s.source,
+        &["commit", "-m", "add a second managed file"],
+    );
+    git(&lab.s.source, &["push"]);
+    diverge_with_conflicts(
+        &lab,
+        &[
+            ("dot_testrc", ORIGIN_CONTENT, LOCAL_SOURCE),
+            ("dot_other", OTHER_ORIGIN, OTHER_LOCAL),
+        ],
+    );
+
+    // Answer file A through an ordinary review row; it reports Done.
+    let inputs = lab.load_merge_inputs();
+    let outcome = lab
+        .engine
+        .keep_source_origin(&lab.target, inputs.origin.as_deref().unwrap())
+        .unwrap();
+    assert!(matches!(outcome, ResolveOutcome::Done { .. }));
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        ORIGIN_CONTENT
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), ORIGIN_CONTENT);
+
+    // What Cancel would discard, as the editor now asks before acting.
+    let rollback = lab.engine.merge_rollback_files().unwrap();
+    assert!(
+        rollback.contains(&PathBuf::from("dot_testrc")),
+        "the answered file must be named as at risk, got {rollback:?}"
+    );
+
+    lab.engine.abort_repo_reconcile();
+
+    // A's SOURCE went back; A's DESTINATION did not. That divergence between
+    // what the user was told and what is true is the whole reason Cancel has
+    // to say this out loud first.
+    assert!(!lab.source_git().merge_in_progress());
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        LOCAL_SOURCE,
+        "the recorded resolution really is rolled back"
+    );
+    assert_eq!(
+        std::fs::read(&lab.target).unwrap(),
+        ORIGIN_CONTENT,
+        "…while its applied destination is not"
+    );
+    assert!(
+        lab.engine.merge_rollback_files().unwrap().is_empty(),
+        "no merge, nothing left to roll back"
     );
 }

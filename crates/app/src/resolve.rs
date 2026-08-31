@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
-use tomte_core::git::{GitClient, GitError};
+use tomte_core::git::{GitClient, GitError, MergeTreeOutcome};
 use tomte_core::template::anchor::SpanMap;
 use tomte_core::template::verify::{VerifyError, verify_write_back};
 use tomte_core::template::writeback::write_back;
@@ -127,7 +127,7 @@ impl ResolveEngine {
         // the DESTINATION, so it overwrites whatever the merge left in that
         // file — conflict markers included — which is exactly what "keep
         // disk" means for this conflict.
-        let merging = self.ensure_merge_started()?;
+        let merging = self.ensure_merge_started(&source)?;
         self.chezmoi.re_add(target)?;
         let (committed, pushed, note) = if merging {
             self.stage_resolution(&source)?;
@@ -352,7 +352,7 @@ impl ResolveEngine {
         // real merge and this file's answer recorded IN it (spec §6.1):
         // `resolve_repo_conflict` writes the source and stages it, which is
         // how git learns the conflict is answered.
-        let merging = self.ensure_merge_started()?;
+        let merging = self.ensure_merge_started(&inputs.source_path)?;
         if merging {
             self.resolve_repo_conflict(&inputs.source_path, &new_source)?;
         } else {
@@ -526,10 +526,26 @@ impl ResolveEngine {
         }
     }
 
-    /// Start the real merge if the repo has diverged and one is not already
-    /// running. Called from the resolve path the moment the user commits to a
-    /// decision — never speculatively, so the repo is only ever put into a
-    /// merge state in response to an explicit choice.
+    /// Start the real merge if this file's decision needs one and one is not
+    /// already running. Called from the resolve path the moment the user
+    /// commits to a decision — never speculatively, so the repo is only ever
+    /// put into a merge state in response to an explicit choice.
+    ///
+    /// The decision has to be about a file that actually needs the merge,
+    /// not merely about any file while the repo happens to be behind. A
+    /// merge writes conflict markers into EVERY file the two sides disagree
+    /// on, so starting one because the user answered a purely local drift
+    /// would scribble on sources they never selected. `merge_tree_conflicts`
+    /// answers that question in the object database — the working tree, the
+    /// index and HEAD are never touched producing it — so the probe itself
+    /// can never be the thing that damages the repo.
+    ///
+    /// Everything it does not positively attribute to THIS file falls back to
+    /// the ordinary path (commit, push, and `commit_phase`'s rejected-push
+    /// rebase recovery): a clean divergence, which the daemon auto-joins
+    /// anyway; a conflict git could not reduce to named files; and a
+    /// merge-tree that could not answer at all. None of those is a licence to
+    /// put the repo into a merge on this file's behalf.
     ///
     /// Replaces the old separate reconcile flow (2026-08-18: local unpushed
     /// commits + origin commits conflicted on the same file, and EVERY
@@ -543,7 +559,7 @@ impl ResolveEngine {
     /// commits the user never saw. A divergence that appeared since the last
     /// fetch still gets caught downstream, by `commit_phase`'s rejected-push
     /// recovery.
-    pub fn ensure_merge_started(&self) -> Result<bool, ResolveError> {
+    pub fn ensure_merge_started(&self, source_path: &Path) -> Result<bool, ResolveError> {
         if self.git.merge_in_progress() {
             return Ok(true);
         }
@@ -552,7 +568,38 @@ impl ResolveEngine {
         if self.git.divergence(&upstream)?.behind == 0 {
             return Ok(false);
         }
-        tomte_core::log_info!("reconcile", "decision made — merging {upstream}");
+        let rel = self.repo_rel(source_path)?;
+        match self.git.merge_tree_conflicts(&upstream)? {
+            MergeTreeOutcome::Conflicts(paths) if paths.contains(&rel) => {}
+            MergeTreeOutcome::Conflicts(paths) => {
+                tomte_core::log_info!(
+                    "reconcile",
+                    "behind {upstream}, but {} is not one of its {} conflict(s) — no merge",
+                    rel.display(),
+                    paths.len()
+                );
+                return Ok(false);
+            }
+            MergeTreeOutcome::Clean => {
+                tomte_core::log_info!(
+                    "reconcile",
+                    "behind {upstream}, but the merge is clean — the daemon joins those"
+                );
+                return Ok(false);
+            }
+            MergeTreeOutcome::Unknown => {
+                tomte_core::log_warn!(
+                    "reconcile",
+                    "merge-tree could not answer for {upstream} — leaving the repo alone"
+                );
+                return Ok(false);
+            }
+        }
+        tomte_core::log_info!(
+            "reconcile",
+            "decision on {} conflicts with {upstream} — merging",
+            rel.display()
+        );
         // `git merge` refuses to run over local modifications it would
         // overwrite, so stray source edits become a commit first (the policy
         // the old reconcile entry point carried). Tolerant like
@@ -589,10 +636,42 @@ impl ResolveEngine {
         }
     }
 
+    /// A merge with origin that every conflict has been answered for, but
+    /// whose merge commit did not happen — the state a failed `merge_commit`
+    /// strands the repo in, and the one state nothing else can dig it out of.
+    ///
+    /// A merge with conflicts LEFT recovers by itself: each conflicted file
+    /// is still a review row, and answering the last one commits the merge.
+    /// This one has no rows left to answer, so unless something asks the
+    /// question the repo sits mid-merge until someone opens a terminal.
+    /// A locked 1Password signing key is the everyday cause, so the app
+    /// probes this on connect and offers [`Self::finish_merge_if_resolved`].
+    pub fn pending_merge_commit(&self) -> Result<bool, ResolveError> {
+        if !self.git.merge_in_progress() {
+            return Ok(false);
+        }
+        Ok(self.git.conflicted_files()?.is_empty())
+    }
+
+    /// The source paths an abort would roll back to their pre-merge content:
+    /// everything the merge has staged, both the conflicts the user answered
+    /// and the files git auto-merged. What Cancel actually discards, so it
+    /// can be said out loud before it happens.
+    pub fn merge_rollback_files(&self) -> Result<Vec<PathBuf>, ResolveError> {
+        if !self.git.merge_in_progress() {
+            return Ok(Vec::new());
+        }
+        Ok(self.git.staged_files()?)
+    }
+
     /// Conclude the merge the per-file decisions are resolving, if the one
     /// that just landed was the last. Anything still conflicted keeps the
     /// merge open on purpose: those files are ordinary review rows, each
     /// resolvable on its own, and the last decision commits the merge.
+    ///
+    /// Also the recovery entry point: called with nothing conflicted and no
+    /// decision in hand, it simply commits a merge an earlier failure left
+    /// hanging (see [`Self::pending_merge_commit`]).
     pub fn finish_merge_if_resolved(&self) -> Result<MergeConclusion, ResolveError> {
         if !self.git.merge_in_progress() {
             return Ok(MergeConclusion::NotMerging);
@@ -634,9 +713,20 @@ impl ResolveEngine {
                 false,
                 Some("the merge with origin ended before this decision could conclude it".into()),
             ),
+            // Typically the merge commit could not be signed. Everything is
+            // resolved and staged, so NO review row is left to re-enter the
+            // merge through — say that it is still open and finishable, or
+            // the repo sits mid-merge in silence.
             Err(e) => {
                 tomte_core::log_error!("reconcile", "could not conclude the merge: {e}");
-                (false, false, Some(format!("merge not concluded: {e}")))
+                (
+                    false,
+                    false,
+                    Some(format!(
+                        "your answer was recorded, but the merge with origin could not be \
+                         committed ({e}) — it is still open; finish it from the dashboard"
+                    )),
+                )
             }
         }
     }
@@ -785,6 +875,14 @@ impl ResolveEngine {
     pub fn abort_repo_reconcile(&self) {
         tomte_core::log_info!("reconcile", "aborted");
         self.git.merge_abort();
+    }
+
+    /// Ask the daemon to rescan. Every mutating path here already ends with
+    /// one; this exposes it for the paths that rewrite the source repo
+    /// WITHOUT going through them — an abort, above all, whose whole effect
+    /// is to make the daemon's last scan describe a repo that is gone.
+    pub fn request_rescan(&self) -> Result<(), ResolveError> {
+        self.rescan()
     }
 
     fn session_start(&self) -> Result<i64, ResolveError> {
