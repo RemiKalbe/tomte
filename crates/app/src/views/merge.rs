@@ -1031,6 +1031,11 @@ pub struct MergeView {
     /// entry) and the height of the panes row. `None` until the first render
     /// sizes them from the viewport.
     pane_widths: Option<[f32; PANE_COLS]>,
+    /// The content width `pane_widths` was last fitted to. Widths are stored
+    /// in px, so a window resize has to rescale them — otherwise the fixed
+    /// columns keep their old size, the flexing one absorbs the whole
+    /// difference, and shrinking the window pushes panes out of sight.
+    pane_avail: f32,
     /// How many panes `pane_widths` was sized for. A load that adds or drops
     /// the origin pane re-divides the row rather than leaving the flexing
     /// column squeezed to nothing.
@@ -1079,6 +1084,7 @@ impl MergeView {
             editor_scroll: gpui::ScrollHandle::new(),
             pane_widths: None,
             pane_cols: 0,
+            pane_avail: 0.,
             panes_height: None,
             dragging: None,
             viewport_h: 0.,
@@ -1469,6 +1475,14 @@ impl MergeView {
     }
 
     /// Region-aligned scroll sync across the read-only input panes: `leader`
+    /// Keep the pane widths fitted to the window. See [`fit_widths`].
+    fn fit_pane_widths(&mut self, cols: usize, avail: f32) {
+        let prev = self.pane_avail;
+        if let Some(widths) = self.pane_widths.as_mut() {
+            fit_widths(widths, cols, avail, prev);
+        }
+    }
+
     /// is a column (`0..PANE_COLS`, origin included whether or not its pane
     /// is drawn) or [`RESULT_LEADER`]. Maps the leader's viewport-top to
     /// (region, fraction) and positions every other column at ITS version of
@@ -2296,13 +2310,28 @@ impl MergeView {
                 .as_ref()
                 .is_some_and(|l| l.origin_rows.is_some()),
         );
-        if self.pane_cols != cols {
-            let each = ((self.viewport_w - super::SIDEBAR_WIDTH) / cols as f32).max(MIN_PANE_W);
+        let avail = (self.viewport_w - super::SIDEBAR_WIDTH).max(0.);
+        if self.pane_cols != cols || self.pane_widths.is_none() {
+            let each = (avail / cols as f32).max(MIN_PANE_W);
             self.pane_widths = Some([each; PANE_COLS]);
             self.pane_cols = cols;
         }
-        if self.panes_height.is_none() {
-            self.panes_height = Some((self.viewport_h * 0.4).max(MIN_PANES_H));
+        // Follow the window. Widths are px, so without this the columns keep
+        // whatever size they had when the count last changed: shrink the
+        // window and the flexing column absorbs every lost pixel until it is
+        // gone, then the fixed ones overflow and panes leave the screen.
+        self.fit_pane_widths(cols, avail);
+        self.pane_avail = avail;
+
+        match self.panes_height {
+            None => self.panes_height = Some((self.viewport_h * 0.4).max(MIN_PANES_H)),
+            // Same story vertically: a drag clamps against the viewport, but
+            // a resize never re-ran that clamp, so shrinking the window left
+            // the panes tall enough to squeeze the result editor out.
+            Some(h) => {
+                let max = (self.viewport_h - MIN_RESULT_H).max(MIN_PANES_H);
+                self.panes_height = Some(h.clamp(MIN_PANES_H, max));
+            }
         }
         // Poses (gallery/tests) set `loaded` directly without going through
         // load(); seed the editor lazily so it exists before body().
@@ -2577,6 +2606,47 @@ enum Divider {
 /// Panels never collapse to nothing — you have to be able to grab the
 /// divider again.
 const MIN_PANE_W: f32 = 120.;
+
+/// The columns that carry an explicit width for a `cols`-pane layout.
+/// `OURS_COL` always flexes into whatever is left, so it never appears here —
+/// which is exactly why the others must be kept small enough to leave it room.
+fn fixed_cols(cols: usize) -> &'static [usize] {
+    if cols >= 4 {
+        &[ORIGIN_COL, THEIRS_COL, BASE_COL]
+    } else {
+        &[THEIRS_COL, BASE_COL]
+    }
+}
+
+/// Refit the fixed columns to `avail`, preserving their relative proportions
+/// and leaving at least `MIN_PANE_W` for the flexing column.
+///
+/// Pure, so the invariant that matters — every pane stays visible at any
+/// window size — is testable without a window. Scaling comes first so a
+/// user's dragged ratios survive a resize; the clamp comes second so the
+/// ratios can never win over "all four panes are on screen".
+fn fit_widths(widths: &mut [f32; PANE_COLS], cols: usize, avail: f32, prev_avail: f32) {
+    let fixed = fixed_cols(cols);
+    if prev_avail > 0. && avail > 0. && (avail - prev_avail).abs() > 0.5 {
+        let k = avail / prev_avail;
+        for &c in fixed {
+            widths[c] *= k;
+        }
+    }
+    for &c in fixed {
+        widths[c] = widths[c].max(MIN_PANE_W);
+    }
+    // Leave the flexing column its minimum; never let the fixed columns eat
+    // the whole row. The floor keeps this sane if `avail` is absurdly small.
+    let budget = (avail - MIN_PANE_W).max(MIN_PANE_W * fixed.len() as f32);
+    let sum: f32 = fixed.iter().map(|&c| widths[c]).sum();
+    if sum > budget {
+        let k = budget / sum;
+        for &c in fixed {
+            widths[c] = (widths[c] * k).max(MIN_PANE_W);
+        }
+    }
+}
 const MIN_PANES_H: f32 = 80.;
 const MIN_RESULT_H: f32 = 120.;
 
@@ -2767,6 +2837,7 @@ mod tests {
         next_target, origin_projection, pane_lines, protected_line_info, region_at, region_display,
         region_has_strip, region_seed_text, row_bg, strips_above_line,
     };
+    use super::{MIN_PANE_W, PANE_COLS, fit_widths, fixed_cols};
     use gpui::SharedString;
     use std::collections::HashMap;
     use tomte_ui::components::{ChoiceKind, Side};
@@ -2876,6 +2947,79 @@ mod tests {
         // Context + inlined conflict (disk then source) + context.
         assert_eq!(seed, "a\nv = 2\nv = 3\nz\n");
         assert_eq!(starts, vec![0, 1, 3, 4]);
+    }
+
+    /// Every pane must survive any window the user can actually make. The
+    /// bug: widths are px and were only ever divided when the pane COUNT
+    /// changed, so shrinking the window left the fixed columns at their old
+    /// size — the flexing column absorbed the loss until it vanished, then
+    /// the fixed ones overflowed and panes left the screen entirely.
+    #[test]
+    fn shrinking_the_window_never_pushes_a_pane_off_screen() {
+        for cols in [3usize, 4] {
+            let fixed = fixed_cols(cols);
+            let mut w = [400.; PANE_COLS];
+            let mut prev = 1600.;
+            // Walk down to the narrowest content width the 840pt window
+            // minimum can produce (840 - the 200pt sidebar).
+            for avail in [1600., 1200., 900., 700., 640.] {
+                fit_widths(&mut w, cols, avail, prev);
+                prev = avail;
+                for &c in fixed {
+                    assert!(
+                        w[c] >= MIN_PANE_W,
+                        "cols={cols} avail={avail}: column {c} shrank to {} (min {MIN_PANE_W})",
+                        w[c]
+                    );
+                }
+                let used: f32 = fixed.iter().map(|&c| w[c]).sum();
+                assert!(
+                    used + MIN_PANE_W <= avail + 0.01,
+                    "cols={cols} avail={avail}: fixed columns take {used}, leaving                      {} for the flexing column (needs {MIN_PANE_W})",
+                    avail - used
+                );
+            }
+        }
+    }
+
+    /// A resize must not silently undo a drag: the columns keep their
+    /// relative sizes while they still fit.
+    #[test]
+    fn resizing_preserves_the_proportions_the_user_dragged() {
+        let mut w = [0.; PANE_COLS];
+        w[ORIGIN_COL] = 500.;
+        w[THEIRS_COL] = 250.;
+        w[BASE_COL] = 250.;
+        fit_widths(&mut w, 4, 800., 1600.); // halve the window
+        assert!(
+            (w[ORIGIN_COL] / w[THEIRS_COL] - 2.0).abs() < 0.01,
+            "origin was twice theirs before the resize, got {} vs {}",
+            w[ORIGIN_COL],
+            w[THEIRS_COL]
+        );
+    }
+
+    /// Growing the window gives the space back rather than stranding the
+    /// columns at their shrunken size.
+    #[test]
+    fn growing_the_window_returns_the_space() {
+        let mut w = [200.; PANE_COLS];
+        fit_widths(&mut w, 4, 1600., 800.);
+        assert!(
+            w[THEIRS_COL] > 200.,
+            "column should have grown with the window, still {}",
+            w[THEIRS_COL]
+        );
+    }
+
+    #[test]
+    fn the_flexing_column_is_never_given_a_fixed_width() {
+        for cols in [3usize, 4] {
+            assert!(
+                !fixed_cols(cols).contains(&OURS_COL),
+                "OURS_COL flexes; giving it a fixed width would leave no                  column to absorb rounding"
+            );
+        }
     }
 
     #[test]
