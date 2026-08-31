@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use support::{Scratch, sh};
 use tomte_core::cmd::SystemRunner;
-use tomte_core::git::{GitClient, MergeTreeOutcome};
+use tomte_core::git::{GitClient, MergeStart, MergeTreeOutcome};
 
 mod support;
 
@@ -230,5 +230,43 @@ fn merge_abort_restores_the_branch() {
     git.merge_abort();
     assert_eq!(git.head_sha().unwrap(), sha);
     assert!(git.conflicted_files().unwrap().is_empty());
+    assert!(!git.merge_in_progress());
+}
+
+#[test]
+fn a_diverged_but_non_conflicting_repo_joins_automatically() {
+    // Both sides moved, on different files. Today this is left alone and the
+    // user gets a red banner; it must now join itself.
+    let scratch = Scratch::new();
+    unsigned(&scratch.source);
+    let git = GitClient::new(Arc::new(SystemRunner), scratch.source.clone());
+
+    // Origin moves…
+    let other = other_clone(&scratch);
+    write(&other.join("remote-only"), "x\n");
+    sh(&other, "git", &["add", "-A"]);
+    sh(&other, "git", &["commit", "-m", "remote"]);
+    sh(&other, "git", &["push", "origin", "main"]);
+    // …while we commit a DIFFERENT file locally.
+    write(&scratch.source.join("local-only"), "y\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "local"]);
+
+    git.fetch("origin").unwrap();
+    let div = git.divergence("origin/main").unwrap();
+    assert!(div.ahead > 0 && div.behind > 0, "precondition: diverged");
+
+    // The virtual merge proves it clean BEFORE anything is written.
+    assert_eq!(
+        git.merge_tree_conflicts("origin/main").unwrap(),
+        MergeTreeOutcome::Clean
+    );
+    assert!(matches!(
+        git.merge("origin/main").unwrap(),
+        MergeStart::Clean
+    ));
+
+    let after = git.divergence("origin/main").unwrap();
+    assert_eq!(after.behind, 0, "origin's commits are now local");
     assert!(!git.merge_in_progress());
 }

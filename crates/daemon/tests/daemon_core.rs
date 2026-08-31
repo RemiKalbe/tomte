@@ -144,6 +144,10 @@ fn fetch_integrates_when_fast_forward_is_lossless() {
 
 #[test]
 fn fetch_leaves_diverged_repos_untouched() {
+    // Both sides touch the SAME file with different content — a genuine
+    // conflict. (A divergence on DIFFERENT files is now auto-joined by a
+    // clean virtual merge; see `fetch_auto_joins_a_clean_divergence` below.
+    // This test guards the case that must still be left for review.)
     let s = Scratch::new();
     let mut core = core_for(&s);
     // second machine pushes…
@@ -157,14 +161,14 @@ fn fetch_leaves_diverged_repos_untouched() {
     git(&other, &["add", "."]);
     git(&other, &["commit", "-m", "remote"]);
     git(&other, &["push"]);
-    // …while the local source has its own unpushed commit → diverged.
-    std::fs::write(s.source.join("local_only"), "x\n").unwrap();
+    // …while the local source has its own unpushed, conflicting commit.
+    std::fs::write(s.source.join("dot_testrc"), "a=local\n").unwrap();
     git(&s.source, &["add", "."]);
     git(&s.source, &["commit", "-m", "local"]);
 
     core.handle_fetch(400).unwrap();
     let target = s.home.join(".testrc");
-    assert!(kinds(&core, &target).contains(&"remote_advanced".to_string()));
+    assert!(kinds(&core, &target).contains(&"source_changed".to_string()));
     let behind_after = std::process::Command::new("git")
         .args(["rev-list", "--count", "HEAD..origin/main"])
         .current_dir(&s.source)
@@ -173,7 +177,56 @@ fn fetch_leaves_diverged_repos_untouched() {
     assert_eq!(
         String::from_utf8_lossy(&behind_after.stdout).trim(),
         "1",
-        "diverged repo must NOT be integrated"
+        "conflicting diverged repo must NOT be integrated"
+    );
+    assert!(
+        !GitClient::new(std::sync::Arc::new(SystemRunner), s.source.clone()).merge_in_progress(),
+        "a probed-but-not-attempted merge must not leave the repo mid-merge"
+    );
+}
+
+#[test]
+fn fetch_auto_joins_a_clean_divergence() {
+    // Both sides moved, on different files: the virtual merge proves it
+    // clean, so fetch joins the histories itself instead of leaving a
+    // divergence for the user to reconcile by hand.
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let rx = core.subscribe();
+    let other = s.root.path().join("other");
+    sh(
+        s.root.path(),
+        "git",
+        &["clone", s.bare.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    std::fs::write(other.join("remote-only"), "x\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "remote"]);
+    git(&other, &["push"]);
+    // …while we commit a DIFFERENT file locally.
+    std::fs::write(s.source.join("local-only"), "y\n").unwrap();
+    git(&s.source, &["add", "."]);
+    git(&s.source, &["commit", "-m", "local"]);
+
+    core.handle_fetch(400).unwrap();
+    let behind_after = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD..origin/main"])
+        .current_dir(&s.source)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&behind_after.stdout).trim(),
+        "0",
+        "clean divergence must be joined"
+    );
+    assert!(
+        !GitClient::new(std::sync::Arc::new(SystemRunner), s.source.clone()).merge_in_progress()
+    );
+    let events: Vec<Event> = rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::FetchDone { behind: 1, .. }))
     );
 }
 

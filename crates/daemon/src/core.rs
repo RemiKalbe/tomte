@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
 use tomte_core::drift::{ContentHash, DriftClass};
-use tomte_core::git::{GitClient, GitError};
+use tomte_core::git::{GitClient, GitError, MergeStart, MergeTreeOutcome};
 use tomte_core::scanner::{DriftScanner, FileDrift, ScanError};
 use tomte_journal::{EventKind, Journal, JournalError, NewEvent};
 use tomte_proto::{DriftSummary, Event};
@@ -558,26 +558,69 @@ impl DaemonCore {
         // Integrate, don't just observe: with no local commits and a clean
         // tree, fast-forwarding is lossless — and NOT doing it left every
         // later push non-fast-forward ("I literally clicked fetch",
-        // 2026-08-10). Diverged or dirty repos stay untouched; those files
-        // keep their remote_ahead/diverged classifications for review.
-        if behind > 0
-            && ahead == 0
-            && self
-                .git
-                .dirty_files()
-                .map(|d| d.is_empty())
-                .unwrap_or(false)
-        {
-            match self.git.ff_merge(&self.remote_ref) {
-                Ok(()) => {
-                    tomte_core::log_info!(
-                        "fetch",
-                        "fast-forwarded {behind} commit(s) to {}",
-                        self.remote_ref
-                    );
+        // 2026-08-10). A dirty tree is left untouched either way — Tomte
+        // never integrates over uncommitted local changes.
+        let clean_tree = self
+            .git
+            .dirty_files()
+            .map(|d| d.is_empty())
+            .unwrap_or(false);
+        if behind > 0 && clean_tree {
+            if ahead == 0 {
+                // Lossless: nothing local to preserve.
+                match self.git.ff_merge(&self.remote_ref) {
+                    Ok(()) => {
+                        tomte_core::log_info!(
+                            "fetch",
+                            "fast-forwarded {behind} commit(s) to {}",
+                            self.remote_ref
+                        );
+                    }
+                    Err(e) => {
+                        tomte_core::log_warn!("fetch", "fast-forward skipped: {e}");
+                    }
                 }
-                Err(e) => {
-                    tomte_core::log_warn!("fetch", "fast-forward skipped: {e}");
+            } else {
+                // Diverged. Join ONLY if a virtual merge proves it clean —
+                // Tomte never leaves the repo mid-merge on its own initiative.
+                match self.git.merge_tree_conflicts(&self.remote_ref) {
+                    Ok(MergeTreeOutcome::Clean) => {
+                        // `merge` returns `MergeStart`. A `Conflicts` here
+                        // would mean the repo is NOW mid-merge — that must
+                        // never be logged as a success, and must never be
+                        // left for the user to discover.
+                        match self.git.merge(&self.remote_ref) {
+                            Ok(MergeStart::Clean) => tomte_core::log_info!(
+                                "fetch",
+                                "joined {behind} commit(s) from {}",
+                                self.remote_ref
+                            ),
+                            Ok(MergeStart::Conflicts(paths)) => {
+                                tomte_core::log_warn!(
+                                    "fetch",
+                                    "merge-tree said clean but {} path(s) conflicted; aborting",
+                                    paths.len()
+                                );
+                                self.git.merge_abort();
+                            }
+                            Err(e) => tomte_core::log_warn!("fetch", "join failed: {e}"),
+                        }
+                    }
+                    // NOTE the empty case: `Conflicts(vec![])` means
+                    // conflicted with no individually-listed file (a
+                    // directory rename conflict, say). It must NOT be
+                    // treated as clean — never match on `.is_empty()`.
+                    Ok(MergeTreeOutcome::Conflicts(paths)) => tomte_core::log_info!(
+                        "fetch",
+                        "{} conflict(s) with {} — left for review",
+                        paths.len(),
+                        self.remote_ref
+                    ),
+                    Ok(MergeTreeOutcome::Unknown) => tomte_core::log_warn!(
+                        "fetch",
+                        "merge-tree gave no answer; not auto-joining"
+                    ),
+                    Err(e) => tomte_core::log_warn!("fetch", "merge probe failed: {e}"),
                 }
             }
         }
