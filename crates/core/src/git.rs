@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cmd::{CommandError, CommandRequest, CommandRunner};
+use crate::cmd::{CommandError, CommandOutput, CommandRequest, CommandRunner};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Divergence {
@@ -62,6 +62,22 @@ impl GitClient {
 
     fn run_utf8(&self, args: &[&str]) -> Result<String, GitError> {
         Ok(String::from_utf8_lossy(&self.run(args, Duration::from_secs(30))?).into_owned())
+    }
+
+    /// Like [`Self::run`] but does not turn a non-zero exit into
+    /// `GitError::Exit` — for probes where a specific non-zero code IS the
+    /// answer (e.g. [`Self::merge_tree_conflicts`]'s "conflicts found").
+    /// `failure_is_expected` makes the command chokepoint log a non-zero
+    /// exit at info, not error — an expected outcome must never read like a
+    /// fault in the logs.
+    fn run_raw(&self, args: &[&str], timeout: Duration) -> Result<CommandOutput, GitError> {
+        Ok(self.runner.run(
+            CommandRequest::new("git")
+                .args(args.iter().copied())
+                .cwd(&self.repo)
+                .timeout(timeout)
+                .failure_is_expected(),
+        )?)
     }
 
     pub fn fetch(&self, remote: &str) -> Result<(), GitError> {
@@ -265,6 +281,56 @@ impl GitClient {
         let _ = self.run(&["merge", "--abort"], Duration::from_secs(30));
     }
 
+    /// Conflicting paths a merge with `upstream` WOULD produce, computed
+    /// entirely in the object database via `git merge-tree --write-tree` —
+    /// the working tree, the index, and HEAD are never touched. `Some(vec![])`
+    /// means the merge is clean. `None` means merge-tree could not produce an
+    /// answer at all (git predates `--write-tree`, added in 2.38, or refuses
+    /// outright — e.g. unrelated histories): the caller must fall back to
+    /// not auto-joining rather than guessing.
+    pub fn merge_tree_conflicts(&self, upstream: &str) -> Result<Option<Vec<PathBuf>>, GitError> {
+        let out = self.run_raw(
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "HEAD",
+                upstream,
+            ],
+            Duration::from_secs(30),
+        )?;
+        match out.exit_code {
+            0 => Ok(Some(Vec::new())),
+            1 if !out.stdout.is_empty() => {
+                // Documented layout (verified against git 2.50.1):
+                //   <tree-oid>\n<conflicted path>\n...\n\n<free-form messages>
+                // The blank line is the real separator between the path list
+                // and human-readable prose ("Auto-merging x", "CONFLICT
+                // ...") — that prose must NOT be parsed as more paths.
+                let text = out.stdout_utf8();
+                Ok(Some(
+                    text.lines()
+                        .skip(1)
+                        .take_while(|l| !l.is_empty())
+                        .map(PathBuf::from)
+                        .collect(),
+                ))
+            }
+            1 => {
+                // Exit 1 normally means "conflicts, see stdout" — but git
+                // also uses it for outright failures (e.g. an unresolvable
+                // `upstream`) where stdout is empty and the reason is on
+                // stderr. That is not an answer; treating it as a clean
+                // merge would be silently wrong, so surface it.
+                Err(GitError::Exit {
+                    code: out.exit_code,
+                    stderr: out.stderr_utf8(),
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn head_sha(&self) -> Result<String, GitError> {
         self.rev_parse("HEAD")
     }
@@ -442,6 +508,20 @@ mod tests {
             GitError::Exit { code, .. } => assert_ne!(code, 0),
             other => panic!("expected GitError::Exit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_tree_conflicts_surfaces_an_unresolvable_upstream_instead_of_reporting_clean() {
+        // git 2.50.1 exits 1 for BOTH "conflicts found" (stdout carries the
+        // tree oid + paths) and "couldn't even attempt the merge" (e.g. a
+        // ref that doesn't exist — empty stdout, reason on stderr). A naive
+        // "exit 1 => Some(vec![...])" reading of stdout would silently
+        // report the latter as a clean merge; it must surface as an error.
+        let (_g, work) = scratch();
+        let err = client(&work)
+            .merge_tree_conflicts("no-such-branch")
+            .unwrap_err();
+        assert!(matches!(err, GitError::Exit { .. }), "{err:?}");
     }
 
     #[test]

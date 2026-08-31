@@ -2,7 +2,7 @@
 //! rejected-push → rebase → push recovery (the 2026-08-10 second-machine
 //! failure: fetch observed origin moving but nothing ever integrated it).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use support::{Scratch, sh};
@@ -159,6 +159,50 @@ fn conflicted_merge_resolves_through_stages_and_pushes() {
     git.push("origin").unwrap();
     let div = git.divergence("origin/main").unwrap();
     assert_eq!((div.behind, div.ahead), (0, 0));
+}
+
+#[test]
+fn merge_tree_reports_clean_and_conflicting_merges_without_touching_the_tree() {
+    let scratch = Scratch::new();
+    unsigned(&scratch.source);
+    let git = GitClient::new(Arc::new(SystemRunner), scratch.source.clone());
+
+    // Two branches touching DIFFERENT files: a clean merge.
+    sh(&scratch.source, "git", &["checkout", "-b", "other"]);
+    write(&scratch.source.join("only-other"), "remote\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "other"]);
+    sh(&scratch.source, "git", &["checkout", "main"]);
+    write(&scratch.source.join("only-main"), "local\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "main"]);
+
+    let head_before = git.head_sha().unwrap();
+    assert_eq!(
+        git.merge_tree_conflicts("other").unwrap(),
+        Some(vec![]),
+        "different files merge cleanly"
+    );
+    assert_eq!(
+        git.head_sha().unwrap(),
+        head_before,
+        "a virtual merge must not move HEAD"
+    );
+    assert!(!git.merge_in_progress(), "and must not start a merge");
+
+    // Now make the SAME file conflict on both branches.
+    sh(&scratch.source, "git", &["checkout", "other"]);
+    write(&scratch.source.join("dot_testrc"), "a=other\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "other testrc"]);
+    sh(&scratch.source, "git", &["checkout", "main"]);
+    write(&scratch.source.join("dot_testrc"), "a=main\n");
+    sh(&scratch.source, "git", &["add", "-A"]);
+    sh(&scratch.source, "git", &["commit", "-m", "main testrc"]);
+
+    let conflicts = git.merge_tree_conflicts("other").unwrap().unwrap();
+    assert_eq!(conflicts, vec![PathBuf::from("dot_testrc")]);
+    assert!(!git.merge_in_progress(), "still no real merge started");
 }
 
 #[test]
