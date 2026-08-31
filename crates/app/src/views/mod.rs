@@ -117,6 +117,12 @@ impl Shell {
     /// Kick the repo-reconcile flow: fetch + merge origin on the background
     /// executor; clean merges finish silently, conflicts open the merge
     /// editor one source file at a time (2026-08-18).
+    ///
+    /// Temporarily unreachable: its only caller was the diverged banner's
+    /// Reconcile button, deleted in Task 4 (divergence is no longer an
+    /// announced event). Left in place — a later task wires a new caller
+    /// once diverged files surface as ordinary per-file review rows.
+    #[allow(dead_code)]
     pub fn start_reconcile(&mut self, cx: &mut Context<Self>) {
         if self.reconcile_in_flight || !self.reconcile_queue.is_empty() {
             return;
@@ -219,8 +225,7 @@ impl Shell {
     }
 
     fn reconcile_finished(&mut self, pushed: bool, note: Option<String>, cx: &mut Context<Self>) {
-        self.state.update(cx, |model, cx| {
-            model.repo_diverged = None;
+        self.state.update(cx, |_model, cx| {
             cx.notify();
         });
         let body = match (pushed, note) {

@@ -29,10 +29,6 @@ pub const STATES: &[(&str, &str)] = &[
     ("dashboard-empty", "everything in sync"),
     ("dashboard-scanning", "fresh boot, first scan running"),
     ("dashboard-rescanning", "data present, rescan in progress"),
-    (
-        "dashboard-diverged",
-        "source repo diverged from origin: Reconcile banner",
-    ),
     ("dashboard-degraded", "1Password-style degraded banner"),
     ("dashboard-disconnected", "daemon not connected"),
     ("review", "sidebar groups + selected file with diff preview"),
@@ -369,11 +365,6 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 ..Default::default()
             },
         ),
-        "dashboard-diverged" => {
-            let mut m = rich_model();
-            m.repo_diverged = Some((4, 2));
-            shell(Route::Dashboard, m)
-        }
         "dashboard-rescanning" => {
             let mut m = rich_model();
             m.scanning = true;
