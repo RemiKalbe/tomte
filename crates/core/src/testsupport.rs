@@ -61,6 +61,17 @@ impl Scratch {
             &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
         );
         git(&source, &["init", "-b", "main"]);
+        // Repo-LOCAL identity and signing policy. `git()` above passes these
+        // per invocation, which covers only the helper's own commits — the
+        // production `GitClient` under test runs plain `git`, and without
+        // this it would inherit the developer's GLOBAL config. On a machine
+        // with 1Password SSH signing that means every `git merge`/`git
+        // commit` a test drives blocks on the agent (or fails outright), so
+        // the suite would pass or fail depending on whose laptop ran it.
+        // Written here, no test can depend on that.
+        git(&source, &["config", "user.email", "t@t"]);
+        git(&source, &["config", "user.name", "t"]);
+        git(&source, &["config", "commit.gpgsign", "false"]);
         std::fs::write(source.join("dot_testrc"), "a=1\n").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-m", "init"]);

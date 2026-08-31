@@ -910,6 +910,17 @@ impl LoadedMerge {
     }
 }
 
+/// What [`MergeView::load`]'s background step came back with. The two are
+/// genuinely different readings of the same file — one from chezmoi, one from
+/// an in-progress merge's index — and only the loader can tell them apart.
+enum MergeLoad {
+    /// Ordinary load: disk / rendered source / base / origin.
+    Ready(MergeInputs),
+    /// The file is conflicted in a merge with origin; panes come from the
+    /// index stages and Save records the resolution into that merge.
+    RepoConflict(std::sync::Arc<MergeInputs>),
+}
+
 pub struct MergeView {
     /// Route-back and banner hand-off; weak because the shell owns this view.
     shell: WeakEntity<Shell>,
@@ -1020,11 +1031,10 @@ impl MergeView {
         }
     }
 
-    /// (Re)load the merge inputs for `target` on the background executor.
-    /// Reopening the editor is always a fresh load — earlier choices for the
-    /// same file do not survive (the inputs may have changed underneath).
-    /// Present prepared repo-conflict inputs (reconcile flow): no
-    /// background load — the engine already read the merge stages.
+    /// Present prepared repo-conflict inputs: no chezmoi load — these panes
+    /// came from the merge's own index stages, which is the only truthful
+    /// reading of a file git left conflicted. Reached from [`Self::load`],
+    /// which asks the engine whether the target is in that state.
     pub fn present_repo_conflict(
         &mut self,
         inputs: std::sync::Arc<MergeInputs>,
@@ -1032,6 +1042,8 @@ impl MergeView {
     ) {
         self.target = Some(inputs.target.clone());
         self.repo_reconcile = true;
+        self.loading = false;
+        self.error = None;
         self.banner = None;
         self.saving = false;
         self.editing = false;
@@ -1040,6 +1052,13 @@ impl MergeView {
         cx.notify();
     }
 
+    /// (Re)load the merge inputs for `target` on the background executor.
+    /// Reopening the editor is always a fresh load — earlier choices for the
+    /// same file do not survive (the inputs may have changed underneath).
+    ///
+    /// Also the one way into the repo-conflict mode: the load asks the engine
+    /// first whether an in-progress merge with origin left this file
+    /// conflicted, because that changes where its two sides must be read from.
     pub fn load(&mut self, target: PathBuf, cx: &mut Context<Self>) {
         self.repo_reconcile = false;
         self.target = Some(target.clone());
@@ -1053,19 +1072,36 @@ impl MergeView {
         cx.notify();
 
         let journal = journal_path();
+        let engine = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone());
         cx.spawn(async move |this, cx| {
             let result = {
                 let target = target.clone();
                 cx.background_executor()
                     .spawn(async move {
+                        // A decision on another file may have put the repo
+                        // into a real merge that left THIS file conflicted.
+                        // Then its working-tree source is git's marker text
+                        // and chezmoi's reading of it is fiction — the panes
+                        // have to come from the merge's index stages.
+                        if let Some(engine) = &engine {
+                            match engine.repo_conflict_for(&target) {
+                                Ok(Some(inputs)) => return Ok(MergeLoad::RepoConflict(inputs)),
+                                Ok(None) => {}
+                                Err(e) => return Err(e.to_string()),
+                            }
+                        }
                         let client = crate::app_chezmoi_client();
-                        let git = crate::app_git_client(&client)?;
+                        let git = crate::app_git_client(&client).map_err(|e| e.to_string())?;
                         // Same fallback as `review.rs`'s `auto_merge_blocking`
                         // and the daemon's own derivation — an unreadable
                         // branch degrades to "main" rather than failing.
                         let branch = git.head_branch().unwrap_or_else(|_| "main".into());
                         let remote_ref = format!("origin/{branch}");
                         merge_inputs::load(&client, &git, &remote_ref, &journal, &target)
+                            .map(MergeLoad::Ready)
+                            .map_err(|e| e.to_string())
                     })
                     .await
             };
@@ -1076,8 +1112,14 @@ impl MergeView {
                 }
                 view.loading = false;
                 match result {
-                    Ok(inputs) => view.loaded = Some(LoadedMerge::new(Arc::new(inputs))),
-                    Err(e) => view.error = Some(e.to_string()),
+                    Ok(MergeLoad::RepoConflict(inputs)) => {
+                        view.present_repo_conflict(inputs, cx);
+                        return;
+                    }
+                    Ok(MergeLoad::Ready(inputs)) => {
+                        view.loaded = Some(LoadedMerge::new(Arc::new(inputs)))
+                    }
+                    Err(e) => view.error = Some(e),
                 }
                 view.seed_editor(cx);
                 cx.notify();
@@ -1488,7 +1530,7 @@ impl MergeView {
             // Bailing out of ONE conflict bails the whole merge — a
             // half-resolved merge state would be worse than none.
             self.shell
-                .update(cx, |shell, cx| shell.cancel_reconcile(cx))
+                .update(cx, |shell, cx| shell.abort_origin_merge(cx))
                 .ok();
             return;
         }
@@ -1532,10 +1574,10 @@ impl MergeView {
         self.banner = None;
         cx.notify();
         if self.repo_reconcile {
-            // Reconcile flow: write the SOURCE file + git add; the Shell
-            // advances to the next conflict (or concludes the merge). The
-            // Shell hand-off happens OUTSIDE this view's update — advancing
-            // re-presents this same MergeView entity, and nesting that
+            // Mid-merge conflict: write the SOURCE file + git add; the Shell
+            // concludes the merge if that was the last one open. The Shell
+            // hand-off happens OUTSIDE this view's update — it routes and
+            // banners through this same MergeView entity, and nesting that
             // panicked gpui ("already being updated", 2026-08-18 crash).
             let source_path = inputs.source_path.clone();
             let shell = self.shell.clone();
@@ -1562,7 +1604,7 @@ impl MergeView {
                 if advance {
                     let _ = cx.update(|cx| {
                         shell
-                            .update(cx, |shell, cx| shell.reconcile_conflict_saved(cx))
+                            .update(cx, |shell, cx| shell.repo_conflict_saved(cx))
                             .ok();
                     });
                 }

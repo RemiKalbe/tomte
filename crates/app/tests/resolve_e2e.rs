@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tomte_app::ipc::IpcClient;
 use tomte_app::merge_inputs;
 use tomte_app::merge_state::MergeState;
-use tomte_app::resolve::{ResolveEngine, ResolveOutcome};
+use tomte_app::resolve::{MergeConclusion, ResolveEngine, ResolveOutcome};
 use tomte_core::cmd::SystemRunner;
 use tomte_core::drift::{ContentHash, DriftClass};
 use tomte_core::git::GitClient;
@@ -50,15 +50,11 @@ struct DriftLab {
 
 impl DriftLab {
     fn new() -> Self {
+        // `Scratch::new` writes the repo-LOCAL identity and `commit.gpgsign
+        // = false` the production `GitClient` needs: it runs plain `git`,
+        // without testsupport's per-invocation `-c` overrides, so without
+        // that it would inherit the developer's global signing config.
         let s = Scratch::new();
-        // The engine's fallback commit runs `git commit` WITHOUT testsupport's
-        // per-invocation `-c` overrides, so the repo itself must carry an
-        // identity and disable signing (the machine's global config may have
-        // 1Password SSH signing enabled). Scratch::new does not persist these.
-        git(&s.source, &["config", "user.email", "t@t"]);
-        git(&s.source, &["config", "user.name", "t"]);
-        git(&s.source, &["config", "commit.gpgsign", "false"]);
-
         let journal_path = s.root.path().join("journal.db");
         let journal = Journal::open(&journal_path, "e2e").unwrap();
         let core = Arc::new(Mutex::new(
@@ -967,5 +963,292 @@ fn story_j_keep_source_origin_refuses_before_touching_anything() {
     assert_eq!(
         std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
         ORIGIN_CONTENT
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 10: a per-file decision resolves the real git merge.
+//
+// These stories need a genuine DIVERGENCE, not just a local commit ahead of
+// origin: since the daemon auto-joins any divergence a virtual merge proves
+// clean, only a SAME-FILE conflict still describes something a human has to
+// answer. `origin_holds_its_own_version` above is deliberately the other
+// shape (this machine fast-forwards first, so its push stays a fast-forward)
+// and cannot serve here.
+// ---------------------------------------------------------------------------
+
+/// A second managed file, so a merge can leave more than one conflict open.
+const OTHER_ORIGIN: &[u8] = b"b=origin\n";
+const OTHER_LOCAL: &[u8] = b"b=this-machine\n";
+
+/// Diverge this machine from origin with a same-file conflict on every named
+/// source file: a second machine commits its version and pushes, while this
+/// machine commits a different version of the same lines WITHOUT integrating
+/// origin first. Local `main` ends up both ahead of and behind `origin/main`,
+/// with the same blobs touched on both sides — the one shape `git merge`
+/// cannot settle on its own.
+fn diverge_with_conflicts(lab: &DriftLab, files: &[(&str, &[u8], &[u8])]) {
+    let other = lab.s.root.path().join("other");
+    sh(
+        lab.s.root.path(),
+        "git",
+        &[
+            "clone",
+            lab.s.bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    for (name, origin_content, _) in files {
+        std::fs::write(other.join(name), origin_content).unwrap();
+    }
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "origin's version"]);
+    git(&other, &["push"]);
+
+    // No fetch/merge in between: this machine commits straight on top of the
+    // shared base, which is what makes the histories diverge.
+    for (name, _, local_content) in files {
+        std::fs::write(lab.s.source.join(name), local_content).unwrap();
+    }
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "this machine's version"]);
+    lab.s.chezmoi().apply(None).unwrap();
+    lab.source_git().fetch("origin").unwrap();
+
+    let d = lab.source_git().divergence("origin/main").unwrap();
+    assert!(
+        d.ahead > 0 && d.behind > 0,
+        "the fixture must actually diverge, got {d:?}"
+    );
+    lab.rescan_and_settle();
+}
+
+/// The one managed file diverges.
+fn diverge_on_the_managed_file(lab: &DriftLab) {
+    diverge_with_conflicts(lab, &[("dot_testrc", ORIGIN_CONTENT, LOCAL_SOURCE)]);
+}
+
+/// Task 10 Step 1, at the primitives: the merge starts only when a decision
+/// asks for it, one resolution answers it, and concluding it clears the
+/// divergence for real.
+#[test]
+fn resolving_a_diverged_file_starts_and_finishes_the_merge() {
+    let lab = DriftLab::new();
+    diverge_on_the_managed_file(&lab);
+    let git = lab.source_git();
+    assert!(!git.merge_in_progress(), "no merge before a decision");
+
+    assert!(
+        lab.engine.ensure_merge_started().unwrap(),
+        "a diverged repo must enter a real merge"
+    );
+    assert!(git.merge_in_progress());
+    assert_eq!(
+        git.conflicted_files().unwrap(),
+        vec![PathBuf::from("dot_testrc")]
+    );
+
+    lab.engine
+        .resolve_repo_conflict(&lab.s.source.join("dot_testrc"), "a=resolved\n")
+        .unwrap();
+    lab.engine.finish_repo_reconcile().unwrap();
+
+    assert!(!git.merge_in_progress(), "merge committed");
+    assert_eq!(git.divergence("origin/main").unwrap().behind, 0);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        b"a=resolved\n"
+    );
+}
+
+/// Never speculatively: with nothing to integrate, the repo is left alone.
+#[test]
+fn ensure_merge_started_leaves_an_undiverged_repo_alone() {
+    let lab = DriftLab::new();
+    let head_before = lab.source_git().head_sha().unwrap();
+    assert!(!lab.engine.ensure_merge_started().unwrap());
+    assert!(!lab.source_git().merge_in_progress());
+    assert_eq!(lab.source_git().head_sha().unwrap(), head_before);
+}
+
+/// The whole point of the task: the user answers ONE review row, and that
+/// answer — not a separate reconcile button — is what drives the merge to a
+/// commit. Origin's side wins here.
+#[test]
+fn keep_source_origin_on_a_diverged_file_commits_the_merge() {
+    let lab = DriftLab::new();
+    diverge_on_the_managed_file(&lab);
+
+    let inputs = lab.load_merge_inputs();
+    assert_eq!(
+        inputs.origin.as_deref().map(str::as_bytes),
+        Some(ORIGIN_CONTENT),
+        "origin must carry its own version for this story to mean anything"
+    );
+
+    let outcome = lab
+        .engine
+        .keep_source_origin(&lab.target, inputs.origin.as_deref().unwrap())
+        .unwrap();
+    let ResolveOutcome::Done {
+        committed, pushed, ..
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(committed, "the last open conflict must commit the merge");
+    assert!(pushed);
+
+    let git = lab.source_git();
+    assert!(!git.merge_in_progress(), "merge committed");
+    assert_eq!(
+        git.divergence("origin/main").unwrap().behind,
+        0,
+        "the divergence the decision answered must be gone"
+    );
+    // Origin's content is now the source content, and the destination agrees.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        ORIGIN_CONTENT
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), ORIGIN_CONTENT);
+    assert!(
+        git.dirty_files().unwrap().is_empty(),
+        "no conflict markers or stray files left behind"
+    );
+}
+
+/// The same, from the other side: "keep disk" re-adds the destination and
+/// that becomes the merge's answer for the file.
+#[test]
+fn keep_disk_on_a_diverged_file_commits_the_merge_with_the_disk_content() {
+    let lab = DriftLab::new();
+    diverge_on_the_managed_file(&lab);
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+
+    let outcome = lab.engine.keep_disk(&lab.target).unwrap();
+    let ResolveOutcome::Done {
+        committed, pushed, ..
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(committed);
+    assert!(pushed);
+
+    let git = lab.source_git();
+    assert!(!git.merge_in_progress());
+    assert_eq!(git.divergence("origin/main").unwrap().behind, 0);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        DRIFTED,
+        "the disk content, not a merge artefact, is what got committed"
+    );
+}
+
+/// Two conflicts, no queue: answering one leaves the merge open and says so,
+/// the still-conflicted file reads its panes from the merge's index stages
+/// (never from its conflict-markered working copy), the apply-only action
+/// refuses to touch it, and the second answer commits the merge.
+#[test]
+fn a_second_conflict_keeps_the_merge_open_until_it_too_is_answered() {
+    let lab = DriftLab::new();
+    std::fs::write(lab.s.source.join("dot_other"), b"b=1\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(
+        &lab.s.source,
+        &["commit", "-m", "add a second managed file"],
+    );
+    git(&lab.s.source, &["push"]);
+    diverge_with_conflicts(
+        &lab,
+        &[
+            ("dot_testrc", ORIGIN_CONTENT, LOCAL_SOURCE),
+            ("dot_other", OTHER_ORIGIN, OTHER_LOCAL),
+        ],
+    );
+
+    // Answer the first row: the merge starts and takes this answer, but the
+    // second file is still unanswered, so nothing is committed yet.
+    let inputs = lab.load_merge_inputs();
+    let outcome = lab
+        .engine
+        .keep_source_origin(&lab.target, inputs.origin.as_deref().unwrap())
+        .unwrap();
+    let ResolveOutcome::Done {
+        committed,
+        pushed,
+        note,
+        ..
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(!committed, "one answer of two cannot commit the merge");
+    assert!(!pushed);
+    let note = note.expect("an unfinished merge must say so");
+    assert!(note.contains("still differ from origin"), "note: {note}");
+
+    let git = lab.source_git();
+    assert!(git.merge_in_progress(), "the merge stays open");
+    assert_eq!(
+        git.conflicted_files().unwrap(),
+        vec![PathBuf::from("dot_other")]
+    );
+
+    // The second file is now a mid-merge conflict. Its working-tree source
+    // holds git's markers, so the editor's panes must come from the index.
+    let other_target = lab.s.home.join(".other");
+    let conflict = lab
+        .engine
+        .repo_conflict_for(&other_target)
+        .unwrap()
+        .expect("a conflicted file must offer repo-conflict inputs");
+    assert_eq!(
+        conflict.ours.as_bytes(),
+        OTHER_LOCAL,
+        "stage 2 = this machine"
+    );
+    assert_eq!(conflict.theirs.as_bytes(), OTHER_ORIGIN, "stage 3 = origin");
+    assert!(
+        std::fs::read_to_string(lab.s.source.join("dot_other"))
+            .unwrap()
+            .contains("<<<<<<<"),
+        "premise: the working copy really is conflict-markered"
+    );
+
+    // …so the apply-only action must refuse rather than write those markers
+    // into the user's destination file.
+    let err = lab
+        .engine
+        .keep_source(&other_target)
+        .expect_err("keep_source must refuse a mid-merge file");
+    assert!(err.to_string().contains("mid-merge"), "err: {err}");
+    assert!(
+        !std::fs::read_to_string(&other_target)
+            .unwrap()
+            .contains("<<<<<<<"),
+        "the destination must be untouched by the refusal"
+    );
+
+    // Answer it (what the merge editor's Save does) and the merge concludes.
+    lab.engine
+        .resolve_repo_conflict(&conflict.source_path, "b=resolved\n")
+        .unwrap();
+    match lab.engine.finish_merge_if_resolved().unwrap() {
+        MergeConclusion::Committed { pushed, note } => {
+            assert!(pushed, "note: {note:?}");
+        }
+        other => panic!("expected Committed, got {other:?}"),
+    }
+    assert!(!git.merge_in_progress());
+    assert_eq!(git.divergence("origin/main").unwrap().behind, 0);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        ORIGIN_CONTENT
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_other")).unwrap(),
+        b"b=resolved\n"
     );
 }

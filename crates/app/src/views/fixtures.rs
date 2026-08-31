@@ -354,8 +354,6 @@ fn posed_merge_loading(cx: &mut Context<Shell>) -> Entity<MergeView> {
 /// Build the posed Shell for a gallery state. `None` = unknown name.
 pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Option<Shell> {
     let mut shell = |route: Route, model: SyncModel| Shell {
-        reconcile_queue: Vec::new(),
-        reconcile_in_flight: false,
         route,
         state: cx.new(|_| model),
         review: None,

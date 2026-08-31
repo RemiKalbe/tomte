@@ -466,8 +466,6 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                 // whenever the entity notifies.
                 cx.observe(&state, |_, _, cx| cx.notify()).detach();
                 Shell {
-                    reconcile_queue: Vec::new(),
-                    reconcile_in_flight: false,
                     route,
                     state,
                     review: None,

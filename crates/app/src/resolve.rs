@@ -55,12 +55,19 @@ pub enum ResolveError {
     Failed(String),
 }
 
-/// Outcome of [`ResolveEngine::start_repo_reconcile`].
-pub enum RepoReconcile {
-    /// Merged clean — committed (and pushed unless noted).
-    Done { pushed: bool, note: Option<String> },
-    /// Mid-merge: resolve each in the merge editor, then finish.
-    Conflicts(Vec<std::sync::Arc<MergeInputs>>),
+/// Outcome of [`ResolveEngine::finish_merge_if_resolved`]: what the merge
+/// with origin looked like after one more per-file decision landed in it.
+#[derive(Debug)]
+pub enum MergeConclusion {
+    /// No merge was running — the decision stood on its own.
+    NotMerging,
+    /// The merge stays open: these paths still need a decision. Not an
+    /// error — each one is an ordinary review row, and the last decision
+    /// to land commits the merge.
+    StillConflicted(Vec<PathBuf>),
+    /// Nothing was left conflicted, so the merge commit was made (and
+    /// pushed unless `note` says why not).
+    Committed { pushed: bool, note: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,9 +121,20 @@ impl ResolveEngine {
         };
         let decision = build_decision("keep_disk", target, dest_blob, Some(source_blob));
         self.session_decision(session, decision)?;
-        self.expect_changes(vec![target.to_path_buf(), source])?;
+        self.expect_changes(vec![target.to_path_buf(), source.clone()])?;
+        // The user has committed to an answer, so a diverged repo may now be
+        // put into a real merge (spec §6.1). `re_add` writes the source from
+        // the DESTINATION, so it overwrites whatever the merge left in that
+        // file — conflict markers included — which is exactly what "keep
+        // disk" means for this conflict.
+        let merging = self.ensure_merge_started()?;
         self.chezmoi.re_add(target)?;
-        let (committed, pushed, note) = self.commit_phase("keep_disk", target);
+        let (committed, pushed, note) = if merging {
+            self.stage_resolution(&source)?;
+            self.conclude_merge()
+        } else {
+            self.commit_phase("keep_disk", target)
+        };
         self.session_end(session, &format!("keep_disk {}", display_name(target)))?;
         self.rescan()?;
         Ok(ResolveOutcome::Done {
@@ -128,9 +146,25 @@ impl ResolveEngine {
     }
 
     /// Restore chezmoi's version: apply the target. No commit phase — apply
-    /// never touches the source repo.
+    /// never touches the source repo, so it decides nothing about a
+    /// divergence with origin and never starts a merge.
+    ///
+    /// That cuts the other way once a merge IS running: a source file git
+    /// left conflicted holds conflict markers, and applying it would copy
+    /// them into the user's destination file. Refused, loudly — the origin
+    /// difference has to be answered first, in the merge editor.
     pub fn keep_source(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "keep_source {}", target.display());
+        if self.git.merge_in_progress() {
+            let source = self.chezmoi.source_path(target)?;
+            if self.is_mid_merge_conflict(&source)? {
+                return Err(ResolveError::Failed(format!(
+                    "{} is mid-merge with origin — its source file holds conflict markers; \
+                     resolve the origin difference in the merge editor first",
+                    display_name(target)
+                )));
+            }
+        }
         let session = self.session_start()?;
         let hashes = self.snapshot_blobs(vec![target.to_path_buf()])?;
         let [dest_blob] = hashes.as_slice() else {
@@ -249,6 +283,19 @@ impl ResolveEngine {
     ) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "{action} {}", inputs.target.display());
         let target = inputs.target.as_path();
+        // A merge already running with THIS file conflicted means its
+        // working-tree source is git's conflict-marker text, and `inputs`
+        // — read from that file — describes nothing that exists. Writing a
+        // resolution derived from it would persist the markers. The way in
+        // is the merge editor's repo-conflict mode, which reads the index
+        // stages instead (see [`Self::repo_conflict_for`]).
+        if self.is_mid_merge_conflict(&inputs.source_path)? {
+            return Err(ResolveError::Failed(format!(
+                "{} is mid-merge with origin — reopen it in the merge editor, \
+                 which reads the two sides from the merge itself",
+                display_name(target)
+            )));
+        }
         let session = self.session_start()?;
         let hashes =
             self.snapshot_blobs(vec![inputs.target.clone(), inputs.source_path.clone()])?;
@@ -262,7 +309,11 @@ impl ResolveEngine {
         self.session_decision(session, decision)?;
         self.expect_changes(vec![inputs.target.clone(), inputs.source_path.clone()])?;
 
-        if inputs.templated {
+        // The new SOURCE text is computed FIRST, before any merge starts:
+        // the templated path reads the current source file as its template,
+        // and a merge started ahead of it would hand `write_back` git's
+        // conflict markers instead of a template.
+        let new_source = if inputs.templated {
             let Some(span_map) = &inputs.span_map else {
                 return Err(ResolveError::Failed(format!(
                     "templated merge inputs for {} carry no span map",
@@ -273,9 +324,7 @@ impl ResolveEngine {
             let attempt =
                 write_back_verified(&self.chezmoi, &template, span_map, &inputs.theirs, resolved)?;
             match attempt {
-                WriteBackAttempt::Verified(new_template) => {
-                    std::fs::write(&inputs.source_path, new_template)?;
-                }
+                WriteBackAttempt::Verified(new_template) => new_template,
                 WriteBackAttempt::Rejected(detail) => {
                     self.session_decision(
                         session,
@@ -296,11 +345,26 @@ impl ResolveEngine {
                 }
             }
         } else {
-            std::fs::write(&inputs.source_path, resolved)?;
+            resolved.to_string()
+        };
+
+        // The decision is made, so a diverged repo may now be put into a
+        // real merge and this file's answer recorded IN it (spec §6.1):
+        // `resolve_repo_conflict` writes the source and stages it, which is
+        // how git learns the conflict is answered.
+        let merging = self.ensure_merge_started()?;
+        if merging {
+            self.resolve_repo_conflict(&inputs.source_path, &new_source)?;
+        } else {
+            std::fs::write(&inputs.source_path, &new_source)?;
         }
 
         self.chezmoi.apply(Some(target))?;
-        let (committed, pushed, note) = self.commit_phase(action, target);
+        let (committed, pushed, note) = if merging {
+            self.conclude_merge()
+        } else {
+            self.commit_phase(action, target)
+        };
         self.session_end(session, &format!("{action} {}", display_name(target)))?;
         self.rescan()?;
         Ok(ResolveOutcome::Done {
@@ -462,52 +526,57 @@ impl ResolveEngine {
         }
     }
 
-    /// Reconcile a diverged source repo with origin (2026-08-18: local
-    /// unpushed commits + origin commits conflicted on the same file, and
-    /// EVERY resolve's push was hostage to it). Merge-based: one abortable
-    /// state, and stage 2/3 map onto the editor's disk/source vocabulary.
-    pub fn start_repo_reconcile(&self) -> Result<RepoReconcile, ResolveError> {
-        // Resume a merge the previous run left mid-flight (a crash between
-        // resolving and concluding, 2026-08-18): pick up the remaining
-        // conflicts — or conclude directly when everything was resolved.
+    /// Start the real merge if the repo has diverged and one is not already
+    /// running. Called from the resolve path the moment the user commits to a
+    /// decision — never speculatively, so the repo is only ever put into a
+    /// merge state in response to an explicit choice.
+    ///
+    /// Replaces the old separate reconcile flow (2026-08-18: local unpushed
+    /// commits + origin commits conflicted on the same file, and EVERY
+    /// resolve's push was hostage to it). The mechanism is unchanged — one
+    /// abortable merge whose stage 2/3 map onto the editor's disk/source
+    /// vocabulary — but a file now enters it from an ordinary review row
+    /// instead of a queue behind its own button.
+    ///
+    /// No fetch of its own: `divergence` reads the `origin/…` ref the daemon
+    /// keeps current, and fetching here would mean a decision could act on
+    /// commits the user never saw. A divergence that appeared since the last
+    /// fetch still gets caught downstream, by `commit_phase`'s rejected-push
+    /// recovery.
+    pub fn ensure_merge_started(&self) -> Result<bool, ResolveError> {
         if self.git.merge_in_progress() {
-            let leftover = self.git.conflicted_files()?;
-            tomte_core::log_info!(
-                "reconcile",
-                "resuming in-progress merge ({} conflict(s) left)",
-                leftover.len()
-            );
-            if leftover.is_empty() {
-                let (pushed, note) = self.finish_repo_reconcile()?;
-                return Ok(RepoReconcile::Done { pushed, note });
-            }
-            return Ok(RepoReconcile::Conflicts(self.conflict_inputs(leftover)?));
+            return Ok(true);
         }
-        tomte_core::log_info!("reconcile", "start: fetching + merging origin");
-        // git merge refuses on a dirty tree; stray source edits become a
-        // commit first (same policy as commit_phase after a resolve).
-        if !self.git.dirty_files()?.is_empty() {
-            self.git.add_all()?;
-            self.git.commit("Update dotfiles (pre-reconcile)")?;
-            tomte_core::log_info!("reconcile", "committed stray local changes first");
-        }
-        self.git.fetch("origin")?;
-        let branch = self.git.head_branch().unwrap_or_else(|_| "main".into());
+        let branch = self.git.head_branch()?;
         let upstream = format!("origin/{branch}");
+        if self.git.divergence(&upstream)?.behind == 0 {
+            return Ok(false);
+        }
+        tomte_core::log_info!("reconcile", "decision made — merging {upstream}");
+        // `git merge` refuses to run over local modifications it would
+        // overwrite, so stray source edits become a commit first (the policy
+        // the old reconcile entry point carried). Tolerant like
+        // `commit_phase`: a commit that cannot be signed is reported, not
+        // fatal, and `git merge` still gets its say — it only objects to the
+        // files it would actually touch.
+        if !self.git.dirty_files()?.is_empty()
+            && let Err(e) = self
+                .git
+                .add_all()
+                .and_then(|()| self.git.commit("Update dotfiles (pre-merge)"))
+        {
+            tomte_core::log_warn!(
+                "reconcile",
+                "could not commit stray source edits before merging: {e}"
+            );
+        }
+        // Conflicts are the EXPECTED outcome — that is exactly the state the
+        // per-file decisions go on to resolve. `Clean` means git merged it
+        // unaided and there is nothing left for the user to answer.
         match self.git.merge(&upstream)? {
             tomte_core::git::MergeStart::Clean => {
-                tomte_core::log_info!("reconcile", "merged clean");
-                let mut note = None;
-                let pushed = match self.git.push("origin") {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tomte_core::log_error!("reconcile", "push failed: {e}");
-                        append_note(&mut note, format!("merged, but push failed: {e}"));
-                        false
-                    }
-                };
-                self.rescan()?;
-                Ok(RepoReconcile::Done { pushed, note })
+                tomte_core::log_info!("reconcile", "merged clean — nothing left to answer");
+                Ok(false)
             }
             tomte_core::git::MergeStart::Conflicts(rels) => {
                 tomte_core::log_info!(
@@ -515,9 +584,108 @@ impl ResolveEngine {
                     "merge conflicts in {} file(s): {rels:?}",
                     rels.len()
                 );
-                Ok(RepoReconcile::Conflicts(self.conflict_inputs(rels)?))
+                Ok(true)
             }
         }
+    }
+
+    /// Conclude the merge the per-file decisions are resolving, if the one
+    /// that just landed was the last. Anything still conflicted keeps the
+    /// merge open on purpose: those files are ordinary review rows, each
+    /// resolvable on its own, and the last decision commits the merge.
+    pub fn finish_merge_if_resolved(&self) -> Result<MergeConclusion, ResolveError> {
+        if !self.git.merge_in_progress() {
+            return Ok(MergeConclusion::NotMerging);
+        }
+        let leftover = self.git.conflicted_files()?;
+        if !leftover.is_empty() {
+            tomte_core::log_info!(
+                "reconcile",
+                "{} conflict(s) still unanswered — merge stays open",
+                leftover.len()
+            );
+            return Ok(MergeConclusion::StillConflicted(leftover));
+        }
+        let (pushed, note) = self.finish_repo_reconcile()?;
+        Ok(MergeConclusion::Committed { pushed, note })
+    }
+
+    /// [`Self::finish_merge_if_resolved`] rendered as the `(committed,
+    /// pushed, note)` triple every resolve outcome reports, so a decision
+    /// taken inside a merge says exactly as much about itself as one taken
+    /// outside — including when it is only a step towards the commit.
+    fn conclude_merge(&self) -> (bool, bool, Option<String>) {
+        match self.finish_merge_if_resolved() {
+            Ok(MergeConclusion::Committed { pushed, note }) => (true, pushed, note),
+            Ok(MergeConclusion::StillConflicted(leftover)) => (
+                false,
+                false,
+                Some(format!(
+                    "recorded — {} more file(s) still differ from origin; \
+                     resolving them finishes the merge",
+                    leftover.len()
+                )),
+            ),
+            // Unreachable in practice (the caller only gets here while a
+            // merge is running), but a stale claim of "committed" would be a
+            // lie, and this path must not invent one.
+            Ok(MergeConclusion::NotMerging) => (
+                false,
+                false,
+                Some("the merge with origin ended before this decision could conclude it".into()),
+            ),
+            Err(e) => {
+                tomte_core::log_error!("reconcile", "could not conclude the merge: {e}");
+                (false, false, Some(format!("merge not concluded: {e}")))
+            }
+        }
+    }
+
+    /// Merge-editor inputs for `target` when an in-progress merge left its
+    /// source file conflicted; `Ok(None)` otherwise. This is how a file
+    /// enters the editor's repo-conflict mode now that there is no reconcile
+    /// queue: mid-merge the working-tree source is git's conflict-marker
+    /// text, so the panes have to come from the index stages rather than
+    /// from chezmoi's view of a file git has scribbled on.
+    pub fn repo_conflict_for(
+        &self,
+        target: &Path,
+    ) -> Result<Option<std::sync::Arc<MergeInputs>>, ResolveError> {
+        if !self.git.merge_in_progress() {
+            return Ok(None);
+        }
+        let source = self.chezmoi.source_path(target)?;
+        let rel = self.repo_rel(&source)?;
+        if !self.git.conflicted_files()?.contains(&rel) {
+            return Ok(None);
+        }
+        match self.conflict_inputs(vec![rel.clone()])?.pop() {
+            Some(inputs) => Ok(Some(inputs)),
+            None => Err(ResolveError::Failed(format!(
+                "{} is conflicted in the merge but produced no merge inputs",
+                rel.display()
+            ))),
+        }
+    }
+
+    /// Whether `source_path` is one of the paths an in-progress merge left
+    /// conflicted. Cheap when no merge is running: `merge_in_progress` is a
+    /// `rev-parse MERGE_HEAD`, and nothing else runs.
+    fn is_mid_merge_conflict(&self, source_path: &Path) -> Result<bool, ResolveError> {
+        if !self.git.merge_in_progress() {
+            return Ok(false);
+        }
+        let rel = self.repo_rel(source_path)?;
+        Ok(self.git.conflicted_files()?.contains(&rel))
+    }
+
+    /// A source path as the source repo names it.
+    fn repo_rel(&self, source_path: &Path) -> Result<PathBuf, ResolveError> {
+        let source_dir = self.chezmoi.source_dir()?;
+        Ok(source_path
+            .strip_prefix(&source_dir)
+            .unwrap_or(source_path)
+            .to_path_buf())
     }
 
     /// Build merge-editor inputs for mid-merge conflicted paths from the
@@ -578,9 +746,15 @@ impl ResolveEngine {
     ) -> Result<(), ResolveError> {
         tomte_core::log_info!("reconcile", "resolved {}", source_path.display());
         std::fs::write(source_path, resolved)?;
-        let source_dir = self.chezmoi.source_dir()?;
-        let rel = source_path.strip_prefix(&source_dir).unwrap_or(source_path);
-        self.git.add_path(rel)?;
+        self.stage_resolution(source_path)
+    }
+
+    /// Tell git one conflicted path is answered, the file already holding the
+    /// answer. Split out of [`Self::resolve_repo_conflict`] for `keep_disk`,
+    /// whose answer is written by `chezmoi re-add` rather than by us.
+    fn stage_resolution(&self, source_path: &Path) -> Result<(), ResolveError> {
+        let rel = self.repo_rel(source_path)?;
+        self.git.add_path(&rel)?;
         Ok(())
     }
 

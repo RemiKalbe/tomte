@@ -15,6 +15,7 @@ use gpui::{
 };
 
 use tomte_app::model::{SyncModel, time_ago};
+use tomte_app::resolve::MergeConclusion;
 use tomte_app::theme::Theme;
 use tomte_ui::components as ui;
 
@@ -63,11 +64,6 @@ pub struct Shell {
     /// Expanded scan-groups in the dashboard timeline, keyed by the group's
     /// newest event timestamp (stable across refreshes).
     pub expanded_scans: std::collections::HashSet<u64>,
-    /// Repo-reconcile flow: source conflicts still awaiting resolution
-    /// (front = the one currently in the editor), and whether the start /
-    /// finish stage is running on the background executor.
-    pub reconcile_queue: Vec<std::sync::Arc<tomte_app::merge_inputs::MergeInputs>>,
-    pub reconcile_in_flight: bool,
     /// A dashboard quick action (keep disk / keep source) is running on the
     /// background executor. Lives here because the dashboard body is rebuilt
     /// from Shell state on every render (unlike the long-lived ReviewView,
@@ -114,106 +110,61 @@ impl Shell {
         cx.notify();
     }
 
-    /// Kick the repo-reconcile flow: fetch + merge origin on the background
-    /// executor; clean merges finish silently, conflicts open the merge
-    /// editor one source file at a time (2026-08-18).
+    /// The merge editor recorded one mid-merge source conflict: its Save
+    /// wrote the source file and staged it, so git now knows that file is
+    /// answered. Conclude the merge if it was the last one open; otherwise
+    /// the remaining conflicts stay ordinary review rows, each resolvable on
+    /// its own — there is no queue any more, and nothing to present next.
     ///
-    /// Temporarily unreachable: its only caller was the diverged banner's
-    /// Reconcile button, deleted in Task 4 (divergence is no longer an
-    /// announced event). Left in place — a later task wires a new caller
-    /// once diverged files surface as ordinary per-file review rows.
-    #[allow(dead_code)]
-    pub fn start_reconcile(&mut self, cx: &mut Context<Self>) {
-        if self.reconcile_in_flight || !self.reconcile_queue.is_empty() {
-            return;
-        }
+    /// Called from OUTSIDE the merge view's own update (see the note at its
+    /// save site): routing and the banner both re-enter that same entity.
+    pub fn repo_conflict_saved(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Review;
+        cx.notify();
         let Some(engine) = cx
             .try_global::<crate::EngineSlot>()
             .and_then(|slot| slot.0.clone())
         else {
             return;
         };
-        self.reconcile_in_flight = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = {
-                let engine = engine.clone();
-                cx.background_executor()
-                    .spawn(async move { engine.start_repo_reconcile() })
-                    .await
-            };
-            this.update(cx, |shell, cx| {
-                shell.reconcile_in_flight = false;
-                match result {
-                    Ok(tomte_app::resolve::RepoReconcile::Done { pushed, note }) => {
-                        shell.reconcile_finished(pushed, note, cx);
-                    }
-                    Ok(tomte_app::resolve::RepoReconcile::Conflicts(queue)) => {
-                        shell.reconcile_queue = queue;
-                        shell.present_next_reconcile(cx);
-                    }
-                    Err(e) => {
-                        tomte_core::log_error!("reconcile", "start failed: {e}");
-                        engine.abort_repo_reconcile();
-                        crate::notify_osa::notify(
-                            &tomte_core::cmd::SystemRunner,
-                            "tomte",
-                            &format!("reconcile failed: {e}"),
-                        );
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// The merge editor recorded a resolution for the front conflict.
-    pub fn reconcile_conflict_saved(&mut self, cx: &mut Context<Self>) {
-        if !self.reconcile_queue.is_empty() {
-            self.reconcile_queue.remove(0);
-        }
-        self.present_next_reconcile(cx);
-    }
-
-    fn present_next_reconcile(&mut self, cx: &mut Context<Self>) {
-        if let Some(inputs) = self.reconcile_queue.first().cloned() {
-            let shell = cx.weak_entity();
-            let merge = self
-                .merge
-                .get_or_insert_with(|| cx.new(|cx| MergeView::new(shell, cx)))
-                .clone();
-            merge.update(cx, |view, cx| view.present_repo_conflict(inputs, cx));
-            self.route = Route::Merge;
-            cx.notify();
-            return;
-        }
-        // Every conflict resolved: conclude the merge, push, rescan.
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            return;
-        };
-        self.reconcile_in_flight = true;
-        self.route = Route::Dashboard;
-        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { engine.finish_repo_reconcile() })
+                .spawn(async move { engine.finish_merge_if_resolved() })
                 .await;
             this.update(cx, |shell, cx| {
-                shell.reconcile_in_flight = false;
                 match result {
-                    Ok((pushed, note)) => shell.reconcile_finished(pushed, note, cx),
+                    Ok(MergeConclusion::Committed { pushed, note }) => {
+                        shell.origin_merge_finished(pushed, note, cx);
+                    }
+                    Ok(MergeConclusion::StillConflicted(leftover)) => {
+                        shell.merge_done(
+                            OutcomeBanner {
+                                text: format!(
+                                    "Recorded · {} more file(s) still differ from origin",
+                                    leftover.len()
+                                )
+                                .into(),
+                                tint: review::BannerTint::Drift,
+                                undoable: false,
+                            },
+                            cx,
+                        );
+                    }
+                    // The editor only saves in this mode while a merge is
+                    // running, so this means it ended underneath us.
+                    Ok(MergeConclusion::NotMerging) => {
+                        tomte_core::log_warn!(
+                            "reconcile",
+                            "resolution recorded but no merge was in progress"
+                        );
+                    }
                     Err(e) => {
                         tomte_core::log_error!("reconcile", "finish failed: {e}");
                         crate::notify_osa::notify(
                             &tomte_core::cmd::SystemRunner,
                             "tomte",
-                            &format!("reconcile could not conclude: {e}"),
+                            &format!("merge with origin could not conclude: {e}"),
                         );
                     }
                 }
@@ -224,7 +175,14 @@ impl Shell {
         .detach();
     }
 
-    fn reconcile_finished(&mut self, pushed: bool, note: Option<String>, cx: &mut Context<Self>) {
+    /// The merge with origin was committed: refresh the model, and say so
+    /// out of band — the user may well be somewhere else by now.
+    fn origin_merge_finished(
+        &mut self,
+        pushed: bool,
+        note: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.state.update(cx, |_model, cx| {
             cx.notify();
         });
@@ -233,13 +191,23 @@ impl Shell {
             (_, Some(note)) => format!("source repo reconciled — {note}"),
             (false, None) => "source repo reconciled (push pending)".to_string(),
         };
+        self.merge_done(
+            OutcomeBanner {
+                text: body.clone().into(),
+                tint: review::BannerTint::Ok,
+                undoable: false,
+            },
+            cx,
+        );
         crate::notify_osa::notify(&tomte_core::cmd::SystemRunner, "tomte", &body);
     }
 
-    /// Abandon the reconcile: abort the in-progress merge, restore the repo.
-    pub fn cancel_reconcile(&mut self, cx: &mut Context<Self>) {
-        self.reconcile_queue.clear();
-        self.route = Route::Dashboard;
+    /// Abandon the merge with origin: abort it, restoring the source repo to
+    /// its pre-merge state. Cancelling ONE mid-merge conflict bails the
+    /// WHOLE merge deliberately — a half-resolved merge state would be worse
+    /// than none.
+    pub fn abort_origin_merge(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Review;
         cx.notify();
         if let Some(engine) = cx
             .try_global::<crate::EngineSlot>()
@@ -608,8 +576,6 @@ mod render_smoke {
                 let mut expanded_scans = HashSet::new();
                 expanded_scans.insert(30u64);
                 Shell {
-                    reconcile_queue: Vec::new(),
-                    reconcile_in_flight: false,
                     route,
                     state,
                     review: None,
@@ -666,8 +632,6 @@ mod render_smoke {
                     view
                 });
                 Shell {
-                    reconcile_queue: Vec::new(),
-                    reconcile_in_flight: false,
                     route: Route::Review,
                     state,
                     review: Some(review),
@@ -689,8 +653,6 @@ mod render_smoke {
         let (_view, vis) = cx.add_window_view(|_window, cx| {
             let state = cx.new(|_| model_with_data());
             Shell {
-                reconcile_queue: Vec::new(),
-                reconcile_in_flight: false,
                 route: Route::Dashboard,
                 state,
                 review: None,
@@ -742,8 +704,6 @@ mod render_smoke {
                 view
             });
             Shell {
-                reconcile_queue: Vec::new(),
-                reconcile_in_flight: false,
                 route: Route::Review,
                 state,
                 review: Some(review),
@@ -774,8 +734,6 @@ mod render_smoke {
                     ..Default::default()
                 });
                 Shell {
-                    reconcile_queue: Vec::new(),
-                    reconcile_in_flight: false,
                     route: Route::Dashboard,
                     state,
                     review: None,
@@ -889,8 +847,6 @@ mod render_smoke {
                     view
                 });
                 Shell {
-                    reconcile_queue: Vec::new(),
-                    reconcile_in_flight: false,
                     route: Route::Merge,
                     state,
                     review: None,
