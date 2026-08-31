@@ -723,8 +723,11 @@ fn region_display(
 /// failed to measure is not zero, and rendering it as one would assert that
 /// nothing is at stake at the exact moment we know least. Only `Files` ever
 /// reaches the user as a number.
+// `pub`, not `pub(super)`: it is a parameter of the public
+// `Shell::abort_origin_merge`, and a type less visible than the signature
+// taking it is a `private_interfaces` warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Rollback {
+pub enum Rollback {
     Files(usize),
     /// `merge_rollback_files` failed (the reason). The abort's semantics are
     /// unchanged; only its size is unknown.
