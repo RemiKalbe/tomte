@@ -143,6 +143,7 @@ mod tests {
             templated: false,
             template: None,
             span_map: None,
+            origin: None,
         }
     }
 

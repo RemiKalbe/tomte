@@ -269,6 +269,7 @@ fn conflict_inputs() -> MergeInputs {
         templated: false,
         template: None,
         span_map: None,
+        origin: None,
     }
 }
 
@@ -290,6 +291,7 @@ fn templated_inputs() -> MergeInputs {
         templated: true,
         template: Some(template.into()),
         span_map,
+        origin: None,
     }
 }
 
@@ -412,6 +414,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                         templated: false,
                         template: None,
                         span_map: None,
+                        origin: None,
                     };
                     view.auto_merge = Some((Arc::new(inputs), "merged\n".into()));
                 });
@@ -502,6 +505,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 templated: true,
                 template: Some(template),
                 span_map,
+                origin: None,
             };
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, inputs, false));
@@ -524,6 +528,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 templated: false,
                 template: None,
                 span_map: None,
+                origin: None,
             };
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, inputs, false));

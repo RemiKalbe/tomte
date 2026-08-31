@@ -472,6 +472,10 @@ impl ResolveEngine {
                     templated: false,
                     template: None,
                     span_map: None,
+                    // Repo-level conflicts already ARE origin's version
+                    // (stage 3, `read(3)` above as `theirs`) — a separate
+                    // origin pane has nothing to add here.
+                    origin: None,
                 }));
             }
         }

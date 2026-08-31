@@ -151,7 +151,15 @@ fn auto_merge_blocking(
     journal: &Path,
 ) -> Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)> {
     let chezmoi = crate::app_chezmoi_client();
-    let inputs = tomte_app::merge_inputs::load(&chezmoi, journal, target).ok()?;
+    let git = crate::app_git_client(&chezmoi).ok()?;
+    // Same fallback as the daemon's own derivation (`format!("origin/{branch}")`
+    // off `head_branch()`, `daemon/src/main.rs`) and `resolve.rs`'s reconcile
+    // helpers: an unreadable branch degrades to "main" rather than failing —
+    // the origin pane is optional, never a hard requirement here.
+    let branch = git.head_branch().unwrap_or_else(|_| "main".into());
+    let remote_ref = format!("origin/{branch}");
+    let inputs =
+        tomte_app::merge_inputs::load(&chezmoi, &git, &remote_ref, journal, target).ok()?;
     let state = tomte_app::merge_state::MergeState::new(&inputs);
     if !state.conflicts().is_empty() {
         return None;

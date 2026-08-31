@@ -724,6 +724,7 @@ mod render_smoke {
                 templated: false,
                 template: None,
                 span_map: None,
+                origin: None,
             }
         }
 
@@ -740,6 +741,7 @@ mod render_smoke {
                 templated: true,
                 template: Some(template.into()),
                 span_map: Some(span_map),
+                origin: None,
             }
         }
 

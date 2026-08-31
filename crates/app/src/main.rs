@@ -22,7 +22,7 @@ use tomte_app::ipc::{IpcClient, IpcError};
 use tomte_app::model::{SyncModel, TIMELINE_CAP};
 use tomte_app::resolve::ResolveEngine;
 use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError, ChezmoiOptions};
-use tomte_core::cmd::{CommandRunner, SystemRunner};
+use tomte_core::cmd::SystemRunner;
 use tomte_core::git::GitClient;
 use tomte_journal::Journal;
 use tomte_proto::{Event, Request, Response};
@@ -67,14 +67,25 @@ pub(crate) fn app_chezmoi_client() -> ChezmoiClient {
     )
 }
 
+/// Git client for the chezmoi source repo. Built fresh per call from
+/// `chezmoi.source_dir()` (a subprocess) rather than cached — mirrors
+/// `app_chezmoi_client()`'s own no-caching convention, and matches how
+/// `merge_inputs::load`'s call sites already build a fresh chezmoi client
+/// inline (often inside a `cx.spawn` → `background_executor` closure, where
+/// threading a long-lived client through is awkward). Kept in step with
+/// `build_engine`'s identical construction of the resolve engine's
+/// long-lived `git` field below.
+pub(crate) fn app_git_client(chezmoi: &ChezmoiClient) -> Result<GitClient, ChezmoiError> {
+    let source_dir = chezmoi.source_dir()?;
+    Ok(GitClient::new(Arc::new(SystemRunner), source_dir))
+}
+
 /// Build the resolve engine for one daemon connection. Blocking — the
 /// `source_dir` lookup is a subprocess — so callers run it on the
 /// background executor.
 fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEngine, ChezmoiError> {
-    let runner: Arc<dyn CommandRunner> = Arc::new(SystemRunner);
     let chezmoi = app_chezmoi_client();
-    let source_dir = chezmoi.source_dir()?;
-    let git = GitClient::new(runner, source_dir);
+    let git = app_git_client(&chezmoi)?;
     Ok(ResolveEngine {
         chezmoi,
         git,

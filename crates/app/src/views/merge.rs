@@ -886,7 +886,13 @@ impl MergeView {
                 cx.background_executor()
                     .spawn(async move {
                         let client = crate::app_chezmoi_client();
-                        merge_inputs::load(&client, &journal, &target)
+                        let git = crate::app_git_client(&client)?;
+                        // Same fallback as `review.rs`'s `auto_merge_blocking`
+                        // and the daemon's own derivation — an unreadable
+                        // branch degrades to "main" rather than failing.
+                        let branch = git.head_branch().unwrap_or_else(|_| "main".into());
+                        let remote_ref = format!("origin/{branch}");
+                        merge_inputs::load(&client, &git, &remote_ref, &journal, &target)
                     })
                     .await
             };
@@ -2268,6 +2274,7 @@ mod tests {
             templated: false,
             template: None,
             span_map: None,
+            origin: None,
         }
     }
 
@@ -2591,6 +2598,7 @@ mod tests {
             templated: true,
             template: Some(template.into()),
             span_map: Some(map),
+            origin: None,
         }));
         assert!(loaded.theirs_rows[0].protected.is_some());
         assert!(loaded.theirs_rows[1].protected.is_none());

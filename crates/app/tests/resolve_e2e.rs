@@ -184,7 +184,14 @@ impl DriftLab {
 
     /// `merge_inputs::load` with the lab's own stack, ready for `MergeState`.
     fn load_merge_inputs(&self) -> merge_inputs::MergeInputs {
-        merge_inputs::load(&self.engine.chezmoi, &self.journal_path, &self.target).unwrap()
+        merge_inputs::load(
+            &self.engine.chezmoi,
+            &self.engine.git,
+            "origin/main",
+            &self.journal_path,
+            &self.target,
+        )
+        .unwrap()
     }
 }
 
