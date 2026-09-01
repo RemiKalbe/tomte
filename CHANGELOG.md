@@ -4,6 +4,21 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.17 — 2026-09-01
+
+### Fixed
+
+- **Resolved files disappear from the queue immediately.** They already did —
+  and then came straight back. The list is rebuilt from the daemon's
+  snapshot on every status poll, and the daemon only catches up after a full
+  rescan, which walks every managed file; a single templated file that reads
+  from 1Password can take several seconds on its own. So for ten or twenty
+  seconds the queue kept showing work you had already finished. Files you
+  resolve are now held aside until a scan has actually had a chance to see
+  them, with the in-sync tally kept consistent with the list beside it. If a
+  scan runs and still reports the file, it comes back — a resolution that
+  did not take should not be hidden.
+
 ## 0.1.16 — 2026-09-01
 
 A fix for 0.1.15: resolving a file while your dotfiles repo was behind origin
