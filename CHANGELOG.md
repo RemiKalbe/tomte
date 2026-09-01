@@ -4,6 +4,55 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.15 — 2026-08-31
+
+Your dotfiles repo has a remote, and until now Tomte pretended it didn't.
+"Source" was really two things — what's on this machine, and what's on
+origin — and when they disagreed you got a red banner and a separate flow
+to deal with it. Origin is now just another version of the file, visible
+and pickable wherever the local one already was.
+
+### Added
+
+- **Origin, everywhere you resolve.** The review list marks the files
+  origin has its own version of. "Keep source" splits into **this machine**
+  and **origin** when the two differ, and stays a single "Keep source"
+  when they agree. The diff gains a selector for which pair you're
+  comparing — disk against either source, or the two sources against each
+  other.
+- **A fourth pane in the merge editor.** When origin has its own take on a
+  file, it gets a column beside the others, in its own colour, with an
+  **origin** button on every region it differs on. Picking it is recorded
+  as origin's text — not as a hand edit — so the result rows say where the
+  content came from.
+
+### Changed
+
+- **The "dotfiles repo diverged from origin" banner is gone.** Divergence
+  isn't an event to announce any more, it's a property of the files it
+  affects. When the histories can be joined safely Tomte does it in the
+  background; when they genuinely conflict, those files show up in the
+  review queue like any other change, and answering them drives the real
+  git merge to completion. There's no separate reconcile flow to enter.
+
+### Fixed
+
+- **"0 in sync".** One unreadable path — a managed directory, say — used to
+  abort the entire scan, freezing the count at zero indefinitely. A file
+  that can't be checked is now recorded and skipped, and never counted as
+  fine.
+- **Panes falling off the window.** The merge editor's columns kept their
+  pixel widths when the window changed size, so shrinking it collapsed one
+  column and pushed the rest off screen. They now follow the window,
+  keeping the proportions you dragged and never letting a pane disappear.
+  Same for the split between the panes and the result.
+- **A locked signing agent no longer stalls the app.** Joining histories in
+  the background writes a commit, which needs your signing key. With
+  1Password locked that used to block the daemon for a minute at a time —
+  and leave the repo mid-merge. Tomte now asks the signer first, skips the
+  join when it can't answer, and picks it up on the next check. Commits
+  stay signed.
+
 ## 0.1.14 — 2026-08-27
 
 The merge editor became a real editor, every code surface became selectable
