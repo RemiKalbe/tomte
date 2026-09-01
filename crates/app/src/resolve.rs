@@ -163,6 +163,16 @@ impl ResolveEngine {
     /// difference has to be answered first, in the merge editor.
     pub fn keep_source(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "keep_source {}", target.display());
+        // Catch up first, exactly as `keep_disk` does. This one never FAILED
+        // while behind — `chezmoi apply` does not dirty the source, so there
+        // was nothing to push and `commit_phase`'s rebase-and-retry recovery
+        // never fired — but it quietly left the repo behind origin. Origin's
+        // changes then never arrived, and the next decision that DID need to
+        // push walked into the non-fast-forward wall.
+        //
+        // The mid-merge guard below runs after this deliberately, so it sees
+        // the state the join actually produced.
+        self.ensure_merge_started()?;
         if self.git.merge_in_progress() {
             let source = self.chezmoi.source_path(target)?;
             if self.is_mid_merge_conflict(&source)? {

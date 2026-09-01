@@ -775,6 +775,109 @@ const LOCAL_SOURCE: &[u8] = b"a=this-machine\n";
 /// so the two sources genuinely disagree while a resolve's push stays a
 /// fast-forward. The destination is levelled with the local source, so the
 /// only disagreement in play is source-vs-origin.
+/// Turn on the chezmoi git automation the way a real user does.
+///
+/// Every fixture here writes an EMPTY chezmoi.toml, so `autoCommit`/`autoPush`
+/// were off in every test — and the whole suite was therefore blind to what
+/// chezmoi does on a machine that has them on: it runs its OWN git from inside
+/// `re-add`, committing and pushing without asking Tomte. That blindness is
+/// how the 0.1.15 field bug shipped green.
+fn chezmoi_commits_and_pushes_for_itself(lab: &DriftLab) {
+    std::fs::write(
+        lab.s.root.path().join("chezmoi.toml"),
+        "[git]\nautoCommit = true\nautoPush = true\n",
+    )
+    .unwrap();
+}
+
+/// The field failure from 0.1.15, reproduced with the user's actual chezmoi
+/// configuration: behind origin, autoPush on, one drifted file.
+///
+/// What happened: the decision skipped the join (this file was not one of
+/// origin's conflicts), then ran `chezmoi re-add`. chezmoi's autoCommit made a
+/// local commit and its autoPush was REJECTED as non-fast-forward — leaving
+/// the repo diverged, so the next decision failed too. The user saw
+/// "Keep disk failed: chezmoi exited with code 1 ... [rejected] main -> main".
+#[test]
+fn keep_disk_succeeds_while_behind_origin_with_chezmoi_autopush_on() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    origin_is_ahead_on_an_unrelated_file(&lab);
+
+    // The user edits a managed file on disk.
+    std::fs::write(&lab.target, b"a=from-the-disk\n").unwrap();
+
+    let git_c = lab.source_git();
+    assert!(
+        git_c.divergence("origin/main").unwrap().behind > 0,
+        "premise: behind origin, which is what makes autoPush reject"
+    );
+
+    // 0.1.15 failed HERE with chezmoi's raw non-fast-forward stderr.
+    lab.engine
+        .keep_disk(&lab.target)
+        .expect("a decision must not fail because the repo was behind origin");
+
+    let after = git_c.divergence("origin/main").unwrap();
+    assert_eq!(
+        (after.behind, after.ahead),
+        (0, 0),
+        "the decision must land on origin, not strand a local commit"
+    );
+    assert!(
+        !git_c.merge_in_progress(),
+        "and must not leave a merge open"
+    );
+
+    // The disk content is what reached the source, and origin's unrelated
+    // commit survived the join.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        b"a=from-the-disk\n"
+    );
+    assert!(
+        lab.s.source.join("dot_unrelated").exists(),
+        "origin's own commit must still be there"
+    );
+}
+
+/// The sibling action, same configuration. `keep_source` survives being
+/// behind for a different reason than `keep_disk` does: it runs `chezmoi
+/// apply`, which does not touch the SOURCE, so chezmoi's autoCommit never
+/// fires and the push is Tomte's own — where `commit_phase`'s
+/// rebase-and-retry recovery can see the rejection and replay on top.
+///
+/// Worth pinning: it means the two actions stay correct through DIFFERENT
+/// mechanisms, and a change to either could silently break only one.
+#[test]
+fn keep_source_also_survives_being_behind_with_chezmoi_autopush_on() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    origin_is_ahead_on_an_unrelated_file(&lab);
+
+    std::fs::write(&lab.target, b"a=disk-edit-to-discard\n").unwrap();
+    let git_c = lab.source_git();
+    assert!(
+        git_c.divergence("origin/main").unwrap().behind > 0,
+        "premise: behind"
+    );
+
+    lab.engine
+        .keep_source(&lab.target)
+        .expect("keep_source must not fail because the repo was behind origin");
+
+    let after = git_c.divergence("origin/main").unwrap();
+    assert_eq!(
+        (after.behind, after.ahead),
+        (0, 0),
+        "the decision must land on origin"
+    );
+    assert!(
+        lab.s.source.join("dot_unrelated").exists(),
+        "origin's own commit must still be there"
+    );
+}
+
 /// Origin moved on a file this machine has never touched, and the fetch was
 /// never integrated: the repo is simply BEHIND and the join is clean.
 fn origin_is_ahead_on_an_unrelated_file(lab: &DriftLab) {
