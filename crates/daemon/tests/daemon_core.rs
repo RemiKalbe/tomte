@@ -314,6 +314,26 @@ fn signable_for_real(repo: &std::path::Path) {
     // which rejects a key it does not hold — pin it so the test does not
     // depend on whose laptop runs it.
     git(repo, &["config", "gpg.ssh.program", "ssh-keygen"]);
+
+    // Git cannot VERIFY an ssh signature without an allowed-signers file, and
+    // reports `%G?` as 'N' when it cannot verify — the same letter it uses for
+    // "not signed at all". Without this the test read a perfectly signed
+    // commit as unsigned on any machine whose global config lacks the file,
+    // which is every CI runner (2026-09-01: this reached a release tag).
+    // Naming the key we just generated makes the check hermetic AND stronger:
+    // 'G' proves the commit is signed by exactly this key, not merely signed.
+    let allowed = repo.join("../allowed-signers");
+    let pubkey = std::fs::read_to_string(format!("{}.pub", key.display()))
+        .expect("ssh-keygen wrote a public key");
+    std::fs::write(&allowed, format!("t@t {pubkey}")).expect("write allowed-signers");
+    git(
+        repo,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            allowed.to_str().unwrap(),
+        ],
+    );
 }
 
 /// The daemon's auto-join is the one commit-creating operation Tomte performs
@@ -407,13 +427,16 @@ fn a_live_signer_lets_the_auto_join_through_and_signs_it() {
         .current_dir(&s.source)
         .output()
         .unwrap();
-    // %G? is 'U' for "signed, no trusted key on file" — this repo has no
-    // allowed-signers list, so U is the good answer: a signature exists. 'N'
-    // would mean the join committed UNSIGNED, which must never happen.
-    assert_ne!(
+    // 'G' — a good signature from the key the fixture generated. Anything
+    // else fails: 'N' is unsigned (or unverifiable), 'B' is a bad signature,
+    // 'U'/'E' mean git could not tie it to the expected key. The fixture
+    // configures allowed-signers precisely so this can be an equality check
+    // rather than "not the worst letter".
+    assert_eq!(
         String::from_utf8_lossy(&sig.stdout).trim(),
-        "N",
-        "the auto-join's merge commit must carry a signature"
+        "G",
+        "the auto-join's merge commit must carry a signature from the \
+         fixture's own key"
     );
 }
 
