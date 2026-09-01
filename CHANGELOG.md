@@ -4,6 +4,40 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## 0.1.16 — 2026-09-01
+
+A fix for 0.1.15: resolving a file while your dotfiles repo was behind origin
+failed with a raw git push rejection, and left the repo diverged so the next
+file failed too.
+
+### Fixed
+
+- **Resolving a file no longer fails when the repo is behind origin.** 0.1.15
+  asked whether the file you were resolving happened to be one of origin's
+  conflicts, and skipped catching up if it wasn't — then ran a chezmoi
+  command anyway. With `autoCommit`/`autoPush` set, chezmoi commits and
+  pushes from inside that command, and pushing while behind is rejected —
+  after the local commit was already made, which turned "behind" into
+  "diverged" and broke every later decision too. Whose file conflicts has no
+  bearing on whether the repo needs origin's commits, so the question is
+  gone: if Tomte is behind, it integrates first.
+- **"Keep source" no longer leaves you silently behind.** It never failed —
+  applying doesn't change the source, so there was nothing to push — but it
+  never caught up either, so origin's changes never arrived and the next
+  decision that did need to push hit the same wall.
+- **Answering one file never waits on another.** Files are resolved
+  independently, in any order, with no error and no banner. A decision made
+  while others are outstanding reports "recorded — N more file(s) still
+  differ from origin" instead of failing. Only the eventual push is
+  collective, because git's unit of push is a commit.
+
+### Internal
+
+- The test fixtures wrote an empty chezmoi config, so `autoCommit`/`autoPush`
+  were off in every test and the suite could not see what chezmoi does on a
+  machine that has them on. They can be switched on now, and the failure
+  above is pinned by a test that reproduces it exactly.
+
 ## 0.1.15 — 2026-08-31
 
 Your dotfiles repo has a remote, and until now Tomte pretended it didn't.
