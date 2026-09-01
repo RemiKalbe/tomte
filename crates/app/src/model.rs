@@ -41,6 +41,22 @@ pub struct SyncModel {
     pub update_ready: Option<crate::update::StagedUpdate>,
     /// Current drifted targets, unique by target path.
     pub drifted: Vec<DriftSummary>,
+    /// Targets this app just resolved, hidden until a scan can see it.
+    ///
+    /// `confirm_resolved` drops the row the moment a decision succeeds, but
+    /// `hydrate_status` rebuilds the list wholesale from the daemon's
+    /// snapshot — so any Status poll landing before the daemon's next scan
+    /// finishes RESURRECTED the row the user had just answered. A rescan
+    /// walks every managed file, and a templated one that shells out to
+    /// 1Password can take seconds on its own (7.8s observed in the field for
+    /// a single file), so that window is tens of seconds: "everything is
+    /// resolved but the UI still shows stuff to resolve".
+    ///
+    /// Bounded on purpose: cleared by the next `ScanDone`. If the daemon
+    /// still reports the target after a scan has run, the resolution did not
+    /// take and the row must come back — hiding a real problem forever would
+    /// be worse than the flicker.
+    pub resolved_pending: std::collections::BTreeSet<PathBuf>,
     pub in_sync: u64,
     pub degraded: Option<String>,
     /// Newest first, capped at [`TIMELINE_CAP`].
@@ -94,12 +110,20 @@ impl SyncModel {
             return;
         }
         self.drifted.clear();
+        let mut hidden = 0u64;
         for d in drifted {
+            // Already answered here; the daemon has not caught up yet.
+            if self.resolved_pending.contains(&d.target) {
+                hidden += 1;
+                continue;
+            }
             if !self.drifted.iter().any(|e| e.target == d.target) {
                 self.drifted.push(d);
             }
         }
-        self.in_sync = in_sync;
+        // Count what the list shows. Leaving `in_sync` at the daemon's number
+        // while hiding rows would make the tally disagree with the queue.
+        self.in_sync = in_sync + hidden;
         self.degraded = degraded;
     }
 
@@ -204,6 +228,10 @@ impl SyncModel {
                 });
             }
             Event::ScanDone { ts: _, drifted } => {
+                // A scan has now run, so the daemon's next snapshot is the
+                // authority again. Anything still reported as drifted after
+                // this point genuinely is — stop hiding it.
+                self.resolved_pending.clear();
                 // Per-target Drift pushes precede ScanDone, so survivors are
                 // already up to date; a clean scan means nothing survived.
                 if drifted == 0 {
@@ -230,6 +258,8 @@ impl SyncModel {
     /// reconcile for free: an in_sync Drift retain is a no-op, and if the
     /// file genuinely re-drifts a fresh Drift event re-adds it.
     pub fn confirm_resolved(&mut self, target: &std::path::Path) {
+        // Remember it, or the next Status poll puts the row straight back.
+        self.resolved_pending.insert(target.to_path_buf());
         let before = self.drifted.len();
         self.drifted.retain(|d| d.target != target);
         // Count moves only when the target actually left the list — a repeat
@@ -475,6 +505,70 @@ mod tests {
             to_hash: None,
             meta,
         }
+    }
+
+    /// The field complaint (2026-09-01): "everything is resolved but the UI
+    /// still shows stuff to resolve and only after at least 10s does it
+    /// finally update."
+    ///
+    /// `confirm_resolved` dropped the row immediately, but `hydrate_status`
+    /// rebuilds the list from the daemon's snapshot — and the daemon's next
+    /// scan walks every managed file, with a single templated one taking 7.8s
+    /// via 1Password in the field. Every Status poll in that window put the
+    /// answered row straight back.
+    #[test]
+    fn a_status_poll_does_not_resurrect_a_row_this_app_just_resolved() {
+        let mut m = SyncModel::default();
+        let stale = || {
+            vec![
+                summary("/a", "conflict", Some(1)),
+                summary("/b", "drifted", Some(2)),
+            ]
+        };
+        m.hydrate_status(stale(), 10, None, false, None);
+        m.confirm_resolved(Path::new("/a"));
+        assert_eq!(m.drifted.len(), 1, "gone immediately");
+
+        // The daemon has not rescanned yet, so its snapshot still lists /a.
+        m.hydrate_status(stale(), 10, None, false, None);
+        assert_eq!(
+            m.drifted
+                .iter()
+                .map(|d| d.target.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("/b")],
+            "the answered row must not come back while the daemon catches up"
+        );
+        assert_eq!(
+            m.in_sync, 11,
+            "the tally must agree with the list it is shown beside"
+        );
+    }
+
+    /// Bounded, so a resolution that did NOT take cannot hide forever. Once a
+    /// scan has run, the daemon is the authority again.
+    #[test]
+    fn a_scan_ends_the_grace_period_so_a_failed_resolution_reappears() {
+        let mut m = SyncModel::default();
+        let stale = || vec![summary("/a", "conflict", Some(1))];
+        m.hydrate_status(stale(), 10, None, false, None);
+        m.confirm_resolved(Path::new("/a"));
+        m.hydrate_status(stale(), 10, None, false, None);
+        assert!(m.drifted.is_empty(), "hidden while the daemon catches up");
+
+        // A scan has now run and STILL reports /a: the resolution did not
+        // take, and hiding a real problem would be worse than the flicker.
+        m.apply_event(Event::ScanDone { ts: 5, drifted: 1 });
+        m.hydrate_status(stale(), 10, None, false, None);
+        assert_eq!(
+            m.drifted
+                .iter()
+                .map(|d| d.target.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("/a")],
+            "a target the daemon still reports after a scan must come back"
+        );
+        assert_eq!(m.in_sync, 10, "and the tally goes back to the daemon's");
     }
 
     #[test]
