@@ -54,6 +54,17 @@ pub enum MergeTreeOutcome {
     Unknown,
 }
 
+/// Logged, not silent: a retry that nobody can see is indistinguishable from
+/// a hang, and this one costs real wall-clock.
+fn tomte_core_log_retry(args: &[&str], attempt: u32, stderr: &str, code: i32) {
+    crate::log_info!(
+        "git",
+        "index.lock busy (exit {code}), retry {attempt}/6 for `git {}`: {}",
+        args.join(" "),
+        stderr.lines().next().unwrap_or("").trim()
+    );
+}
+
 #[derive(Clone)]
 pub struct GitClient {
     runner: Arc<dyn CommandRunner>,
@@ -65,7 +76,38 @@ impl GitClient {
         Self { runner, repo }
     }
 
+    /// `index.lock` contention is transient, not a failure.
+    ///
+    /// Two things touch the source repo at once by design: the daemon scans
+    /// it on its own cadence while the app resolves a file in it. Plenty of
+    /// read-shaped commands take that lock anyway — `git status` refreshes
+    /// the index stat cache — so a scan and a decision can collide through no
+    /// fault of either. Git's own advice for the message is to retry.
+    ///
+    /// Surfaced by CI (2026-09-01), where slower scheduling hit a window that
+    /// never opened on a dev machine. Bounded and short: a genuinely stale
+    /// lock still fails, it just fails after ~600ms instead of instantly.
+    fn is_index_lock_contention(stderr: &str) -> bool {
+        stderr.contains("index.lock") && stderr.contains("File exists")
+    }
+
     fn run(&self, args: &[&str], timeout: Duration) -> Result<Vec<u8>, GitError> {
+        let mut attempt = 0;
+        loop {
+            match self.run_once(args, timeout) {
+                Err(GitError::Exit { code, stderr })
+                    if attempt < 6 && Self::is_index_lock_contention(&stderr) =>
+                {
+                    attempt += 1;
+                    tomte_core_log_retry(args, attempt, &stderr, code);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn run_once(&self, args: &[&str], timeout: Duration) -> Result<Vec<u8>, GitError> {
         let out = self.runner.run(
             CommandRequest::new("git")
                 .args(args.iter().copied())
@@ -656,6 +698,49 @@ mod tests {
             git.merge_tree_conflicts("upstream").unwrap(),
             MergeTreeOutcome::Conflicts(vec![]),
             "exit 1 must report Conflicts, never Clean, regardless of the parsed path list"
+        );
+    }
+
+    /// The daemon scans the source repo while the app resolves a file in it,
+    /// and plenty of read-shaped git commands take `index.lock` anyway
+    /// (`git status` refreshes the stat cache). A collision is transient, and
+    /// git's own advice for the message is to retry — so it must not surface
+    /// as a failed decision. CI caught this where a dev machine never did.
+    #[test]
+    fn index_lock_contention_is_retried_not_reported_as_failure() {
+        let fake = FakeRunner::new();
+        // Verbatim from the CI failure.
+        fake.push_ok(
+            128,
+            "",
+            "fatal: Unable to create '/tmp/x/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n",
+        );
+        fake.push_ok(0, "cafebabecafebabecafebabecafebabecafebabe\n", "");
+        let git = GitClient::new(Arc::new(fake), PathBuf::from("/does-not-matter"));
+        assert_eq!(
+            git.head_sha().unwrap(),
+            "cafebabecafebabecafebabecafebabecafebabe",
+            "a busy index must be retried, not turned into a failed decision"
+        );
+    }
+
+    /// Bounded: a lock that never clears is a real failure and must still be
+    /// reported, not retried forever behind a spinner.
+    #[test]
+    fn a_lock_that_never_clears_still_fails() {
+        let fake = FakeRunner::new();
+        for _ in 0..12 {
+            fake.push_ok(
+                128,
+                "",
+                "fatal: Unable to create '/tmp/x/.git/index.lock': File exists.\n",
+            );
+        }
+        let git = GitClient::new(Arc::new(fake), PathBuf::from("/does-not-matter"));
+        let err = git.head_sha().unwrap_err();
+        assert!(
+            err.to_string().contains("index.lock"),
+            "the persistent lock must be surfaced verbatim: {err}"
         );
     }
 
