@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
-use tomte_core::git::{GitClient, GitError, MergeTreeOutcome};
+use tomte_core::git::{GitClient, GitError};
 use tomte_core::template::anchor::SpanMap;
 use tomte_core::template::verify::{VerifyError, verify_write_back};
 use tomte_core::template::writeback::write_back;
@@ -127,12 +127,20 @@ impl ResolveEngine {
         // the DESTINATION, so it overwrites whatever the merge left in that
         // file — conflict markers included — which is exactly what "keep
         // disk" means for this conflict.
-        let merging = self.ensure_merge_started(&source)?;
-        self.chezmoi.re_add(target)?;
+        let merging = self.ensure_merge_started()?;
         let (committed, pushed, note) = if merging {
+            // NOT `chezmoi re-add` here. A chezmoi configured with autoCommit
+            // commits from inside re-add, and git refuses to commit with
+            // unmerged paths — so mid-merge that call fails outright. It
+            // cannot be suppressed per-invocation either (CHEZMOI_GIT_* env
+            // overrides are ignored). Copying the destination over the source
+            // is exactly what re-add does for a non-templated file, which is
+            // all that reaches here — `is_templated` returned early above.
+            std::fs::copy(target, &source)?;
             self.stage_resolution(&source)?;
             self.conclude_merge()
         } else {
+            self.chezmoi.re_add(target)?;
             self.commit_phase("keep_disk", target)
         };
         self.session_end(session, &format!("keep_disk {}", display_name(target)))?;
@@ -352,7 +360,7 @@ impl ResolveEngine {
         // real merge and this file's answer recorded IN it (spec §6.1):
         // `resolve_repo_conflict` writes the source and stages it, which is
         // how git learns the conflict is answered.
-        let merging = self.ensure_merge_started(&inputs.source_path)?;
+        let merging = self.ensure_merge_started()?;
         if merging {
             self.resolve_repo_conflict(&inputs.source_path, &new_source)?;
         } else {
@@ -559,7 +567,21 @@ impl ResolveEngine {
     /// commits the user never saw. A divergence that appeared since the last
     /// fetch still gets caught downstream, by `commit_phase`'s rejected-push
     /// recovery.
-    pub fn ensure_merge_started(&self, source_path: &Path) -> Result<bool, ResolveError> {
+    /// Catch the source repo up with origin so a decision can actually reach
+    /// it, returning whether a CONFLICTED merge is now open.
+    ///
+    /// Every caller follows this with something that can push. Being behind
+    /// origin makes that push non-fast-forward, so there is nothing to decide
+    /// here: if we are behind, we integrate. A clean join is silent; a
+    /// conflicting one opens a merge whose conflicts are ordinary review rows.
+    ///
+    /// It deliberately does NOT ask whether *this* file is one of the
+    /// conflicts. 0.1.15 did, and skipped the join for everything else — so a
+    /// decision ran `chezmoi re-add`, chezmoi's autoCommit made a local commit,
+    /// its autoPush was rejected for being behind, and "behind" became
+    /// "diverged", breaking every later decision too. Whose file conflicts has
+    /// no bearing on whether the repo needs origin's commits.
+    pub fn ensure_merge_started(&self) -> Result<bool, ResolveError> {
         if self.git.merge_in_progress() {
             return Ok(true);
         }
@@ -568,38 +590,6 @@ impl ResolveEngine {
         if self.git.divergence(&upstream)?.behind == 0 {
             return Ok(false);
         }
-        let rel = self.repo_rel(source_path)?;
-        match self.git.merge_tree_conflicts(&upstream)? {
-            MergeTreeOutcome::Conflicts(paths) if paths.contains(&rel) => {}
-            MergeTreeOutcome::Conflicts(paths) => {
-                tomte_core::log_info!(
-                    "reconcile",
-                    "behind {upstream}, but {} is not one of its {} conflict(s) — no merge",
-                    rel.display(),
-                    paths.len()
-                );
-                return Ok(false);
-            }
-            MergeTreeOutcome::Clean => {
-                tomte_core::log_info!(
-                    "reconcile",
-                    "behind {upstream}, but the merge is clean — the daemon joins those"
-                );
-                return Ok(false);
-            }
-            MergeTreeOutcome::Unknown => {
-                tomte_core::log_warn!(
-                    "reconcile",
-                    "merge-tree could not answer for {upstream} — leaving the repo alone"
-                );
-                return Ok(false);
-            }
-        }
-        tomte_core::log_info!(
-            "reconcile",
-            "decision on {} conflicts with {upstream} — merging",
-            rel.display()
-        );
         // `git merge` refuses to run over local modifications it would
         // overwrite, so stray source edits become a commit first (the policy
         // the old reconcile entry point carried). Tolerant like
@@ -617,18 +607,18 @@ impl ResolveEngine {
                 "could not commit stray source edits before merging: {e}"
             );
         }
-        // Conflicts are the EXPECTED outcome — that is exactly the state the
-        // per-file decisions go on to resolve. `Clean` means git merged it
-        // unaided and there is nothing left for the user to answer.
         match self.git.merge(&upstream)? {
             tomte_core::git::MergeStart::Clean => {
-                tomte_core::log_info!("reconcile", "merged clean — nothing left to answer");
+                tomte_core::log_info!("reconcile", "joined {upstream} — nothing to answer");
                 Ok(false)
             }
+            // Expected, and not a failure: these files are review rows now.
+            // Each is answerable on its own, in any order; the merge commits
+            // when the last one lands.
             tomte_core::git::MergeStart::Conflicts(rels) => {
                 tomte_core::log_info!(
                     "reconcile",
-                    "merge conflicts in {} file(s): {rels:?}",
+                    "joined {upstream} with {} file(s) to answer: {rels:?}",
                     rels.len()
                 );
                 Ok(true)

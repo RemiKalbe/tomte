@@ -775,6 +775,67 @@ const LOCAL_SOURCE: &[u8] = b"a=this-machine\n";
 /// so the two sources genuinely disagree while a resolve's push stays a
 /// fast-forward. The destination is levelled with the local source, so the
 /// only disagreement in play is source-vs-origin.
+/// Origin moved on a file this machine has never touched, and the fetch was
+/// never integrated: the repo is simply BEHIND and the join is clean.
+fn origin_is_ahead_on_an_unrelated_file(lab: &DriftLab) {
+    let other = lab.s.root.path().join("other-ahead");
+    sh(
+        lab.s.root.path(),
+        "git",
+        &[
+            "clone",
+            lab.s.bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(other.join("dot_unrelated"), b"origin only\n").unwrap();
+    git(&other, &["add", "."]);
+    git(
+        &other,
+        &["commit", "-m", "origin adds a file this machine lacks"],
+    );
+    git(&other, &["push"]);
+    // Fetched but deliberately NOT merged — this is the "behind" state.
+    lab.source_git().fetch("origin").unwrap();
+}
+
+/// The 0.1.15 field bug: a decision on a repo that is merely BEHIND origin
+/// deferred the join to the daemon, then ran a chezmoi command anyway. With
+/// chezmoi's autoPush that push is rejected — after autoCommit has already
+/// made a local commit, turning "behind" into "diverged" and breaking the
+/// next decision too. The join has to happen first.
+#[test]
+fn story_k_a_decision_joins_a_repo_that_is_merely_behind() {
+    let lab = DriftLab::new();
+    origin_is_ahead_on_an_unrelated_file(&lab);
+
+    let behind = lab.source_git().divergence("origin/main").unwrap().behind;
+    assert!(
+        behind > 0,
+        "precondition: the repo must start behind origin"
+    );
+
+    let merging = lab.engine.ensure_merge_started().unwrap();
+
+    assert!(
+        !merging,
+        "a clean join leaves nothing conflicted for the user to answer"
+    );
+    assert_eq!(
+        lab.source_git().divergence("origin/main").unwrap().behind,
+        0,
+        "the repo must be caught up BEFORE anything that can push runs"
+    );
+    assert!(
+        !lab.source_git().merge_in_progress(),
+        "a clean join must not leave the repo mid-merge"
+    );
+    assert!(
+        lab.s.source.join("dot_unrelated").exists(),
+        "the join must actually bring origin's commit in"
+    );
+}
+
 fn origin_holds_its_own_version(lab: &DriftLab) {
     let other = lab.s.root.path().join("other");
     sh(
@@ -1039,9 +1100,7 @@ fn resolving_a_diverged_file_starts_and_finishes_the_merge() {
     assert!(!git.merge_in_progress(), "no merge before a decision");
 
     assert!(
-        lab.engine
-            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
-            .unwrap(),
+        lab.engine.ensure_merge_started().unwrap(),
         "a diverged repo must enter a real merge"
     );
     assert!(git.merge_in_progress());
@@ -1068,11 +1127,7 @@ fn resolving_a_diverged_file_starts_and_finishes_the_merge() {
 fn ensure_merge_started_leaves_an_undiverged_repo_alone() {
     let lab = DriftLab::new();
     let head_before = lab.source_git().head_sha().unwrap();
-    assert!(
-        !lab.engine
-            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
-            .unwrap()
-    );
+    assert!(!lab.engine.ensure_merge_started().unwrap());
     assert!(!lab.source_git().merge_in_progress());
     assert_eq!(lab.source_git().head_sha().unwrap(), head_before);
 }
@@ -1289,7 +1344,7 @@ fn an_unsignable_merge_commit_strands_the_merge_and_stays_recoverable() {
     let git_c = lab.source_git();
     let source = lab.s.source.join("dot_testrc");
 
-    assert!(lab.engine.ensure_merge_started(&source).unwrap());
+    assert!(lab.engine.ensure_merge_started().unwrap());
     lab.engine
         .resolve_repo_conflict(&source, "a=resolved\n")
         .unwrap();
@@ -1335,11 +1390,7 @@ fn an_unsignable_merge_commit_strands_the_merge_and_stays_recoverable() {
 fn a_merge_with_conflicts_left_is_not_reported_as_pending() {
     let lab = DriftLab::new();
     diverge_on_the_managed_file(&lab);
-    assert!(
-        lab.engine
-            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
-            .unwrap()
-    );
+    assert!(lab.engine.ensure_merge_started().unwrap());
     assert!(
         !lab.engine.pending_merge_commit().unwrap(),
         "an unanswered conflict recovers through its own review row"
@@ -1351,7 +1402,7 @@ fn a_merge_with_conflicts_left_is_not_reported_as_pending() {
 /// conflict markers into every disagreeing source, including ones the user
 /// never selected.
 #[test]
-fn a_decision_about_a_file_origin_did_not_touch_starts_no_merge() {
+fn a_decision_about_an_unconflicted_file_still_catches_the_repo_up() {
     let lab = DriftLab::new();
     // A second managed file, shared with origin.
     std::fs::write(lab.s.source.join("dot_other"), b"b=1\n").unwrap();
@@ -1371,29 +1422,51 @@ fn a_decision_about_a_file_origin_did_not_touch_starts_no_merge() {
     let git_c = lab.source_git();
     assert!(
         git_c.divergence("origin/main").unwrap().behind > 0,
-        "premise: the repo IS behind, so `behind` alone would have merged"
-    );
-    assert!(
-        !lab.engine
-            .ensure_merge_started(&lab.s.source.join("dot_testrc"))
-            .unwrap(),
-        "a decision about a file origin did not touch must not start a merge"
-    );
-    assert!(!git_c.merge_in_progress());
-    assert!(
-        !std::fs::read_to_string(lab.s.source.join("dot_other"))
-            .unwrap()
-            .contains("<<<<<<<"),
-        "the never-selected file's source must be untouched"
+        "premise: the repo starts behind origin"
     );
 
-    // …while the file that DOES conflict still starts one.
+    // Answering dot_testrc — a file origin never touched — must NOT be
+    // refused and must NOT be silently skipped. 0.1.15 skipped the join here
+    // because this file was not one of the conflicts, then ran a chezmoi
+    // command anyway: autoCommit made a local commit, autoPush was rejected
+    // for being behind, and "behind" became "diverged", breaking the next
+    // decision too. Whose file conflicts has no bearing on whether the repo
+    // needs origin's commits.
+    let merging = lab
+        .engine
+        .ensure_merge_started()
+        .expect("catching up must never fail a decision the user is making");
+
     assert!(
-        lab.engine
-            .ensure_merge_started(&lab.s.source.join("dot_other"))
-            .unwrap()
+        merging,
+        "origin conflicts on dot_other, so a merge is open for it to be answered in"
     );
     assert!(git_c.merge_in_progress());
+    // `behind` is still non-zero here and that is correct: HEAD does not move
+    // until the merge commits. What matters is that MERGE_HEAD is origin's
+    // tip, so the commit this merge eventually makes CONTAINS origin — which
+    // is exactly what makes the later push fast-forward.
+    assert_eq!(
+        git_c.rev_parse("MERGE_HEAD").unwrap(),
+        git_c.rev_parse("origin/main").unwrap(),
+        "the open merge must be against origin's tip"
+    );
+    assert_eq!(
+        git_c.conflicted_files().unwrap(),
+        vec![PathBuf::from("dot_other")],
+        "only the genuinely conflicting file is left to answer"
+    );
+
+    // dot_testrc is NOT conflicted, so it is answerable right now — resolving
+    // it does not wait on dot_other. That is the isolation that matters:
+    // decisions are independent even though the eventual push is one commit.
+    assert!(
+        !git_c
+            .conflicted_files()
+            .unwrap()
+            .contains(&PathBuf::from("dot_testrc")),
+        "a file origin never touched must not become a conflict to answer"
+    );
 }
 
 /// Cancel's blast radius, measured. An abort rolls back every source file the
