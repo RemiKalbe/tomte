@@ -2,6 +2,7 @@
 //! pure sync model, IPC client) consumed by both the `tomte` binary and
 //! integration tests. Views and the AppKit platform layer stay bin-only.
 
+pub mod action_queue;
 pub mod ipc;
 pub mod merge_inputs;
 pub mod merge_state;

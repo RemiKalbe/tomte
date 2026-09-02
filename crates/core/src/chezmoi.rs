@@ -132,6 +132,12 @@ pub enum ChezmoiError {
         context: &'static str,
         detail: String,
     },
+    /// The call itself was wrong — not chezmoi failing, us asking wrongly.
+    /// Surfaced rather than asserted because this runs inside a GUI: a panic
+    /// would take the window with it, and a silent no-op would be worse than
+    /// either.
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// Classify stderr from a failed chezmoi invocation into a structured
@@ -347,6 +353,16 @@ impl ChezmoiClient {
     /// and chezmoi would otherwise prompt `(diff/overwrite/…)?` — which under
     /// `--no-tty` dies with `EOF`. Callers apply only on an explicit user
     /// decision, so overwriting is exactly the contract.
+    /// Apply one or more destinations, or all of them when `targets` is
+    /// empty. Same per-invocation economics as [`Self::re_add`].
+    pub fn apply_many(&self, targets: &[PathBuf]) -> Result<(), ChezmoiError> {
+        let mut args = vec!["apply".to_string(), "--force".to_string()];
+        args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_ok(&refs, None)?;
+        Ok(())
+    }
+
     pub fn apply(&self, target: Option<&Path>) -> Result<(), ChezmoiError> {
         match target {
             Some(t) => self.run_ok(&["apply", "--force", &t.to_string_lossy()], None)?,
@@ -357,8 +373,26 @@ impl ChezmoiClient {
 
     /// Re-add a modified target into the source state. NOTE: chezmoi silently
     /// ignores templated sources — callers must pre-detect `.tmpl` and refuse.
-    pub fn re_add(&self, target: &Path) -> Result<(), ChezmoiError> {
-        self.run_ok(&["re-add", &target.to_string_lossy()], None)?;
+    /// Re-add one or more destinations into the source, in ONE invocation.
+    ///
+    /// chezmoi takes `target...` and re-adds every one, which matters far
+    /// more than it looks: a single `re-add` costs ~2.5s on a real setup
+    /// (process start plus config and template evaluation), and that cost is
+    /// per INVOCATION, not per file. Resolving thirty files one call at a
+    /// time paid it thirty times. An empty slice keeps chezmoi's own meaning
+    /// — every modified file — so callers must not hand one over by accident.
+    pub fn re_add(&self, targets: &[PathBuf]) -> Result<(), ChezmoiError> {
+        if targets.is_empty() {
+            return Err(ChezmoiError::Failed(
+                "re_add called with no targets; chezmoi would re-add EVERY \
+                 modified file, which no caller means"
+                    .into(),
+            ));
+        }
+        let mut args = vec!["re-add".to_string()];
+        args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_ok(&refs, None)?;
         Ok(())
     }
 
@@ -487,7 +521,7 @@ mod tests {
         let fake = Arc::new(FakeRunner::new());
         fake.push_ok(0, "", "");
         client(fake.clone())
-            .re_add(std::path::Path::new("/Users/x/.zshrc"))
+            .re_add(&[PathBuf::from("/Users/x/.zshrc")])
             .unwrap();
         let call = &fake.calls()[0];
         assert_eq!(
@@ -495,6 +529,71 @@ mod tests {
             vec!["--no-tty", "--no-pager", "re-add", "/Users/x/.zshrc"]
         );
         assert_eq!(call.timeout, ChezmoiOptions::default().timeout);
+    }
+
+    /// The whole point of the multi-target form: N files, ONE invocation.
+    /// chezmoi's ~2.5s startup is paid per CALL, so this is the difference
+    /// between 2.5s and 2.5s×N for a batch of decisions.
+    #[test]
+    fn re_add_sends_every_target_in_a_single_invocation() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "", "");
+        client(fake.clone())
+            .re_add(&[
+                PathBuf::from("/Users/x/.zshrc"),
+                PathBuf::from("/Users/x/.gitconfig"),
+                PathBuf::from("/Users/x/.vimrc"),
+            ])
+            .unwrap();
+        assert_eq!(fake.calls().len(), 1, "one invocation, not three");
+        assert_eq!(
+            fake.calls()[0].args,
+            vec![
+                "--no-tty",
+                "--no-pager",
+                "re-add",
+                "/Users/x/.zshrc",
+                "/Users/x/.gitconfig",
+                "/Users/x/.vimrc"
+            ]
+        );
+    }
+
+    /// An empty slice means "every modified file" to chezmoi, which would
+    /// sweep unrelated drift into the source. No caller means that.
+    #[test]
+    fn re_add_refuses_an_empty_target_list_rather_than_re_adding_everything() {
+        let fake = Arc::new(FakeRunner::new());
+        let err = client(fake.clone()).re_add(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("no targets"),
+            "must say why it refused: {err}"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "and must not have invoked chezmoi at all"
+        );
+    }
+
+    #[test]
+    fn apply_many_sends_every_target_in_a_single_invocation() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "", "");
+        client(fake.clone())
+            .apply_many(&[PathBuf::from("/Users/x/.a"), PathBuf::from("/Users/x/.b")])
+            .unwrap();
+        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(
+            fake.calls()[0].args,
+            vec![
+                "--no-tty",
+                "--no-pager",
+                "apply",
+                "--force",
+                "/Users/x/.a",
+                "/Users/x/.b"
+            ]
+        );
     }
 
     #[test]

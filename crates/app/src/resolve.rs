@@ -140,7 +140,8 @@ impl ResolveEngine {
             self.stage_resolution(&source)?;
             self.conclude_merge()
         } else {
-            self.chezmoi.re_add(target)?;
+            self.chezmoi
+                .re_add(std::slice::from_ref(&target.to_path_buf()))?;
             self.commit_phase("keep_disk", target)
         };
         self.session_end(session, &format!("keep_disk {}", display_name(target)))?;
