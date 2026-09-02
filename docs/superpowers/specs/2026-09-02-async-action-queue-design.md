@@ -53,6 +53,12 @@ per file  (ms, IPC)   session_end
 once                  rescan
 ```
 
+Mid-merge, a batch falls back to the single-file paths. Not because
+`chezmoi re-add` cannot run over unmerged paths — it can, even with
+autoCommit on (Task 1 proved the first draft of this sentence wrong) — but
+because the shared tail stages the whole index, and mid-merge that would
+commit conflicts the user never answered.
+
 Merge-editor saves and `Keep source · origin` are queued (non-blocking)
 but run singly: the former is inherently one-at-a-time (the user is reading
 a diff), the latter loads origin content per file and is rare.
