@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use tomte_app::ipc::IpcClient;
 use tomte_app::merge_inputs;
 use tomte_app::merge_state::MergeState;
-use tomte_app::resolve::{MergeConclusion, ResolveEngine, ResolveOutcome};
+use tomte_app::resolve::{
+    BatchDecision, BatchItem, MergeConclusion, ResolveEngine, ResolveOutcome,
+};
 use tomte_core::cmd::SystemRunner;
 use tomte_core::drift::{ContentHash, DriftClass};
 use tomte_core::git::GitClient;
@@ -276,6 +278,228 @@ fn story_a_keep_disk_readds_commits_pushes_and_settles_in_sync() {
         lab.settled_status().is_empty(),
         "daemon status must be drift-free after keep_disk"
     );
+}
+
+/// Three one-click decisions must cost ONE re-add, ONE commit and ONE push —
+/// not three of each. From the field log: re-add ≈ 2.5s and push ≈ 1.5s per
+/// invocation, and both accept a list.
+#[test]
+fn story_m_a_batch_of_keep_disk_shares_one_commit_and_one_push() {
+    let lab = DriftLab::new();
+    // Three managed files, all drifted on disk. Every source is created and
+    // applied in ONE pass before any drift is seeded: `apply(None)` is
+    // repo-wide and `--force`, so applying between the drifts would wash the
+    // earlier ones straight back out.
+    let files: [(&str, &str, &[u8]); 3] = [
+        ("dot_a", ".a", b"a=disk\n"),
+        ("dot_b", ".b", b"b=disk\n"),
+        ("dot_c", ".c", b"c=disk\n"),
+    ];
+    for (src, _, _) in files {
+        std::fs::write(lab.s.source.join(src), b"x=1\n").unwrap();
+    }
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "three more managed files"]);
+    git(&lab.s.source, &["push"]);
+    lab.s.chezmoi().apply(None).unwrap();
+    for (_, dst, body) in files {
+        std::fs::write(lab.s.home.join(dst), body).unwrap();
+    }
+    let commits_before = commit_count(&lab.s.bare);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        BatchItem {
+            target: lab.s.home.join(".a"),
+            decision: BatchDecision::KeepDisk,
+        },
+        BatchItem {
+            target: lab.s.home.join(".b"),
+            decision: BatchDecision::KeepDisk,
+        },
+        BatchItem {
+            target: lab.s.home.join(".c"),
+            decision: BatchDecision::KeepDisk,
+        },
+    ]);
+
+    // One entry per item, in input order.
+    assert_eq!(
+        outcome
+            .per_target
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            lab.s.home.join(".a"),
+            lab.s.home.join(".b"),
+            lab.s.home.join(".c"),
+        ]
+    );
+
+    // Every file resolved, each with its OWN session (undo stays per file).
+    let mut sessions = std::collections::BTreeSet::new();
+    for (target, result) in &outcome.per_target {
+        match result {
+            Ok(ResolveOutcome::Done {
+                session,
+                committed,
+                pushed,
+                ..
+            }) => {
+                assert!(
+                    *committed && *pushed,
+                    "{}: the batch tail must land on origin",
+                    target.display()
+                );
+                sessions.insert(*session);
+            }
+            other => panic!("{}: expected Done, got {other:?}", target.display()),
+        }
+    }
+    assert_eq!(
+        sessions.len(),
+        3,
+        "three files, three sessions — undo is per file"
+    );
+
+    // ONE commit reached origin for the whole batch.
+    assert_eq!(
+        commit_count(&lab.s.bare) - commits_before,
+        1,
+        "a batch is one commit and one push, not one per file"
+    );
+    for (src, body) in [
+        ("dot_a", "a=disk\n"),
+        ("dot_b", "b=disk\n"),
+        ("dot_c", "c=disk\n"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(lab.s.source.join(src)).unwrap(),
+            body,
+            "{src} must carry the disk content the batch chose"
+        );
+    }
+}
+
+/// Mid-merge the shared tail is unavailable (autoCommit cannot run over
+/// unmerged paths), so a batch must fall back to the single-file paths —
+/// and still resolve every item.
+///
+/// chezmoi's git automation is ON here deliberately, the way the real user's
+/// is: with it OFF the batch tail happens to survive mid-merge by accident
+/// (chezmoi's `re-add` commits nothing, and Tomte's own `git add` resolves
+/// the path before committing), so the story would pass with the fallback
+/// deleted and prove nothing. autoCommit is what makes `re-add` run git
+/// from the inside, where unmerged paths are fatal.
+#[test]
+fn story_n_a_batch_while_mid_merge_falls_back_to_single_file_paths() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    diverge_on_the_managed_file(&lab); // existing helper: same-file conflict
+    std::fs::write(&lab.target, b"a=disk\n").unwrap();
+    let outcome = lab.engine.resolve_batch(vec![BatchItem {
+        target: lab.target.clone(),
+        decision: BatchDecision::KeepDisk,
+    }]);
+    let (_, r) = &outcome.per_target[0];
+    assert!(matches!(r, Ok(ResolveOutcome::Done { .. })), "got {r:?}");
+    assert!(
+        !lab.source_git().merge_in_progress(),
+        "the only conflict was answered, so the merge concluded"
+    );
+    // And it answered it with the DISK content, not with what the merge left
+    // in the source file (conflict markers included).
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        b"a=disk\n"
+    );
+}
+
+/// WHY the mid-merge fallback is not optional: the shared tail commits the
+/// whole index, so running it inside a merge would commit the conflicts the
+/// user never answered — conflict markers and all — and call the merge done.
+///
+/// Two files conflict with origin; the batch answers ONE. The merge must stay
+/// open on the other, with its conflict markers still uncommitted.
+///
+/// This is the assertion story_n cannot make: with a single conflict, the
+/// batch tail happens to reach the same end state, so that story passes with
+/// the fallback deleted. This one does not.
+#[test]
+fn story_o_a_mid_merge_batch_never_commits_a_conflict_it_did_not_answer() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    std::fs::write(lab.s.source.join("dot_other"), b"b=1\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "a second managed file"]);
+    git(&lab.s.source, &["push"]);
+    diverge_with_conflicts(
+        &lab,
+        &[
+            ("dot_testrc", ORIGIN_CONTENT, LOCAL_SOURCE),
+            ("dot_other", OTHER_ORIGIN, OTHER_LOCAL),
+        ],
+    );
+
+    std::fs::write(&lab.target, b"a=disk\n").unwrap();
+    let outcome = lab.engine.resolve_batch(vec![BatchItem {
+        target: lab.target.clone(),
+        decision: BatchDecision::KeepDisk,
+    }]);
+    let (_, r) = &outcome.per_target[0];
+    let Ok(ResolveOutcome::Done {
+        committed,
+        pushed,
+        note,
+        ..
+    }) = r
+    else {
+        panic!("the answered file must still resolve, got {r:?}");
+    };
+    assert!(
+        !committed && !pushed,
+        "one conflict is still open, so there is nothing to commit yet"
+    );
+    assert!(
+        note.as_deref().unwrap_or_default().contains("still differ"),
+        "the user must be told the merge is waiting on another file, got {note:?}"
+    );
+
+    // The merge is still open, still holding the file nobody answered.
+    let git_c = lab.source_git();
+    assert!(
+        git_c.merge_in_progress(),
+        "answering one of two conflicts must not conclude the merge"
+    );
+    assert_eq!(
+        git_c.conflicted_files().unwrap(),
+        vec![PathBuf::from("dot_other")]
+    );
+    assert!(
+        std::fs::read_to_string(lab.s.source.join("dot_other"))
+            .unwrap()
+            .contains("<<<<<<<"),
+        "and its conflict markers must still be sitting in the working tree, \
+         uncommitted"
+    );
+}
+
+/// Commits on the bare origin's `main`. Read with a plain subprocess, the way
+/// `behind_count` does in the daemon suite — counting commits is an assertion
+/// about the fixture, not a capability the production `GitClient` needs.
+fn commit_count(repo: &std::path::Path) -> usize {
+    let out = std::process::Command::new("git")
+        .args(["rev-list", "--count", "main"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rev-list in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
 #[test]

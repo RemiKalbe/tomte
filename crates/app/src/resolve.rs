@@ -89,6 +89,42 @@ pub enum ResolveOutcome {
     ProtectedSpan { detail: String },
 }
 
+/// Which one-click decision a batch item carries.
+///
+/// `KeepSourceLocal` is the LOCAL source (`chezmoi apply`). Keeping ORIGIN's
+/// version is deliberately absent: [`ResolveEngine::keep_source_origin`]
+/// rewrites the source file through the write-after-verify path and can
+/// reject the whole thing (`ProtectedSpan`), so it has no batchable tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchDecision {
+    KeepDisk,
+    KeepSourceLocal,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    pub target: PathBuf,
+    pub decision: BatchDecision,
+}
+
+#[derive(Debug)]
+pub struct BatchOutcome {
+    /// One entry per item, in input order. `Done` carries that file's OWN
+    /// session id, so per-file undo is unchanged.
+    pub per_target: Vec<(PathBuf, Result<ResolveOutcome, ResolveError>)>,
+}
+
+/// A batch item that cleared [`ResolveEngine::resolve_batch`]'s cheap
+/// per-file phase: its own journal session is open and its decision (with the
+/// undo snapshots) is journaled, so only the shared tail and `session_end`
+/// remain.
+struct Prepared {
+    target: PathBuf,
+    source: PathBuf,
+    decision: BatchDecision,
+    session: i64,
+}
+
 #[derive(Clone)]
 pub struct ResolveEngine {
     // Arc'd / cheaply clonable so background closures can own clones.
@@ -204,6 +240,192 @@ impl ResolveEngine {
             pushed: false,
             note: None,
         })
+    }
+
+    /// Resolve several one-click decisions with ONE shared tail.
+    ///
+    /// Per file: its own journal session, snapshot and decision, exactly as
+    /// [`Self::keep_disk`] / [`Self::keep_source`] do — so Undo is unchanged.
+    /// Shared: one `expect_changes`, one `chezmoi re-add` for every keep-disk
+    /// target, one `chezmoi apply` for every keep-source target, one commit,
+    /// one push, one rescan. Those are the seconds (re-add ~2.5s, push ~1.5s,
+    /// per INVOCATION, not per file); the sessions are milliseconds.
+    ///
+    /// Mid-merge the shared tail is not available, and the reason is sharper
+    /// than "git dislikes unmerged paths": the tail stages the WHOLE index
+    /// and commits it. Run inside a merge it would commit the conflicts the
+    /// user never answered — conflict markers and all — and call the merge
+    /// concluded. So items fall back to their single-file paths, one at a
+    /// time, where each answer is staged into the merge on its own and the
+    /// merge only concludes once nothing is left conflicted. Slower, and the
+    /// only correct answer. Pinned by `story_o` in `resolve_e2e`.
+    pub fn resolve_batch(&self, items: Vec<BatchItem>) -> BatchOutcome {
+        tomte_core::log_info!("resolve", "resolve_batch of {} files", items.len());
+        let mut per_target: Vec<(PathBuf, Result<ResolveOutcome, ResolveError>)> =
+            Vec::with_capacity(items.len());
+
+        // Catch up with origin once for the whole batch. If that opens a
+        // conflicted merge, the batch tail cannot be used — run singly.
+        match self.ensure_merge_started() {
+            Ok(true) => {
+                for item in items {
+                    let r = match item.decision {
+                        BatchDecision::KeepDisk => self.keep_disk(&item.target),
+                        BatchDecision::KeepSourceLocal => self.keep_source(&item.target),
+                    };
+                    per_target.push((item.target, r));
+                }
+                return BatchOutcome { per_target };
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // Nothing was journaled or mutated for anyone: the batch
+                // could not even reach the repo.
+                let msg = e.to_string();
+                for item in items {
+                    per_target.push((item.target, Err(ResolveError::Failed(msg.clone()))));
+                }
+                return BatchOutcome { per_target };
+            }
+        }
+
+        // Phase 1 — per file, cheap: session, snapshot, decision.
+        let mut prepared: Vec<Prepared> = Vec::new();
+        // `prepared[i]` reports into `per_target[slots[i]]`. Recorded as the
+        // entries are pushed, so input order survives skipped and failed
+        // items without searching for anything afterwards.
+        let mut slots: Vec<usize> = Vec::new();
+        for item in items {
+            let slot = per_target.len();
+            match self.prepare_batch_item(&item) {
+                Ok(Some(p)) => {
+                    // Phase 3 overwrites this for EVERY prepared item. It is
+                    // an honest error rather than `NeedsMergeEditor` so that
+                    // if a future edit ever let one leak, the caller reads a
+                    // failure instead of a bogus "open the merge editor".
+                    per_target.push((
+                        item.target,
+                        Err(ResolveError::Failed(
+                            "internal: the batch never reported this file".into(),
+                        )),
+                    ));
+                    slots.push(slot);
+                    prepared.push(p);
+                }
+                // Templated keep-disk: refused exactly as `keep_disk` refuses
+                // it, without a session and without touching anything.
+                Ok(None) => per_target.push((item.target, Ok(ResolveOutcome::NeedsMergeEditor))),
+                Err(e) => per_target.push((item.target, Err(e))),
+            }
+        }
+        if prepared.is_empty() {
+            return BatchOutcome { per_target };
+        }
+
+        // Phase 2 — the shared tail, the whole point of the method.
+        let tail: Result<(bool, bool, Option<String>), ResolveError> = (|| {
+            let mut expect: Vec<PathBuf> = Vec::new();
+            for p in &prepared {
+                expect.push(p.target.clone());
+                if p.decision == BatchDecision::KeepDisk {
+                    expect.push(p.source.clone());
+                }
+            }
+            self.expect_changes(expect)?;
+            let readds: Vec<PathBuf> = prepared
+                .iter()
+                .filter(|p| p.decision == BatchDecision::KeepDisk)
+                .map(|p| p.target.clone())
+                .collect();
+            // Guarded, never called empty: an empty target list keeps
+            // chezmoi's own meaning — EVERY modified file — and `re_add`
+            // refuses one outright rather than let that happen.
+            if !readds.is_empty() {
+                self.chezmoi.re_add(&readds)?;
+            }
+            let applies: Vec<PathBuf> = prepared
+                .iter()
+                .filter(|p| p.decision == BatchDecision::KeepSourceLocal)
+                .map(|p| p.target.clone())
+                .collect();
+            if !applies.is_empty() {
+                self.chezmoi.apply_many(&applies)?;
+            }
+            let targets: Vec<&Path> = prepared.iter().map(|p| p.target.as_path()).collect();
+            Ok(self.commit_batch(&targets))
+        })();
+
+        // Phase 3 — per file again: end its own session, report its own
+        // result. The commit/push verdict is the tail's, shared by everyone
+        // who rode it.
+        for (p, slot) in prepared.iter().zip(&slots) {
+            per_target[*slot].1 = match &tail {
+                Ok((committed, pushed, note)) => {
+                    let label = match p.decision {
+                        BatchDecision::KeepDisk => "keep_disk",
+                        BatchDecision::KeepSourceLocal => "keep_source",
+                    };
+                    self.session_end(p.session, &format!("{label} {}", display_name(&p.target)))
+                        .map(|()| ResolveOutcome::Done {
+                            session: p.session,
+                            committed: *committed,
+                            pushed: *pushed,
+                            note: note.clone(),
+                        })
+                }
+                Err(e) => Err(ResolveError::Failed(format!(
+                    "batch failed before this file could land: {e}"
+                ))),
+            };
+        }
+        if let Err(e) = self.rescan() {
+            // Every file already landed; a missed rescan only means the
+            // daemon's view is stale, which the next scan fixes.
+            tomte_core::log_warn!("resolve", "rescan after batch failed: {e}");
+        }
+        BatchOutcome { per_target }
+    }
+
+    /// The cheap per-file half of a batch item: resolve its source path,
+    /// refuse a templated keep-disk (`Ok(None)`, the `NeedsMergeEditor` of
+    /// [`Self::keep_disk`]), then open its OWN session and journal its
+    /// decision with the blobs undo will need.
+    ///
+    /// The blob count is checked as strictly as the single-file paths check
+    /// it: `SnapshotBlobs` silently omits a path it could not snapshot, and a
+    /// keep-disk decision journaled without its `source_blob` is an undo that
+    /// cannot restore the source.
+    fn prepare_batch_item(&self, item: &BatchItem) -> Result<Option<Prepared>, ResolveError> {
+        let source = self.chezmoi.source_path(&item.target)?;
+        if item.decision == BatchDecision::KeepDisk && is_templated(&source) {
+            return Ok(None);
+        }
+        let session = self.session_start()?;
+        let (action, snapshot_paths) = match item.decision {
+            BatchDecision::KeepDisk => ("keep_disk", vec![item.target.clone(), source.clone()]),
+            BatchDecision::KeepSourceLocal => ("keep_source", vec![item.target.clone()]),
+        };
+        let want = snapshot_paths.len();
+        let hashes = self.snapshot_blobs(snapshot_paths)?;
+        if hashes.len() != want {
+            return Err(ResolveError::Failed(format!(
+                "snapshot returned {} blobs for {want} paths",
+                hashes.len()
+            )));
+        }
+        let decision = build_decision(
+            action,
+            &item.target,
+            &hashes[0],
+            hashes.get(1).map(String::as_str),
+        );
+        self.session_decision(session, decision)?;
+        Ok(Some(Prepared {
+            target: item.target.clone(),
+            source,
+            decision: item.decision,
+            session,
+        }))
     }
 
     /// Keep ORIGIN's version of the source: origin's rendered content becomes
@@ -455,27 +677,43 @@ impl ResolveEngine {
         Ok(Some(of))
     }
 
+    /// Commit phase for ONE resolved file: `tomte: <action> <file-name>`.
+    fn commit_phase(&self, action: &str, target: &Path) -> (bool, bool, Option<String>) {
+        self.commit_with_message(&commit_message(action, target))
+    }
+
+    /// Commit phase for a whole batch: ONE commit naming the batch, ONE push,
+    /// the same recovery. A batch of one still gets a message a human can
+    /// read in `git log`.
+    fn commit_batch(&self, targets: &[&Path]) -> (bool, bool, Option<String>) {
+        let message = match targets {
+            [one] => commit_message("resolve", one),
+            many => format!("Resolve {} files via tomte", many.len()),
+        };
+        self.commit_with_message(&message)
+    }
+
     /// Shared commit phase: when the source repo is left dirty (chezmoi
     /// autoCommit off or failed), stage everything and commit; then push.
     /// Both are best-effort — a locked 1Password failing the signed commit
     /// must not fail the resolution, only report honestly (spec §10).
-    fn commit_phase(&self, action: &str, target: &Path) -> (bool, bool, Option<String>) {
+    ///
+    /// The message is the caller's, single file or batch, so the
+    /// rejected-push rebase-and-retry recovery below exists exactly ONCE.
+    fn commit_with_message(&self, message: &str) -> (bool, bool, Option<String>) {
         let mut note = None;
         let committed = match self.git.dirty_files() {
             // Clean repo: chezmoi autoCommit already committed (or there was
             // nothing to commit) — a preexisting commit counts as committed.
             Ok(dirty) if dirty.is_empty() => true,
-            Ok(_) => {
-                let message = commit_message(action, target);
-                match self.git.add_all().and_then(|()| self.git.commit(&message)) {
-                    Ok(_sha) => true,
-                    Err(e) => {
-                        tomte_core::log_error!("resolve", "commit failed: {e}");
-                        append_note(&mut note, format!("commit failed: {e}"));
-                        false
-                    }
+            Ok(_) => match self.git.add_all().and_then(|()| self.git.commit(message)) {
+                Ok(_sha) => true,
+                Err(e) => {
+                    tomte_core::log_error!("resolve", "commit failed: {e}");
+                    append_note(&mut note, format!("commit failed: {e}"));
+                    false
                 }
-            }
+            },
             Err(e) => {
                 append_note(&mut note, format!("could not check source repo: {e}"));
                 false
