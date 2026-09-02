@@ -114,14 +114,23 @@ pub struct BatchOutcome {
     pub per_target: Vec<(PathBuf, Result<ResolveOutcome, ResolveError>)>,
 }
 
-/// A batch item that cleared [`ResolveEngine::resolve_batch`]'s cheap
-/// per-file phase: its own journal session is open and its decision (with the
-/// undo snapshots) is journaled, so only the shared tail and `session_end`
-/// remain.
-struct Prepared {
+/// A batch item that survived [`ResolveEngine::resolve_batch`]'s pre-flight:
+/// its source path is known and a templated keep-disk has already been
+/// refused. Not yet journaled — nothing has been touched.
+struct Candidate {
     target: PathBuf,
     source: PathBuf,
     decision: BatchDecision,
+    /// Index of this item's entry in [`BatchOutcome::per_target`], carried so
+    /// its result lands in INPUT order however many siblings were refused.
+    slot: usize,
+}
+
+/// A candidate whose own journal session is open and whose decision (with the
+/// blobs undo needs) is journaled, so only the shared tail and `session_end`
+/// remain.
+struct Prepared {
+    candidate: Candidate,
     session: i64,
 }
 
@@ -165,13 +174,17 @@ impl ResolveEngine {
         // disk" means for this conflict.
         let merging = self.ensure_merge_started()?;
         let (committed, pushed, note) = if merging {
-            // NOT `chezmoi re-add` here. A chezmoi configured with autoCommit
-            // commits from inside re-add, and git refuses to commit with
-            // unmerged paths — so mid-merge that call fails outright. It
-            // cannot be suppressed per-invocation either (CHEZMOI_GIT_* env
-            // overrides are ignored). Copying the destination over the source
-            // is exactly what re-add does for a non-templated file, which is
-            // all that reaches here — `is_templated` returned early above.
+            // NOT `chezmoi re-add` here — but not because re-add cannot run
+            // mid-merge. It can: with autoCommit on, its own `git add`
+            // resolves the very file it just overwrote, so its commit
+            // succeeds. That is the problem. `git add` stages the WHOLE
+            // index, so re-add's commit would sweep up every OTHER file the
+            // merge left conflicted — markers and all — and conclude a merge
+            // the user only answered one row of. Copying the destination over
+            // the source is exactly what re-add does for a non-templated
+            // file, which is all that reaches here (`is_templated` returned
+            // early above), and it leaves the staging to
+            // `stage_resolution`, which stages THIS file only.
             std::fs::copy(target, &source)?;
             self.stage_resolution(&source)?;
             self.conclude_merge()
@@ -247,9 +260,17 @@ impl ResolveEngine {
     /// Per file: its own journal session, snapshot and decision, exactly as
     /// [`Self::keep_disk`] / [`Self::keep_source`] do — so Undo is unchanged.
     /// Shared: one `expect_changes`, one `chezmoi re-add` for every keep-disk
-    /// target, one `chezmoi apply` for every keep-source target, one commit,
-    /// one push, one rescan. Those are the seconds (re-add ~2.5s, push ~1.5s,
-    /// per INVOCATION, not per file); the sessions are milliseconds.
+    /// target, one `chezmoi apply` for every keep-source target, one commit
+    /// and one push for the keep-disk group, one rescan. Those are the
+    /// seconds (re-add ~2.5s, push ~1.5s, per INVOCATION, not per file); the
+    /// sessions are milliseconds.
+    ///
+    /// The two decision groups are reported SEPARATELY, because they mutate
+    /// different things and one failing says nothing about the other. Only
+    /// keep-disk reaches the source repo, so only it can be committed and
+    /// pushed; keep-source reports `committed: false, pushed: false`, exactly
+    /// as [`Self::keep_source`] does. A keep-source-only batch touches the
+    /// repo not at all.
     ///
     /// Mid-merge the shared tail is not available, and the reason is sharper
     /// than "git dislikes unmerged paths": the tail stages the WHOLE index
@@ -264,16 +285,52 @@ impl ResolveEngine {
         let mut per_target: Vec<(PathBuf, Result<ResolveOutcome, ResolveError>)> =
             Vec::with_capacity(items.len());
 
+        // Pre-flight — refuse what must be refused BEFORE touching the repo.
+        // A templated keep-disk is refused exactly as `keep_disk` refuses it,
+        // and it happens HERE rather than after the catch-up below so that a
+        // batch of nothing but templated files really does touch nothing: it
+        // must not be the reason a merge with origin gets started.
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for item in items {
+            let slot = per_target.len();
+            match self.chezmoi.source_path(&item.target) {
+                Ok(source) if item.decision == BatchDecision::KeepDisk && is_templated(&source) => {
+                    per_target.push((item.target, Ok(ResolveOutcome::NeedsMergeEditor)));
+                }
+                Ok(source) => {
+                    // Overwritten below for EVERY candidate. An honest error
+                    // rather than `NeedsMergeEditor` so that if a future edit
+                    // ever let one leak, the caller reads a failure instead of
+                    // a bogus "open the merge editor".
+                    per_target.push((
+                        item.target.clone(),
+                        Err(ResolveError::Failed(
+                            "internal: the batch never reported this file".into(),
+                        )),
+                    ));
+                    candidates.push(Candidate {
+                        target: item.target,
+                        source,
+                        decision: item.decision,
+                        slot,
+                    });
+                }
+                Err(e) => per_target.push((item.target, Err(e.into()))),
+            }
+        }
+        if candidates.is_empty() {
+            return BatchOutcome { per_target };
+        }
+
         // Catch up with origin once for the whole batch. If that opens a
         // conflicted merge, the batch tail cannot be used — run singly.
         match self.ensure_merge_started() {
             Ok(true) => {
-                for item in items {
-                    let r = match item.decision {
-                        BatchDecision::KeepDisk => self.keep_disk(&item.target),
-                        BatchDecision::KeepSourceLocal => self.keep_source(&item.target),
+                for c in candidates {
+                    per_target[c.slot].1 = match c.decision {
+                        BatchDecision::KeepDisk => self.keep_disk(&c.target),
+                        BatchDecision::KeepSourceLocal => self.keep_source(&c.target),
                     };
-                    per_target.push((item.target, r));
                 }
                 return BatchOutcome { per_target };
             }
@@ -282,40 +339,21 @@ impl ResolveEngine {
                 // Nothing was journaled or mutated for anyone: the batch
                 // could not even reach the repo.
                 let msg = e.to_string();
-                for item in items {
-                    per_target.push((item.target, Err(ResolveError::Failed(msg.clone()))));
+                for c in candidates {
+                    per_target[c.slot].1 = Err(ResolveError::Failed(msg.clone()));
                 }
                 return BatchOutcome { per_target };
             }
         }
 
-        // Phase 1 — per file, cheap: session, snapshot, decision.
+        // Phase 1 — per file, cheap: session, snapshot, decision. AFTER the
+        // catch-up on purpose: a merge rewrites source files, and a snapshot
+        // taken before it would journal content undo must not restore.
         let mut prepared: Vec<Prepared> = Vec::new();
-        // `prepared[i]` reports into `per_target[slots[i]]`. Recorded as the
-        // entries are pushed, so input order survives skipped and failed
-        // items without searching for anything afterwards.
-        let mut slots: Vec<usize> = Vec::new();
-        for item in items {
-            let slot = per_target.len();
-            match self.prepare_batch_item(&item) {
-                Ok(Some(p)) => {
-                    // Phase 3 overwrites this for EVERY prepared item. It is
-                    // an honest error rather than `NeedsMergeEditor` so that
-                    // if a future edit ever let one leak, the caller reads a
-                    // failure instead of a bogus "open the merge editor".
-                    per_target.push((
-                        item.target,
-                        Err(ResolveError::Failed(
-                            "internal: the batch never reported this file".into(),
-                        )),
-                    ));
-                    slots.push(slot);
-                    prepared.push(p);
-                }
-                // Templated keep-disk: refused exactly as `keep_disk` refuses
-                // it, without a session and without touching anything.
-                Ok(None) => per_target.push((item.target, Ok(ResolveOutcome::NeedsMergeEditor))),
-                Err(e) => per_target.push((item.target, Err(e))),
+        for candidate in candidates {
+            match self.open_batch_session(&candidate) {
+                Ok(session) => prepared.push(Prepared { candidate, session }),
+                Err(e) => per_target[candidate.slot].1 = Err(e),
             }
         }
         if prepared.is_empty() {
@@ -323,59 +361,95 @@ impl ResolveEngine {
         }
 
         // Phase 2 — the shared tail, the whole point of the method.
-        let tail: Result<(bool, bool, Option<String>), ResolveError> = (|| {
-            let mut expect: Vec<PathBuf> = Vec::new();
+        //
+        // The two decision groups are evaluated SEPARATELY. They mutate
+        // different things — `re-add` rewrites source files, `apply` rewrites
+        // destination files — so one failing says nothing about the other. A
+        // single shared verdict would have reported "this file was not
+        // resolved" for keep-disk files whose sources had already been
+        // rewritten, skipped their `session_end`, and so put those writes
+        // beyond `undo_last` (which reads the last FINISHED session).
+        let mut expect: Vec<PathBuf> = Vec::new();
+        for p in &prepared {
+            expect.push(p.candidate.target.clone());
+            if p.candidate.decision == BatchDecision::KeepDisk {
+                expect.push(p.candidate.source.clone());
+            }
+        }
+        if let Err(e) = self.expect_changes(expect) {
+            // Pre-announcing is the first thing the tail does, so nothing has
+            // been mutated for anyone yet.
             for p in &prepared {
-                expect.push(p.target.clone());
-                if p.decision == BatchDecision::KeepDisk {
-                    expect.push(p.source.clone());
-                }
+                per_target[p.candidate.slot].1 = Err(ResolveError::Failed(format!(
+                    "batch failed before this file could land: {e}"
+                )));
             }
-            self.expect_changes(expect)?;
-            let readds: Vec<PathBuf> = prepared
-                .iter()
-                .filter(|p| p.decision == BatchDecision::KeepDisk)
-                .map(|p| p.target.clone())
-                .collect();
-            // Guarded, never called empty: an empty target list keeps
-            // chezmoi's own meaning — EVERY modified file — and `re_add`
-            // refuses one outright rather than let that happen.
-            if !readds.is_empty() {
-                self.chezmoi.re_add(&readds)?;
+            return BatchOutcome { per_target };
+        }
+
+        let readds = self.batch_targets(&prepared, BatchDecision::KeepDisk);
+        // Guarded, never called empty: an empty target list keeps chezmoi's
+        // own meaning — EVERY modified file — and both `re_add` and
+        // `apply_many` refuse one outright rather than let that happen.
+        let readd = (!readds.is_empty()).then(|| self.chezmoi.re_add(&readds));
+        let applies = self.batch_targets(&prepared, BatchDecision::KeepSourceLocal);
+        let applied = (!applies.is_empty()).then(|| self.chezmoi.apply_many(&applies));
+
+        // Only keep-disk writes reach the SOURCE repo, so the commit and push
+        // belong to that group alone, and run only if its re-add landed. A
+        // keep-source-only batch therefore commits nothing and pushes
+        // nothing, and reports `false/false` exactly as single-file
+        // `keep_source` does — rather than counting a clean repo as
+        // "committed" and pushing a no-op.
+        let disk_outcome: Result<(bool, bool, Option<String>), String> = match readd {
+            Some(Err(e)) => Err(e.to_string()),
+            Some(Ok(())) => {
+                let targets: Vec<&Path> = prepared
+                    .iter()
+                    .filter(|p| p.candidate.decision == BatchDecision::KeepDisk)
+                    .map(|p| p.candidate.target.as_path())
+                    .collect();
+                Ok(self.commit_batch(&targets))
             }
-            let applies: Vec<PathBuf> = prepared
-                .iter()
-                .filter(|p| p.decision == BatchDecision::KeepSourceLocal)
-                .map(|p| p.target.clone())
-                .collect();
-            if !applies.is_empty() {
-                self.chezmoi.apply_many(&applies)?;
-            }
-            let targets: Vec<&Path> = prepared.iter().map(|p| p.target.as_path()).collect();
-            Ok(self.commit_batch(&targets))
-        })();
+            None => Ok((false, false, None)),
+        };
+        let source_outcome: Result<(), String> = match applied {
+            Some(Err(e)) => Err(e.to_string()),
+            _ => Ok(()),
+        };
 
         // Phase 3 — per file again: end its own session, report its own
-        // result. The commit/push verdict is the tail's, shared by everyone
-        // who rode it.
-        for (p, slot) in prepared.iter().zip(&slots) {
-            per_target[*slot].1 = match &tail {
-                Ok((committed, pushed, note)) => {
-                    let label = match p.decision {
-                        BatchDecision::KeepDisk => "keep_disk",
-                        BatchDecision::KeepSourceLocal => "keep_source",
-                    };
-                    self.session_end(p.session, &format!("{label} {}", display_name(&p.target)))
-                        .map(|()| ResolveOutcome::Done {
-                            session: p.session,
-                            committed: *committed,
-                            pushed: *pushed,
-                            note: note.clone(),
-                        })
-                }
-                Err(e) => Err(ResolveError::Failed(format!(
-                    "batch failed before this file could land: {e}"
-                ))),
+        // group's result.
+        for p in &prepared {
+            let (label, landed) = match p.candidate.decision {
+                BatchDecision::KeepDisk => (
+                    "keep_disk",
+                    disk_outcome
+                        .as_ref()
+                        .map(|(c, pu, note)| (*c, *pu, note.clone()))
+                        .map_err(|e| format!("the batch re-add failed: {e}")),
+                ),
+                BatchDecision::KeepSourceLocal => (
+                    "keep_source",
+                    source_outcome
+                        .as_ref()
+                        .map(|()| (false, false, None))
+                        .map_err(|e| format!("the batch apply failed: {e}")),
+                ),
+            };
+            per_target[p.candidate.slot].1 = match landed {
+                Ok((committed, pushed, note)) => self
+                    .session_end(
+                        p.session,
+                        &format!("{label} {}", display_name(&p.candidate.target)),
+                    )
+                    .map(|()| ResolveOutcome::Done {
+                        session: p.session,
+                        committed,
+                        pushed,
+                        note,
+                    }),
+                Err(msg) => Err(ResolveError::Failed(msg)),
             };
         }
         if let Err(e) = self.rescan() {
@@ -386,24 +460,29 @@ impl ResolveEngine {
         BatchOutcome { per_target }
     }
 
-    /// The cheap per-file half of a batch item: resolve its source path,
-    /// refuse a templated keep-disk (`Ok(None)`, the `NeedsMergeEditor` of
-    /// [`Self::keep_disk`]), then open its OWN session and journal its
-    /// decision with the blobs undo will need.
+    /// The targets of one decision group, in input order — the list a single
+    /// `re-add` or `apply` invocation is handed.
+    fn batch_targets(&self, prepared: &[Prepared], decision: BatchDecision) -> Vec<PathBuf> {
+        prepared
+            .iter()
+            .filter(|p| p.candidate.decision == decision)
+            .map(|p| p.candidate.target.clone())
+            .collect()
+    }
+
+    /// Open a batch item's OWN journal session and record its decision with
+    /// the blobs undo will need. One session per file, never one per batch:
+    /// that is what keeps Undo per file.
     ///
     /// The blob count is checked as strictly as the single-file paths check
     /// it: `SnapshotBlobs` silently omits a path it could not snapshot, and a
     /// keep-disk decision journaled without its `source_blob` is an undo that
     /// cannot restore the source.
-    fn prepare_batch_item(&self, item: &BatchItem) -> Result<Option<Prepared>, ResolveError> {
-        let source = self.chezmoi.source_path(&item.target)?;
-        if item.decision == BatchDecision::KeepDisk && is_templated(&source) {
-            return Ok(None);
-        }
+    fn open_batch_session(&self, c: &Candidate) -> Result<i64, ResolveError> {
         let session = self.session_start()?;
-        let (action, snapshot_paths) = match item.decision {
-            BatchDecision::KeepDisk => ("keep_disk", vec![item.target.clone(), source.clone()]),
-            BatchDecision::KeepSourceLocal => ("keep_source", vec![item.target.clone()]),
+        let (action, snapshot_paths) = match c.decision {
+            BatchDecision::KeepDisk => ("keep_disk", vec![c.target.clone(), c.source.clone()]),
+            BatchDecision::KeepSourceLocal => ("keep_source", vec![c.target.clone()]),
         };
         let want = snapshot_paths.len();
         let hashes = self.snapshot_blobs(snapshot_paths)?;
@@ -415,17 +494,12 @@ impl ResolveEngine {
         }
         let decision = build_decision(
             action,
-            &item.target,
+            &c.target,
             &hashes[0],
             hashes.get(1).map(String::as_str),
         );
         self.session_decision(session, decision)?;
-        Ok(Some(Prepared {
-            target: item.target.clone(),
-            source,
-            decision: item.decision,
-            session,
-        }))
+        Ok(session)
     }
 
     /// Keep ORIGIN's version of the source: origin's rendered content becomes

@@ -15,7 +15,7 @@ use tomte_app::ipc::IpcClient;
 use tomte_app::merge_inputs;
 use tomte_app::merge_state::MergeState;
 use tomte_app::resolve::{
-    BatchDecision, BatchItem, MergeConclusion, ResolveEngine, ResolveOutcome,
+    BatchDecision, BatchItem, BatchOutcome, MergeConclusion, ResolveEngine, ResolveOutcome,
 };
 use tomte_core::cmd::SystemRunner;
 use tomte_core::drift::{ContentHash, DriftClass};
@@ -32,6 +32,8 @@ use tomte_proto::{DriftSummary, Event, Request, Response};
 const DRIFTED: &[u8] = b"a=local\n";
 /// The scratch source's rendered content (`dot_testrc` = "a=1\n").
 const RENDERED: &[u8] = b"a=1\n";
+/// Pristine content of the extra managed files a batch story adds.
+const MANAGED_BASE: &[u8] = b"x=1\n";
 
 fn now_ts() -> u64 {
     std::time::SystemTime::now()
@@ -381,16 +383,17 @@ fn story_m_a_batch_of_keep_disk_shares_one_commit_and_one_push() {
     }
 }
 
-/// Mid-merge the shared tail is unavailable (autoCommit cannot run over
-/// unmerged paths), so a batch must fall back to the single-file paths —
-/// and still resolve every item.
+/// Mid-merge the shared tail is unavailable — it stages the whole index, so
+/// it would commit conflicts nobody answered — so a batch must fall back to
+/// the single-file paths, and still resolve every item.
 ///
-/// chezmoi's git automation is ON here deliberately, the way the real user's
-/// is: with it OFF the batch tail happens to survive mid-merge by accident
-/// (chezmoi's `re-add` commits nothing, and Tomte's own `git add` resolves
-/// the path before committing), so the story would pass with the fallback
-/// deleted and prove nothing. autoCommit is what makes `re-add` run git
-/// from the inside, where unmerged paths are fatal.
+/// This story alone does not prove the fallback is needed — with only one
+/// conflict the batch tail reaches the same end state, so it passes with the
+/// fallback deleted. `story_o` is the one that bites. What this pins is the
+/// other half: mid-merge, a batch still RESOLVES its item and still drives
+/// the merge to a commit when nothing is left conflicted.
+///
+/// chezmoi's git automation is ON deliberately, the way the real user's is.
 #[test]
 fn story_n_a_batch_while_mid_merge_falls_back_to_single_file_paths() {
     let lab = DriftLab::new();
@@ -482,6 +485,383 @@ fn story_o_a_mid_merge_batch_never_commits_a_conflict_it_did_not_answer() {
         "and its conflict markers must still be sitting in the working tree, \
          uncommitted"
     );
+}
+
+/// The headline invariant of the three-phase design: a batch shares its
+/// TAIL, never its journal session, so Undo still works one file at a time.
+///
+/// `keep_source` items, because `undo_last` restores DESTINATION files
+/// (source-side revert is deferred to Plan 7) — so the destination is where
+/// a per-file undo is observable at all.
+#[test]
+fn story_p_undo_after_a_batch_reverts_exactly_one_file() {
+    let lab = DriftLab::new();
+    more_managed_files(&lab, &["a", "b", "c"]);
+    for (dst, body) in [(".a", "a=disk\n"), (".b", "b=disk\n"), (".c", "c=disk\n")] {
+        std::fs::write(lab.s.home.join(dst), body).unwrap();
+    }
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".a", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".b", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".c", BatchDecision::KeepSourceLocal),
+    ]);
+    let sessions: Vec<i64> = (0..3).map(|ix| done(&outcome, ix).0).collect();
+    assert_eq!(
+        sessions
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3,
+        "three files, three sessions"
+    );
+    for dst in [".a", ".b", ".c"] {
+        assert_eq!(std::fs::read(lab.s.home.join(dst)).unwrap(), MANAGED_BASE);
+    }
+    // Let the batch's rescan finish (and release the core) before undoing:
+    // the undo's IPC calls must not race a scan holding the daemon core.
+    lab.wait_scan_done();
+    assert!(lab.settled_status().is_empty(), "in-sync before the undo");
+
+    let undone = lab.engine.undo_last().unwrap();
+    assert_eq!(
+        undone,
+        Some(sessions[2]),
+        "undo must target the LAST file's OWN session, not the batch"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".c")).unwrap(),
+        b"c=disk\n",
+        "the undone file must be back to what the user had on disk"
+    );
+    for dst in [".a", ".b"] {
+        assert_eq!(
+            std::fs::read(lab.s.home.join(dst)).unwrap(),
+            MANAGED_BASE,
+            "{dst} rode the same tail but is NOT part of .c's undo"
+        );
+    }
+}
+
+/// A mixed batch, one tail: the keep-disk half rides the commit and push,
+/// the keep-source half does not. `chezmoi apply` never touches the source
+/// repo, so there is nothing for it to have committed — the same verdict
+/// single-file `keep_source` reports.
+///
+/// Also the only end-to-end exercise of `apply_many`.
+#[test]
+fn story_q_a_mixed_batch_commits_the_keep_disk_half_only() {
+    let lab = DriftLab::new();
+    more_managed_files(&lab, &["a", "b"]);
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    std::fs::write(lab.s.home.join(".b"), b"b=discard-me\n").unwrap();
+    let commits_before = commit_count(&lab.s.bare);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+        batch_item(&lab, ".b", BatchDecision::KeepSourceLocal),
+    ]);
+
+    let (_, committed, pushed, note) = done(&outcome, 0);
+    assert!(committed && pushed, "the keep-disk half must reach origin");
+    assert_eq!(note, None);
+    let (_, committed, pushed, note) = done(&outcome, 1);
+    assert!(
+        !committed && !pushed,
+        "apply never touches the source repo, so this half committed nothing"
+    );
+    assert_eq!(note, None);
+
+    // Filesystem truth for both halves, out of ONE shared tail.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_a")).unwrap(),
+        b"a=disk\n",
+        "re-add must have carried the disk content into the source"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".b")).unwrap(),
+        MANAGED_BASE,
+        "apply_many must have restored the rendered content"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_b")).unwrap(),
+        MANAGED_BASE,
+        "and must not have touched its source"
+    );
+    assert_eq!(
+        commit_count(&lab.s.bare) - commits_before,
+        1,
+        "one commit for the batch, carrying the keep-disk half"
+    );
+}
+
+/// A keep-source-only batch must not commit or push AT ALL.
+///
+/// `apply` never touches the source repo, and the commit phase counts a clean
+/// repo as "committed" (chezmoi's autoCommit may have done it). Running the
+/// tail regardless reported "committed & pushed" on a sweep that committed
+/// nothing, and paid for a no-op push (~1.5s) to say it.
+///
+/// The tail is not merely wasted, either: it stages with `git add --all`. So
+/// the fixture leaves an unrelated source edit in progress — the user
+/// halfway through editing another dotfile — and the sweep must not commit
+/// it out from under them.
+#[test]
+fn story_r_a_keep_source_only_batch_commits_and_pushes_nothing() {
+    let lab = DriftLab::new();
+    more_managed_files(&lab, &["a", "b", "c"]);
+    std::fs::write(lab.s.home.join(".a"), b"a=discard\n").unwrap();
+    std::fs::write(lab.s.home.join(".b"), b"b=discard\n").unwrap();
+    std::fs::write(
+        lab.s.source.join("dot_c"),
+        b"c=an edit the user has not finished\n",
+    )
+    .unwrap();
+    let head_before = lab.source_git().head_sha().unwrap();
+    let commits_before = commit_count(&lab.s.bare);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".a", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".b", BatchDecision::KeepSourceLocal),
+    ]);
+    for ix in 0..2 {
+        let (_, committed, pushed, note) = done(&outcome, ix);
+        assert!(
+            !committed && !pushed,
+            "entry {ix}: apply commits nothing and pushes nothing"
+        );
+        assert_eq!(note, None);
+    }
+    assert_eq!(
+        lab.source_git().head_sha().unwrap(),
+        head_before,
+        "no commit may have been made"
+    );
+    assert_eq!(
+        commit_count(&lab.s.bare),
+        commits_before,
+        "and nothing may have been pushed"
+    );
+    assert_eq!(
+        lab.source_git().dirty_files().unwrap(),
+        vec![PathBuf::from("dot_c")],
+        "the unrelated source edit must still be the user's to finish"
+    );
+    for dst in [".a", ".b"] {
+        assert_eq!(std::fs::read(lab.s.home.join(dst)).unwrap(), MANAGED_BASE);
+    }
+}
+
+/// A templated keep-disk is refused (chezmoi's `re-add` silently ignores
+/// templates), and the refusal must keep its SLOT: `per_target` is one entry
+/// per item in INPUT order, whatever gets refused in the middle.
+#[test]
+fn story_s_a_templated_keep_disk_keeps_its_slot_and_its_sibling_still_lands() {
+    const TEMPLATE: &[u8] = b"a={{ \"tpl\" }}\n";
+    let lab = DriftLab::new();
+    git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
+    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TEMPLATE).unwrap();
+    more_managed_files(&lab, &["a"]); // commits and pushes the rename too
+    assert_eq!(std::fs::read(&lab.target).unwrap(), b"a=tpl\n");
+
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+
+    let outcome = lab.engine.resolve_batch(vec![
+        BatchItem {
+            target: lab.target.clone(),
+            decision: BatchDecision::KeepDisk,
+        },
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+    ]);
+
+    assert_eq!(outcome.per_target.len(), 2, "one entry per item");
+    assert_eq!(
+        outcome.per_target[0].0, lab.target,
+        "the refused item keeps slot 0"
+    );
+    assert_eq!(
+        outcome.per_target[0].1.as_ref().unwrap(),
+        &ResolveOutcome::NeedsMergeEditor
+    );
+
+    // The sibling still landed, on the shared tail.
+    let (_, committed, pushed, _) = done(&outcome, 1);
+    assert!(committed && pushed);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_a")).unwrap(),
+        b"a=disk\n"
+    );
+
+    // The template and its drifted destination are untouched — the refusal
+    // costs the sibling nothing and the template nothing.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        TEMPLATE
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), DRIFTED);
+}
+
+/// The templated refusal happens BEFORE the catch-up with origin, so a batch
+/// of nothing but templated files really does touch nothing. It must not be
+/// the reason the repo enters a merge with origin — that merge writes
+/// conflict markers into every file the two sides disagree on, and this batch
+/// decided nothing that could justify it.
+#[test]
+fn story_t_an_all_templated_batch_does_not_even_start_a_merge() {
+    const BASE_TPL: &[u8] = b"a={{ \"base\" }}\n";
+    const ORIGIN_TPL: &[u8] = b"a={{ \"origin\" }}\n";
+    const LOCAL_TPL: &[u8] = b"a={{ \"local\" }}\n";
+    let lab = DriftLab::new();
+    git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
+    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), BASE_TPL).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "templatize"]);
+    git(&lab.s.source, &["push"]);
+    diverge_with_conflicts(&lab, &[("dot_testrc.tmpl", ORIGIN_TPL, LOCAL_TPL)]);
+
+    let git_c = lab.source_git();
+    let head_before = git_c.head_sha().unwrap();
+    let behind_before = git_c.divergence("origin/main").unwrap().behind;
+    assert!(
+        behind_before > 0,
+        "premise: a merge is waiting to be started"
+    );
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+
+    let outcome = lab.engine.resolve_batch(vec![BatchItem {
+        target: lab.target.clone(),
+        decision: BatchDecision::KeepDisk,
+    }]);
+
+    assert_eq!(
+        outcome.per_target[0].1.as_ref().unwrap(),
+        &ResolveOutcome::NeedsMergeEditor
+    );
+    assert!(
+        !git_c.merge_in_progress(),
+        "a batch that refused every item must not have started a merge"
+    );
+    assert_eq!(
+        git_c.head_sha().unwrap(),
+        head_before,
+        "and must not have committed anything"
+    );
+    assert_eq!(
+        git_c.divergence("origin/main").unwrap().behind,
+        behind_before,
+        "the divergence is exactly as it was"
+    );
+    assert_eq!(
+        std::fs::read(&lab.target).unwrap(),
+        DRIFTED,
+        "the drift is still there to be answered in the merge editor"
+    );
+}
+
+/// The two decision groups must be reported SEPARATELY, and the reason is
+/// Undo.
+///
+/// `chezmoi apply` can fail on its own — a template that no longer renders is
+/// enough — long after `chezmoi re-add` has already rewritten the keep-disk
+/// sources. A single shared verdict called those files "not resolved", skipped
+/// their `session_end`, and so put real writes beyond `undo_last`, which reads
+/// the last FINISHED session. The next decision's catch-up would then sweep
+/// them into a commit named "Update dotfiles (pre-merge)" with no way back.
+#[test]
+fn story_u_a_failed_apply_does_not_strand_the_keep_disk_files_that_landed() {
+    let lab = DriftLab::new();
+    // A second managed file, templated and valid, so the fixture can apply.
+    std::fs::write(lab.s.source.join("dot_broken.tmpl"), b"b={{ \"ok\" }}\n").unwrap();
+    more_managed_files(&lab, &["a"]);
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".broken")).unwrap(),
+        b"b=ok\n"
+    );
+
+    // Now break it, so `chezmoi apply` on it fails while `re-add` on the
+    // OTHER file still succeeds (verified: re-add does not render siblings).
+    std::fs::write(lab.s.source.join("dot_broken.tmpl"), b"b={{ }}\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "break the template"]);
+    git(&lab.s.source, &["push"]);
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    let commits_before = commit_count(&lab.s.bare);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+        batch_item(&lab, ".broken", BatchDecision::KeepSourceLocal),
+    ]);
+
+    // The keep-source half failed, and says which call failed.
+    let (_, result) = &outcome.per_target[1];
+    let Err(e) = result else {
+        panic!("the broken template cannot have applied, got {result:?}");
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("the batch apply failed"),
+        "must name the call that failed, got {msg:?}"
+    );
+
+    // The keep-disk half LANDED, and says so.
+    let (session_a, committed, pushed, note) = done(&outcome, 0);
+    assert!(
+        committed && pushed,
+        "re-add succeeded, so this file was resolved and committed: note {note:?}"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_a")).unwrap(),
+        b"a=disk\n",
+        "its source really was rewritten — reporting failure would be a lie"
+    );
+    assert_eq!(commit_count(&lab.s.bare) - commits_before, 1);
+
+    // And it is UNDOABLE: its session was finished, so `undo_last` can find
+    // it. Before the groups were split this was `None` — the write existed
+    // with no finished session pointing at it.
+    assert_eq!(
+        lab.engine.undo_last().unwrap(),
+        Some(session_a),
+        "the file that landed must be reachable by undo"
+    );
+}
+
+/// Extra managed files for a batch story: `dot_<name>` = `MANAGED_BASE`,
+/// committed, pushed, and applied — so `~/.<name>` exists and is in sync,
+/// ready to be drifted. Applied in ONE pass on purpose: `apply(None)` is
+/// repo-wide and `--force`, so applying between drifts would wash the earlier
+/// ones straight back out.
+fn more_managed_files(lab: &DriftLab, names: &[&str]) {
+    for name in names {
+        std::fs::write(lab.s.source.join(format!("dot_{name}")), MANAGED_BASE).unwrap();
+    }
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "more managed files"]);
+    git(&lab.s.source, &["push"]);
+    lab.s.chezmoi().apply(None).unwrap();
+}
+
+fn batch_item(lab: &DriftLab, name: &str, decision: BatchDecision) -> BatchItem {
+    BatchItem {
+        target: lab.s.home.join(name),
+        decision,
+    }
+}
+
+/// The `Done` fields of one `per_target` entry: `(session, committed, pushed,
+/// note)`, or a panic naming the file and what came back instead.
+fn done(outcome: &BatchOutcome, ix: usize) -> (i64, bool, bool, Option<String>) {
+    let (target, result) = &outcome.per_target[ix];
+    match result {
+        Ok(ResolveOutcome::Done {
+            session,
+            committed,
+            pushed,
+            note,
+        }) => (*session, *committed, *pushed, note.clone()),
+        other => panic!("{}: expected Done, got {other:?}", target.display()),
+    }
 }
 
 /// Commits on the bare origin's `main`. Read with a plain subprocess, the way

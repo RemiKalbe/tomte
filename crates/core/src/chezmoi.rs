@@ -353,9 +353,18 @@ impl ChezmoiClient {
     /// and chezmoi would otherwise prompt `(diff/overwrite/…)?` — which under
     /// `--no-tty` dies with `EOF`. Callers apply only on an explicit user
     /// decision, so overwriting is exactly the contract.
-    /// Apply one or more destinations, or all of them when `targets` is
-    /// empty. Same per-invocation economics as [`Self::re_add`].
+    /// Apply one or more destinations in ONE invocation. Same per-invocation
+    /// economics as [`Self::re_add`], and the same refusal: an empty slice
+    /// keeps chezmoi's own meaning — apply the ENTIRE source state over the
+    /// destination — so callers must not hand one over by accident.
     pub fn apply_many(&self, targets: &[PathBuf]) -> Result<(), ChezmoiError> {
+        if targets.is_empty() {
+            return Err(ChezmoiError::Failed(
+                "apply_many called with no targets; chezmoi would apply the \
+                 ENTIRE source state over the destination, which no caller means"
+                    .into(),
+            ));
+        }
         let mut args = vec!["apply".to_string(), "--force".to_string()];
         args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -565,6 +574,20 @@ mod tests {
     fn re_add_refuses_an_empty_target_list_rather_than_re_adding_everything() {
         let fake = Arc::new(FakeRunner::new());
         let err = client(fake.clone()).re_add(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("no targets"),
+            "must say why it refused: {err}"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "and must not have invoked chezmoi at all"
+        );
+    }
+
+    #[test]
+    fn apply_many_refuses_an_empty_target_list_rather_than_applying_everything() {
+        let fake = Arc::new(FakeRunner::new());
+        let err = client(fake.clone()).apply_many(&[]).unwrap_err();
         assert!(
             err.to_string().contains("no targets"),
             "must say why it refused: {err}"
