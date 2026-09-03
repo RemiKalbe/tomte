@@ -8,6 +8,7 @@ pub mod merge;
 pub mod review;
 pub mod settings;
 
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
 use gpui::{
@@ -157,41 +158,7 @@ impl Shell {
                 .spawn(async move { engine.finish_merge_if_resolved() })
                 .await;
             this.update(cx, |shell, cx| {
-                match result {
-                    Ok(MergeConclusion::Committed { pushed, note }) => {
-                        shell.origin_merge_finished(pushed, note, cx);
-                    }
-                    Ok(MergeConclusion::StillConflicted(leftover)) => {
-                        shell.merge_done(
-                            OutcomeBanner {
-                                text: format!(
-                                    "Recorded · {} more file(s) still differ from origin",
-                                    leftover.len()
-                                )
-                                .into(),
-                                tint: review::BannerTint::Drift,
-                                undoable: false,
-                            },
-                            cx,
-                        );
-                    }
-                    // The editor only saves in this mode while a merge is
-                    // running, so this means it ended underneath us.
-                    Ok(MergeConclusion::NotMerging) => {
-                        tomte_core::log_warn!(
-                            "reconcile",
-                            "resolution recorded but no merge was in progress"
-                        );
-                    }
-                    Err(e) => {
-                        tomte_core::log_error!("reconcile", "finish failed: {e}");
-                        crate::notify_osa::notify(
-                            &tomte_core::cmd::SystemRunner,
-                            "tomte",
-                            &format!("merge with origin could not conclude: {e}"),
-                        );
-                    }
-                }
+                shell.conclude_staged_merge(result, cx);
                 // A failed conclude is exactly what strands a merge, so ask
                 // right here whether one now needs the dashboard banner.
                 shell.refresh_pending_merge(cx);
@@ -200,6 +167,55 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    /// Report one `finish_merge_if_resolved` result — the merge a staged
+    /// repo conflict belongs to, concluded (or not).
+    ///
+    /// Shared by [`Self::repo_conflict_saved`] and by the action queue's
+    /// drain so both tell the user the same story. Does NOT probe for a
+    /// stranded merge: its two callers each own that call, and probing here
+    /// as well would double it.
+    fn conclude_staged_merge(
+        &mut self,
+        result: Result<MergeConclusion, ResolveError>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(MergeConclusion::Committed { pushed, note }) => {
+                self.origin_merge_finished(pushed, note, cx);
+            }
+            Ok(MergeConclusion::StillConflicted(leftover)) => {
+                self.merge_done(
+                    OutcomeBanner {
+                        text: format!(
+                            "Recorded · {} more file(s) still differ from origin",
+                            leftover.len()
+                        )
+                        .into(),
+                        tint: review::BannerTint::Drift,
+                        undoable: false,
+                    },
+                    cx,
+                );
+            }
+            // The editor only saves in this mode while a merge is running,
+            // so this means it ended underneath us.
+            Ok(MergeConclusion::NotMerging) => {
+                tomte_core::log_warn!(
+                    "reconcile",
+                    "resolution recorded but no merge was in progress"
+                );
+            }
+            Err(e) => {
+                tomte_core::log_error!("reconcile", "finish failed: {e}");
+                crate::notify_osa::notify(
+                    &tomte_core::cmd::SystemRunner,
+                    "tomte",
+                    &format!("merge with origin could not conclude: {e}"),
+                );
+            }
+        }
     }
 
     /// The merge with origin was committed: refresh the model, and say so
@@ -415,11 +431,17 @@ impl Shell {
             .try_global::<crate::EngineSlot>()
             .and_then(|slot| slot.0.clone())
         else {
-            // Disconnected: PARK. Everything stays queued and every row
-            // stays "processing" — these are the user's decisions, and
+            // No engine to run with: PARK. Everything stays queued and every
+            // row stays "processing" — these are the user's decisions, and
             // dropping them here would be exactly the discarded click the
-            // queue exists to stop. The connect latch in `render` calls
-            // this again once an engine exists.
+            // queue exists to stop.
+            //
+            // `EngineSlot` is written once, when the app first connects
+            // (`main.rs`), so this is reached before that publish or when
+            // building the engine failed. A daemon that goes away LATER
+            // leaves the engine in place: the batch then runs and fails
+            // honestly against the repo rather than parking. The connect
+            // latch in `render` calls this again once the slot is filled.
             return;
         };
         let batch = self.queue.take_batch();
@@ -429,12 +451,41 @@ impl Shell {
         self.queue_pumping = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
+            let runner = engine.clone();
             let results = cx
                 .background_executor()
-                .spawn(async move { run_batch(&engine, batch) })
+                .spawn(async move { run_batch(&runner, batch) })
                 .await;
-            this.update(cx, |shell, cx| shell.batch_finished(results, cx))
+            // A staged repo conflict is only half of that decision's work:
+            // the merge it belongs to still has to be concluded, and that is
+            // a merge commit and a push on the very repository the NEXT
+            // batch would start writing to. So it is awaited HERE, inside
+            // the in-flight window and before the latch clears, rather than
+            // spawned off to race the drain.
+            let conclusion = if results
+                .iter()
+                .any(|(_, _, r)| matches!(r, Ok(BatchResult::RepoConflictStaged)))
+            {
+                // Routed BEFORE the await, exactly as `repo_conflict_saved`
+                // does it: the editor is finished with either way, and the
+                // arms that only report a failure do not route themselves.
+                this.update(cx, |shell, cx| {
+                    shell.route = Route::Review;
+                    cx.notify();
+                })
                 .ok();
+                Some(
+                    cx.background_executor()
+                        .spawn(async move { engine.finish_merge_if_resolved() })
+                        .await,
+                )
+            } else {
+                None
+            };
+            this.update(cx, |shell, cx| {
+                shell.batch_finished(results, conclusion, cx)
+            })
+            .ok();
         })
         .detach();
     }
@@ -447,15 +498,23 @@ impl Shell {
     /// target it belongs to. A decision whose result went nowhere is a
     /// decision the user believes was applied.
     ///
-    /// Runs as a Shell update, so it may touch `self.state` and call Shell
-    /// methods — but it must never nest an update of a view that is itself
-    /// mid-update, which is why the merge hand-off below goes through
-    /// [`Self::repo_conflict_saved`] (which spawns its own task) rather than
-    /// reaching into the merge view from here.
-    fn batch_finished(&mut self, results: Vec<DecisionReport>, cx: &mut Context<Self>) {
+    /// `conclusion` is present exactly when the batch staged a repo
+    /// conflict: it is that merge's ALREADY-AWAITED outcome, so the latch
+    /// below clears only once every git mutation the batch owed is done —
+    /// never while a merge commit and push are still running.
+    ///
+    /// Reached from a fresh Shell update, so it may touch `self.state` and
+    /// nest an update of the review view (through `merge_done`). What it
+    /// must never do is nest an update of a view that is itself mid-update,
+    /// which is why nothing here reaches back into the merge editor.
+    fn batch_finished(
+        &mut self,
+        results: Vec<DecisionReport>,
+        conclusion: Option<Result<MergeConclusion, ResolveError>>,
+        cx: &mut Context<Self>,
+    ) {
         self.queue_pumping = false;
         let mut finished: Vec<(PathBuf, Option<SharedString>)> = Vec::with_capacity(results.len());
-        let mut staged_repo_conflict = false;
         for (target, label, result) in results {
             let failure: Option<SharedString> = match result {
                 Ok(BatchResult::Resolved(ResolveOutcome::Done { .. })) => {
@@ -474,11 +533,9 @@ impl Shell {
                 // Not a resolve session: the answer went into the merge's
                 // index, so there is no session id and nothing for
                 // `confirm_resolved` to retire. The merge's own conclusion
-                // (and the rescan behind it) is what drops the row.
-                Ok(BatchResult::RepoConflictStaged) => {
-                    staged_repo_conflict = true;
-                    None
-                }
+                // (`conclusion`, below) and the rescan behind it is what
+                // drops the row.
+                Ok(BatchResult::RepoConflictStaged) => None,
                 // The label is the user's own words for the choice, so a
                 // failure minutes later still names the button they pressed.
                 Err(e) => Some(format!("{label} failed: {e}").into()),
@@ -486,16 +543,13 @@ impl Shell {
             finished.push((target, failure));
         }
         self.queue.finish_all(&finished);
-        if staged_repo_conflict {
-            // Conclude the merge if that was the last conflict open. It ends
-            // with `refresh_pending_merge` itself, so the probe still runs.
-            self.repo_conflict_saved(cx);
-        } else {
-            // Any decision above can have started a merge with origin and
-            // then failed to commit it, leaving nothing conflicted and so no
-            // row to try again from.
-            self.refresh_pending_merge(cx);
+        if let Some(conclusion) = conclusion {
+            self.conclude_staged_merge(conclusion, cx);
         }
+        // Once, on every path: any decision above can have started a merge
+        // with origin and then failed to commit it, leaving nothing
+        // conflicted and so no row to try again from.
+        self.refresh_pending_merge(cx);
         cx.notify();
         self.pump(cx);
     }
@@ -646,15 +700,67 @@ pub(crate) enum BatchResult {
     RepoConflictStaged,
 }
 
-/// Run one batch to completion. Called on the background executor and
-/// touches no gpui state, so `pub(crate)` for the headless driver too.
+/// Run one batch to completion, panic and all. Called on the background
+/// executor and touches no gpui state, so `pub(crate)` for the headless
+/// driver too.
+pub(crate) fn run_batch(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<DecisionReport> {
+    let owed: Vec<(PathBuf, &'static str)> = batch
+        .iter()
+        .map(|a| (a.target.clone(), a.decision.label()))
+        .collect();
+    catching_panics(owed, AssertUnwindSafe(|| run_batch_inner(engine, batch)))
+}
+
+/// Run `work`, turning a panic inside it into one failure report per target
+/// it was owed.
+///
+/// The queue has to be UN-WEDGEABLE. A panic escaping the drain would leave
+/// `queue_pumping` set and the batch stuck in `running` forever: every later
+/// decision would pile up behind it, every row would sit at "processing",
+/// and nothing would ever clear it — not even the connect latch, since
+/// `pump` returns early on that latch. So the panic becomes ordinary
+/// per-target failures instead, which `finish_all` records against the rows
+/// they belong to and the user can retry.
+fn catching_panics(
+    owed: Vec<(PathBuf, &'static str)>,
+    work: impl FnOnce() -> Vec<DecisionReport> + std::panic::UnwindSafe,
+) -> Vec<DecisionReport> {
+    match std::panic::catch_unwind(work) {
+        Ok(reports) => reports,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            tomte_core::log_error!(
+                "resolve",
+                "a queued batch of {} file(s) panicked: {detail}",
+                owed.len()
+            );
+            owed.into_iter()
+                .map(|(target, label)| {
+                    (
+                        target,
+                        label,
+                        Err(ResolveError::Failed(
+                            "internal error — see the log".to_string(),
+                        )),
+                    )
+                })
+                .collect()
+        }
+    }
+}
+
+/// The batch itself, free to panic.
 ///
 /// A run of batchable decisions goes through
 /// [`ResolveEngine::resolve_batch`]: one `re-add`/`apply`, one commit and one
 /// push for the whole run instead of that tail per file. Every other
 /// decision needs the repo to itself and goes through its own single-file
 /// engine method.
-pub(crate) fn run_batch(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<DecisionReport> {
+fn run_batch_inner(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<DecisionReport> {
     // Every arm below can reach `ensure_merge_started` and so leave a merge
     // with origin resolved but uncommitted. It cannot probe for one from
     // here — the background executor has no `Context` — so the completion
@@ -725,9 +831,10 @@ impl Render for Shell {
         {
             self.pending_merge_probed = true;
             self.refresh_pending_merge(cx);
-            // A queue parked by a disconnect resumes here. `pump` is
-            // idempotent and this arm is latched to once per connection
-            // epoch, so it cannot loop on itself.
+            // Resume a queue parked because no engine existed yet: the
+            // first decision can be made while the app is still connecting,
+            // and a reconnect re-arms this arm. `pump` is idempotent and
+            // this fires once per connection epoch, so it cannot loop.
             self.pump(cx);
         }
         // The changelog is a popup: no sidebar, no chrome, just the document.
@@ -1474,6 +1581,15 @@ mod render_smoke {
                 2,
                 "with no engine the queue parks — a parked decision is not a dropped one"
             );
+            // `depth()` alone cannot tell parked from taken-and-dropped: it
+            // counts `pending + running`, so a `pump` that took the batch
+            // and then lost it would satisfy the assertion above while
+            // wedging the queue for good. Both decisions must still be
+            // PENDING.
+            assert!(
+                shell.queue.running().is_empty(),
+                "nothing was taken out of the queue — the batch is still pending, not lost"
+            );
             assert!(
                 !shell.queue_pumping,
                 "nothing is in flight, so a reconnect is free to pump"
@@ -1483,5 +1599,74 @@ mod render_smoke {
                 "parking is not a failure to report"
             );
         });
+    }
+    /// A panic inside a batch must come back as ordinary per-target
+    /// failures. If it escaped instead, `queue_pumping` would stay set and
+    /// the batch would stay in `running` forever — every later decision
+    /// piling up behind rows frozen at "processing", with nothing able to
+    /// clear it, because `pump` returns early on that very latch.
+    ///
+    /// Driven through `catching_panics` rather than a fake engine:
+    /// `run_batch_inner` takes a concrete `&ResolveEngine` built from
+    /// concrete chezmoi/git clients, so there is no seam to inject a
+    /// panicking one. The catch itself is the whole mechanism, and this
+    /// drives it directly.
+    #[test]
+    fn a_panicking_batch_reports_a_failure_for_every_target_it_owed() {
+        use std::panic::AssertUnwindSafe;
+        use std::path::Path;
+
+        let owed = vec![
+            (PathBuf::from("/a"), "Keep disk"),
+            (PathBuf::from("/b"), "Keep source · this machine"),
+        ];
+        let reports = catching_panics(owed, AssertUnwindSafe(|| panic!("index out of bounds")));
+
+        assert_eq!(
+            reports
+                .iter()
+                .map(|(t, _, _)| t.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("/a"), Path::new("/b")],
+            "every target the batch was owed is reported, not just the first"
+        );
+        for (target, _, result) in &reports {
+            let Err(e) = result else {
+                panic!("{} was reported as a success", target.display());
+            };
+            assert!(
+                e.to_string().contains("internal error"),
+                "{}: {e}",
+                target.display()
+            );
+        }
+
+        // And the reports are exactly what un-wedges the queue: `finish_all`
+        // takes them, clears `running`, and leaves each row answerable.
+        let mut q = ActionQueue::default();
+        q.push(QueuedAction {
+            target: PathBuf::from("/a"),
+            decision: Decision::KeepDisk,
+        });
+        q.push(QueuedAction {
+            target: PathBuf::from("/b"),
+            decision: Decision::KeepSourceLocal,
+        });
+        q.take_batch();
+        let finished: Vec<(PathBuf, Option<SharedString>)> = reports
+            .into_iter()
+            .map(|(target, label, result)| {
+                let err = result
+                    .err()
+                    .map(|e| SharedString::from(format!("{label} failed: {e}")));
+                (target, err)
+            })
+            .collect();
+        q.finish_all(&finished);
+        assert_eq!(q.depth(), 0, "the queue is drained, not wedged");
+        assert!(
+            q.failure(Path::new("/a")).is_some() && q.failure(Path::new("/b")).is_some(),
+            "and each row shows why it failed rather than sitting at \"processing\""
+        );
     }
 }
