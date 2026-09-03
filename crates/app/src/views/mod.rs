@@ -47,10 +47,11 @@ pub enum Route {
 
 /// A repo-level operation the user asked for; runs when the latch is free.
 ///
-/// Neither of these is about ONE file, so neither can live in the action
-/// queue: they answer the whole merge with origin that the queue's decisions
-/// are being staged into. They still take their turn behind the same latch,
-/// because they write the same git repository.
+/// None of these is about ONE file, so none can live in the action queue:
+/// the first two answer the whole merge with origin that the queue's
+/// decisions are being staged into, and the third undoes whichever session
+/// happened to finish last. They still take their turn behind the same
+/// latch, because they write the same files a draining batch is reading.
 #[derive(Debug)]
 pub(super) enum PendingRepoOp {
     /// Commit the merge the dashboard banner is reporting.
@@ -59,6 +60,10 @@ pub(super) enum PendingRepoOp {
     /// what the editor told the user it would discard, so the banner
     /// afterwards names the same thing the confirmation did.
     AbortMerge(merge::Rollback),
+    /// Restore the destination files of the last finished journal session.
+    /// Not per-target — "the last thing that landed" is a property of the
+    /// journal, not of the row the button sits under.
+    UndoLast,
 }
 
 pub struct Shell {
@@ -120,37 +125,40 @@ pub struct Shell {
     /// [`Self::pump`] is safe to call from anywhere.
     ///
     /// The rule it exists to enforce is "everything that mutates the repo
-    /// enters through [`Self::pump`]", and this task closed the Shell's own
-    /// two remaining doors: a finish and an abort now take their turn behind
-    /// it instead of spawning a commit+push, or a merge abort, beside a
-    /// draining batch.
+    /// enters through [`Self::pump`]". Task 3b closed the Shell's own two
+    /// doors (a finish and an abort now take their turn behind it instead of
+    /// spawning a commit+push, or a merge abort, beside a draining batch);
+    /// Task 4 closed Review's three: its quick actions and "Keep both" are
+    /// [`Decision`]s on the queue, and its Undo is a [`PendingRepoOp`] —
+    /// `undo_last` writes managed DESTINATION files back from the journal,
+    /// which is the same set of files a batch's `chezmoi re-add` is reading.
     ///
-    /// STILL OUTSIDE IT, each spawned by a view behind its own
-    /// `action_in_flight` / `saving` boolean, so each can still overlap a
-    /// batch:
-    /// - `ReviewView`'s quick actions (`run_action` → keep disk / keep
-    ///   source · this machine / keep source · origin);
-    /// - `ReviewView::run_undo` — `undo_last` writes managed DESTINATION
-    ///   files back from the journal, which is the same set of files a
-    ///   batch's `chezmoi re-add` is reading;
-    /// - `ReviewView::run_keep_both` — `resolve_merged`, a source write plus
-    ///   commit and push;
+    /// STILL OUTSIDE IT, each spawned by a view behind its own `saving` /
+    /// `action_in_flight` boolean, so each can still overlap a batch:
     /// - the dashboard's quick actions;
     /// - `MergeView::save` — `resolve_merged` or `resolve_repo_conflict`;
     /// - the merge conclusion (a merge commit and a push)
     ///   [`Self::repo_conflict_saved`] spawns for that last one.
     ///
-    /// Tasks 4-5 of this plan route those through [`Self::enqueue`]; only
-    /// then does this latch describe the whole app.
+    /// Task 5 of this plan routes those through [`Self::enqueue`]; only then
+    /// does this latch describe the whole app.
     pub queue_pumping: bool,
-    /// A finish or abort the user pressed that has not run yet, because the
-    /// latch was held or no engine existed. [`Self::pump`] runs it BEFORE it
-    /// takes the next batch.
+    /// A finish, an abort, or an undo the user pressed that has not run yet,
+    /// because the latch was held or no engine existed. [`Self::pump`] runs
+    /// it BEFORE it takes the next batch.
     ///
     /// One slot, not a queue: pressing "Finish merge" twice means one
-    /// finish, and an abort pressed after it supersedes it — these are
-    /// answers about a single merge, and the last answer is the one the user
-    /// means.
+    /// finish, and the answers here are about a single merge, so the last
+    /// answer is normally the one the user means.
+    ///
+    /// NORMALLY — the precedence is deliberately ASYMMETRIC, and
+    /// [`Self::request_repo_op`] is where it is written down: an abort may
+    /// replace a pending finish (the later, CONFIRMED answer), a finish may
+    /// never replace a pending abort (one unconfirmed click must not commit
+    /// a merge the user confirmed throwing away), and an undo replaces
+    /// neither (it is about a journal session, not about this merge, and
+    /// running it ahead of either answer would restore files on top of a
+    /// repo state that is still being decided).
     pub(super) deferred_repo_op: Option<PendingRepoOp>,
 }
 
@@ -333,16 +341,10 @@ impl Shell {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    catching_panics(
-                        "a merge abort",
-                        // NOT `internal_error`: a panic must not come back
-                        // as "the rollback ran and the rescan failed".
-                        AbortOutcome::Panicked,
-                        AssertUnwindSafe(|| {
-                            engine.abort_repo_reconcile();
-                            AbortOutcome::RolledBack(engine.request_rescan())
-                        }),
-                    )
+                    abort_outcome(AssertUnwindSafe(|| {
+                        engine.abort_repo_reconcile();
+                        AbortOutcome::RolledBack(engine.request_rescan())
+                    }))
                 })
                 .await;
             this.update(cx, |shell, cx| {
@@ -406,6 +408,61 @@ impl Shell {
         self.request_repo_op(PendingRepoOp::FinishMerge, cx);
     }
 
+    /// Undo the last finished journal session: restore its destination files
+    /// from their snapshots. Pressed on Review's outcome banner.
+    ///
+    /// A REQUEST, not the work. `undo_last` writes the very destination
+    /// files a draining batch's `chezmoi re-add` is reading, so it takes its
+    /// turn behind [`Self::queue_pumping`] like everything else that mutates
+    /// what the repo tracks. Not a per-file [`Decision`] either: "the last
+    /// thing that landed" is a property of the journal, and a queue whose
+    /// entries are keyed by target has nowhere to put it.
+    pub fn undo_last(&mut self, cx: &mut Context<Self>) {
+        self.request_repo_op(PendingRepoOp::UndoLast, cx);
+    }
+
+    /// Is ANY git work owed — running, queued, or waiting for the latch?
+    ///
+    /// The gate for Undo, and only for Undo. Every other button in the app
+    /// stays live while work drains (that is the whole point of the queue),
+    /// but "undo the last thing that landed" is unambiguous only when
+    /// nothing is landing: with a batch in flight the session it would undo
+    /// is whichever one happens to finish first.
+    pub fn is_busy(&self) -> bool {
+        self.queue_pumping || self.queue.depth() > 0 || self.deferred_repo_op.is_some()
+    }
+
+    /// The undo, running with the latch already taken. Only [`Self::pump`]
+    /// calls this.
+    fn run_undo(&mut self, engine: std::sync::Arc<ResolveEngine>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    catching_panics(
+                        "an undo",
+                        internal_error,
+                        AssertUnwindSafe(|| engine.undo_last()),
+                    )
+                })
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.queue_pumping = false;
+                // Reached from a FRESH Shell update, so nesting the review
+                // view's update is safe here — unlike the synchronous path
+                // in `request_repo_op`, which runs inside that same view.
+                // `merge_done` re-selects the current row from inside it, so
+                // the diff reflects the restored file.
+                shell.merge_done(review::undo_banner(&result), cx);
+                cx.notify();
+                // Whatever queued while the undo ran.
+                shell.pump(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Remember a repo-level operation and try to run it right away.
     ///
     /// Returns immediately, always: if the latch is held (or nothing is
@@ -413,7 +470,7 @@ impl Shell {
     /// [`Self::pump`] picks it up — the click is remembered, never
     /// discarded.
     ///
-    /// THE TWO DIRECTIONS ARE NOT SYMMETRIC. An abort may replace a pending
+    /// THE DIRECTIONS ARE NOT SYMMETRIC. An abort may replace a pending
     /// finish: it is the user's later choice, and a CONFIRMED one — the
     /// merge editor arms Cancel and makes them press "Discard merge" a
     /// second time (`merge.rs`'s `discard_merge`). A finish must NEVER
@@ -424,7 +481,26 @@ impl Shell {
     /// said out loud: a destructive answer already given is not overridable
     /// by a stray click, and a click that does nothing must not do it
     /// silently.
+    ///
+    /// An UNDO displaces neither of them. It is about the last journal
+    /// session, not about this merge, and running it ahead of a finish or an
+    /// abort would restore destination files on top of a repo state that is
+    /// still being decided. It is dropped and logged rather than banner-ed:
+    /// the only caller is the Review banner's Undo button, which is pressed
+    /// from inside that view's own update, and `merge_done` reaches back
+    /// into that same view — the nesting gpui refuses (2026-08-18 crash).
+    /// The button is disabled whenever [`Self::is_busy`], so reaching this
+    /// arm at all takes a click landing in the same frame as the press that
+    /// deferred the other op.
     fn request_repo_op(&mut self, op: PendingRepoOp, cx: &mut Context<Self>) {
+        if matches!(op, PendingRepoOp::UndoLast) && self.deferred_repo_op.is_some() {
+            tomte_core::log_info!(
+                "resolve",
+                "undo ignored: {:?} is already queued for this repo",
+                self.deferred_repo_op
+            );
+            return;
+        }
         if matches!(op, PendingRepoOp::FinishMerge)
             && matches!(self.deferred_repo_op, Some(PendingRepoOp::AbortMerge(_)))
         {
@@ -537,11 +613,6 @@ impl Shell {
     /// `if in_flight { return }` guards it replaces: the interface's job
     /// ends the moment the choice is remembered, and the row it came from
     /// goes to "processing" instead of the click being discarded.
-    // Only this file's tests call it yet — Tasks 4-5 of this plan replace
-    // the views' blocking `action_in_flight` / `saving` flags with it. The
-    // queue and its drain land (and are tested) as one piece rather than
-    // half a mechanism.
-    #[allow(dead_code)]
     pub fn enqueue(&mut self, action: QueuedAction, cx: &mut Context<Self>) {
         self.queue.push(action);
         cx.notify();
@@ -599,6 +670,7 @@ impl Shell {
             match op {
                 PendingRepoOp::FinishMerge => self.run_finish(engine, cx),
                 PendingRepoOp::AbortMerge(rolled_back) => self.run_abort(engine, rolled_back, cx),
+                PendingRepoOp::UndoLast => self.run_undo(engine, cx),
             }
             return;
         }
@@ -912,6 +984,26 @@ enum AbortOutcome {
     Panicked(String),
 }
 
+/// Run the abort's work under [`catching_panics`] with the ONE fallback that
+/// claims nothing.
+///
+/// A seam, not a wrapper for its own sake: `abort_banner` can be tested
+/// against every outcome, but that proves nothing about which outcome the
+/// abort HANDS it, and a fallback of the wrong shape ([`internal_error`],
+/// say, re-wrapped) turns every panic back into "the roll-back ran, the
+/// rescan failed". There is no way to make `abort_repo_reconcile` panic, so
+/// the choice of fallback lives here where a test can drive it with a
+/// closure that does.
+fn abort_outcome(work: impl FnOnce() -> AbortOutcome + std::panic::UnwindSafe) -> AbortOutcome {
+    catching_panics(
+        "a merge abort",
+        // NOT `internal_error`: a panic must not come back as "the rollback
+        // ran and the rescan failed".
+        AbortOutcome::Panicked,
+        work,
+    )
+}
+
 /// The banner one abort outcome earns.
 ///
 /// Split out of the completion so the panic arm is testable: it must never
@@ -977,8 +1069,11 @@ fn internal_error<T>(detail: String) -> Result<T, ResolveError> {
 /// and nothing would ever clear it, not even the connect latch, since `pump`
 /// returns early on that latch. So the panic becomes an ordinary value the
 /// completion already knows how to report: per-target failures for a batch
-/// ([`panicked_batch`]), an `Err` for a finish, a conclusion or an abort
-/// ([`internal_error`]).
+/// ([`panicked_batch`]); an `Err` for a finish, a conclusion, or an undo
+/// ([`internal_error`]); and, for the abort, its own
+/// [`AbortOutcome::Panicked`] — the one caller whose fallback is NOT an
+/// ordinary failure, because "the rollback ran and the rescan failed" is a
+/// claim a panic cannot support (see [`abort_banner`]).
 fn catching_panics<T>(
     what: &str,
     on_panic: impl FnOnce(String) -> T,
@@ -1326,40 +1421,80 @@ mod render_smoke {
     /// actions — and with no `EngineSlot` global set (this test app never
     /// connects), they render through the DISABLED path. The review window
     /// gets a posed selection so the header action buttons and the outcome
-    /// banner (with its Undo button) render too, plus one in-flight pass for
-    /// the "working…" marker.
+    /// banner (with its Undo button) render too.
+    ///
+    /// The queue poses came with Task 4 and each is a whole render path of
+    /// its own: the PROCESSING group and its muted rows, a row carrying a
+    /// failure message under its name, and the Undo button in its disabled
+    /// form. The review view reads the SHELL for all three, from inside its
+    /// own render — the one shape that would panic if the Shell were still
+    /// leased at that point.
     #[gpui::test]
     fn resolve_action_ui_renders_without_engine_or_panic(cx: &mut TestAppContext) {
         use review::{BannerTint, OutcomeBanner, ReviewView};
-        for (in_flight, banner) in [
+
+        let target = PathBuf::from("/tmp/smoke/.zshrc");
+        let landed = || {
+            Some(OutcomeBanner {
+                text: "Kept disk version · committed & pushed".into(),
+                tint: BannerTint::Ok,
+                undoable: true,
+            })
+        };
+        type Pose = Box<dyn Fn(&mut ActionQueue)>;
+        let idle: Pose = Box::new(|_| {});
+        let running: Pose = Box::new(|q: &mut ActionQueue| {
+            q.push(QueuedAction {
+                target: PathBuf::from("/tmp/smoke/.zshrc"),
+                decision: Decision::KeepDisk,
+            });
+            q.take_batch();
+            // A second target, queued behind it and still waiting.
+            q.push(QueuedAction {
+                target: PathBuf::from("/tmp/smoke/other.toml"),
+                decision: Decision::KeepSourceLocal,
+            });
+        });
+        let failed: Pose = Box::new(|q: &mut ActionQueue| {
+            q.push(QueuedAction {
+                target: PathBuf::from("/tmp/smoke/.zshrc"),
+                decision: Decision::KeepDisk,
+            });
+            q.take_batch();
+            q.finish_all(&[(
+                PathBuf::from("/tmp/smoke/.zshrc"),
+                Some("Keep disk failed: op timed out".into()),
+            )]);
+        });
+        for (banner, pose, pumping) in [
+            (landed(), &idle, false),
             (
-                false,
-                Some(OutcomeBanner {
-                    text: "Kept disk version · committed & pushed".into(),
-                    tint: BannerTint::Ok,
-                    undoable: true,
-                }),
-            ),
-            (
-                false,
                 Some(OutcomeBanner {
                     text: "Keep disk failed: daemon gone".into(),
                     tint: BannerTint::Conflict,
                     undoable: false,
                 }),
+                &idle,
+                false,
             ),
-            (true, None),
+            // Work in flight: the selected file's buttons are inert, the
+            // PROCESSING group renders, and Undo is disabled rather than gone.
+            (landed(), &running, true),
+            // A failure on the selected row, with nothing running.
+            (landed(), &failed, false),
         ] {
+            let target = target.clone();
             let (_view, vis) = cx.add_window_view(|_window, cx| {
                 let state = cx.new(|_| model_with_data());
                 let shell = cx.weak_entity();
                 let review = cx.new(|cx| {
                     let mut view = ReviewView::new(state.clone(), shell, cx);
-                    view.selected = Some(PathBuf::from("/tmp/smoke/.zshrc"));
+                    view.selected = Some(target);
                     view.last_outcome = banner.clone();
-                    view.action_in_flight = in_flight;
                     view
                 });
+                let mut queue = ActionQueue::default();
+                pose(&mut queue);
                 Shell {
                     route: Route::Review,
                     state,
@@ -1370,14 +1505,14 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     // also exercises the dashboard's "working…" swap when the
                     // shell flag is up (the drifted row is in the timeline)
-                    dashboard_action_in_flight: in_flight,
+                    dashboard_action_in_flight: pumping,
                     unlock_in_flight: false,
                     pending_merge: false,
                     merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
-                    queue: Default::default(),
-                    queue_pumping: false,
+                    queue,
+                    queue_pumping: pumping,
                     deferred_repo_op: None,
                 }
             });
@@ -1529,9 +1664,16 @@ mod render_smoke {
         }
         // Guards the guard: if the call sites are renamed out from under the
         // needles, this finds nothing and would pass vacuously.
+        //
+        // THREE, not the four this started at. Task 4 moved Review's two
+        // action paths onto the queue, where the single drain
+        // (`run_batch_inner`) runs the engine call and `batch_finished`
+        // owns the probe for all of them. What is left is the dashboard's
+        // quick actions, the merge editor's Save, and that drain — and
+        // Task 5 folds the first two in too.
         assert!(
-            checked >= 4,
-            "expected at least the four known action paths, found {checked} — \
+            checked >= 3,
+            "expected at least the three known action paths, found {checked} — \
              have `action.run` / `resolve_merged` been renamed?"
         );
     }
@@ -2361,6 +2503,177 @@ mod render_smoke {
         });
     }
 
+    /// The user's own acceptance bar, end to end: confirming a file records
+    /// the decision and moves to the next one, with nothing to wait for.
+    ///
+    /// The fixture's selection is `.config/zed/settings.json`, third in
+    /// display order (`env.nu`, `secrets.yaml`, then the two one-click
+    /// rows), so the row after it is `.gitconfig`. No `EngineSlot` is
+    /// published, so the decision PARKS on the queue — which is the point:
+    /// the interface is done with it either way.
+    ///
+    /// MUTATION: drop the `advance_from` call from `run_action` → the
+    /// selection stays on the file just answered. MUTATION: have
+    /// `ReviewView::enqueue` skip the `shell.update` → the queue is empty
+    /// and the click was discarded, the exact defect this plan removes.
+    #[gpui::test]
+    fn a_review_decision_queues_and_advances_the_selection(cx: &mut TestAppContext) {
+        use review::ResolveAction;
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gallery"));
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review", smoke_paths(), cx).expect("review fixture")
+        });
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the fixture poses a review view");
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selected.clone()),
+            Some(home.join(".config/zed/settings.json"))
+        );
+
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| view.run_action(ResolveAction::KeepDisk, cx))
+        });
+
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(
+                s.queue
+                    .is_processing(&home.join(".config/zed/settings.json")),
+                "the decision is recorded on the Shell's queue, not discarded"
+            );
+            assert_eq!(s.queue.depth(), 1);
+        });
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selected.clone()),
+            Some(home.join(".gitconfig")),
+            "and the selection advanced to the next row that still needs a decision"
+        );
+    }
+
+    /// Undo is a repo op like the other two: it takes the latch, runs
+    /// behind it, reports through Review's banner, and lets go. Before this
+    /// it spawned `undo_last` beside a draining batch — and `undo_last`
+    /// rewrites the very destination files that batch's `chezmoi re-add` is
+    /// reading.
+    ///
+    /// The lab's journal has no finished session, so the honest answer is
+    /// "nothing to undo" — which still has to REACH the user.
+    ///
+    /// MUTATION: drop the `PendingRepoOp::UndoLast` arm's `run_undo` from
+    /// `pump` (leave the op taken) → the latch never clears and no banner
+    /// lands.
+    #[gpui::test]
+    fn an_undo_takes_the_latch_runs_and_reports(cx: &mut TestAppContext) {
+        let _lab = EngineLab::publish(cx);
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                assert!(!s.is_busy(), "idle: the Undo button is live");
+                s.undo_last(cx);
+                assert!(s.queue_pumping, "the undo took the latch straight away");
+                assert!(s.deferred_repo_op.is_none(), "it ran, it did not wait");
+                assert!(s.is_busy(), "and the button is inert while it runs");
+            });
+        });
+        vis.run_until_parked();
+        let review = vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(!s.queue_pumping, "the latch is free again");
+            assert!(!s.is_busy());
+            s.review.clone()
+        });
+        let review = review.expect("the undo's banner made a review view");
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("an undo is reported, never silent");
+        assert_eq!(banner.text.as_ref(), "nothing to undo");
+        assert!(!banner.undoable, "undoing an undo restores nothing");
+    }
+
+    /// An undo displaces neither answer about the merge, and — unlike the
+    /// finish-vs-abort drop — it must not say so through `merge_done`.
+    /// `undo_last` is called from inside the review view's own update, and
+    /// `merge_done` reaches back into that same view: the nesting gpui
+    /// refuses. The log line is the whole report from this path.
+    ///
+    /// MUTATION: drop the `UndoLast` guard from `request_repo_op` → the
+    /// finish is superseded and the first assertion fails. MUTATION: report
+    /// the drop through `merge_done` → the second fails.
+    #[gpui::test]
+    fn an_undo_never_displaces_a_pending_merge_answer(cx: &mut TestAppContext) {
+        // No engine: `pump` parks, so the deferred op stays put and the slot
+        // is the only thing deciding.
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.finish_pending_merge(cx);
+                s.undo_last(cx);
+                assert!(
+                    matches!(s.deferred_repo_op, Some(PendingRepoOp::FinishMerge)),
+                    "the answer about the merge survives an undo pressed after it"
+                );
+            });
+        });
+        // The route rendered the review view; the drop must not have put
+        // anything in it. Banner-ing this drop would nest an update of the
+        // very view Undo is pressed from — the crash of 2026-08-18.
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the Review route built its view");
+        assert!(
+            vis.update(|_window, cx| review.read(cx).last_outcome.clone())
+                .is_none(),
+            "the dropped undo is reported through the log only"
+        );
+        // The same holds for the abort, the other repo-level answer.
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.deferred_repo_op = Some(PendingRepoOp::AbortMerge(merge::Rollback::Files(1)));
+                s.undo_last(cx);
+                assert!(matches!(
+                    s.deferred_repo_op,
+                    Some(PendingRepoOp::AbortMerge(_))
+                ));
+            });
+        });
+    }
+
+    /// The abort re-probes for a stranded merge on BOTH arms, and the
+    /// dashboard banner it raises has to come DOWN when the merge it was
+    /// reporting is gone. Nothing else clears that flag: every file in such
+    /// a merge is answered, so no drifted row will ever contradict it.
+    ///
+    /// MUTATION: drop `refresh_pending_merge` from `run_abort`'s completion
+    /// → the banner stays up over a merge that no longer exists.
+    #[gpui::test]
+    fn an_abort_reprobes_whether_a_merge_is_still_pending(cx: &mut TestAppContext) {
+        let _lab = EngineLab::publish(cx);
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Merge, cx));
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                // The dashboard banner is up, over a merge the scratch repo
+                // does not actually have.
+                s.pending_merge = true;
+                s.abort_origin_merge(merge::Rollback::Files(1), cx);
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(
+                !s.pending_merge,
+                "the probe ran and took the banner down with the merge"
+            );
+            assert!(!s.queue_pumping, "and the latch is free");
+        });
+    }
+
     /// The abort's panic fallback must not borrow the rolled-back arm's
     /// sentence. A failed rescan happens AFTER `merge_abort` ran, so the
     /// rollback did happen; a panic can land before or inside it, so nothing
@@ -2414,37 +2727,31 @@ mod render_smoke {
     }
 
     /// `a_panicked_abort_never_claims_the_roll_back_happened` proves
-    /// `abort_banner` maps the outcomes correctly. It cannot prove that
-    /// `run_abort` HANDS it the right one, and that is where the bug lived:
-    /// a fallback of the wrong shape turns every panic back into "the
-    /// roll-back ran, the rescan failed". There is no seam to make
-    /// `abort_repo_reconcile` panic, so this reads the call site instead —
-    /// the same tool `every_resolve_action_path_also_probes_for_a_stranded_merge`
-    /// uses for a claim no test can execute.
+    /// `abort_banner` maps the outcomes correctly. It cannot prove that the
+    /// abort HANDS it the right one, and that is where the bug lived: a
+    /// fallback of the wrong shape turns every panic back into "the
+    /// roll-back ran, the rescan failed".
     ///
-    /// The types already rule out the ACCIDENTAL version: the abort's work
-    /// closure returns `AbortOutcome`, so `internal_error` no longer fits
-    /// without being deliberately re-wrapped. This catches the deliberate
-    /// one.
+    /// `abort_repo_reconcile` cannot be made to panic, so `run_abort`'s
+    /// choice of fallback lives in [`abort_outcome`] — a real seam, driven
+    /// here with a closure that panics. (The predecessor of this test split
+    /// this file's own source text on a literal, which passed or failed on
+    /// formatting rather than on behaviour.)
     ///
-    /// MUTATION: pass `|d| AbortOutcome::RolledBack(internal_error(d))` as
-    /// the abort's fallback → this fails.
+    /// MUTATION: give `abort_outcome` the fallback
+    /// `|d| AbortOutcome::RolledBack(internal_error(d))` → the first
+    /// assertion fails.
     #[test]
     fn the_abort_hands_catching_panics_a_fallback_that_claims_nothing() {
-        let src = include_str!("mod.rs");
-        // The first occurrence is `run_abort`'s call; this test's own body
-        // spells the marker with escaped quotes, so it cannot match itself.
-        let (_, after) = src
-            .split_once("\"a merge abort\",")
-            .expect("run_abort still names its closure to `catching_panics`");
-        let fallback = &after[..after
-            .find("AssertUnwindSafe")
-            .expect("the abort's work closure still follows its fallback")];
+        let boom = abort_outcome(|| panic!("index out of bounds"));
         assert!(
-            fallback.contains("AbortOutcome::Panicked"),
-            "the abort's panic fallback must be `AbortOutcome::Panicked` — anything that \
-             reports a completed roll-back would have the banner assert a rollback that \
-             may never have run. Found:{fallback}"
+            matches!(boom, AbortOutcome::Panicked(ref d) if d.contains("index out of bounds")),
+            "a panicking abort must come back as `Panicked` — anything that reports a \
+             completed roll-back would have the banner assert a rollback that may never \
+             have run. Got: {boom:?}"
         );
+        // And an abort that returns is left exactly as it is.
+        let done = abort_outcome(|| AbortOutcome::RolledBack(Ok(())));
+        assert!(matches!(done, AbortOutcome::RolledBack(Ok(()))), "{done:?}");
     }
 }

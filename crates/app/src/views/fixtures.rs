@@ -21,6 +21,7 @@ use super::review::{
 };
 use super::settings::SettingsPaths;
 use super::{Route, Shell};
+use tomte_app::action_queue::{Decision, QueuedAction};
 
 /// Every state the gallery can pose: `(name, description)`.
 pub const STATES: &[(&str, &str)] = &[
@@ -36,7 +37,14 @@ pub const STATES: &[(&str, &str)] = &[
     ("review", "sidebar groups + selected file with diff preview"),
     ("review-empty", "nothing selected"),
     ("review-banner", "action outcome banner with Undo"),
-    ("review-working", "action in flight"),
+    (
+        "review-processing",
+        "two decisions recorded: the Processing group, the selected file's buttons inert",
+    ),
+    (
+        "review-failed",
+        "a decision came back failed: the message sticks to its row, buttons live",
+    ),
     (
         "review-keep-both",
         "clean auto-merge: third quick action offered",
@@ -242,7 +250,6 @@ fn posed_review(
     cx: &mut Context<Shell>,
     state: Entity<SyncModel>,
     banner: Option<OutcomeBanner>,
-    in_flight: bool,
     selected: bool,
 ) -> Entity<ReviewView> {
     let shell = cx.weak_entity();
@@ -273,7 +280,6 @@ fn posed_review(
             ];
         }
         view.last_outcome = banner;
-        view.action_in_flight = in_flight;
         view
     })
 }
@@ -417,7 +423,8 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "review"
         | "review-empty"
         | "review-banner"
-        | "review-working"
+        | "review-processing"
+        | "review-failed"
         | "review-keep-both"
         | "review-origin"
         | "review-origin-compared" => {
@@ -439,21 +446,47 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 }
             }
             let mut s = shell(Route::Review, model);
-            let (banner, in_flight, selected) = match name {
-                "review-empty" => (None, false, false),
+            let (banner, selected) = match name {
+                "review-empty" => (None, false),
                 "review-banner" => (
                     Some(OutcomeBanner {
                         text: "Kept disk version · committed & pushed".into(),
                         tint: BannerTint::Ok,
                         undoable: true,
                     }),
-                    false,
                     true,
                 ),
-                "review-working" => (None, true, true),
-                _ => (None, false, true),
+                _ => (None, true),
             };
-            let review = posed_review(cx, s.state.clone(), banner, in_flight, selected);
+            // The queue is the Shell's, so these poses push straight into it
+            // — exactly what `Shell::enqueue` does with the click.
+            if name == "review-processing" {
+                s.queue.push(QueuedAction {
+                    target: home(".config/zed/settings.json"),
+                    decision: Decision::KeepDisk,
+                });
+                // Hand it to the (absent) engine: this one is RUNNING, and
+                // the one pushed after it is waiting for the repo.
+                let _running = s.queue.take_batch();
+                s.queue.push(QueuedAction {
+                    target: home(".gitconfig"),
+                    decision: Decision::KeepSourceLocal,
+                });
+                s.queue_pumping = true;
+            }
+            if name == "review-failed" {
+                let target = home(".config/zed/settings.json");
+                s.queue.push(QueuedAction {
+                    target: target.clone(),
+                    decision: Decision::KeepDisk,
+                });
+                s.queue.take_batch();
+                s.queue.finish_all(&[(
+                    target,
+                    Some("Keep disk failed: chezmoi exited with code 1".into()),
+                )]);
+            }
+            let review = posed_review(cx, s.state.clone(), banner, selected);
             if origin {
                 review.update(cx, |view, _| {
                     view.origin_diffs =

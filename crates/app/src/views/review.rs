@@ -2,15 +2,24 @@
 //! preview (spec §7.2, approved mockup A; plan 5 Task 6).
 //!
 //! Everything blocking — `chezmoi cat`, `chezmoi source-path`, the read-only
-//! journal, destination fs reads, and the resolve-engine actions — runs on
-//! the background executor and lands back in the entity via
-//! `WeakEntity::update` (spec §3.2 non-blocking rule). One-click resolutions
-//! ("keep disk" / "keep source" / undo, plan 6 Task 3) go through the
-//! [`ResolveEngine`] published in the [`crate::EngineSlot`] global; their
-//! outcomes render as a slim banner above the diff. "Open merge editor"
-//! (conflicts, templated files) hands the selected target to the Shell's
-//! full-window merge editor (plan 7 Task 3).
+//! journal and destination fs reads — runs on the background executor and
+//! lands back in the entity via `WeakEntity::update` (spec §3.2 non-blocking
+//! rule).
+//!
+//! This view NO LONGER RUNS RESOLUTIONS ITSELF (plan 8 Task 4). A one-click
+//! decision ("keep disk" / "keep source" / "keep both") becomes a
+//! [`Decision`] on the Shell's [`tomte_app::action_queue::ActionQueue`] and
+//! the click is done: the row moves to PROCESSING, the selection advances to
+//! the next file that still needs one, and the work drains serially on the
+//! Shell. A failure comes back onto its row, where choosing again is the
+//! retry — no banner, because by then the user is three files further on.
+//! Undo is a repo-level op on the Shell for the same reason (it writes the
+//! destination files a draining batch reads), and its outcome IS a banner:
+//! it is not about the selected row. "Open merge editor" (conflicts,
+//! templated files) hands the selected target to the Shell's full-window
+//! merge editor (plan 7 Task 3).
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,6 +28,7 @@ use gpui::{
     AnyElement, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful,
     WeakEntity, Window, div, prelude::*, px,
 };
+use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
 use tomte_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
@@ -75,6 +85,31 @@ pub fn severity_groups(drifted: &[DriftSummary]) -> (Vec<DriftSummary>, Vec<Drif
     }
     conflicts.append(&mut needs_rest);
     (conflicts, one_click)
+}
+
+/// After confirming `resolved`, select the next row that still needs a
+/// decision: the one after it in display order, else the one before, else
+/// none. Rows already processing are skipped — they are not answerable.
+///
+/// A pure function over the display order rather than a method, so the rule
+/// spec §2.6 asks for ("confirming advances the selection", making a sweep
+/// one click per file) is testable without a window.
+///
+/// `resolved` missing from `ordered` means the list moved underneath the
+/// click; the selection then stays where it is rather than jumping to a row
+/// chosen from a list the user was not looking at.
+pub(super) fn next_after(
+    resolved: &Path,
+    ordered: &[PathBuf],
+    processing: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let ix = ordered.iter().position(|p| p == resolved)?;
+    let answerable = |p: &&PathBuf| p.as_path() != resolved && !processing(p);
+    ordered[ix + 1..]
+        .iter()
+        .find(answerable)
+        .or_else(|| ordered[..ix].iter().rev().find(answerable))
+        .cloned()
 }
 
 /// The diff preview lifecycle (spec §10: loading and errors are states).
@@ -496,48 +531,6 @@ pub(crate) struct OutcomeBanner {
     pub(crate) undoable: bool,
 }
 
-/// Banner for the "Keep both" quick action (merged write-back).
-fn keep_both_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBanner {
-    match result {
-        Ok(ResolveOutcome::Done {
-            note: None,
-            committed,
-            pushed,
-            ..
-        }) => OutcomeBanner {
-            text: if *committed && *pushed {
-                "Kept both (merged) · committed & pushed".into()
-            } else {
-                "Kept both (merged)".into()
-            },
-            tint: BannerTint::Ok,
-            undoable: true,
-        },
-        Ok(ResolveOutcome::Done {
-            note: Some(note), ..
-        }) => OutcomeBanner {
-            text: format!("Kept both (merged) · {note}").into(),
-            tint: BannerTint::Drift,
-            undoable: true,
-        },
-        Ok(ResolveOutcome::NeedsMergeEditor) => OutcomeBanner {
-            text: "Templated file · use the merge editor".into(),
-            tint: BannerTint::Drift,
-            undoable: false,
-        },
-        Ok(ResolveOutcome::ProtectedSpan { detail }) => OutcomeBanner {
-            text: format!("This change touches a templated value · {detail}").into(),
-            tint: BannerTint::Drift,
-            undoable: false,
-        },
-        Err(e) => OutcomeBanner {
-            text: format!("Keep both failed: {e}").into(),
-            tint: BannerTint::Conflict,
-            undoable: false,
-        },
-    }
-}
-
 /// Map an action result onto its banner. Tint policy: a `note` means the
 /// resolution succeeded locally but commit/push degraded (drift tint, note
 /// shown); no note is full success (ok tint); engine errors are conflicts.
@@ -595,7 +588,10 @@ fn outcome_banner(
 
 /// Banner for the undo action itself (never undoable again: the undo session
 /// journals no destination blobs, so a second undo would restore nothing).
-fn undo_banner(result: &Result<Option<i64>, ResolveError>) -> OutcomeBanner {
+///
+/// `pub(super)` because the undo now runs on the Shell, behind its latch:
+/// the completion there is what hands this banner back to this view.
+pub(super) fn undo_banner(result: &Result<Option<i64>, ResolveError>) -> OutcomeBanner {
     match result {
         Ok(Some(_)) => OutcomeBanner {
             text: "restored files from snapshots".into(),
@@ -764,6 +760,63 @@ fn per_line_ranges(lines: &[String], ranges: &[Range<usize>]) -> Vec<Vec<Range<u
     out
 }
 
+/// What one processing row is waiting on, in the user's terms.
+///
+/// The queue can only name the CHOICE for a decision it still holds:
+/// `ActionQueue::take_batch` moves the running batch's `QueuedAction`s out to
+/// whoever runs them and keeps the targets alone, so a running row's decision
+/// is genuinely not there to read. Rather than invent a label for it, the row
+/// says which of the two states it is in — both true, neither guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueuedStatus {
+    /// Handed to the engine; the git work for it is under way.
+    Running,
+    /// Recorded, waiting for the repo to be free.
+    Waiting,
+}
+
+impl QueuedStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running…",
+            Self::Waiting => "queued",
+        }
+    }
+}
+
+/// The Shell's action queue as one render pass needs to see it.
+///
+/// Copied out of the Shell ONCE per render rather than read row by row:
+/// every row and button below needs `cx` mutably for its click listener, and
+/// a live borrow of the Shell entity cannot be held across that.
+#[derive(Default)]
+pub(super) struct QueueSnapshot {
+    /// Everything queued or running, in `ActionQueue::processing` order —
+    /// the running batch first, then the rest as the user chose them.
+    processing: Vec<(PathBuf, QueuedStatus)>,
+    /// Rows whose last decision failed, with the message that says why.
+    failures: BTreeMap<PathBuf, SharedString>,
+    /// ANY git work is owed — a decision, or a repo op waiting for the latch.
+    busy: bool,
+}
+
+impl QueueSnapshot {
+    fn status(&self, target: &Path) -> Option<QueuedStatus> {
+        self.processing
+            .iter()
+            .find(|(p, _)| p == target)
+            .map(|(_, s)| *s)
+    }
+
+    fn is_processing(&self, target: &Path) -> bool {
+        self.status(target).is_some()
+    }
+
+    fn failure(&self, target: &Path) -> Option<&SharedString> {
+        self.failures.get(target)
+    }
+}
+
 pub struct ReviewView {
     state: Entity<SyncModel>,
     /// Back-reference for cross-view navigation ("Open merge editor" routes
@@ -791,9 +844,6 @@ pub struct ReviewView {
     /// Outcome of the last resolve/undo action, rendered as a banner above
     /// the diff. `pub(super)` for the render-smoke tests.
     pub(super) last_outcome: Option<OutcomeBanner>,
-    /// A resolve/undo action is running on the background executor: buttons
-    /// disable and the header shows "working…". `pub(super)` for smoke tests.
-    pub(super) action_in_flight: bool,
     /// The diff is a read-only [`ui::TextArea`] (2026-08-23 feedback: "diffs
     /// should be selectable"): same editor as the merge result, minus the
     /// decision strips — so a diff can be selected and copied like text.
@@ -825,7 +875,6 @@ impl ReviewView {
             provenance: Vec::new(),
             auto_merge: None,
             last_outcome: None,
-            action_in_flight: false,
             preview_editor: None,
             preview_dirty: true,
             preview_appearance: None,
@@ -903,139 +952,156 @@ impl ReviewView {
             .detach();
     }
 
-    /// Run a one-click resolution for the selected target on the background
-    /// executor; the outcome lands back as a banner and the preview reloads
-    /// through the existing `select()` path.
-    fn run_action(&mut self, action: ResolveAction, cx: &mut Context<Self>) {
-        if self.action_in_flight {
-            return;
-        }
+    /// Record a one-click resolution for the selected target and move on.
+    ///
+    /// This is the whole point of the queue (spec §2.1): the click is
+    /// remembered, the row moves to "processing", the selection advances,
+    /// and the user answers the next file without waiting for this one. The
+    /// work runs on the Shell's serial drain; a failure comes back onto this
+    /// row (§2.5), where choosing again is the retry.
+    ///
+    /// `pub(super)` so the render-smoke tests can press a button without a
+    /// synthetic mouse event, the same reason `header_source_actions` is.
+    pub(super) fn run_action(&mut self, action: ResolveAction, cx: &mut Context<Self>) {
         let Some(target) = self.selected.clone() else {
             return;
         };
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            return;
+        // Origin's text exactly as this view is showing it belongs to the
+        // button the user pressed, so it is captured at click time and
+        // travels WITH the decision — by the time the queue runs it, the
+        // selection may well be three files further on.
+        let decision = match action {
+            ResolveAction::KeepDisk => Decision::KeepDisk,
+            ResolveAction::KeepSourceLocal => Decision::KeepSourceLocal,
+            ResolveAction::KeepSourceOrigin => {
+                let Some(seen) = self.origin_diffs.as_ref().map(|d| d.seen.clone()) else {
+                    // The button only exists when origin's content loaded,
+                    // so this is structural — and still reported rather than
+                    // dropped, in the same words the engine would use.
+                    self.last_outcome = Some(outcome_banner(
+                        action,
+                        true,
+                        &Err(ResolveError::Failed(
+                            "no origin version was loaded for this file — open it in \
+                             Review first"
+                                .into(),
+                        )),
+                    ));
+                    cx.notify();
+                    return;
+                };
+                Decision::KeepSourceOrigin { seen }
+            }
         };
-        // Origin's text exactly as this view is showing it, and whether the
-        // split was on screen — both belong to the button the user pressed,
-        // so they are captured at click time rather than read back later.
-        let origin_seen = self.origin_diffs.as_ref().map(|d| d.seen.clone());
-        let split = self.origin_diffs.is_some();
-        self.action_in_flight = true;
         self.last_outcome = None;
+        self.enqueue(target.clone(), decision, cx);
+        self.advance_from(&target, cx);
+    }
+
+    /// Hand one decision to the Shell's queue.
+    ///
+    /// Updating the Shell from inside THIS view's own update is safe because
+    /// `Shell::enqueue` → `Shell::pump` only ever SPAWNS: it never reaches
+    /// back into the review view synchronously. Nesting an update of a view
+    /// that is itself mid-update is what crashed gpui on 2026-08-18.
+    fn enqueue(&mut self, target: PathBuf, decision: Decision, cx: &mut Context<Self>) {
+        let queued = target.clone();
+        if let Err(e) = self.shell.update(cx, |shell, cx| {
+            shell.enqueue(QueuedAction { target, decision }, cx)
+        }) {
+            // The window is going away underneath the click. Nothing can be
+            // shown to a user who no longer has a view, but a decision that
+            // went nowhere is never silent.
+            tomte_core::log_error!(
+                "resolve",
+                "the decision for {} was not queued: {e}",
+                queued.display()
+            );
+        }
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = {
-                let target = target.clone();
-                cx.background_executor()
-                    .spawn(async move { action.run(&engine, &target, origin_seen.as_deref()) })
-                    .await
-            };
-            this.update(cx, |view, cx| {
-                view.action_in_flight = false;
-                view.last_outcome = Some(outcome_banner(action, split, &result));
-                if matches!(result, Ok(ResolveOutcome::Done { .. })) {
-                    view.state.update(cx, |model, cx| {
-                        model.confirm_resolved(&target);
-                        cx.notify();
-                    });
-                }
-                // Reload the preview so the diff reflects the new reality
-                // (re-selecting is the established refresh path).
-                if view.selected.as_deref() == Some(target.as_path()) {
-                    view.select(target.clone(), cx);
-                }
-                // A decision can have started a merge with origin and then
-                // failed to commit it (an unsignable merge commit). That
-                // leaves nothing conflicted and so no row to try again from,
-                // so ask the Shell to re-probe and raise its banner.
-                view.shell
-                    .update(cx, |shell, cx| shell.refresh_pending_merge(cx))
-                    .ok();
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+    }
+
+    /// Spec §2.6: after a decision, select the next row that still needs
+    /// one, so a sweep is one click per file with no re-targeting click
+    /// between.
+    fn advance_from(&mut self, resolved: &Path, cx: &mut Context<Self>) {
+        let ordered: Vec<PathBuf> = {
+            let (needs_you, one_click) = severity_groups(&self.state.read(cx).drifted);
+            needs_you
+                .iter()
+                .chain(one_click.iter())
+                .map(|d| d.target.clone())
+                .collect()
+        };
+        let queue = self.queue_snapshot(cx);
+        if let Some(next) = next_after(resolved, &ordered, &|p| queue.is_processing(p)) {
+            self.select(next, cx);
+        }
     }
 
     /// Undo the last finished session (restore destination files from their
     /// journaled snapshots), reported through the same banner.
+    ///
+    /// Not a per-file decision and so not a queue entry: it is a repo-level
+    /// op on the Shell, taking the same latch as everything else that
+    /// mutates what the repo tracks — `undo_last` rewrites the very
+    /// destination files a draining batch's `chezmoi re-add` is reading.
     fn run_undo(&mut self, cx: &mut Context<Self>) {
-        if self.action_in_flight {
-            return;
+        if let Err(e) = self.shell.update(cx, |shell, cx| shell.undo_last(cx)) {
+            tomte_core::log_error!("resolve", "undo was not requested: {e}");
         }
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            return;
-        };
-        self.action_in_flight = true;
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { engine.undo_last() })
-                .await;
-            this.update(cx, |view, cx| {
-                view.action_in_flight = false;
-                view.last_outcome = Some(undo_banner(&result));
-                if let Some(target) = view.selected.clone() {
-                    view.select(target, cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
-    /// "Keep both": write the clean auto-merge through the same snapshot →
-    /// resolve_merged pipeline the merge editor's Save uses (undoable).
+    /// "Keep both": queue the clean auto-merge as the same merged write the
+    /// merge editor's Save makes, and advance like any other decision.
     fn run_keep_both(&mut self, cx: &mut Context<Self>) {
         let Some((inputs, assembled)) = self.auto_merge.clone() else {
             return;
         };
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            return;
+        let target = inputs.target.clone();
+        self.last_outcome = None;
+        self.enqueue(
+            target.clone(),
+            Decision::Merged {
+                resolved: assembled,
+                inputs,
+            },
+            cx,
+        );
+        self.advance_from(&target, cx);
+    }
+
+    /// The Shell's queue, copied out for this render pass. Empty when the
+    /// shell is gone (the window is closing): no rows are processing if
+    /// nothing can be running.
+    fn queue_snapshot(&self, cx: &Context<Self>) -> QueueSnapshot {
+        let Some(shell) = self.shell.upgrade() else {
+            return QueueSnapshot::default();
         };
-        self.action_in_flight = true;
-        cx.notify();
-        let resolved_target = inputs.target.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { engine.resolve_merged(&inputs, &assembled) })
-                .await;
-            this.update(cx, |view, cx| {
-                view.action_in_flight = false;
-                view.last_outcome = Some(keep_both_banner(&result));
-                if matches!(result, Ok(ResolveOutcome::Done { .. })) {
-                    view.state.update(cx, |model, cx| {
-                        model.confirm_resolved(&resolved_target);
-                        cx.notify();
-                    });
-                }
-                if let Some(target) = view.selected.clone() {
-                    view.select(target, cx);
-                }
-                // "Keep both" writes through `resolve_merged`, which reaches
-                // `ensure_merge_started` — so it can strand a merge too.
-                view.shell
-                    .update(cx, |shell, cx| shell.refresh_pending_merge(cx))
-                    .ok();
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        let shell = shell.read(cx);
+        let running = shell.queue.running();
+        QueueSnapshot {
+            processing: shell
+                .queue
+                .processing()
+                .into_iter()
+                .map(|target| {
+                    let status = if running.contains(&target) {
+                        QueuedStatus::Running
+                    } else {
+                        QueuedStatus::Waiting
+                    };
+                    (target, status)
+                })
+                .collect(),
+            failures: shell
+                .queue
+                .failures()
+                .map(|(t, m)| (t.clone(), m.clone()))
+                .collect(),
+            busy: shell.is_busy(),
+        }
     }
 
     /// Hand the selected target to the Shell's full-window merge editor
@@ -1091,19 +1157,25 @@ impl ReviewView {
         source_actions(self.origin_diffs.is_some())
     }
 
-    /// One header action button. Enabled needs a live engine (daemon
-    /// connected) — `run_action` itself re-checks selection and in-flight.
+    /// One header action button. `blocked` is the reason it cannot be
+    /// pressed, `None` when it can — `run_action` itself re-checks the
+    /// selection.
+    ///
+    /// The button NEVER swaps to a "working…" label: that swap is the defect
+    /// this plan exists to remove (spec §1.1). It is live for every file but
+    /// the one whose decision is already recorded, and even that one only
+    /// until its work lands.
     fn action_button(
         &self,
         action: ResolveAction,
         split: bool,
-        enabled: bool,
+        blocked: Option<SharedString>,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let label = action.button_label(split);
-        let el = if enabled {
-            ui::button(
+        let el = match blocked {
+            None => ui::button(
                 theme,
                 action.button_id(),
                 label.into(),
@@ -1112,15 +1184,14 @@ impl ReviewView {
                 ui::ButtonVariant::Tonal(action.tint(theme)),
                 ui::ButtonSize::Sm,
                 cx.listener(move |view, _ev, _window, cx| view.run_action(action, cx)),
-            )
-        } else {
-            ui::disabled_button(
+            ),
+            Some(why) => ui::disabled_button(
                 theme,
                 action.button_id(),
                 label.into(),
                 ui::ButtonSize::Sm,
-                Some("daemon not connected".into()),
-            )
+                Some(why),
+            ),
         };
         // Wrap onto the next header row rather than squash: a squeezed
         // button overflows its own label (`whitespace_nowrap`).
@@ -1190,17 +1261,38 @@ impl ReviewView {
 
     /// The slim outcome banner above the diff, with an Undo button on
     /// successful resolutions.
-    fn banner_el(&self, banner: &OutcomeBanner, theme: Theme, cx: &mut Context<Self>) -> Div {
+    ///
+    /// Undo is the ONE button in this view that goes inert while work
+    /// drains, and it stays on screen while it does: "undo the last thing
+    /// that landed" is unambiguous only when nothing is landing, and a
+    /// button that vanishes teaches the user nothing about why.
+    fn banner_el(
+        &self,
+        banner: &OutcomeBanner,
+        queue: &QueueSnapshot,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let color = banner.tint.color(theme);
-        let undo = (banner.undoable && !self.action_in_flight).then(|| {
-            ui::button(
-                theme,
-                "outcome-undo",
-                "Undo".into(),
-                ui::ButtonVariant::Solid(color),
-                ui::ButtonSize::Micro,
-                cx.listener(|view, _ev, _window, cx| view.run_undo(cx)),
-            )
+        let undo = banner.undoable.then(|| {
+            if queue.busy {
+                ui::disabled_button(
+                    theme,
+                    "outcome-undo",
+                    "Undo".into(),
+                    ui::ButtonSize::Micro,
+                    Some("finishing queued decisions first".into()),
+                )
+            } else {
+                ui::button(
+                    theme,
+                    "outcome-undo",
+                    "Undo".into(),
+                    ui::ButtonVariant::Solid(color),
+                    ui::ButtonSize::Micro,
+                    cx.listener(|view, _ev, _window, cx| view.run_undo(cx)),
+                )
+            }
             .into_any_element()
         });
         ui::banner(theme, banner.tint, banner.text.clone(), undo)
@@ -1208,27 +1300,67 @@ impl ReviewView {
 
     fn sidebar(
         &self,
-        needs_you: &[DriftSummary],
-        one_click: &[DriftSummary],
+        drifted: &[DriftSummary],
+        queue: &QueueSnapshot,
         in_sync: u64,
         now: u64,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let (needs_you, one_click) = severity_groups(drifted);
         let mut ix = 0usize;
         let mut rows: Vec<AnyElement> = Vec::new();
+        // Processing leads: a decision the user has made is no longer a
+        // question, and spec §2.1 has the row MOVE here rather than sit in
+        // its severity group with inert buttons — one file, one row.
+        if !queue.processing.is_empty() {
+            rows.push(group_header("PROCESSING", theme).into_any_element());
+            for (target, status) in &queue.processing {
+                // A queued target the model no longer lists (a rescan
+                // dropped it, say) still has work owed and still gets a row:
+                // it is answered-and-running, and hiding it would lose the
+                // only trace of that.
+                let entry = drifted
+                    .iter()
+                    .find(|d| d.target == *target)
+                    .cloned()
+                    .unwrap_or_else(|| DriftSummary {
+                        target: target.clone(),
+                        class: String::new(),
+                        since_ts: None,
+                        origin_differs: false,
+                    });
+                rows.push(
+                    self.target_row(ix, &entry, now, Some(*status), None, theme, cx)
+                        .into_any_element(),
+                );
+                ix += 1;
+            }
+        }
         for (label, group) in [
-            ("NEEDS A DECISION", needs_you),
-            ("SAFE TO RESOLVE", one_click),
+            ("NEEDS A DECISION", &needs_you),
+            ("SAFE TO RESOLVE", &one_click),
         ] {
+            let group: Vec<&DriftSummary> = group
+                .iter()
+                .filter(|d| !queue.is_processing(&d.target))
+                .collect();
             if group.is_empty() {
                 continue;
             }
             rows.push(group_header(label, theme).into_any_element());
             for entry in group {
                 rows.push(
-                    self.target_row(ix, entry, now, theme, cx)
-                        .into_any_element(),
+                    self.target_row(
+                        ix,
+                        entry,
+                        now,
+                        None,
+                        queue.failure(&entry.target),
+                        theme,
+                        cx,
+                    )
+                    .into_any_element(),
                 );
                 ix += 1;
             }
@@ -1302,63 +1434,114 @@ fn origin_hint(ix: usize, entry: &DriftSummary, theme: Theme) -> Option<Stateful
 }
 
 impl ReviewView {
+    /// One sidebar row.
+    ///
+    /// `queued` is `Some` for a row under PROCESSING: the whole row recedes
+    /// to muted and stops being a click target, because a decision is
+    /// already recorded for it and there is nothing to answer. `failure` is
+    /// the message the last decision for this row came back with — it stays
+    /// on the row (spec §2.5) and the row stays live, because choosing again
+    /// IS the retry.
+    #[allow(clippy::too_many_arguments)]
     fn target_row(
         &self,
         ix: usize,
         entry: &DriftSummary,
         now: u64,
+        queued: Option<QueuedStatus>,
+        failure: Option<&SharedString>,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let selected = self.selected.as_deref() == Some(entry.target.as_path());
-        let color = theme.class_color(&entry.class);
+        // A processing row carries no severity: the question it was asking
+        // has been answered. Its class tint would still read as "decide me".
+        let color = if queued.is_some() {
+            theme.text_muted
+        } else {
+            theme.class_color(&entry.class)
+        };
         let name: SharedString = entry
             .target
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| entry.target.display().to_string())
             .into();
-        let since: SharedString = entry
-            .since_ts
-            .map(|ts| time_ago(now, ts))
-            .unwrap_or_default()
-            .into();
+        // The trailing column says what the row is waiting on while it is
+        // waiting, and how long it has been drifted otherwise. Both are
+        // one short line; only one can be true at a time.
+        let trailing: SharedString = match queued {
+            Some(status) => status.label().into(),
+            None => entry
+                .since_ts
+                .map(|ts| time_ago(now, ts))
+                .unwrap_or_default()
+                .into(),
+        };
         let target = entry.target.clone();
         div()
             .id(ElementId::named_usize("review-target", ix))
             .px_3()
             .py_1()
             .flex()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
+            .flex_col()
+            .gap_0p5()
+            .when(queued.is_none(), |el| el.cursor_pointer())
             .when(selected, |el| el.bg(theme.surface))
-            .child(div().w_2().h_2().rounded_full().flex_shrink_0().bg(color))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .text_color(theme.text)
-                    .truncate()
-                    .child(name),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w_2().h_2().rounded_full().flex_shrink_0().bg(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(if queued.is_some() {
+                                theme.text_muted
+                            } else {
+                                theme.text
+                            })
+                            .truncate()
+                            .child(name),
+                    )
+                    // The ONE surface where `DriftSummary::origin_differs`
+                    // is authoritative — see `origin_hint`.
+                    .children(origin_hint(ix, entry, theme))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child(trailing),
+                    ),
             )
-            // The ONE surface where `DriftSummary::origin_differs` is
-            // authoritative — see `origin_hint`.
-            .children(origin_hint(ix, entry, theme))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.text_muted)
-                    .child(since),
-            )
-            .on_click(cx.listener(move |view, _ev, _window, cx| {
-                view.select(target.clone(), cx);
+            // Wraps rather than truncates: this is the only place the
+            // failure is ever said, and half of "op could not authenticate"
+            // is not a message.
+            .children(failure.map(|message| {
+                div().pl(px(16.)).child(ui::status_text(
+                    theme,
+                    message.clone(),
+                    ui::StatusTone::Conflict,
+                ))
             }))
+            .when(queued.is_none(), |el| {
+                el.on_click(cx.listener(move |view, _ev, _window, cx| {
+                    view.select(target.clone(), cx);
+                }))
+            })
     }
 
-    fn detail(&self, now: u64, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn detail(
+        &self,
+        queue: &QueueSnapshot,
+        now: u64,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(selected) = self.selected.as_deref() else {
             return centered_note(theme, "select a file to review".into(), theme.text_muted);
         };
@@ -1386,43 +1569,47 @@ impl ReviewView {
         // yet observed) case where the two disagreed about the file.
         // Authoritative: origin's LOADED content, not the scan's hint.
         let split = self.origin_diffs.is_some();
-        let mut header_actions: Vec<AnyElement> = Vec::new();
-        if self.action_in_flight {
-            header_actions
-                .push(ui::status_text(theme, "working…", ui::StatusTone::Muted).into_any_element());
+        // The ONLY reasons a decision button is inert. Both are about THIS
+        // file: every other file's buttons stay live while this one's work
+        // drains, which is the whole point of the queue (spec §1.1).
+        let blocked: Option<SharedString> = if !engine_ready {
+            Some("daemon not connected".into())
+        } else if queue.is_processing(selected) {
+            Some("already queued — the decision is recorded".into())
         } else {
+            None
+        };
+        let mut header_actions: Vec<AnyElement> = Vec::new();
+        header_actions.push(
+            self.action_button(ResolveAction::KeepDisk, split, blocked.clone(), theme, cx)
+                .into_any_element(),
+        );
+        header_actions.extend(self.header_source_actions().into_iter().map(|action| {
+            self.action_button(action, split, blocked.clone(), theme, cx)
+                .into_any_element()
+        }));
+        if self.auto_merge.is_some() {
             header_actions.push(
-                self.action_button(ResolveAction::KeepDisk, split, engine_ready, theme, cx)
-                    .into_any_element(),
+                match &blocked {
+                    None => ui::button(
+                        theme,
+                        "keep-both",
+                        "Keep both".into(),
+                        ui::ButtonVariant::Tonal(theme.ok),
+                        ui::ButtonSize::Sm,
+                        cx.listener(|view, _ev, _window, cx| view.run_keep_both(cx)),
+                    ),
+                    Some(why) => ui::disabled_button(
+                        theme,
+                        "keep-both",
+                        "Keep both".into(),
+                        ui::ButtonSize::Sm,
+                        Some(why.clone()),
+                    ),
+                }
+                .flex_shrink_0()
+                .into_any_element(),
             );
-            header_actions.extend(self.header_source_actions().into_iter().map(|action| {
-                self.action_button(action, split, engine_ready, theme, cx)
-                    .into_any_element()
-            }));
-            if self.auto_merge.is_some() {
-                header_actions.push(
-                    if engine_ready {
-                        ui::button(
-                            theme,
-                            "keep-both",
-                            "Keep both".into(),
-                            ui::ButtonVariant::Tonal(theme.ok),
-                            ui::ButtonSize::Sm,
-                            cx.listener(|view, _ev, _window, cx| view.run_keep_both(cx)),
-                        )
-                    } else {
-                        ui::disabled_button(
-                            theme,
-                            "keep-both",
-                            "Keep both".into(),
-                            ui::ButtonSize::Sm,
-                            Some("daemon not connected".into()),
-                        )
-                    }
-                    .flex_shrink_0()
-                    .into_any_element(),
-                );
-            }
         }
         header_actions.push(
             self.merge_editor_button(engine_ready, is_conflict, theme, cx)
@@ -1501,7 +1688,7 @@ impl ReviewView {
                 ],
             ))
             .when_some(self.last_outcome.clone(), |el, banner| {
-                el.child(self.banner_el(&banner, theme, cx))
+                el.child(self.banner_el(&banner, queue, theme, cx))
             })
             .when(!self.provenance.is_empty(), |el| {
                 let dragging = self.history_drag.is_some();
@@ -1645,7 +1832,9 @@ impl ReviewView {
         let model = self.state.read(cx);
         let drifted = model.drifted.clone();
         let in_sync = model.in_sync;
-        let (needs_you, one_click) = severity_groups(&drifted);
+        // Read once, before anything below needs `cx` mutably for a
+        // listener: the Shell cannot be borrowed across those.
+        let queue = self.queue_snapshot(cx);
 
         let dragging = self.sidebar_drag.is_some();
         div()
@@ -1682,7 +1871,7 @@ impl ReviewView {
                     }
                 }),
             )
-            .child(self.sidebar(&needs_you, &one_click, in_sync, now, theme, cx))
+            .child(self.sidebar(&drifted, &queue, in_sync, now, theme, cx))
             .child(ui::resize_handle(
                 "review-sidebar-divider",
                 ui::ResizeAxis::X,
@@ -1694,7 +1883,7 @@ impl ReviewView {
                     cx.notify();
                 }),
             ))
-            .child(self.detail(now, theme, cx))
+            .child(self.detail(&queue, now, theme, cx))
     }
 }
 
@@ -1848,7 +2037,7 @@ mod tests {
 
     use super::{
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, ResolveAction, flatten_document,
-        origin_diffs, origin_hint, outcome_banner, per_line_ranges, preview_decors,
+        next_after, origin_diffs, origin_hint, outcome_banner, per_line_ranges, preview_decors,
         severity_groups, source_actions, undo_banner,
     };
     use tomte_app::theme::Theme;
@@ -2017,6 +2206,47 @@ mod tests {
         // it has to be origin's text verbatim — not a re-derivation.
         let diffs = origin_diffs("a=origin\n", "a=disk\n", "a=local\n");
         assert_eq!(diffs.seen, "a=origin\n");
+    }
+
+    /// Spec §2.6: confirming advances the selection, so a sweep is one click
+    /// per file with no re-targeting click between.
+    ///
+    /// MUTATION: drop the `.or_else(…)` backward search → the "last row"
+    /// case returns `None`. MUTATION: drop `!processing(p)` from
+    /// `answerable` → the third case lands on `/c`, a row whose buttons are
+    /// inert.
+    #[test]
+    fn next_after_prefers_the_following_row_then_the_preceding_one_and_skips_processing() {
+        use std::path::PathBuf;
+
+        let order: Vec<PathBuf> = ["/a", "/b", "/c", "/d"].iter().map(PathBuf::from).collect();
+        let none = |_: &Path| false;
+        assert_eq!(
+            next_after(Path::new("/b"), &order, &none),
+            Some(PathBuf::from("/c"))
+        );
+        assert_eq!(
+            next_after(Path::new("/d"), &order, &none),
+            Some(PathBuf::from("/c")),
+            "last row: fall back to the one before"
+        );
+        let c_busy = |p: &Path| p == Path::new("/c");
+        assert_eq!(
+            next_after(Path::new("/b"), &order, &c_busy),
+            Some(PathBuf::from("/d")),
+            "a processing row is not a place to land"
+        );
+        let only: Vec<PathBuf> = vec![PathBuf::from("/a")];
+        assert_eq!(next_after(Path::new("/a"), &only, &none), None);
+        // The row just answered is itself processing by the time this runs,
+        // but it must not be a candidate even if the caller says otherwise.
+        assert_eq!(
+            next_after(Path::new("/a"), &only, &|_| false),
+            None,
+            "the row just answered is never the next one to answer"
+        );
+        // A list that moved underneath the click leaves the selection alone.
+        assert_eq!(next_after(Path::new("/zz"), &order, &none), None);
     }
 
     #[test]
