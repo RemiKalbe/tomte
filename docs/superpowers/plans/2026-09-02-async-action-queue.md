@@ -647,6 +647,296 @@ git commit -m "feat(shell): own the action queue and drain it serially"
 
 ---
 
+### Task 3b: Merge finish and abort take their turn behind the latch
+
+**Why this task exists.** The Task 3 re-review (89319fd) found, pre-existing
+and Important: nothing outside `pump`/`batch_finished` reads `queue_pumping`,
+so `Shell::finish_pending_merge` (the dashboard's finish button,
+`dashboard.rs:411`) and `Shell::abort_origin_merge` (the merge editor's roll
+back, `merge.rs:1683`) still spawn a git commit+push or a merge abort while a
+batch is draining — the same overlap class as the Critical race closed in
+Task 3's fix round, now easier to hit because batches run longer. It also
+found that no test reaches `pump`'s real path because no test publishes an
+`EngineSlot`: removing the conclusion await, or `catching_panics`, leaves all
+335 tests green. Views are bin-only (`crates/app/src/lib.rs` header), so that
+coverage must live in `mod.rs`'s own test module — and `tomte-daemon` plus
+`tomte-core`'s `test-support` are already dev-dependencies of the bin
+(`crates/app/Cargo.toml`), so a real engine can be built there.
+
+**Files:**
+- Modify: `crates/app/src/views/mod.rs` — Shell fields, `finish_pending_merge` (:339), `abort_origin_merge` (:259), `pump` (:426), `batch_finished` (:510), `catching_panics` (:724), the park comment (:439-444), the render-latch comment (~:731), tests.
+- Modify (struct literals only, for the new field): `crates/app/src/main.rs` (~:479), `crates/app/src/views/fixtures.rs` (~:367), and the eight literals in `mod.rs` tests — `grep -n 'merge_finish_in_flight:'` finds all ten.
+- Do NOT touch `dashboard.rs`: it copies `merge_finish_in_flight` (:175-176, :396-411) for its button label. Keep that field and its meaning: "a finish is running right now".
+
+**Interfaces:**
+- Consumes (Task 3): `Shell::queue: ActionQueue`, `Shell::queue_pumping`, `Shell::pump`, `Shell::batch_finished(results, conclusion, cx)`, `Shell::conclude_staged_merge`, `catching_panics`, `run_batch`, `crate::EngineSlot(pub Option<Arc<ResolveEngine>>)` (`main.rs:48`).
+- Produces:
+
+```rust
+/// A repo-level operation the user asked for; runs when the latch is free.
+#[derive(Debug)]
+pub(super) enum PendingRepoOp {
+    FinishMerge,
+    AbortMerge(merge::Rollback),
+}
+// on Shell:
+pub(super) deferred_repo_op: Option<PendingRepoOp>,
+```
+
+and a test-only lab in `mod.rs`'s test module that Task 7 reuses:
+
+```rust
+#[cfg(test)]
+pub(crate) struct EngineLab {
+    pub s: tomte_core::testsupport::Scratch,
+    pub engine: Arc<ResolveEngine>,
+    pub journal_path: PathBuf,
+}
+#[cfg(test)]
+impl EngineLab {
+    /// Scratch home + bare origin + in-process daemon + connected engine,
+    /// published as the app's `EngineSlot` so `pump` runs for real.
+    pub(crate) fn publish(cx: &mut TestAppContext) -> Self;
+    /// The managed destination file, `~/.testrc` in the scratch home.
+    pub(crate) fn target(&self) -> PathBuf;
+    /// Its source: `<source>/dot_testrc`.
+    pub(crate) fn source_file(&self) -> PathBuf;
+}
+```
+
+**The one rule this task installs:** `queue_pumping` is true while ANY
+app-initiated git mutation runs — a queue batch, that batch's staged-merge
+conclusion, a merge finish, or a merge abort. Everything that mutates the
+repo enters through `pump`; nothing else spawns git work. Write that as the
+doc comment on `queue_pumping`.
+
+- [ ] **Step 1: A deferred-op slot, and finish/abort become requests**
+
+Add `deferred_repo_op: Option<PendingRepoOp>` to `Shell` (all ten struct
+literals get `deferred_repo_op: None`). Rewrite the two public methods as
+requests — same signatures, so `dashboard.rs:411` and `merge.rs:1683` are
+untouched:
+
+```rust
+pub fn finish_pending_merge(&mut self, cx: &mut Context<Self>) {
+    self.request_repo_op(PendingRepoOp::FinishMerge, cx);
+}
+
+pub fn abort_origin_merge(&mut self, rolled_back: merge::Rollback, cx: &mut Context<Self>) {
+    // The user leaves the editor NOW; the rollback runs when its turn
+    // comes. Decisions they make in Review meanwhile queue behind it and
+    // run against the rolled-back repo — which is what "abort" means.
+    self.route = Route::Review;
+    self.request_repo_op(PendingRepoOp::AbortMerge(rolled_back), cx);
+}
+
+fn request_repo_op(&mut self, op: PendingRepoOp, cx: &mut Context<Self>) {
+    if let Some(prev) = self.deferred_repo_op.replace(op) {
+        tomte_core::log_info!("reconcile", "{prev:?} superseded before it ran");
+    }
+    cx.notify();
+    self.pump(cx);
+}
+```
+
+- [ ] **Step 2: `pump` runs a deferred op before it takes a batch**
+
+In `pump`, after the latch check and the engine lookup (a parked queue keeps
+its deferred op — it stays `Some` until something runs it):
+
+```rust
+if let Some(op) = self.deferred_repo_op.take() {
+    self.queue_pumping = true;
+    cx.notify();
+    match op {
+        PendingRepoOp::FinishMerge => self.run_finish(engine, cx),
+        PendingRepoOp::AbortMerge(rolled_back) => self.run_abort(engine, rolled_back, cx),
+    }
+    return;
+}
+let batch = self.queue.take_batch();
+// … unchanged from here
+```
+
+`run_finish(&mut self, engine: Arc<ResolveEngine>, cx)` is today's body of
+`finish_pending_merge` from `self.merge_finish_in_flight = true;` onward;
+`run_abort(&mut self, engine, rolled_back, cx)` is today's body of
+`abort_origin_merge` from `cx.spawn` onward. Delete the
+`if self.merge_finish_in_flight { return; }` guard — the latch is the guard
+now. Both completions (inside their `this.update`) end with:
+
+```rust
+shell.merge_finish_in_flight = false; // finish only
+shell.queue_pumping = false;
+cx.notify();
+shell.pump(cx); // whatever queued meanwhile
+```
+
+The ordering this gives, and that Step 6 pins: a finish or abort pressed
+while a batch drains runs *after that batch lands and before the next batch
+starts*. For abort that matters: decisions queued after the press run
+against the rolled-back repo instead of being staged into a merge the user
+just discarded.
+
+- [ ] **Step 3: No git closure can wedge the latch**
+
+Generalise `catching_panics` to any result type, keeping the payload →
+`String` extraction and the log line (now `"{what} panicked: {detail}"`):
+
+```rust
+fn catching_panics<T>(
+    what: &str,
+    on_panic: impl FnOnce(String) -> T,
+    work: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> T
+```
+
+`run_batch` passes `on_panic = |_| one Err per owed target` as today. The
+three other background closures — the staged-merge conclusion inside `pump`
+(`finish_merge_if_resolved`), `run_finish`'s, and `run_abort`'s — wrap their
+work the same way with `on_panic = |d| Err(ResolveError::Failed(format!("internal error — see the log: {d}")))`
+(for abort: whatever error shape its `rescanned` arm already reports), so
+every completion still runs, still clears the latch, still calls `pump`.
+Use `std::panic::AssertUnwindSafe` where a closure captures the engine `Arc`.
+
+- [ ] **Step 4: Say what is true about the park**
+
+`EngineSlot` is republished on EVERY (re)connect (`main.rs:660` loop,
+publish at `:745-752`; `main.rs:45-47` says "rebuilt on every successful
+(re)connect"), and a reconnect whose `build_engine` fails publishes
+`EngineSlot(None)`. Rewrite the park comment (`mod.rs:439-444`) and the
+render-latch comment (~`:731`): the park is reached before the first connect
+AND after a reconnect that could not build an engine; the queue then waits
+with its rows at "processing" and its deferred op intact until a connect
+publishes an engine, at which point the render latch pumps. A daemon that
+goes away without a reconnect attempt leaves a stale engine in place, and
+the batch fails honestly at `SessionStart`.
+
+- [ ] **Step 5: The lab — a real engine inside the bin's tests**
+
+In `mod.rs`'s `#[cfg(test)] mod tests`, add `EngineLab::publish(cx)` by
+copying the construction in `crates/app/tests/resolve_e2e.rs:55-89`:
+`Scratch::new()`, `Journal::open(&journal_path, "e2e")`, `DaemonCore::new(s.chezmoi(), GitClient::new(Arc::new(SystemRunner), s.source.clone()), journal, "origin/main".into())`,
+a `UnixListener::bind` + `std::thread::spawn(move || serve(listener, ServeCtx::ready(core, now_ts, Arc::new(|| {}))))`,
+`IpcClient::connect(&sock)`, and the `ResolveEngine { chezmoi: s.chezmoi(), git: …, ipc, journal_path }`
+literal — then `cx.update(|cx| cx.set_global(crate::EngineSlot(Some(engine.clone()))))`.
+Imports: `tomte_daemon::core::DaemonCore`, `tomte_daemon::server::{ServeCtx, serve}`,
+`tomte_core::testsupport::Scratch`, `tomte_journal::Journal`; copy `now_ts`
+too. Give it one drifted managed file the way `resolve_e2e.rs` does after
+construction (write `b"a=local\n"` to `s.home.join(".testrc")`; the scratch
+source already holds `dot_testrc` = `"a=1\n"`), so a `KeepDisk` on
+`lab.target()` has work to do. Build the Shell with `cx.new(|cx| Shell { … })`
+the way `shell_renders_every_route_without_panicking` does (mod.rs
+~:1038-1080). The Shell's `state` may be empty: check `model.rs`'s
+`confirm_resolved` is a no-op on an unknown target (it is called from
+`batch_finished`), and say so in the test if it is.
+
+- [ ] **Step 6: Tests — each names the mutation that fails it**
+
+```rust
+#[gpui::test]
+fn a_batch_really_drains_through_pump(cx: &mut TestAppContext) {
+    // Finding 4 of the Task 3 re-review: without an engine no test reached
+    // run_batch. MUTATION: make pump return before spawning → fails here.
+    let lab = EngineLab::publish(cx);
+    let shell = /* fresh Shell */;
+    shell.update(cx, |s, cx| {
+        s.enqueue(QueuedAction { target: lab.target(), decision: Decision::KeepDisk }, cx);
+        assert!(s.queue_pumping);
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.queue.depth(), 0);
+        assert!(!s.queue_pumping);
+        assert!(s.queue.failure(&lab.target()).is_none(), "{:?}", s.queue.failure(&lab.target()));
+    });
+    assert_eq!(std::fs::read(lab.source_file()).unwrap(), b"a=local\n");
+}
+
+#[gpui::test]
+fn a_finish_pressed_mid_drain_runs_before_the_next_batch(cx: &mut TestAppContext) {
+    // MUTATION: in pump, take the batch before checking deferred_repo_op →
+    // the probe below sees running() non-empty.
+    let lab = EngineLab::publish(cx);
+    let shell = /* fresh Shell */;
+    shell.update(cx, |s, cx| {
+        s.queue_pumping = true; // stand in for a batch that is draining
+        s.queue.push(QueuedAction { target: lab.target(), decision: Decision::KeepDisk });
+        s.finish_pending_merge(cx); // pressed while draining
+        assert!(matches!(s.deferred_repo_op, Some(PendingRepoOp::FinishMerge)));
+        assert!(!s.merge_finish_in_flight, "nothing may run while the latch is held");
+        assert!(s.queue.running().is_empty());
+    });
+    // The stand-in batch lands with nothing to report.
+    shell.update(cx, |s, cx| s.batch_finished(Vec::new(), None, cx));
+    // PROBE before anything is polled: the finish took the latch; the
+    // pending batch did NOT.
+    shell.read_with(cx, |s, _| {
+        assert!(s.deferred_repo_op.is_none());
+        assert!(s.merge_finish_in_flight);
+        assert!(s.queue_pumping);
+        assert!(s.queue.running().is_empty());
+        assert_eq!(s.queue.depth(), 1);
+    });
+    cx.run_until_parked(); // the finish (NotMerging here), then the batch
+    shell.read_with(cx, |s, _| {
+        assert!(!s.merge_finish_in_flight);
+        assert!(!s.queue_pumping);
+        assert_eq!(s.queue.depth(), 0);
+    });
+    assert_eq!(std::fs::read(lab.source_file()).unwrap(), b"a=local\n");
+}
+
+#[gpui::test]
+fn an_abort_pressed_mid_drain_routes_now_and_runs_later(cx: &mut TestAppContext) {
+    // Same shape as the finish test with PendingRepoOp::AbortMerge(rollback),
+    // and additionally: route == Route::Review immediately after the press,
+    // while the latch is still held. Build the Rollback the way
+    // merge.rs:1683's caller does (read merge::Rollback). On a non-merging
+    // scratch repo the abort still rescans and merge_done shows the
+    // rolled-back banner: assert the review view's outcome banner is Some
+    // after run_until_parked.
+}
+
+#[gpui::test]
+fn a_deferred_op_survives_a_parked_queue(cx: &mut TestAppContext) {
+    // No EngineSlot published. MUTATION: pump drops deferred_repo_op when it
+    // parks → the second assertion fails.
+    let shell = /* fresh Shell */;
+    shell.update(cx, |s, cx| s.finish_pending_merge(cx));
+    shell.read_with(cx, |s, _| {
+        assert!(!s.queue_pumping);
+        assert!(matches!(s.deferred_repo_op, Some(PendingRepoOp::FinishMerge)));
+    });
+}
+
+#[test]
+fn catching_panics_hands_back_the_fallback_for_any_type() {
+    let v: Result<u8, String> = catching_panics("t", Err, || panic!("boom"));
+    assert!(matches!(v, Err(ref d) if d.contains("boom")));
+    let v: Result<u8, String> = catching_panics("t", Err, || Ok(7));
+    assert_eq!(v, Ok(7));
+}
+```
+
+Keep `a_panicking_batch_reports_a_failure_for_every_target_it_owed` and
+`enqueue_never_blocks_and_drains_in_order` green through the changes.
+
+- [ ] **Step 7: Run, gate, commit**
+
+Run the new tests by name, then the full gate IN THE FOREGROUND:
+`cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`
+with its output grepped for `^warning` (only the `block v0.1.6` /
+`proc-macro-error2` line may appear); `cargo test --workspace`; the same
+once more with `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`.
+
+```bash
+git add crates/app/src/views/mod.rs crates/app/src/main.rs crates/app/src/views/fixtures.rs
+git commit -m "fix(shell): merge finish and abort wait their turn behind the queue latch"
+```
+
+---
+
 ### Task 4: Review view — enqueue, Processing section, failure chip, auto-advance
 
 **Files:**
