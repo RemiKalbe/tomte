@@ -81,11 +81,19 @@ impl Decision {
     /// ([`crate::resolve::ResolveEngine::resolve_batch`]) alongside other
     /// batchable decisions, rather than needing the repo to itself?
     ///
-    /// Only the two decisions with no per-file failure mode beyond the
-    /// shared tail's own: `keep_source_origin` can reject a protected span,
-    /// and every merge-editor save writes source text that has to be its own
-    /// affair. `KeepDisk` and `KeepSourceLocal` are exactly
-    /// [`BatchDecision`]'s two variants — see [`Self::as_batch`].
+    /// `KeepDisk` and `KeepSourceLocal` are exactly [`BatchDecision`]'s two
+    /// variants — see [`Self::as_batch`] — because those are the only two
+    /// tails `resolve_batch` actually implements: one shared `re-add`, one
+    /// shared `apply`. `keep_source_origin` and every merge-editor save each
+    /// write their OWN source text (write-after-verify, or origin's
+    /// content), and `resolve_batch` has no shared tail for that — batching
+    /// them would mean giving each its own write-after-verify path inside
+    /// the batch, which does not exist.
+    ///
+    /// That is not the same claim as "batchable means it cannot fail per
+    /// file": a templated `KeepDisk` is still refused per file inside the
+    /// batch, in `resolve_batch`'s pre-flight pass, exactly as single-file
+    /// `keep_disk` refuses it.
     pub fn batchable(&self) -> bool {
         self.as_batch().is_some()
     }
@@ -170,12 +178,21 @@ impl ActionQueue {
     }
 
     /// Record a whole batch's results at once: `err` present for a target
-    /// means it failed and its row must say so. Every target moves out of
-    /// `running` regardless — a batch is drained together (see
-    /// [`Self::take_batch`]), so it is recorded together.
+    /// means it failed and its row must say so.
+    ///
+    /// Clears `running` WHOLESALE rather than name-by-name. `take_batch`
+    /// always hands out the running set as one call, and `resolve_batch`
+    /// always reports exactly one entry per item it was given — but nothing
+    /// here enforces that a caller reports every target it received.
+    /// Draining by name would let one dropped result (upstream loses a
+    /// message, a future caller has a bug) strand its siblings in `running`
+    /// forever: `take_batch` would then return empty for good, wedging the
+    /// WHOLE queue, not just the target whose result went missing. A batch
+    /// is the unit `take_batch` hands out, so it is the unit `finish_all`
+    /// closes out, whatever `results` does or doesn't name.
     pub fn finish_all(&mut self, results: &[(PathBuf, Option<SharedString>)]) {
+        self.running.clear();
         for (target, err) in results {
-            self.running.retain(|running| running != target);
             if let Some(message) = err {
                 self.failed.insert(target.clone(), message.clone());
             }
@@ -417,6 +434,33 @@ mod tests {
         assert!(
             q.is_processing(Path::new("/a")) && q.is_processing(Path::new("/b")),
             "/a is running, /b still pending — both count as processing"
+        );
+    }
+
+    /// A batch is the unit `take_batch` hands out, so it must be the unit
+    /// `finish_all` closes out — a caller that reports results for only
+    /// SOME of a batch's targets must not strand the rest in `running`
+    /// forever, wedging the whole queue behind them.
+    #[test]
+    fn finish_all_clears_the_whole_running_batch_even_with_a_partial_report() {
+        let mut q = ActionQueue::default();
+        q.push(action("/a", Decision::KeepDisk));
+        q.push(action("/b", Decision::KeepSourceLocal));
+        let batch = q.take_batch();
+        assert_eq!(batch.len(), 2, "both are batchable, taken together");
+
+        // Queued while the batch above is still running.
+        q.push(action("/c", Decision::KeepDisk));
+        assert!(q.take_batch().is_empty(), "the batch is still running");
+
+        // Only /a's result comes back — /b's went missing upstream.
+        q.finish_all(&[(PathBuf::from("/a"), None)]);
+
+        let next = q.take_batch();
+        assert_eq!(
+            next[0].target,
+            Path::new("/c"),
+            "a partial report must not strand /b in `running` and wedge the queue"
         );
     }
 }
