@@ -1191,7 +1191,8 @@ git commit -m "feat: merge-editor Save and dashboard quick actions go through th
 - Test: `crates/core/src/chezmoi.rs` `mod tests`
 - Modify: `crates/core/src/git.rs` (`merge_abort` :415-417)
 - Modify: `crates/app/src/resolve.rs` (`abort_repo_reconcile` :1188)
-- Modify: `crates/app/src/views/mod.rs` (`AbortOutcome`, `abort_banner`, `run_abort`, `request_repo_op`)
+- Modify: `crates/app/src/views/mod.rs` (`AbortOutcome`, `abort_banner`, `run_abort`, `request_repo_op`; delete `merge_finish_in_flight`)
+- Modify: `crates/app/src/views/dashboard.rs`, `crates/app/src/views/fixtures.rs`, `crates/app/src/main.rs` (struct literals / `finish_button_state` for Ruling 41 only)
 
 **Interfaces:**
 - Produces: bounded retry inside `run_ok_with_timeout` on
@@ -1270,6 +1271,13 @@ sees `merge_in_progress() == false`.
 3. `request_repo_op(FinishMerge)`: also dropped (logged, surfaced as the
    pending-abort case is) when `self.running_repo_op == Some(RepoOpKind::Abort)`.
    A finish never outranks an abort, pending OR in flight.
+4. **Ruling 41 (from Task 5):** `Shell::merge_finish_in_flight` now duplicates
+   `running_repo_op == Some(RepoOpKind::Finish)`. Delete the field; the
+   dashboard snapshot already carries `running_repo_op`, so
+   `finish_button_state` reads the running kind instead of a separate
+   bool (keep its four states and its tests; update every struct literal —
+   `grep -n 'merge_finish_in_flight'`). One source of truth for "a finish
+   is running".
 
 Tests (name the mutation each catches):
 - `git.rs`: `merge_abort` on a repo with no merge in progress returns `Err`
@@ -1287,7 +1295,7 @@ Tests (name the mutation each catches):
 - [ ] **Step 5: Run, gate, commit**
 
 ```bash
-git add crates/core/src/chezmoi.rs crates/core/src/git.rs crates/app/src/resolve.rs crates/app/src/views/mod.rs
+git add crates/core/src/chezmoi.rs crates/core/src/git.rs crates/app/src/resolve.rs crates/app/src/views/mod.rs crates/app/src/views/dashboard.rs crates/app/src/views/fixtures.rs crates/app/src/main.rs
 git commit -m "fix: retry a transient 1Password failure, bounded; a failed merge abort says so"
 ```
 
