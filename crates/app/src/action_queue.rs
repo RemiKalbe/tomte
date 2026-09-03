@@ -56,6 +56,14 @@ pub enum Decision {
         resolved: String,
         inputs: Arc<MergeInputs>,
     },
+    /// Review's "Keep both": the clean 3-way auto-merge, written exactly as
+    /// [`Self::Merged`] is. A variant of its own only so the words the user
+    /// pressed travel with it — a failure that reads "Save failed" on a row
+    /// whose button said "Keep both" names a button that is not on screen.
+    KeepBoth {
+        resolved: String,
+        inputs: Arc<MergeInputs>,
+    },
     /// Merge-editor Save on a file left conflicted by an open merge with
     /// origin — resolved against the index stages, not the working tree.
     RepoConflict {
@@ -65,15 +73,38 @@ pub enum Decision {
 }
 
 impl Decision {
-    /// What the user chose, in their words. Used verbatim in the outcome
-    /// banner, so a queued action that fails minutes later still says which
-    /// choice failed.
+    /// What the user chose, in their words. Used verbatim in the failure a
+    /// row shows, so a queued action that fails minutes later still says
+    /// which choice failed — and in the PROCESSING row, so a queue of thirty
+    /// says what each one is waiting to do.
     pub fn label(&self) -> &'static str {
         match self {
             Decision::KeepDisk => "Keep disk",
             Decision::KeepSourceLocal => "Keep source · this machine",
             Decision::KeepSourceOrigin { .. } => "Keep source · origin",
+            Decision::KeepBoth { .. } => "Keep both",
             Decision::Merged { .. } | Decision::RepoConflict { .. } => "Save",
+        }
+    }
+
+    /// What the choice DID, past tense — the words a landed decision reports
+    /// itself with, minutes after the click, in the outcome banner and in the
+    /// out-of-band notification a dashboard decision earns.
+    ///
+    /// Separate from [`Self::label`] on purpose: a success says what happened
+    /// ("Kept disk version · committed & pushed"), a failure names the button
+    /// that failed ("Keep disk failed: …"). Both are the same choice in the
+    /// user's vocabulary, which is why they live side by side here rather
+    /// than being derived from each other.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Decision::KeepDisk => "Kept disk version",
+            Decision::KeepSourceLocal => "Restored chezmoi's version",
+            Decision::KeepSourceOrigin { .. } => "Restored origin's version",
+            Decision::Merged { .. } | Decision::KeepBoth { .. } => "Merged",
+            // Its banner comes from the merge's own conclusion, never from
+            // here — a staged conflict has not landed anywhere yet.
+            Decision::RepoConflict { .. } => "Recorded the resolution",
         }
     }
 
@@ -106,16 +137,28 @@ impl Decision {
             Decision::KeepSourceLocal => Some(BatchDecision::KeepSourceLocal),
             Decision::KeepSourceOrigin { .. }
             | Decision::Merged { .. }
+            | Decision::KeepBoth { .. }
             | Decision::RepoConflict { .. } => None,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct QueuedAction {
     /// The destination file this decision is about. Identity for the UI: the
     /// row it came from, and the row a failure attaches to.
     pub target: PathBuf,
     pub decision: Decision,
+    /// Say so out of band when this one lands.
+    ///
+    /// TRUE only for the dashboard's quick actions. That surface has no
+    /// banner and no processing group — the timeline row it was pressed on
+    /// just stops being drifted — so without a notification the decision
+    /// lands in silence, minutes later, quite possibly while the user is in
+    /// another application. Review and the merge editor both have a place on
+    /// screen to say it, so they set FALSE and a second, redundant
+    /// notification per file never fires.
+    pub notify_on_done: bool,
 }
 
 /// Pending and running decisions, plus the failures that have not been
@@ -123,11 +166,19 @@ pub struct QueuedAction {
 #[derive(Default)]
 pub struct ActionQueue {
     pending: VecDeque<QueuedAction>,
-    /// Targets currently executing, in the order [`Self::take_batch`] took
-    /// them. A `Vec` rather than the single `Option<PathBuf>` this replaced:
-    /// a batch takes several targets running at once, all under one
-    /// in-flight resolve call.
-    running: Vec<PathBuf>,
+    /// The batch currently executing, in the order [`Self::take_batch`] took
+    /// it. A `Vec` rather than the single `Option<PathBuf>` this replaced: a
+    /// batch takes several targets running at once, all under one in-flight
+    /// resolve call.
+    ///
+    /// The whole ACTION, not just its target: `take_batch` hands a CLONE to
+    /// whoever runs it and keeps this copy, because two questions outlive the
+    /// hand-off. A processing row has to say WHICH choice is running (a queue
+    /// of thirty saying "running…" says nothing), and
+    /// [`QueuedAction::notify_on_done`] has to survive to the completion that
+    /// decides whether to announce it. Both were unanswerable while this held
+    /// bare paths.
+    running: Vec<QueuedAction>,
     /// Targets whose last queued action failed, with the message. Kept until
     /// the user retries ([`Self::push`]) or the target stops being drifted
     /// ([`Self::retain_failures`]) — a failure that vanished on the next
@@ -174,7 +225,7 @@ impl ActionQueue {
         } else {
             batch.push(self.pending.pop_front().expect("front just checked Some"));
         }
-        self.running.extend(batch.iter().map(|a| a.target.clone()));
+        self.running.extend(batch.iter().cloned());
         batch
     }
 
@@ -200,10 +251,26 @@ impl ActionQueue {
         }
     }
 
-    /// Targets currently executing, in the order [`Self::take_batch`] took
-    /// them.
-    pub fn running(&self) -> &[PathBuf] {
+    /// The batch currently executing, in the order [`Self::take_batch`] took
+    /// it. Callers that only want the targets map over it.
+    pub fn running(&self) -> &[QueuedAction] {
         &self.running
+    }
+
+    /// The choice recorded for one target, in the user's own words
+    /// ([`Decision::label`]) — running first, then pending.
+    ///
+    /// Running first because that is the order the two can only ever be in:
+    /// [`Self::push`] replaces a target's PENDING entry, so a target cannot
+    /// be pending twice, and a target that is running and then re-chosen has
+    /// its new choice pending behind the old one — the running one is what is
+    /// actually happening to the file right now, and the row says that.
+    pub fn decision_label(&self, target: &Path) -> Option<&'static str> {
+        self.running
+            .iter()
+            .chain(self.pending.iter())
+            .find(|a| a.target == target)
+            .map(|a| a.decision.label())
     }
 
     /// Everything queued or running, in the order the user chose it: the
@@ -219,8 +286,8 @@ impl ActionQueue {
     pub fn processing(&self) -> Vec<PathBuf> {
         self.running
             .iter()
-            .cloned()
-            .chain(self.pending.iter().map(|p| p.target.clone()))
+            .chain(self.pending.iter())
+            .map(|a| a.target.clone())
             .collect()
     }
 
@@ -251,6 +318,40 @@ impl ActionQueue {
     pub fn retain_failures(&mut self, keep: impl Fn(&Path) -> bool) {
         self.failed.retain(|target, _| keep(target));
     }
+
+    /// Drop every PENDING decision `pred` matches and record `msg` as its
+    /// failure. Returns the targets, so the caller can log what it just took
+    /// away from the user.
+    ///
+    /// Fail-fast for decisions a repo-level answer is about to invalidate: an
+    /// abort of the merge with origin rolls the source repo back, and a
+    /// merge-editor save that was going to be staged INTO that merge has
+    /// nowhere left to go. Running it afterwards would either fail obscurely
+    /// or, worse, quietly start a second merge — so it is refused here, in
+    /// the user's terms, on the row it came from (spec §2.5).
+    ///
+    /// RUNNING items are deliberately untouched: they are in flight under the
+    /// latch, this queue cannot recall them, and pretending otherwise would
+    /// put a failure on a row whose work is still going to land.
+    pub fn fail_pending_where(
+        &mut self,
+        pred: impl Fn(&QueuedAction) -> bool,
+        msg: &str,
+    ) -> Vec<PathBuf> {
+        let mut failed = Vec::new();
+        self.pending.retain(|action| {
+            if pred(action) {
+                failed.push(action.target.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for target in &failed {
+            self.failed.insert(target.clone(), msg.to_string().into());
+        }
+        failed
+    }
 }
 
 #[cfg(test)]
@@ -269,7 +370,14 @@ mod tests {
         QueuedAction {
             target: PathBuf::from(target),
             decision,
+            notify_on_done: false,
         }
+    }
+
+    /// The targets of a batch, for assertions that are about ORDER rather
+    /// than about what each one carries.
+    fn targets(batch: &[QueuedAction]) -> Vec<&Path> {
+        batch.iter().map(|a| a.target.as_path()).collect()
     }
 
     /// A minimal `Arc<MergeInputs>` for decisions that only need to exist,
@@ -314,10 +422,7 @@ mod tests {
         q.finish_all(&[(PathBuf::from("/a"), None)]);
         let second = q.take_batch();
         assert_eq!(
-            second
-                .iter()
-                .map(|a| a.target.as_path())
-                .collect::<Vec<_>>(),
+            targets(&second),
             [Path::new("/b")],
             "and starts as soon as the repo is free"
         );
@@ -406,7 +511,7 @@ mod tests {
 
         let first = q.take_batch();
         assert_eq!(
-            first.iter().map(|a| a.target.as_path()).collect::<Vec<_>>(),
+            targets(&first),
             [Path::new("/a"), Path::new("/b")],
             "the leading run of batchable decisions goes together"
         );
@@ -446,11 +551,11 @@ mod tests {
 
         let batch = q.take_batch();
         assert_eq!(
-            batch.iter().map(|a| a.target.as_path()).collect::<Vec<_>>(),
+            targets(&batch),
             [Path::new("/a")],
             "a batch of one is still a valid batch"
         );
-        assert_eq!(q.running(), [PathBuf::from("/a")]);
+        assert_eq!(targets(q.running()), [Path::new("/a")]);
         assert!(
             is_processing(&q, "/a") && is_processing(&q, "/b"),
             "/a is running, /b still pending — both count as processing"
@@ -482,5 +587,91 @@ mod tests {
             Path::new("/c"),
             "a partial report must not strand /b in `running` and wedge the queue"
         );
+    }
+
+    /// A processing row has to say WHICH choice it is waiting on: thirty rows
+    /// all reading "running…" say nothing about what is happening to any of
+    /// them. `take_batch` used to keep only the targets, so a running row's
+    /// decision was genuinely unreadable.
+    ///
+    /// The two cases are asserted separately because a target cannot be both
+    /// at once: `push` replaces a target's pending entry, so nothing is ever
+    /// pending twice, and a re-choice made while the first is running is the
+    /// one case where both exist — covered last.
+    ///
+    /// MUTATION: have `decision_label` search `pending` before `running` →
+    /// the last assertion names the choice that is NOT the one running.
+    #[test]
+    fn decision_label_names_the_choice_a_row_is_waiting_on() {
+        let mut q = ActionQueue::default();
+        assert_eq!(q.decision_label(Path::new("/a")), None, "nothing recorded");
+
+        // Pending: the label is readable before anything runs.
+        q.push(action("/a", Decision::KeepDisk));
+        assert_eq!(q.decision_label(Path::new("/a")), Some("Keep disk"));
+
+        // Running: still readable AFTER `take_batch` handed the batch out.
+        q.take_batch();
+        assert_eq!(
+            q.decision_label(Path::new("/a")),
+            Some("Keep disk"),
+            "the queue keeps the running action, not just its target"
+        );
+
+        // Both: re-chosen while the first is still running. What is happening
+        // to the file right now is the RUNNING one.
+        q.push(action("/a", Decision::KeepSourceLocal));
+        assert_eq!(
+            q.decision_label(Path::new("/a")),
+            Some("Keep disk"),
+            "the running choice is the one actually touching the file"
+        );
+    }
+
+    /// An abort of the merge with origin rolls the source repo back, and a
+    /// merge-editor save that was going to be staged INTO that merge has
+    /// nowhere left to go. It is refused here rather than run against a repo
+    /// that no longer has the merge — and the decisions that do NOT depend on
+    /// the merge stay queued, because they run correctly either way.
+    ///
+    /// MUTATION: have `fail_pending_where` drain `running` too → `/c` is
+    /// taken out from under the batch that is executing it.
+    #[test]
+    fn fail_pending_where_takes_only_the_pending_decisions_it_names() {
+        let mut q = ActionQueue::default();
+        q.push(action("/c", Decision::KeepDisk));
+        q.take_batch(); // /c is running, under the latch
+        q.push(action(
+            "/a",
+            Decision::RepoConflict {
+                source_path: PathBuf::from("/src/a"),
+                resolved: "x".into(),
+            },
+        ));
+        q.push(action("/b", Decision::KeepDisk));
+
+        let failed = q.fail_pending_where(
+            |a| matches!(a.decision, Decision::RepoConflict { .. }),
+            "merge rolled back before this save ran — save again",
+        );
+
+        assert_eq!(failed, [PathBuf::from("/a")], "only the save it orphans");
+        assert_eq!(
+            q.failure(Path::new("/a")).map(|m| m.as_ref()),
+            Some("merge rolled back before this save ran — save again"),
+            "and the row says why, in the user's terms"
+        );
+        assert_eq!(
+            targets(q.running()),
+            [Path::new("/c")],
+            "a running decision is in flight under the latch and cannot be recalled"
+        );
+        assert_eq!(
+            q.decision_label(Path::new("/b")),
+            Some("Keep disk"),
+            "a keep-disk does not depend on the merge: it stays queued and \
+             runs against the rolled-back repo"
+        );
+        assert_eq!(q.depth(), 2, "/a is gone, /b and /c remain");
     }
 }

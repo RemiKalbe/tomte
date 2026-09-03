@@ -470,7 +470,6 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     merge: None,
                     paths,
                     expanded_scans: Default::default(),
-                    dashboard_action_in_flight: false,
                     unlock_in_flight: false,
                     pending_merge: false,
                     merge_finish_in_flight: false,
@@ -479,6 +478,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     queue: Default::default(),
                     queue_pumping: false,
                     deferred_repo_op: None,
+                    running_repo_op: None,
                 };
                 // Views read the model in render, so every model change
                 // re-renders this window — and prunes the queue state that

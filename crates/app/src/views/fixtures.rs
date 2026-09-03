@@ -15,7 +15,8 @@ use tomte_core::merge::{Choice, MergeDocument, MergeOptions};
 use tomte_core::template::{anchor::anchor, lexer::lex};
 use tomte_proto::DriftSummary;
 
-use super::merge::{LoadedMerge, MergeView};
+use super::PendingRepoOp;
+use super::merge::{LoadedMerge, MergeView, Rollback};
 use super::review::{
     BannerTint, DiffPair, OutcomeBanner, PreviewState, ProvRow, ReviewView, origin_diffs,
 };
@@ -34,6 +35,10 @@ pub const STATES: &[(&str, &str)] = &[
     ("dashboard-rescanning", "data present, rescan in progress"),
     ("dashboard-degraded", "1Password-style degraded banner"),
     ("dashboard-disconnected", "daemon not connected"),
+    (
+        "dashboard-rolling-back",
+        "pending-merge banner while a confirmed roll-back waits: Finish is inert",
+    ),
     ("review", "sidebar groups + selected file with diff preview"),
     ("review-empty", "nothing selected"),
     ("review-banner", "action outcome banner with Undo"),
@@ -367,7 +372,6 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         merge: None,
         paths: paths.clone(),
         expanded_scans: HashSet::new(),
-        dashboard_action_in_flight: false,
         unlock_in_flight: false,
         pending_merge: false,
         merge_finish_in_flight: false,
@@ -376,6 +380,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         queue: Default::default(),
         queue_pumping: false,
         deferred_repo_op: None,
+        running_repo_op: None,
     };
 
     // Component previews: bare Shell routed at the preview (no posed data).
@@ -420,6 +425,17 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             shell(Route::Dashboard, m)
         }
         "dashboard-disconnected" => shell(Route::Dashboard, SyncModel::default()),
+        // The one state where the pending-merge banner must NOT offer to
+        // commit: the user confirmed discarding this merge in the editor and
+        // the roll-back is waiting for the latch. A live "Finish merge" here
+        // would be a button offering the opposite of the answer they gave.
+        "dashboard-rolling-back" => {
+            let mut s = shell(Route::Dashboard, rich_model());
+            s.pending_merge = true;
+            s.queue_pumping = true; // a batch holds the latch, so the abort waits
+            s.deferred_repo_op = Some(PendingRepoOp::AbortMerge(Rollback::Files(2)));
+            s
+        }
         "review"
         | "review-empty"
         | "review-banner"
@@ -464,6 +480,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 s.queue.push(QueuedAction {
                     target: home(".config/zed/settings.json"),
                     decision: Decision::KeepDisk,
+                    notify_on_done: false,
                 });
                 // Hand it to the (absent) engine: this one is RUNNING, and
                 // the one pushed after it is waiting for the repo.
@@ -471,6 +488,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 s.queue.push(QueuedAction {
                     target: home(".gitconfig"),
                     decision: Decision::KeepSourceLocal,
+                    notify_on_done: false,
                 });
                 s.queue_pumping = true;
             }
@@ -479,6 +497,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 s.queue.push(QueuedAction {
                     target: target.clone(),
                     decision: Decision::KeepDisk,
+                    notify_on_done: false,
                 });
                 s.queue.take_batch();
                 s.queue.finish_all(&[(

@@ -66,6 +66,44 @@ pub(super) enum PendingRepoOp {
     UndoLast,
 }
 
+/// Which repo-level operation, without its payload.
+///
+/// The payload ([`merge::Rollback`]) is neither `Copy` nor renderable, and
+/// the surfaces that have to REACT to a pending or running op — the
+/// dashboard's Finish button — only ever ask which one it is. So they get
+/// this, copied into their snapshot, rather than a borrow of the op itself.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum RepoOpKind {
+    Finish,
+    Abort,
+    Undo,
+}
+
+/// Where an outcome banner goes: to the user, or to where the user will be.
+///
+/// THE ONE DIFFERENCE between a repo-level answer the user is standing there
+/// waiting for and the same answer arriving out of the queue. Task 5's ruling:
+/// a landed queued decision never changes the route.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BannerDelivery {
+    /// The user pressed the button that produced this and is waiting for it:
+    /// show it and take them to Review ([`Shell::merge_done`]).
+    Route,
+    /// It came out of the queue, possibly minutes later: leave it where they
+    /// will find it and do not move them ([`Shell::show_outcome`]).
+    InPlace,
+}
+
+impl PendingRepoOp {
+    pub(super) fn kind(&self) -> RepoOpKind {
+        match self {
+            Self::FinishMerge => RepoOpKind::Finish,
+            Self::AbortMerge(_) => RepoOpKind::Abort,
+            Self::UndoLast => RepoOpKind::Undo,
+        }
+    }
+}
+
 pub struct Shell {
     pub route: Route,
     /// The shared sync model; the window observes it (wired in `open_shell`)
@@ -87,11 +125,6 @@ pub struct Shell {
     /// Expanded scan-groups in the dashboard timeline, keyed by the group's
     /// newest event timestamp (stable across refreshes).
     pub expanded_scans: std::collections::HashSet<u64>,
-    /// A dashboard quick action (keep disk / keep source) is running on the
-    /// background executor. Lives here because the dashboard body is rebuilt
-    /// from Shell state on every render (unlike the long-lived ReviewView,
-    /// which tracks its own in-flight flag).
-    pub dashboard_action_in_flight: bool,
     /// The 1Password unlock probe (degraded-banner button) is waiting on the
     /// user's approval.
     pub unlock_in_flight: bool,
@@ -125,23 +158,26 @@ pub struct Shell {
     /// [`Self::pump`] is safe to call from anywhere.
     ///
     /// The rule it exists to enforce is "everything that mutates the repo
-    /// enters through [`Self::pump`]". Task 3b closed the Shell's own two
-    /// doors (a finish and an abort now take their turn behind it instead of
-    /// spawning a commit+push, or a merge abort, beside a draining batch);
-    /// Task 4 closed Review's three: its quick actions and "Keep both" are
-    /// [`Decision`]s on the queue, and its Undo is a [`PendingRepoOp`] —
-    /// `undo_last` writes managed DESTINATION files back from the journal,
-    /// which is the same set of files a batch's `chezmoi re-add` is reading.
+    /// enters through [`Self::pump`]", and as of Task 5 that rule is WHOLE:
+    /// no surface in this app spawns git work of its own any more.
     ///
-    /// STILL OUTSIDE IT, each spawned by a view behind its own `saving` /
-    /// `action_in_flight` boolean, so each can still overlap a batch:
-    /// - the dashboard's quick actions;
-    /// - `MergeView::save` — `resolve_merged` or `resolve_repo_conflict`;
-    /// - the merge conclusion (a merge commit and a push)
-    ///   [`Self::repo_conflict_saved`] spawns for that last one.
+    /// Task 3b closed the Shell's own two doors (a finish and an abort now
+    /// take their turn behind it instead of spawning a commit+push, or a
+    /// merge abort, beside a draining batch). Task 4 closed Review's three:
+    /// its quick actions and "Keep both" are [`Decision`]s on the queue, and
+    /// its Undo is a [`PendingRepoOp`] — `undo_last` writes managed
+    /// DESTINATION files back from the journal, which is the same set of
+    /// files a batch's `chezmoi re-add` is reading. Task 5 closed the last
+    /// three: the dashboard's quick actions and `MergeView::save` are
+    /// [`Decision`]s too, and the merge conclusion a staged repo conflict
+    /// owes (a merge commit and a push) is awaited inside the batch's own
+    /// in-flight window, before this clears — it used to be spawned beside
+    /// the drain by a `Shell::repo_conflict_saved` that no longer exists.
     ///
-    /// Task 5 of this plan routes those through [`Self::enqueue`]; only then
-    /// does this latch describe the whole app.
+    /// Anything added later that writes the source repo, the index, or a
+    /// managed destination file belongs behind this latch too: as a
+    /// [`Decision`] if it is about one file, as a [`PendingRepoOp`] if it is
+    /// about the repository.
     pub queue_pumping: bool,
     /// A finish, an abort, or an undo the user pressed that has not run yet,
     /// because the latch was held or no engine existed. [`Self::pump`] runs
@@ -160,6 +196,16 @@ pub struct Shell {
     /// running it ahead of either answer would restore files on top of a
     /// repo state that is still being decided).
     pub(super) deferred_repo_op: Option<PendingRepoOp>,
+    /// Which repo op [`Self::pump`] has actually STARTED, if any. Set where
+    /// the op is picked up, cleared where its completion clears
+    /// [`Self::queue_pumping`] — the two are the same window.
+    ///
+    /// [`Self::deferred_repo_op`] alone cannot tell the dashboard's Finish
+    /// button what to say: an abort that is still waiting and an abort that
+    /// is halfway through rewriting the source tree are both states in which
+    /// a finish must not be offered, and `deferred_repo_op` is `None` for the
+    /// second one.
+    pub(super) running_repo_op: Option<RepoOpKind>,
 }
 
 impl Shell {
@@ -196,47 +242,18 @@ impl Shell {
         cx.notify();
     }
 
-    /// The merge editor recorded one mid-merge source conflict: its Save
-    /// wrote the source file and staged it, so git now knows that file is
-    /// answered. Conclude the merge if it was the last one open; otherwise
-    /// the remaining conflicts stay ordinary review rows, each resolvable on
-    /// its own — there is no queue any more, and nothing to present next.
-    ///
-    /// Called from OUTSIDE the merge view's own update (see the note at its
-    /// save site): routing and the banner both re-enter that same entity.
-    pub fn repo_conflict_saved(&mut self, cx: &mut Context<Self>) {
-        self.route = Route::Review;
-        cx.notify();
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { engine.finish_merge_if_resolved() })
-                .await;
-            this.update(cx, |shell, cx| {
-                shell.conclude_staged_merge(result, cx);
-                // A failed conclude is exactly what strands a merge, so ask
-                // right here whether one now needs the dashboard banner.
-                shell.refresh_pending_merge(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     /// Report one `finish_merge_if_resolved` result — the merge a staged
     /// repo conflict belongs to, concluded (or not).
     ///
-    /// Shared by [`Self::repo_conflict_saved`] and by the action queue's
-    /// drain so both tell the user the same story. Does NOT probe for a
-    /// stranded merge: its two callers each own that call, and probing here
-    /// as well would double it.
+    /// Reached from the QUEUE only, since Task 5 deleted the detached
+    /// `repo_conflict_saved` that was the other caller: a merge-editor Save
+    /// on a mid-merge conflict is a [`Decision`] now, and the conclusion it
+    /// owes is awaited inside the batch's own in-flight window. So every
+    /// banner here is delivered [`BannerDelivery::InPlace`] — the user was
+    /// routed at Save time and may be three files further on by now.
+    ///
+    /// Does NOT probe for a stranded merge: [`Self::batch_finished`] owns
+    /// that call on every path, and probing here as well would double it.
     fn conclude_staged_merge(
         &mut self,
         result: Result<MergeConclusion, ResolveError>,
@@ -244,10 +261,10 @@ impl Shell {
     ) {
         match result {
             Ok(MergeConclusion::Committed { pushed, note }) => {
-                self.origin_merge_finished(pushed, note, cx);
+                self.origin_merge_finished(pushed, note, BannerDelivery::InPlace, cx);
             }
             Ok(MergeConclusion::StillConflicted(leftover)) => {
-                self.merge_done(
+                self.deliver(
                     OutcomeBanner {
                         text: format!(
                             "Recorded · {} more file(s) still differ from origin",
@@ -257,6 +274,7 @@ impl Shell {
                         tint: review::BannerTint::Drift,
                         undoable: false,
                     },
+                    BannerDelivery::InPlace,
                     cx,
                 );
             }
@@ -270,21 +288,25 @@ impl Shell {
             }
             Err(e) => {
                 tomte_core::log_error!("reconcile", "finish failed: {e}");
-                crate::notify_osa::notify(
-                    &tomte_core::cmd::SystemRunner,
-                    "tomte",
-                    &format!("merge with origin could not conclude: {e}"),
-                );
+                self.notify_in_background(format!("merge with origin could not conclude: {e}"), cx);
             }
         }
     }
 
     /// The merge with origin was committed: refresh the model, and say so
     /// out of band — the user may well be somewhere else by now.
+    ///
+    /// `delivery` is the one thing its two callers disagree about. A deferred
+    /// `FinishMerge` is a button the user pressed and is waiting on, so its
+    /// answer routes to Review as it always has; the same conclusion reached
+    /// through the QUEUE lands minutes after a Save, and yanking the user out
+    /// of whatever they moved on to would be the very thing the queue exists
+    /// to stop.
     fn origin_merge_finished(
         &mut self,
         pushed: bool,
         note: Option<String>,
+        delivery: BannerDelivery,
         cx: &mut Context<Self>,
     ) {
         self.state.update(cx, |_model, cx| {
@@ -295,15 +317,36 @@ impl Shell {
             (_, Some(note)) => format!("source repo reconciled — {note}"),
             (false, None) => "source repo reconciled (push pending)".to_string(),
         };
-        self.merge_done(
+        self.deliver(
             OutcomeBanner {
                 text: body.clone().into(),
                 tint: review::BannerTint::Ok,
                 undoable: false,
             },
+            delivery,
             cx,
         );
-        crate::notify_osa::notify(&tomte_core::cmd::SystemRunner, "tomte", &body);
+        self.notify_in_background(body, cx);
+    }
+
+    /// Post one desktop notification without blocking the window.
+    ///
+    /// [`crate::notify_osa::notify`] runs `osascript` and BLOCKS on it, so
+    /// firing it inside a Shell update freezes the UI for the length of a
+    /// subprocess — every caller here is inside one. Suppressed under
+    /// `cfg(test)`: a test run must not post real notifications to whoever is
+    /// running it, and the body is built by pure functions the tests assert
+    /// on directly.
+    fn notify_in_background(&self, body: String, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            tomte_core::log_info!("resolve", "notification (suppressed in tests): {body}");
+            return;
+        }
+        cx.background_executor()
+            .spawn(async move {
+                crate::notify_osa::notify(&tomte_core::cmd::SystemRunner, "tomte", &body);
+            })
+            .detach();
     }
 
     /// Abandon the merge with origin: abort it, restoring the source repo to
@@ -349,6 +392,7 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 shell.queue_pumping = false;
+                shell.running_repo_op = None;
                 shell.merge_done(abort_banner(outcome, &rolled_back), cx);
                 // On BOTH arms. A rollback that completed ended the merge the
                 // dashboard banner was reporting, and one that panicked left
@@ -448,6 +492,7 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 shell.queue_pumping = false;
+                shell.running_repo_op = None;
                 // Reached from a FRESH Shell update, so nesting the review
                 // view's update is safe here — unlike the synchronous path
                 // in `request_repo_op`, which runs inside that same view.
@@ -520,6 +565,38 @@ impl Shell {
             );
             return;
         }
+        // An abort rolls the source repo back, so every merge-editor save
+        // still waiting to be staged INTO that merge is orphaned: there will
+        // be no merge left to stage it into. Fail those NOW, on their own
+        // rows, in words that say what to do — running them afterwards would
+        // either fail obscurely or quietly open a SECOND merge with origin.
+        //
+        // Only the repo-conflict saves. `Merged`, `KeepDisk`,
+        // `KeepSourceLocal` and `KeepSourceOrigin` do not depend on the merge
+        // and run correctly against the rolled-back repo, which is exactly
+        // what "abort, then apply my other decisions" should mean.
+        //
+        // Pure queue mutation, deliberately: this runs inside the merge
+        // view's own update (the Discard button), so it must not reach back
+        // into any view.
+        if matches!(op, PendingRepoOp::AbortMerge(_)) {
+            let orphaned = self.queue.fail_pending_where(
+                |a| matches!(a.decision, Decision::RepoConflict { .. }),
+                "merge rolled back before this save ran — save again",
+            );
+            if !orphaned.is_empty() {
+                tomte_core::log_info!(
+                    "reconcile",
+                    "roll-back orphaned {} queued save(s): {}",
+                    orphaned.len(),
+                    orphaned
+                        .iter()
+                        .map(|t| t.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         if let Some(prev) = self.deferred_repo_op.replace(op) {
             tomte_core::log_info!("reconcile", "{prev:?} superseded before it ran");
         }
@@ -557,9 +634,12 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 shell.merge_finish_in_flight = false;
                 shell.queue_pumping = false;
+                shell.running_repo_op = None;
                 match result {
                     Ok(MergeConclusion::Committed { pushed, note }) => {
-                        shell.origin_merge_finished(pushed, note, cx);
+                        // The user pressed Finish and is waiting on it: this
+                        // answer routes, as it always has.
+                        shell.origin_merge_finished(pushed, note, BannerDelivery::Route, cx);
                     }
                     // Conflicts reappeared (the user resolved something in a
                     // terminal, say): those are review rows again, so the
@@ -574,10 +654,9 @@ impl Shell {
                     Ok(MergeConclusion::NotMerging) => {}
                     Err(e) => {
                         tomte_core::log_error!("reconcile", "finish failed: {e}");
-                        crate::notify_osa::notify(
-                            &tomte_core::cmd::SystemRunner,
-                            "tomte",
-                            &format!("merge with origin could not be committed: {e}"),
+                        shell.notify_in_background(
+                            format!("merge with origin could not be committed: {e}"),
+                            cx,
                         );
                     }
                 }
@@ -595,6 +674,20 @@ impl Shell {
     /// banner owns the Undo button), reload its preview so the diff reflects
     /// the converged reality, and route back.
     pub fn merge_done(&mut self, banner: OutcomeBanner, cx: &mut Context<Self>) {
+        self.show_outcome(banner, cx);
+        self.route = Route::Review;
+        cx.notify();
+    }
+
+    /// Put an outcome banner on the Review view WITHOUT moving the user.
+    ///
+    /// The other half of [`Self::merge_done`], and the one the QUEUE uses.
+    /// A decision the user made minutes ago must not yank them out of
+    /// whatever they are doing when it lands: they were routed at the moment
+    /// they pressed the button, and they may have opened another file, the
+    /// merge editor, or Settings since. The banner is waiting for them in
+    /// Review either way.
+    pub fn show_outcome(&mut self, banner: OutcomeBanner, cx: &mut Context<Self>) {
         let review = self.ensure_review(cx);
         review.update(cx, |view, cx| {
             view.last_outcome = Some(banner);
@@ -603,8 +696,15 @@ impl Shell {
             }
             cx.notify();
         });
-        self.route = Route::Review;
         cx.notify();
+    }
+
+    /// Deliver one banner the way its origin calls for.
+    fn deliver(&mut self, banner: OutcomeBanner, delivery: BannerDelivery, cx: &mut Context<Self>) {
+        match delivery {
+            BannerDelivery::Route => self.merge_done(banner, cx),
+            BannerDelivery::InPlace => self.show_outcome(banner, cx),
+        }
     }
 
     /// Record a decision and start draining if nothing is in flight.
@@ -713,6 +813,9 @@ impl Shell {
             // the line that says the press finally got its turn.
             tomte_core::log_info!("reconcile", "running deferred {op:?}");
             self.queue_pumping = true;
+            // Same window as the latch, and the only way a surface can tell
+            // "an abort is waiting" from "an abort is under way".
+            self.running_repo_op = Some(op.kind());
             cx.notify();
             match op {
                 PendingRepoOp::FinishMerge => self.run_finish(engine, cx),
@@ -743,14 +846,11 @@ impl Shell {
                 .iter()
                 .any(|(_, _, r)| matches!(r, Ok(BatchResult::RepoConflictStaged)))
             {
-                // Routed BEFORE the await, exactly as `repo_conflict_saved`
-                // does it: the editor is finished with either way, and the
-                // arms that only report a failure do not route themselves.
-                this.update(cx, |shell, cx| {
-                    shell.route = Route::Review;
-                    cx.notify();
-                })
-                .ok();
+                // NO ROUTING HERE. The Save that staged this routed the user
+                // to Review at the moment they pressed it; this runs however
+                // long afterwards the queue took, and by then they may be in
+                // the merge editor on another file. Moving them then is the
+                // yank the queue exists to remove.
                 Some(
                     cx.background_executor()
                         .spawn(async move {
@@ -787,7 +887,7 @@ impl Shell {
     /// never while a merge commit and push are still running.
     ///
     /// Reached from a fresh Shell update, so it may touch `self.state` and
-    /// nest an update of the review view (through `merge_done`). What it
+    /// nest an update of the review view (through `show_outcome`). What it
     /// must never do is nest an update of a view that is itself mid-update,
     /// which is why nothing here reaches back into the merge editor.
     fn batch_finished(
@@ -797,8 +897,31 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.queue_pumping = false;
+        // The decisions this batch is finishing, read BEFORE `finish_all`
+        // clears them: what each one was, and whether its surface asked to be
+        // told out of band when it landed. Cloned rather than borrowed —
+        // everything below needs `&mut self`.
+        let ran: Vec<QueuedAction> = self.queue.running().to_vec();
         let mut finished: Vec<(PathBuf, Option<SharedString>)> = Vec::with_capacity(results.len());
+        let mut landed: Vec<OutcomeBanner> = Vec::new();
+        let mut announce: Vec<String> = Vec::new();
         for (target, label, result) in results {
+            // `run_batch` reports exactly the batch it was handed, so this
+            // normally finds it. A report for something else is not something
+            // to guess about: it gets no banner and no notification, only its
+            // failure or its success, which is what the row is about.
+            let decision = ran
+                .iter()
+                .find(|a| a.target == target)
+                .map(|a| (&a.decision, a.notify_on_done));
+            if let Some((decision, true)) = decision {
+                announce.push(dashboard::quick_action_body(decision, &target, &result));
+            }
+            if let Some((decision, _)) = decision
+                && let Some(banner) = review::queued_outcome_banner(decision, &result)
+            {
+                landed.push(banner);
+            }
             let failure: Option<SharedString> = match result {
                 Ok(BatchResult::Resolved(ResolveOutcome::Done { .. })) => {
                     self.state.update(cx, |model, cx| {
@@ -826,6 +949,23 @@ impl Shell {
             finished.push((target, failure));
         }
         self.queue.finish_all(&finished);
+        // A merge-editor Save reports itself, WITHOUT moving the user:
+        // `MergeView::save` left "Save queued · <file>" on screen and that
+        // claim has to be settled now, whichever way the save went.
+        // `queued_outcome_banner` decides which decisions those are — no
+        // other kind comes back with a banner, so a thirty-file sweep cannot
+        // quietly overwrite what the banner was saying.
+        //
+        // At most one in practice: `take_batch` hands out either a run of
+        // batchable one-click decisions (never banner-ed) or exactly one
+        // decision that runs alone, which is what a Save is. The `pop` is the
+        // last-wins rule for the case where that stops being true.
+        if let Some(banner) = landed.pop() {
+            self.show_outcome(banner, cx);
+        }
+        for body in announce {
+            self.notify_in_background(body, cx);
+        }
         if let Some(conclusion) = conclusion {
             self.conclude_staged_merge(conclusion, cx);
         }
@@ -1178,7 +1318,10 @@ fn run_batch_inner(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<Deci
     // rather than only the first: a caller that passes more must not have
     // the rest silently disappear.
     let mut reports = Vec::with_capacity(batch.len());
-    for QueuedAction { target, decision } in batch {
+    for QueuedAction {
+        target, decision, ..
+    } in batch
+    {
         let label = decision.label();
         let result = match decision {
             Decision::KeepDisk => engine.keep_disk(&target).map(BatchResult::Resolved),
@@ -1186,9 +1329,14 @@ fn run_batch_inner(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<Deci
             Decision::KeepSourceOrigin { seen } => engine
                 .keep_source_origin(&target, &seen)
                 .map(BatchResult::Resolved),
-            Decision::Merged { resolved, inputs } => engine
-                .resolve_merged(&inputs, &resolved)
-                .map(BatchResult::Resolved),
+            // "Keep both" is the merge editor's write with the auto-merge as
+            // its resolution — the same engine call, deliberately, so the two
+            // cannot drift apart. Only the words differ (`Decision::label`).
+            Decision::Merged { resolved, inputs } | Decision::KeepBoth { resolved, inputs } => {
+                engine
+                    .resolve_merged(&inputs, &resolved)
+                    .map(BatchResult::Resolved)
+            }
             Decision::RepoConflict {
                 source_path,
                 resolved,
@@ -1280,10 +1428,11 @@ impl Render for Shell {
                             state: self.state.clone(),
                             now_ts: dashboard::system_now,
                             expanded_scans: self.expanded_scans.clone(),
-                            action_in_flight: self.dashboard_action_in_flight,
                             unlock_in_flight: self.unlock_in_flight,
                             pending_merge: self.pending_merge,
                             merge_finish_in_flight: self.merge_finish_in_flight,
+                            pending_repo_op: self.deferred_repo_op.as_ref().map(|op| op.kind()),
+                            running_repo_op: self.running_repo_op,
                         }
                         .render(theme, cx)
                         .into_any_element(),
@@ -1448,7 +1597,6 @@ mod render_smoke {
                     merge: None,
                     paths: smoke_paths(),
                     expanded_scans,
-                    dashboard_action_in_flight: false,
                     unlock_in_flight: false,
                     pending_merge: false,
                     merge_finish_in_flight: false,
@@ -1457,6 +1605,7 @@ mod render_smoke {
                     queue: Default::default(),
                     queue_pumping: false,
                     deferred_repo_op: None,
+                    running_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1494,18 +1643,21 @@ mod render_smoke {
             q.push(QueuedAction {
                 target: PathBuf::from("/tmp/smoke/.zshrc"),
                 decision: Decision::KeepDisk,
+                notify_on_done: false,
             });
             q.take_batch();
             // A second target, queued behind it and still waiting.
             q.push(QueuedAction {
                 target: PathBuf::from("/tmp/smoke/other.toml"),
                 decision: Decision::KeepSourceLocal,
+                notify_on_done: false,
             });
         });
         let failed: Pose = Box::new(|q: &mut ActionQueue| {
             q.push(QueuedAction {
                 target: PathBuf::from("/tmp/smoke/.zshrc"),
                 decision: Decision::KeepDisk,
+                notify_on_done: false,
             });
             q.take_batch();
             q.finish_all(&[(
@@ -1550,9 +1702,6 @@ mod render_smoke {
                     merge: None,
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
-                    // also exercises the dashboard's "working…" swap when the
-                    // shell flag is up (the drifted row is in the timeline)
-                    dashboard_action_in_flight: pumping,
                     unlock_in_flight: false,
                     pending_merge: false,
                     merge_finish_in_flight: false,
@@ -1561,12 +1710,14 @@ mod render_smoke {
                     queue,
                     queue_pumping: pumping,
                     deferred_repo_op: None,
+                    running_repo_op: None,
                 }
             });
             vis.run_until_parked();
         }
-        // Dashboard route with the busy flag: quick actions yield to the
-        // "working…" marker.
+        // The dashboard route on the same model: its inline quick actions
+        // render (the drifted row is in the timeline) and stay LIVE — a
+        // decision draining elsewhere no longer makes them a no-op.
         let (_view, vis) = cx.add_window_view(|_window, cx| {
             let state = cx.new(|_| model_with_data());
             Shell {
@@ -1577,7 +1728,6 @@ mod render_smoke {
                 merge: None,
                 paths: smoke_paths(),
                 expanded_scans: HashSet::new(),
-                dashboard_action_in_flight: true,
                 unlock_in_flight: false,
                 pending_merge: false,
                 merge_finish_in_flight: false,
@@ -1586,6 +1736,7 @@ mod render_smoke {
                 queue: Default::default(),
                 queue_pumping: false,
                 deferred_repo_op: None,
+                running_repo_op: None,
             }
         });
         vis.run_until_parked();
@@ -1634,7 +1785,6 @@ mod render_smoke {
                 merge: None,
                 paths: smoke_paths(),
                 expanded_scans: HashSet::new(),
-                dashboard_action_in_flight: false,
                 unlock_in_flight: false,
                 pending_merge: false,
                 merge_finish_in_flight: false,
@@ -1643,6 +1793,7 @@ mod render_smoke {
                 queue: Default::default(),
                 queue_pumping: false,
                 deferred_repo_op: None,
+                running_repo_op: None,
             }
         });
         vis.run_until_parked();
@@ -1665,10 +1816,15 @@ mod render_smoke {
     /// without its probe, and the fix is always the same one line.
     #[test]
     fn every_resolve_action_path_also_probes_for_a_stranded_merge() {
-        // Reaching either of these reaches `ensure_merge_started`:
-        // `action.run` dispatches keep_disk / keep_source_origin, and
-        // `resolve_merged` is the merge editor's and "Keep both"'s write.
-        const STARTS_A_MERGE: [&str; 2] = ["action.run(", ".resolve_merged("];
+        // Reaching any of these reaches `ensure_merge_started`: `keep_disk`
+        // and `keep_source_origin` are the one-click writes, `resolve_merged`
+        // is the merge editor's and "Keep both"'s.
+        const STARTS_A_MERGE: [&str; 4] = [
+            "action.run(",
+            ".resolve_merged(",
+            ".keep_disk(",
+            ".keep_source_origin(",
+        ];
         const PROBE: &str = "refresh_pending_merge";
         let sources = [
             ("views/mod.rs", include_str!("mod.rs")),
@@ -1712,21 +1868,28 @@ mod render_smoke {
         // Guards the guard: if the call sites are renamed out from under the
         // needles, this finds nothing and would pass vacuously.
         //
-        // THREE, not the four this started at. Task 4 moved Review's two
-        // action paths onto the queue. What is left is the dashboard's quick
-        // actions, the merge editor's Save, and the queue's own drain — and
-        // Task 5 folds the first two in too.
+        // ONE, down from the four this started at, and that is the POINT of
+        // this task rather than a weakening of the test. Task 4 moved
+        // Review's two action paths onto the queue and Task 5 moved the
+        // dashboard's and the merge editor's, so exactly one function in
+        // these four files still calls an engine method that can start a
+        // merge: `run_batch_inner`, the queue's drain.
         //
-        // The drain (`run_batch_inner`) satisfies the needle by DELEGATION,
-        // not by probing: it runs on the background executor with no
-        // `Context` to probe from, and its doc names `batch_finished` as
-        // where `refresh_pending_merge` actually runs, on every path. That
-        // naming is what this crude scan reads. Whoever rewrites that doc
-        // must keep the reference, or move the probe.
-        assert!(
-            checked >= 3,
-            "expected at least the three known action paths, found {checked} — \
-             have `action.run` / `resolve_merged` been renamed?"
+        // It satisfies the needle by DELEGATION, not by probing: it runs on
+        // the background executor with no `Context` to probe from, and its
+        // body names `batch_finished` as where `refresh_pending_merge`
+        // actually runs, on every path. That naming is what this crude scan
+        // reads. Whoever rewrites that comment must keep the reference, or
+        // move the probe.
+        //
+        // A NEW door — any view spawning an engine call of its own again —
+        // adds a chunk here and has to carry its own probe, which is the
+        // whole reason this scan outlives the doors it was written for.
+        assert_eq!(
+            checked, 1,
+            "expected exactly the queue's drain, found {checked} — either a \
+             view started spawning resolves again, or `resolve_merged` / \
+             `keep_disk` have been renamed"
         );
     }
 
@@ -1747,7 +1910,6 @@ mod render_smoke {
                     merge: None,
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
-                    dashboard_action_in_flight: false,
                     unlock_in_flight: false,
                     pending_merge: true,
                     merge_finish_in_flight: finishing,
@@ -1756,6 +1918,7 @@ mod render_smoke {
                     queue: Default::default(),
                     queue_pumping: false,
                     deferred_repo_op: None,
+                    running_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1805,7 +1968,6 @@ mod render_smoke {
                 merge: Some(merge),
                 paths: smoke_paths(),
                 expanded_scans: HashSet::new(),
-                dashboard_action_in_flight: false,
                 unlock_in_flight: false,
                 pending_merge: false,
                 merge_finish_in_flight: false,
@@ -1814,6 +1976,7 @@ mod render_smoke {
                 queue: Default::default(),
                 queue_pumping: false,
                 deferred_repo_op: None,
+                running_repo_op: None,
             }
         });
         vis.run_until_parked();
@@ -1849,7 +2012,6 @@ mod render_smoke {
                     merge: None,
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
-                    dashboard_action_in_flight: false,
                     unlock_in_flight: false,
                     pending_merge: false,
                     merge_finish_in_flight: false,
@@ -1858,6 +2020,7 @@ mod render_smoke {
                     queue: Default::default(),
                     queue_pumping: false,
                     deferred_repo_op: None,
+                    running_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1940,10 +2103,11 @@ mod render_smoke {
                 view.loaded = Some(LoadedMerge::new(Arc::new(templated_degraded())));
             }),
             Box::new(|view| {
-                // save in flight plus a sticky (protected-span) banner
+                // A sticky banner that keeps the editor open. No "saving in
+                // flight" pose any more: Save records the decision and leaves
+                // in the same frame, so the editor has no in-flight state.
                 view.target = Some(PathBuf::from("/tmp/smoke/.testrc"));
                 view.loaded = Some(LoadedMerge::new(Arc::new(templated_degraded())));
-                view.saving = true;
                 view.banner = Some(review::OutcomeBanner {
                     text: "this change touches a templated value — protected span".into(),
                     tint: BannerTint::Drift,
@@ -1968,7 +2132,6 @@ mod render_smoke {
                     merge: Some(merge),
                     paths: smoke_paths(),
                     expanded_scans: HashSet::new(),
-                    dashboard_action_in_flight: false,
                     unlock_in_flight: false,
                     pending_merge: false,
                     merge_finish_in_flight: false,
@@ -1977,6 +2140,7 @@ mod render_smoke {
                     queue: Default::default(),
                     queue_pumping: false,
                     deferred_repo_op: None,
+                    running_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -2005,6 +2169,7 @@ mod render_smoke {
                     QueuedAction {
                         target: PathBuf::from("/a"),
                         decision: Decision::KeepDisk,
+                        notify_on_done: false,
                     },
                     cx,
                 );
@@ -2012,6 +2177,7 @@ mod render_smoke {
                     QueuedAction {
                         target: PathBuf::from("/b"),
                         decision: Decision::KeepDisk,
+                        notify_on_done: false,
                     },
                     cx,
                 );
@@ -2102,10 +2268,12 @@ mod render_smoke {
         q.push(QueuedAction {
             target: PathBuf::from("/a"),
             decision: Decision::KeepDisk,
+            notify_on_done: false,
         });
         q.push(QueuedAction {
             target: PathBuf::from("/b"),
             decision: Decision::KeepSourceLocal,
+            notify_on_done: false,
         });
         q.take_batch();
         let finished: Vec<(PathBuf, Option<SharedString>)> = reports
@@ -2234,7 +2402,6 @@ mod render_smoke {
             merge: None,
             paths: smoke_paths(),
             expanded_scans: HashSet::new(),
-            dashboard_action_in_flight: false,
             unlock_in_flight: false,
             pending_merge: false,
             merge_finish_in_flight: false,
@@ -2243,6 +2410,7 @@ mod render_smoke {
             queue: Default::default(),
             queue_pumping: false,
             deferred_repo_op: None,
+            running_repo_op: None,
         }
     }
 
@@ -2269,6 +2437,7 @@ mod render_smoke {
                     QueuedAction {
                         target: queued,
                         decision: Decision::KeepDisk,
+                        notify_on_done: false,
                     },
                     cx,
                 );
@@ -2314,6 +2483,7 @@ mod render_smoke {
                 s.queue.push(QueuedAction {
                     target: queued,
                     decision: Decision::KeepDisk,
+                    notify_on_done: false,
                 });
                 s.finish_pending_merge(cx); // pressed while draining
                 assert!(matches!(
@@ -2388,6 +2558,7 @@ mod render_smoke {
                 s.queue.push(QueuedAction {
                     target: queued,
                     decision: Decision::KeepDisk,
+                    notify_on_done: false,
                 });
                 // Exactly what `MergeView::discard_merge` hands over.
                 s.abort_origin_merge(merge::Rollback::Files(2), cx);
@@ -2886,5 +3057,236 @@ mod render_smoke {
         // And an abort that returns is left exactly as it is.
         let done = abort_outcome(|| AbortOutcome::RolledBack(Ok(())));
         assert!(matches!(done, AbortOutcome::RolledBack(Ok(()))), "{done:?}");
+    }
+
+    /// The merge editor's Save is a QUEUE entry now, and the whole reason
+    /// that matters: a save no longer blocks the next review decision. Before
+    /// this, `MergeView::save` spawned `resolve_merged` itself behind its own
+    /// `saving` boolean — beside whatever the queue was draining, on the same
+    /// git repository — and the editor sat on "saving…" until it came back.
+    ///
+    /// No `EngineSlot` is published, so both decisions PARK. That is the
+    /// point twice over: the interface is done with each of them either way,
+    /// and a disconnected daemon no longer answers a Save with "cannot save"
+    /// (the press is remembered, and runs when something reconnects).
+    ///
+    /// MUTATION: reinstate a `saving`-style early return in `save` (or its
+    /// engine lookup, which with no engine returns before enqueueing) → the
+    /// merge decision never reaches the queue and `depth()` is 1.
+    /// MUTATION: have `save` spawn `resolve_merged` again instead of
+    /// enqueueing → same.
+    #[gpui::test]
+    fn a_merge_save_queues_and_never_blocks_the_next_decision(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("merge-resolved", smoke_paths(), cx).expect("merge-resolved fixture")
+        });
+        let merge = vis
+            .update(|_window, cx| shell.read(cx).merge.clone())
+            .expect("the fixture poses a resolved merge");
+        let target = vis
+            .update(|_window, cx| merge.read(cx).target.clone())
+            .expect("posed with a target");
+
+        vis.update(|_window, cx| merge.update(cx, |view, cx| view.save(cx)));
+        // The hand-off is deliberately OUTSIDE the view's own update, so it
+        // lands on the next turn of the executor.
+        vis.run_until_parked();
+
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(
+                s.queue.decision_label(&target),
+                Some("Save"),
+                "the resolution is on the queue, not in flight inside the editor"
+            );
+            assert_eq!(s.route, Route::Review, "and the editor is left immediately");
+        });
+
+        // A review decision on ANOTHER file, made while the save is still
+        // owed work. This is the user's own complaint: it must be accepted.
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.enqueue(
+                    QueuedAction {
+                        target: PathBuf::from("/b"),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    },
+                    cx,
+                );
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 2, "both decisions are remembered");
+            let processing = s.queue.processing();
+            assert!(
+                processing.contains(&target) && processing.contains(&PathBuf::from("/b")),
+                "and both rows are processing: {processing:?}"
+            );
+        });
+
+        // The Save's own banner is the one place it routes the user, and it
+        // says only what is true so far.
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the save's hand-off made a review view");
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("a save is never silent");
+        assert!(
+            banner.text.starts_with("Save queued · "),
+            "the banner claims only that it was recorded: {}",
+            banner.text
+        );
+    }
+
+    /// An abort rolls the source repo back, so a merge-editor save still
+    /// waiting to be staged INTO that merge has nowhere to go. It fails
+    /// FAST, on its own row, in words that say what to do — running it
+    /// afterwards would either fail obscurely or quietly open a second merge.
+    ///
+    /// And only that one: a keep-disk queued behind the abort does not depend
+    /// on the merge and runs correctly against the rolled-back repo, which is
+    /// what "abort, then apply my other decisions" has to mean.
+    ///
+    /// MUTATION: remove the `fail_pending_where` call from `request_repo_op`
+    /// → the orphaned save is still pending and its row shows no failure.
+    /// MUTATION: widen the predicate to every decision → the keep-disk is
+    /// thrown away too.
+    #[gpui::test]
+    fn an_abort_fails_the_saves_it_would_orphan_and_keeps_the_rest(cx: &mut TestAppContext) {
+        use std::path::Path;
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Merge, cx));
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                // A batch is draining, so nothing below can start.
+                s.queue_pumping = true;
+                s.queue.push(QueuedAction {
+                    target: PathBuf::from("/staged"),
+                    decision: Decision::RepoConflict {
+                        source_path: PathBuf::from("/src/staged"),
+                        resolved: "x".into(),
+                    },
+                    notify_on_done: false,
+                });
+                s.queue.push(QueuedAction {
+                    target: PathBuf::from("/plain"),
+                    decision: Decision::KeepDisk,
+                    notify_on_done: false,
+                });
+
+                s.abort_origin_merge(merge::Rollback::Files(2), cx);
+
+                assert_eq!(
+                    s.queue.failure(Path::new("/staged")).map(|m| m.as_ref()),
+                    Some("merge rolled back before this save ran — save again"),
+                    "the orphaned save says so on its row, and says what to do"
+                );
+                assert_eq!(
+                    s.queue.decision_label(Path::new("/plain")),
+                    Some("Keep disk"),
+                    "a decision that does not depend on the merge stays queued"
+                );
+                assert_eq!(s.queue.depth(), 1);
+                assert!(
+                    matches!(s.deferred_repo_op, Some(PendingRepoOp::AbortMerge(_))),
+                    "and the roll-back itself still waits for the latch"
+                );
+            });
+        });
+    }
+
+    /// `running_repo_op` exists so a surface can tell "an answer is waiting"
+    /// from "an answer is under way" — `deferred_repo_op` is `None` for the
+    /// second, and the dashboard's Finish button has to say something
+    /// different in each. It is set where the op is picked up and cleared
+    /// where the latch is, so the two windows are the same window.
+    ///
+    /// MUTATION: drop `running_repo_op = Some(op.kind())` from `pump` → the
+    /// middle probe fails. MUTATION: drop the clear from `run_finish`'s
+    /// completion → the last one does, and the Finish button would read
+    /// "Finishing…" forever.
+    #[gpui::test]
+    fn running_repo_op_spans_exactly_the_op_it_is_running(cx: &mut TestAppContext) {
+        let _lab = EngineLab::publish(cx);
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Dashboard, cx));
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.queue_pumping = true; // a batch holds the latch
+                s.finish_pending_merge(cx);
+                assert_eq!(
+                    s.running_repo_op, None,
+                    "pressed but not started: the button says \"queued\", not \"finishing\""
+                );
+                assert_eq!(
+                    s.deferred_repo_op.as_ref().map(|op| op.kind()),
+                    Some(RepoOpKind::Finish)
+                );
+            });
+        });
+        // The stand-in batch lands; `pump` picks the finish up.
+        vis.update(|_window, cx| shell.update(cx, |s, cx| s.batch_finished(Vec::new(), None, cx)));
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(
+                s.running_repo_op,
+                Some(RepoOpKind::Finish),
+                "taken and started"
+            );
+            assert!(s.deferred_repo_op.is_none(), "it is no longer waiting");
+            assert!(s.queue_pumping, "the same window as the latch");
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.running_repo_op, None, "and cleared when it finished");
+            assert!(!s.queue_pumping);
+        });
+    }
+
+    /// THE YANK RULE. A decision the user made minutes ago must never move
+    /// them when it lands: they were routed at the moment they pressed the
+    /// button, and may have opened another file, the merge editor, or
+    /// Settings since. `show_outcome` puts the banner where they will find
+    /// it; `merge_done` is for the answers they are standing there waiting
+    /// for.
+    ///
+    /// MUTATION: have `show_outcome` set `route = Route::Review` (i.e. make
+    /// it `merge_done` again) → the first assertion fails.
+    #[gpui::test]
+    fn a_landed_outcome_reports_without_moving_the_user(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Settings, cx));
+        let banner = || OutcomeBanner {
+            text: "Merged · committed & pushed".into(),
+            tint: review::BannerTint::Ok,
+            undoable: true,
+        };
+
+        vis.update(|_window, cx| shell.update(cx, |s, cx| s.show_outcome(banner(), cx)));
+        let review = vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(
+                s.route,
+                Route::Settings,
+                "a queued decision landing must not drag the user out of where they are"
+            );
+            s.review.clone()
+        });
+        let review = review.expect("the banner still made a review view to land in");
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).last_outcome.clone())
+                .map(|b| b.text),
+            Some(banner().text),
+            "and it is waiting for them there"
+        );
+
+        // The other half: an answer the user pressed and is waiting on DOES
+        // take them to it.
+        vis.update(|_window, cx| shell.update(cx, |s, cx| s.merge_done(banner(), cx)));
+        vis.update(|_window, cx| assert_eq!(shell.read(cx).route, Route::Review));
     }
 }

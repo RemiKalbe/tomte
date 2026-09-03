@@ -30,7 +30,7 @@ use gpui::{
 };
 use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
-use tomte_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
+use tomte_app::resolve::{ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
 use tomte_core::chezmoi::ChezmoiError;
 use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
@@ -359,30 +359,6 @@ impl ResolveAction {
             Self::KeepSourceOrigin => "Restored origin's version",
         }
     }
-
-    /// Run the matching engine method. Blocking — background executor only.
-    ///
-    /// `origin_seen` is origin's text as the caller SHOWED it (`None` on
-    /// surfaces that load no content). Only `KeepSourceOrigin` uses it, and it
-    /// refuses without it rather than writing something the user never saw —
-    /// see [`ResolveEngine::keep_source_origin`].
-    pub(super) fn run(
-        self,
-        engine: &ResolveEngine,
-        target: &Path,
-        origin_seen: Option<&str>,
-    ) -> Result<ResolveOutcome, ResolveError> {
-        match self {
-            Self::KeepDisk => engine.keep_disk(target),
-            Self::KeepSourceLocal => engine.keep_source(target),
-            Self::KeepSourceOrigin => match origin_seen {
-                Some(seen) => engine.keep_source_origin(target, seen),
-                None => Err(ResolveError::Failed(
-                    "no origin version was loaded for this file — open it in Review first".into(),
-                )),
-            },
-        }
-    }
 }
 
 /// Which two contents the diff compares. Origin is a content state of its
@@ -586,6 +562,94 @@ fn outcome_banner(
     }
 }
 
+/// The banner a decision earns when it LANDS out of the queue, or `None` for
+/// one that has no business banner-ing.
+///
+/// EXACTLY THE MERGE EDITOR'S SAVE, and for one reason: it is the only
+/// decision that leaves a claim on screen that this has to come back and
+/// settle. `MergeView::save` routes the user to Review under "Save queued ·
+/// <file>", and that sentence is still true only until the queue gets to it —
+/// after that it is stale whichever way the save went, so success, refusal
+/// and failure all have to replace it.
+///
+/// Every other decision gets `None`, and that is not an oversight:
+/// - a one-click decision's ROW is its feedback. It leaves the list when it
+///   lands, and by then the user is three files further on (the reason Task 4
+///   dropped the banner for these in the first place). Banner-ing them again
+///   would also mean the last file of a sweep silently overwrites whatever
+///   the banner was saying — a roll-back report, an undo's result;
+/// - a FAILURE sticks to its row (spec §2.5), where choosing again is the
+///   retry;
+/// - a dashboard quick action says so out of band, where its user is.
+///
+/// The staged repo conflict is the one arm that comes back `None` from inside
+/// the merge editor's own decisions: it has not landed anywhere yet, and the
+/// merge's own conclusion ([`Shell::conclude_staged_merge`]) is its banner.
+///
+/// [`Shell::conclude_staged_merge`]: super::Shell
+pub(super) fn queued_outcome_banner(
+    decision: &Decision,
+    result: &Result<super::BatchResult, ResolveError>,
+) -> Option<OutcomeBanner> {
+    if !matches!(
+        decision,
+        Decision::Merged { .. } | Decision::RepoConflict { .. }
+    ) {
+        return None;
+    }
+    let outcome = match result {
+        Ok(super::BatchResult::Resolved(outcome)) => outcome,
+        // Recorded into the merge's index. What that MEANT — committed,
+        // still conflicted — is the merge's conclusion to report.
+        Ok(super::BatchResult::RepoConflictStaged) => return None,
+        Err(e) => {
+            return Some(OutcomeBanner {
+                // The user's own word for the button, as the row uses it: the
+                // banner still says "Save queued" until this replaces it.
+                text: format!("{} failed: {e}", decision.label()).into(),
+                tint: BannerTint::Conflict,
+                undoable: false,
+            });
+        }
+    };
+    Some(match outcome {
+        ResolveOutcome::Done {
+            note: None,
+            committed,
+            pushed,
+            ..
+        } => OutcomeBanner {
+            // An apply-only convergence commits nothing, so only advertise
+            // the commit and the push when they actually happened.
+            text: if *committed && *pushed {
+                format!("{} · committed & pushed", decision.verb()).into()
+            } else {
+                decision.verb().to_lowercase().into()
+            },
+            tint: BannerTint::Ok,
+            undoable: true,
+        },
+        ResolveOutcome::Done {
+            note: Some(note), ..
+        } => OutcomeBanner {
+            text: format!("{} · {note}", decision.verb()).into(),
+            tint: BannerTint::Drift,
+            undoable: true,
+        },
+        ResolveOutcome::ProtectedSpan { detail } => OutcomeBanner {
+            text: format!("This change touches a templated value · {detail}").into(),
+            tint: BannerTint::Drift,
+            undoable: false,
+        },
+        // Defensive: `resolve_merged` never reports this outcome.
+        ResolveOutcome::NeedsMergeEditor => OutcomeBanner {
+            text: "Unexpected engine outcome · nothing was changed".into(),
+            tint: BannerTint::Drift,
+            undoable: false,
+        },
+    })
+}
+
 /// Banner for the undo action itself (never undoable again: the undo session
 /// journals no destination blobs, so a second undo would restore nothing).
 ///
@@ -761,12 +825,6 @@ fn per_line_ranges(lines: &[String], ranges: &[Range<usize>]) -> Vec<Vec<Range<u
 }
 
 /// What one processing row is waiting on, in the user's terms.
-///
-/// The queue can only name the CHOICE for a decision it still holds:
-/// `ActionQueue::take_batch` moves the running batch's `QueuedAction`s out to
-/// whoever runs them and keeps the targets alone, so a running row's decision
-/// is genuinely not there to read. Rather than invent a label for it, the row
-/// says which of the two states it is in — both true, neither guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueuedStatus {
     /// Handed to the engine; the git work for it is under way.
@@ -802,6 +860,32 @@ impl QueuedStatus {
     }
 }
 
+/// One processing row's whole state: which choice, and how far along.
+///
+/// The CHOICE is here because a queue of thirty rows all reading "running…"
+/// says nothing about what is happening to any of them — the file name is
+/// the only thing distinguishing them, and the decision the user made on it
+/// minutes ago is exactly what they are trying to remember. The queue keeps
+/// its running actions (not just their targets) so this can be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct QueuedDecision {
+    pub(super) status: QueuedStatus,
+    /// The user's own words for the choice — `Decision::label`.
+    pub(super) label: &'static str,
+}
+
+impl QueuedDecision {
+    /// The row's trailing column: "Keep disk · running…".
+    fn trailing(self) -> SharedString {
+        format!("{} · {}", self.label, self.status.label()).into()
+    }
+
+    /// Past changing — see [`QueuedStatus::locks_row`], the rule itself.
+    fn locks_row(self) -> bool {
+        self.status.locks_row()
+    }
+}
+
 /// The Shell's action queue as one render pass needs to see it.
 ///
 /// Copied out of the Shell ONCE per render rather than read row by row:
@@ -811,7 +895,7 @@ impl QueuedStatus {
 pub(super) struct QueueSnapshot {
     /// Everything queued or running, in `ActionQueue::processing` order —
     /// the running batch first, then the rest as the user chose them.
-    processing: Vec<(PathBuf, QueuedStatus)>,
+    processing: Vec<(PathBuf, QueuedDecision)>,
     /// Rows whose last decision failed, with the message that says why.
     failures: BTreeMap<PathBuf, SharedString>,
     /// ANY git work is owed — a decision, or a repo op waiting for the latch.
@@ -819,7 +903,7 @@ pub(super) struct QueueSnapshot {
 }
 
 impl QueueSnapshot {
-    fn status(&self, target: &Path) -> Option<QueuedStatus> {
+    fn status(&self, target: &Path) -> Option<QueuedDecision> {
         self.processing
             .iter()
             .find(|(p, _)| p == target)
@@ -835,7 +919,7 @@ impl QueueSnapshot {
     /// Is this target's decision past changing — see
     /// [`QueuedStatus::locks_row`], which is the rule itself.
     fn locks_row(&self, target: &Path) -> bool {
-        self.status(target).is_some_and(QueuedStatus::locks_row)
+        self.status(target).is_some_and(QueuedDecision::locks_row)
     }
 
     fn failure(&self, target: &Path) -> Option<&SharedString> {
@@ -907,11 +991,11 @@ pub(super) enum SidebarRow {
     Group(&'static str),
     Target {
         entry: DriftSummary,
-        queued: Option<QueuedStatus>,
+        queued: Option<QueuedDecision>,
         /// Past changing: not a click target, and its buttons are inert.
         ///
         /// A FIELD, not something the row recomputes. It is derived from
-        /// `queued` through [`QueuedStatus::locks_row`] right here, in the
+        /// `queued` through [`QueuedDecision::locks_row`] right here, in the
         /// one function a test can read, and `ReviewView::target_row` then
         /// uses it verbatim. Deriving it a second time at the render site is
         /// exactly how round 1's fix regressed on one untested line — so
@@ -931,7 +1015,7 @@ pub(super) fn sidebar_rows(drifted: &[DriftSummary], queue: &QueueSnapshot) -> V
     let mut rows = Vec::new();
     if !queue.processing.is_empty() {
         rows.push(SidebarRow::Group("PROCESSING"));
-        for (target, status) in &queue.processing {
+        for (target, queued) in &queue.processing {
             let entry = drifted
                 .iter()
                 .find(|d| d.target == *target)
@@ -944,8 +1028,8 @@ pub(super) fn sidebar_rows(drifted: &[DriftSummary], queue: &QueueSnapshot) -> V
                 });
             rows.push(SidebarRow::Target {
                 entry,
-                queued: Some(*status),
-                locked: status.locks_row(),
+                queued: Some(*queued),
+                locked: queued.locks_row(),
             });
         }
     }
@@ -1161,7 +1245,17 @@ impl ReviewView {
     fn enqueue(&mut self, target: PathBuf, decision: Decision, cx: &mut Context<Self>) {
         let queued = target.clone();
         if let Err(e) = self.shell.update(cx, |shell, cx| {
-            shell.enqueue(QueuedAction { target, decision }, cx)
+            shell.enqueue(
+                QueuedAction {
+                    target,
+                    decision,
+                    // This view has a banner and a PROCESSING row to say it
+                    // with; a desktop notification on top would be a second
+                    // report of the same fact.
+                    notify_on_done: false,
+                },
+                cx,
+            )
         }) {
             // The window is going away underneath the click. Nothing can be
             // shown to a user who no longer has a view, but a decision that
@@ -1209,6 +1303,11 @@ impl ReviewView {
 
     /// "Keep both": queue the clean auto-merge as the same merged write the
     /// merge editor's Save makes, and advance like any other decision.
+    ///
+    /// `Decision::KeepBoth`, not `Decision::Merged`, although the engine call
+    /// is identical: the decision carries the words that will be said about
+    /// it minutes later, and a row under a button labelled "Keep both" that
+    /// comes back saying "Save failed" names a button that is not on screen.
     fn run_keep_both(&mut self, cx: &mut Context<Self>) {
         let Some((inputs, assembled)) = self.auto_merge.clone() else {
             return;
@@ -1217,7 +1316,7 @@ impl ReviewView {
         self.last_outcome = None;
         self.enqueue(
             target.clone(),
-            Decision::Merged {
+            Decision::KeepBoth {
                 resolved: assembled,
                 inputs,
             },
@@ -1241,12 +1340,18 @@ impl ReviewView {
                 .processing()
                 .into_iter()
                 .map(|target| {
-                    let status = if running.contains(&target) {
+                    let status = if running.iter().any(|a| a.target == target) {
                         QueuedStatus::Running
                     } else {
                         QueuedStatus::Waiting
                     };
-                    (target, status)
+                    // `processing` IS running ∪ pending and `decision_label`
+                    // searches both, so the fallback is unreachable. It says
+                    // "a decision" rather than naming one, because a row that
+                    // claimed a choice the user did not make would be worse
+                    // than a row that admits it lost the name.
+                    let label = shell.queue.decision_label(&target).unwrap_or("A decision");
+                    (target, QueuedDecision { status, label })
                 })
                 .collect(),
             failures: shell
@@ -1585,7 +1690,7 @@ impl ReviewView {
         ix: usize,
         entry: &DriftSummary,
         now: u64,
-        queued: Option<QueuedStatus>,
+        queued: Option<QueuedDecision>,
         locked: bool,
         failure: Option<&SharedString>,
         theme: Theme,
@@ -1605,11 +1710,16 @@ impl ReviewView {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| entry.target.display().to_string())
             .into();
-        // The trailing column says what the row is waiting on while it is
-        // waiting, and how long it has been drifted otherwise. Both are
-        // one short line; only one can be true at a time.
+        // A processing row's trailing column goes BLANK: how long the file
+        // has been drifted stopped being the interesting fact about it the
+        // moment a decision was recorded, and what replaced it — the choice
+        // AND its state — is too long for a 200px sidebar's right edge. It
+        // goes on its own line under the name instead, where it fits whole:
+        // "Keep source · this machine · queued" truncated to "Keep source ·
+        // thi…" would answer nothing, and answering "which decision is this
+        // row waiting on" is the entire point of showing it.
         let trailing: SharedString = match queued {
-            Some(status) => status.label().into(),
+            Some(_) => "".into(),
             None => entry
                 .since_ts
                 .map(|ts| time_ago(now, ts))
@@ -1656,6 +1766,20 @@ impl ReviewView {
                             .child(trailing),
                     ),
             )
+            // What this row is waiting on, in the words of the button that
+            // was pressed. `line_clamp(1)` over a definite width, never
+            // `truncate()`: gpui's truncate does not ellipsize (it just
+            // clips), so an overlong label would end mid-word with no sign
+            // that anything was cut.
+            .children(queued.map(|queued| {
+                div()
+                    .pl(px(16.))
+                    .w_full()
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .line_clamp(1)
+                    .child(queued.trailing())
+            }))
             // Wraps rather than truncates: this is the only place the
             // failure is ever said, and half of "op could not authenticate"
             // is not a message.
@@ -2160,15 +2284,19 @@ fn preview_decors(lines: &[DiffLine], theme: Theme) -> Vec<ui::text_area::LineDe
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use tomte_app::action_queue::Decision;
     use tomte_app::resolve::{ResolveError, ResolveOutcome};
     use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind};
     use tomte_proto::DriftSummary;
 
+    use super::super::BatchResult;
+
     use super::{
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
-        QueuedStatus, ResolveAction, SidebarRow, UndoAffordance, blocked_reason, flatten_document,
-        next_after, origin_diffs, origin_hint, outcome_banner, per_line_ranges, preview_decors,
-        severity_groups, sidebar_rows, source_actions, undo_affordance, undo_banner,
+        QueuedDecision, QueuedStatus, ResolveAction, SidebarRow, UndoAffordance, blocked_reason,
+        flatten_document, next_after, origin_diffs, origin_hint, outcome_banner, per_line_ranges,
+        preview_decors, queued_outcome_banner, severity_groups, sidebar_rows, source_actions,
+        undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -2339,16 +2467,35 @@ mod tests {
     }
 
     /// A queue pose: `running` are under the latch, `waiting` behind it.
+    /// Every row carries the same choice — the tests that care about WHICH
+    /// choice pose it explicitly (`posed_queue_of`).
     fn posed_queue(running: &[&str], waiting: &[&str], busy: bool) -> QueueSnapshot {
+        let rows: Vec<(&str, QueuedStatus, &'static str)> = running
+            .iter()
+            .map(|t| (*t, QueuedStatus::Running, "Keep disk"))
+            .chain(
+                waiting
+                    .iter()
+                    .map(|t| (*t, QueuedStatus::Waiting, "Keep disk")),
+            )
+            .collect();
+        posed_queue_of(&rows, busy)
+    }
+
+    /// The same, with each row's decision label spelled out.
+    fn posed_queue_of(rows: &[(&str, QueuedStatus, &'static str)], busy: bool) -> QueueSnapshot {
         QueueSnapshot {
-            processing: running
+            processing: rows
                 .iter()
-                .map(|t| (PathBuf::from(*t), QueuedStatus::Running))
-                .chain(
-                    waiting
-                        .iter()
-                        .map(|t| (PathBuf::from(*t), QueuedStatus::Waiting)),
-                )
+                .map(|(t, status, label)| {
+                    (
+                        PathBuf::from(*t),
+                        QueuedDecision {
+                            status: *status,
+                            label,
+                        },
+                    )
+                })
                 .collect(),
             failures: Default::default(),
             busy,
@@ -2356,8 +2503,8 @@ mod tests {
     }
 
     /// The sidebar plan as one line per row: a header's label, or a row's
-    /// target, the state it renders in, and whether it is still a click
-    /// target.
+    /// target, the DECISION it is waiting on, the state it renders in, and
+    /// whether it is still a click target.
     ///
     /// The lock is in here because it is what makes §2.4 reachable: the
     /// selection has advanced off the row by the time a decision is queued,
@@ -2378,9 +2525,10 @@ mod tests {
                     entry.target.display(),
                     match queued {
                         None => "answerable".to_string(),
-                        Some(status) => format!(
-                            "{}, {}",
-                            match status {
+                        Some(queued) => format!(
+                            "{} {}, {}",
+                            queued.label,
+                            match queued.status {
                                 QueuedStatus::Running => "running",
                                 QueuedStatus::Waiting => "queued",
                             },
@@ -2424,7 +2572,7 @@ mod tests {
             plan(&sidebar_rows(&drifted, &posed_queue(&["/a"], &[], true))),
             [
                 "PROCESSING",
-                "/a [running, locked]",
+                "/a [Keep disk running, locked]",
                 "SAFE TO RESOLVE",
                 "/b [answerable]",
             ]
@@ -2439,11 +2587,57 @@ mod tests {
             )),
             [
                 "PROCESSING",
-                "/a [running, locked]",
+                "/a [Keep disk running, locked]",
                 // The whole of §2.4's reachability, in one word: a decision
                 // that has not started yet can still be re-chosen.
-                "/b [queued, selectable]",
+                "/b [Keep disk queued, selectable]",
             ]
+        );
+    }
+
+    /// A processing row names the DECISION it is waiting on, not merely that
+    /// it is waiting. Thirty rows all reading "running…" are thirty file
+    /// names and no answer to the question the user is actually asking:
+    /// which of these did I press keep-disk on?
+    ///
+    /// MUTATION: drop `label` from the row's trailing text (render the bare
+    /// status) → the two rows below become indistinguishable. MUTATION: have
+    /// `ActionQueue::decision_label` search pending before running → a row
+    /// re-chosen mid-flight would name the choice that is NOT running.
+    #[test]
+    fn a_processing_row_names_the_decision_it_is_waiting_on() {
+        let drifted = vec![s("/a", "conflict"), s("/b", "destination_drift")];
+        let queue = posed_queue_of(
+            &[
+                ("/a", QueuedStatus::Running, "Keep both"),
+                ("/b", QueuedStatus::Waiting, "Keep source · this machine"),
+            ],
+            true,
+        );
+        assert_eq!(
+            plan(&sidebar_rows(&drifted, &queue)),
+            [
+                "PROCESSING",
+                "/a [Keep both running, locked]",
+                "/b [Keep source · this machine queued, selectable]",
+            ]
+        );
+        // And the row's own trailing line, which is what the sidebar renders.
+        assert_eq!(
+            queue
+                .status(Path::new("/a"))
+                .expect("posed")
+                .trailing()
+                .as_ref(),
+            "Keep both · running…"
+        );
+        assert_eq!(
+            queue
+                .status(Path::new("/b"))
+                .expect("posed")
+                .trailing()
+                .as_ref(),
+            "Keep source · this machine · queued"
         );
     }
 
@@ -2453,7 +2647,10 @@ mod tests {
     #[test]
     fn a_processing_row_survives_the_model_dropping_it() {
         let rows = sidebar_rows(&[], &posed_queue(&["/gone"], &[], true));
-        assert_eq!(plan(&rows), ["PROCESSING", "/gone [running, locked]"]);
+        assert_eq!(
+            plan(&rows),
+            ["PROCESSING", "/gone [Keep disk running, locked]"]
+        );
     }
 
     /// Spec §2.4 has to be REACHABLE: a decision that has not started yet
@@ -2463,8 +2660,9 @@ mod tests {
     /// deep — exactly when correcting it matters.
     ///
     /// MUTATION: gate `blocked_reason` on `is_processing` instead of
-    /// `is_running` → the queued case reports a reason and the buttons go
-    /// dead. MUTATION: have `is_running` accept `Waiting` → same.
+    /// `QueueSnapshot::locks_row` → the queued case reports a reason and the
+    /// buttons go dead. MUTATION: widen `QueuedStatus::locks_row`, the rule
+    /// itself, to accept `Waiting` → same.
     #[test]
     fn only_a_running_decision_locks_its_file_out_of_being_re_chosen() {
         let a = Path::new("/a");
@@ -2797,6 +2995,98 @@ mod tests {
         assert_eq!(
             legends(DiffPair::LocalVsOrigin),
             ("this machine's source", "origin's source")
+        );
+    }
+
+    /// What the QUEUE says when a decision lands, minutes after the click.
+    ///
+    /// Only the merge editor's Save gets a banner, and it must: that surface
+    /// left "Save queued · <file>" on screen, and that sentence goes stale
+    /// the moment the queue reaches it — whichever way it went. Everything
+    /// else stays silent, because its row IS its report and because the last
+    /// file of a thirty-file sweep would otherwise silently overwrite
+    /// whatever the banner was saying (a roll-back's result, an undo's).
+    ///
+    /// MUTATION: return a banner for `Decision::KeepDisk` too → the last two
+    /// assertions fail, and a keep-disk landing after a roll-back would
+    /// replace "Merge with origin rolled back" with "Kept disk version".
+    /// MUTATION: return `None` for the `Err` arm → a failed save leaves
+    /// "Save queued" up forever, claiming something that did not happen.
+    #[test]
+    fn only_a_merge_save_reports_itself_when_it_lands() {
+        let merged = || Decision::Merged {
+            resolved: "x".into(),
+            inputs: std::sync::Arc::new(tomte_app::merge_inputs::MergeInputs {
+                target: PathBuf::from("/a"),
+                ours: String::new(),
+                theirs: String::new(),
+                base: None,
+                source_path: PathBuf::from("/src/a"),
+                templated: false,
+                template: None,
+                span_map: None,
+                origin: None,
+            }),
+        };
+        let ok = |o: ResolveOutcome| Ok(BatchResult::Resolved(o));
+
+        let b = queued_outcome_banner(&merged(), &ok(done(true, true, None)))
+            .expect("the save that left \"Save queued\" up has to settle it");
+        assert_eq!(b.text.as_ref(), "Merged · committed & pushed");
+        assert_eq!(b.tint, BannerTint::Ok);
+        assert!(b.undoable);
+
+        let b = queued_outcome_banner(&merged(), &ok(done(true, false, Some("push failed"))))
+            .expect("a degraded commit is still a landing");
+        assert_eq!(b.text.as_ref(), "Merged · push failed");
+        assert_eq!(b.tint, BannerTint::Drift);
+        assert!(b.undoable, "the merge itself succeeded");
+
+        let b = queued_outcome_banner(
+            &merged(),
+            &ok(ResolveOutcome::ProtectedSpan {
+                detail: "edit at rendered bytes 8..13 touches a protected template span".into(),
+            }),
+        )
+        .expect("a refusal must replace the queued claim too");
+        assert!(
+            b.text
+                .starts_with("This change touches a templated value · "),
+            "text: {}",
+            b.text
+        );
+        assert!(!b.undoable, "nothing was mutated");
+
+        let b = queued_outcome_banner(&merged(), &Err(ResolveError::Failed("daemon gone".into())))
+            .expect("a failed save must not leave \"Save queued\" standing");
+        assert_eq!(b.text.as_ref(), "Save failed: daemon gone");
+        assert_eq!(b.tint, BannerTint::Conflict);
+        assert!(!b.undoable);
+
+        // A staged repo conflict has not landed anywhere: the merge's own
+        // conclusion is what reports it.
+        assert!(
+            queued_outcome_banner(
+                &Decision::RepoConflict {
+                    source_path: PathBuf::from("/src/a"),
+                    resolved: "x".into(),
+                },
+                &Ok(BatchResult::RepoConflictStaged),
+            )
+            .is_none()
+        );
+
+        // The one-click decisions: their row leaving the list is the report.
+        assert!(
+            queued_outcome_banner(&Decision::KeepDisk, &ok(done(true, true, None))).is_none(),
+            "a one-click decision must not banner: by the time it lands the \
+             user is three files on, and it would overwrite whatever the \
+             banner was actually saying"
+        );
+        assert!(
+            queued_outcome_banner(&Decision::KeepDisk, &Err(ResolveError::Failed("x".into())))
+                .is_none(),
+            "its failure sticks to its row (spec §2.5), where choosing again is the retry"
         );
     }
 

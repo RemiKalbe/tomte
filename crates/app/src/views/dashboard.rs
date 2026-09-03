@@ -14,6 +14,7 @@ use gpui::{
     App, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful, WeakEntity,
     div, prelude::*, uniform_list,
 };
+use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::model::{
     SyncModel, TimelineItem, TimelineRow, class_label, group_timeline, kind_glyph, kind_label,
     time_ago,
@@ -23,10 +24,8 @@ use tomte_app::theme::Theme;
 use tomte_core::cmd::SystemRunner;
 use tomte_ui::components as ui;
 
-use crate::notify_osa::notify;
-
-use super::Shell;
 use super::review::ResolveAction;
+use super::{RepoOpKind, Shell};
 
 /// Seconds since the Unix epoch — the production clock injected into
 /// [`DashboardView::now_ts`] (tests inject fixed values into the pure fns).
@@ -162,9 +161,6 @@ pub struct DashboardView {
     /// Cloned from `Shell::expanded_scans` by the caller — reading the Shell
     /// entity from inside its own render panics ("already being updated").
     pub expanded_scans: HashSet<u64>,
-    /// Copied from `Shell::dashboard_action_in_flight`: a quick action is
-    /// running, so the inline row buttons yield to a "working…" marker.
-    pub action_in_flight: bool,
     /// Copied from `Shell::unlock_in_flight`: the 1Password unlock probe is
     /// waiting on the user's approval.
     pub unlock_in_flight: bool,
@@ -174,6 +170,45 @@ pub struct DashboardView {
     pub pending_merge: bool,
     /// Copied from `Shell::merge_finish_in_flight`.
     pub merge_finish_in_flight: bool,
+    /// `Shell::deferred_repo_op`'s kind: a repo-level answer the user gave
+    /// that has not started yet, because the latch is held.
+    pub pending_repo_op: Option<RepoOpKind>,
+    /// `Shell::running_repo_op`: the one that IS running.
+    pub running_repo_op: Option<RepoOpKind>,
+}
+
+/// The Finish button's label and whether it is live, for one repo-op state.
+///
+/// A pure function so the four cases are assertable without a window — and
+/// so the rule lives in one place rather than inside a `when_some` chain in
+/// the middle of a banner.
+///
+/// The abort arm is the one that matters. `Shell::request_repo_op` already
+/// REFUSES a finish that would displace a confirmed roll-back, but a button
+/// that stays bright and does nothing when pressed teaches the user that the
+/// app is broken. This stops the press from ever reaching that guard, and the
+/// guard stays as the last line of defence for the click that lands in the
+/// same frame as the confirmation.
+pub(super) fn finish_button_state(
+    pending: Option<RepoOpKind>,
+    running: Option<RepoOpKind>,
+    finish_in_flight: bool,
+) -> (&'static str, bool) {
+    if pending == Some(RepoOpKind::Abort) || running == Some(RepoOpKind::Abort) {
+        // Pending or running, the merge this banner is about is being thrown
+        // away. Offering to commit it would be offering the opposite of the
+        // answer the user already confirmed.
+        return ("Rolling back…", false);
+    }
+    if pending == Some(RepoOpKind::Finish) {
+        // Pressed, and waiting behind a batch that can take seconds. Saying
+        // "Finish merge" still would invite a second press that does nothing.
+        return ("Finish merge · queued", false);
+    }
+    if running == Some(RepoOpKind::Finish) || finish_in_flight {
+        return ("Finishing…", false);
+    }
+    ("Finish merge", true)
 }
 
 impl DashboardView {
@@ -230,10 +265,17 @@ impl DashboardView {
         let engine = cx
             .try_global::<crate::EngineSlot>()
             .and_then(|slot| slot.0.clone());
-        let busy = self.action_in_flight;
+        // The quick actions no longer RUN anything, so they need the engine
+        // only as a readiness flag: with nothing connected a decision could
+        // only park, and this surface has no processing row to show that.
+        let engine_ready = engine.is_some();
         let unlock_in_flight = self.unlock_in_flight;
         let pending_merge = self.pending_merge;
-        let merge_finish_in_flight = self.merge_finish_in_flight;
+        let (finish_label, finish_live) = finish_button_state(
+            self.pending_repo_op,
+            self.running_repo_op,
+            self.merge_finish_in_flight,
+        );
 
         div()
             .flex()
@@ -393,24 +435,30 @@ impl DashboardView {
             // silence until someone opens a terminal.
             .when(pending_merge, |el| {
                 let shell = shell.clone();
-                let action = Some(if merge_finish_in_flight {
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.text_muted)
-                        .child("committing…")
-                        .into_any_element()
-                } else {
+                let action = Some(if finish_live {
                     ui::button(
                         theme,
                         "pending-merge-finish",
-                        "Finish merge".into(),
+                        finish_label.into(),
                         ui::ButtonVariant::Solid(theme.conflict),
                         ui::ButtonSize::Micro,
                         move |_event, _window, cx| {
                             let _ = shell.update(cx, |shell, cx| shell.finish_pending_merge(cx));
                         },
                     )
+                    .into_any_element()
+                } else {
+                    // Still a button, not a bare word: it says what the app is
+                    // doing to this merge and stays in the place the live one
+                    // occupies, so the banner does not reflow under the cursor.
+                    ui::disabled_button(
+                        theme,
+                        "pending-merge-finish",
+                        finish_label.into(),
+                        ui::ButtonSize::Micro,
+                        None,
+                    )
+                    .flex_none()
                     .into_any_element()
                 });
                 el.child(
@@ -496,14 +544,7 @@ impl DashboardView {
                     move |range, _window, _cx| {
                         range
                             .map(|ix| {
-                                render_line(
-                                    ix,
-                                    &lines[ix],
-                                    theme,
-                                    shell.clone(),
-                                    engine.clone(),
-                                    busy,
-                                )
+                                render_line(ix, &lines[ix], theme, shell.clone(), engine_ready)
                             })
                             .collect()
                     },
@@ -729,8 +770,7 @@ fn render_line(
     line: &Line,
     theme: Theme,
     shell: WeakEntity<Shell>,
-    engine: Option<Arc<ResolveEngine>>,
-    busy: bool,
+    engine_ready: bool,
 ) -> gpui::AnyElement {
     match line {
         Line::Group {
@@ -804,7 +844,7 @@ fn render_line(
             let quick = (*drifted)
                 .then_some(target.as_ref())
                 .flatten()
-                .map(|target| quick_actions(ix, target, theme, engine, busy, shell.clone()));
+                .map(|target| quick_actions(ix, target, theme, engine_ready, shell.clone()));
             let base = div()
                 .h_7()
                 .w_full()
@@ -898,24 +938,20 @@ fn render_line(
 }
 
 /// The inline quick-action cluster for one drifted row: keep-disk /
-/// keep-source buttons, or a "working…" marker while any dashboard action
-/// runs. Outcomes surface as an osascript notification (the dashboard is
-/// transient — no banner).
+/// keep-source buttons. Outcomes surface as an osascript notification (the
+/// dashboard is transient — no banner, and no processing group either).
+///
+/// No "working…" marker any more, and no shared busy flag behind it: a
+/// decision here is queued like every other, so the buttons on THIS row and
+/// on every other row stay live while it drains. That flag existing at all
+/// was defect §1.1 — one boolean that made every other file's button a no-op.
 fn quick_actions(
     ix: usize,
     target: &Path,
     theme: Theme,
-    engine: Option<Arc<ResolveEngine>>,
-    busy: bool,
+    engine_ready: bool,
     shell: WeakEntity<Shell>,
 ) -> Div {
-    if busy {
-        return div()
-            .flex_none()
-            .text_xs()
-            .text_color(theme.text_muted)
-            .child("working…");
-    }
     // Ghost until the row is hovered (Zed idiom): the chip carries the
     // information at rest; the response appears when the user reaches for it.
     div()
@@ -930,7 +966,7 @@ fn quick_actions(
             ResolveAction::KeepDisk,
             target,
             theme,
-            engine.clone(),
+            engine_ready,
             shell.clone(),
         ))
         // Row actions carry no origin split: nothing here has loaded the
@@ -943,21 +979,32 @@ fn quick_actions(
             ResolveAction::KeepSourceLocal,
             target,
             theme,
-            engine,
+            engine_ready,
             shell,
         ))
 }
 
+/// One inline quick action: record the decision on the Shell's queue and be
+/// done with it.
+///
+/// The click used to spawn the engine call itself, behind a shell-wide
+/// `dashboard_action_in_flight` boolean — beside whatever the queue was
+/// draining, on the same git repository. Now it is a [`Decision`] like every
+/// other, and the press returns the instant the choice is remembered.
+///
+/// `engine_ready` still disables the buttons when nothing is connected,
+/// matching Review's own gating: with no daemon the decision would only park,
+/// and this surface has no processing row to show that it did.
 fn quick_action_button(
     ix: usize,
     action: ResolveAction,
     target: &Path,
     theme: Theme,
-    engine: Option<Arc<ResolveEngine>>,
+    engine_ready: bool,
     shell: WeakEntity<Shell>,
 ) -> Stateful<Div> {
     let id = ElementId::named_usize(action.button_id(), ix);
-    let Some(engine) = engine else {
+    if !engine_ready {
         return ui::disabled_button(
             theme,
             id,
@@ -966,7 +1013,7 @@ fn quick_action_button(
             Some("daemon not connected".into()),
         )
         .flex_none();
-    };
+    }
     let target = target.to_path_buf();
     ui::button(
         theme,
@@ -978,92 +1025,70 @@ fn quick_action_button(
             // The row underneath opens Review on click — quick actions must
             // not also navigate.
             cx.stop_propagation();
-            run_quick_action(action, engine.clone(), target.clone(), shell.clone(), cx);
+            // No origin split on this surface: nothing here has loaded the
+            // file's content (see `quick_actions`), so the two decisions it
+            // can make are the two that need none.
+            let decision = match action {
+                ResolveAction::KeepDisk => Decision::KeepDisk,
+                _ => Decision::KeepSourceLocal,
+            };
+            let target = target.clone();
+            let _ = shell.update(cx, |shell, cx| {
+                shell.enqueue(
+                    QueuedAction {
+                        target,
+                        decision,
+                        // The one surface that asks to be told: this row just
+                        // stops being drifted, there is no banner here, and
+                        // the answer can be minutes away.
+                        notify_on_done: true,
+                    },
+                    cx,
+                );
+            });
         },
     )
     .flex_none()
 }
 
-/// Run one quick action: flag the shell busy, do the blocking engine call +
-/// notification on the background executor, then clear the flag. No call
-/// ever runs on the main thread.
-fn run_quick_action(
-    action: ResolveAction,
-    engine: Arc<ResolveEngine>,
-    target: PathBuf,
-    shell: WeakEntity<Shell>,
-    cx: &mut App,
-) {
-    let flag = |cx: &mut App, shell: &WeakEntity<Shell>, value: bool| {
-        let _ = shell.update(cx, |shell, cx| {
-            shell.dashboard_action_in_flight = value;
-            cx.notify();
-        });
-    };
-    flag(cx, &shell, true);
-    cx.spawn(async move |cx| {
-        let resolved_target = target.clone();
-        let resolved = cx
-            .background_executor()
-            .spawn(async move {
-                // No origin split on this surface (see `quick_actions`), so
-                // there is no shown-origin text to honour either.
-                let result = action.run(&engine, &target, None);
-                let body = quick_action_body(action, &target, &result);
-                notify(&SystemRunner, "tomte", &body);
-                matches!(result, Ok(ResolveOutcome::Done { .. }))
-            })
-            .await;
-        let _ = cx.update(|cx| {
-            flag(cx, &shell, false);
-            let _ = shell.update(cx, |shell, cx| {
-                if resolved {
-                    shell.state.update(cx, |model, cx| {
-                        model.confirm_resolved(&resolved_target);
-                        cx.notify();
-                    });
-                }
-                // `keep_disk` reaches `ensure_merge_started`, so a quick
-                // action can strand a merge exactly like a review row can —
-                // and its notification says "finish it from the dashboard",
-                // which is THIS surface. Without the probe that sentence
-                // points at a screen showing nothing. Unconditional: the
-                // strand arrives as `Done { committed: false, note }`, which
-                // is not distinguishable here, and the probe is one
-                // `rev-parse` when no merge is running.
-                shell.refresh_pending_merge(cx);
-                cx.notify();
-            });
-        });
-    })
-    .detach();
-}
-
-/// Notification body for a quick action's outcome — same honesty rules as
-/// the review banner (`note` = degraded commit/push, spelled out).
-fn quick_action_body(
-    action: ResolveAction,
+/// Notification body for a queued dashboard decision's outcome — same honesty
+/// rules as the review banner (`note` = degraded commit/push, spelled out).
+///
+/// Takes the [`Decision`], not the button: by the time this is built the
+/// press is minutes old, the queue is what remembers it, and the queue speaks
+/// in decisions. `verb` is what the choice did, `label` names the button that
+/// failed — the same two words the row and the banner use.
+pub(super) fn quick_action_body(
+    decision: &Decision,
     target: &Path,
-    result: &Result<ResolveOutcome, ResolveError>,
+    result: &Result<super::BatchResult, ResolveError>,
 ) -> String {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| target.display().to_string());
-    match result {
-        Ok(ResolveOutcome::Done { note: None, .. }) => format!("{}: {name}", action.verb()),
-        Ok(ResolveOutcome::Done {
+    let outcome = match result {
+        Ok(super::BatchResult::Resolved(outcome)) => outcome,
+        // Defensive: only a merge-editor Save stages a repo conflict, and
+        // that surface never asks for a notification.
+        Ok(super::BatchResult::RepoConflictStaged) => {
+            return format!("{name}: recorded into the merge with origin");
+        }
+        Err(e) => return format!("{} {name} failed: {e}", decision.label()),
+    };
+    match outcome {
+        ResolveOutcome::Done { note: None, .. } => format!("{}: {name}", decision.verb()),
+        ResolveOutcome::Done {
             note: Some(note), ..
-        }) => format!("{}: {name} · {note}", action.verb()),
-        Ok(ResolveOutcome::NeedsMergeEditor) => {
+        } => format!("{}: {name} · {note}", decision.verb()),
+        ResolveOutcome::NeedsMergeEditor => {
             format!("{name} is templated · use the merge editor")
         }
         // Defensive: quick actions never run `resolve_merged`, the only
         // producer of this outcome.
-        Ok(ResolveOutcome::ProtectedSpan { .. }) => {
+        ResolveOutcome::ProtectedSpan { .. } => {
             format!("{name}: this change touches a templated value · open the merge editor")
         }
-        Err(e) => format!("{} {name} failed: {e}", action.label()),
     }
 }
 
@@ -1071,18 +1096,19 @@ fn quick_action_body(
 mod tests {
     use std::path::Path;
 
+    use tomte_app::action_queue::Decision;
     use tomte_app::resolve::{ResolveError, ResolveOutcome};
 
-    use super::super::review::ResolveAction;
-    use super::{DegradedRemedy, degraded_remedy, quick_action_body};
+    use super::super::{BatchResult, RepoOpKind};
+    use super::{DegradedRemedy, degraded_remedy, finish_button_state, quick_action_body};
 
-    fn done(note: Option<&str>) -> ResolveOutcome {
-        ResolveOutcome::Done {
+    fn done(note: Option<&str>) -> Result<BatchResult, ResolveError> {
+        Ok(BatchResult::Resolved(ResolveOutcome::Done {
             session: 1,
             committed: true,
             pushed: note.is_none(),
             note: note.map(str::to_owned),
-        }
+        }))
     }
 
     #[test]
@@ -1107,42 +1133,83 @@ mod tests {
     fn quick_action_body_reports_success_degraded_templated_and_error() {
         let t = Path::new("/Users/x/.zshrc");
         assert_eq!(
-            quick_action_body(ResolveAction::KeepDisk, t, &Ok(done(None))),
+            quick_action_body(&Decision::KeepDisk, t, &done(None)),
             "Kept disk version: .zshrc"
         );
         assert_eq!(
-            quick_action_body(
-                ResolveAction::KeepSourceLocal,
-                t,
-                &Ok(done(Some("push failed")))
-            ),
+            quick_action_body(&Decision::KeepSourceLocal, t, &done(Some("push failed"))),
             "Restored chezmoi's version: .zshrc · push failed"
         );
         assert_eq!(
             quick_action_body(
-                ResolveAction::KeepDisk,
+                &Decision::KeepDisk,
                 t,
-                &Ok(ResolveOutcome::NeedsMergeEditor)
+                &Ok(BatchResult::Resolved(ResolveOutcome::NeedsMergeEditor))
             ),
             ".zshrc is templated · use the merge editor"
         );
         assert_eq!(
             quick_action_body(
-                ResolveAction::KeepDisk,
+                &Decision::KeepDisk,
                 t,
                 &Err(ResolveError::Failed("daemon gone".into()))
             ),
-            "Keep disk .zshrc failed: daemon gone"
+            "Keep disk .zshrc failed: daemon gone",
+            "a failure names the button that was pressed, not what it would have done"
         );
         assert_eq!(
             quick_action_body(
-                ResolveAction::KeepDisk,
+                &Decision::KeepDisk,
                 t,
-                &Ok(ResolveOutcome::ProtectedSpan {
+                &Ok(BatchResult::Resolved(ResolveOutcome::ProtectedSpan {
                     detail: "touches a protected template span".into()
-                })
+                }))
             ),
             ".zshrc: this change touches a templated value · open the merge editor"
+        );
+    }
+
+    /// The dashboard's Finish button must never offer to COMMIT a merge the
+    /// user confirmed throwing away, and must never look pressable while the
+    /// press it already took is queued behind a batch. `request_repo_op`
+    /// refuses such a press, but a bright button that silently does nothing
+    /// reads as a broken app.
+    ///
+    /// MUTATION: drop the `running == Some(Abort)` half of the first arm →
+    /// the third case offers "Finish merge" while the roll-back is actually
+    /// rewriting the source tree. MUTATION: return `true` for the pending
+    /// finish → the second case invites a press that can only be dropped.
+    #[test]
+    fn the_finish_button_says_what_is_happening_to_this_merge() {
+        assert_eq!(
+            finish_button_state(None, None, false),
+            ("Finish merge", true),
+            "nothing owed: the banner's one way out is live"
+        );
+        assert_eq!(
+            finish_button_state(Some(RepoOpKind::Finish), None, false),
+            ("Finish merge · queued", false),
+            "already pressed, waiting for the latch"
+        );
+        assert_eq!(
+            finish_button_state(None, Some(RepoOpKind::Finish), true),
+            ("Finishing…", false)
+        );
+        assert_eq!(
+            finish_button_state(Some(RepoOpKind::Abort), None, false),
+            ("Rolling back…", false),
+            "a confirmed roll-back is queued: committing is the opposite answer"
+        );
+        assert_eq!(
+            finish_button_state(None, Some(RepoOpKind::Abort), false),
+            ("Rolling back…", false),
+            "and while it actually runs"
+        );
+        // An undo is about the journal, not about this merge: it defers the
+        // finish behind itself like any other op, so the button stays live.
+        assert_eq!(
+            finish_button_state(Some(RepoOpKind::Undo), None, false),
+            ("Finish merge", true)
         );
     }
 }

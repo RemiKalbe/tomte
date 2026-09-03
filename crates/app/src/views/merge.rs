@@ -26,9 +26,9 @@ use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, KeyBinding, Rgba,
     SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, px,
 };
+use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::merge_inputs::{self, MergeInputs};
 use tomte_app::merge_state::MergeState;
-use tomte_app::resolve::{ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
 use tomte_core::merge::{Choice, MergeDocument, RegionKind};
 use tomte_core::template::anchor::{SpanMap, SpanOrigin};
@@ -767,48 +767,6 @@ pub(super) fn cancel_warning(rollback: &Rollback) -> String {
     text
 }
 
-fn merge_banner(result: &Result<ResolveOutcome, ResolveError>) -> OutcomeBanner {
-    match result {
-        Ok(ResolveOutcome::Done {
-            note: None,
-            committed,
-            pushed,
-            ..
-        }) => OutcomeBanner {
-            text: if *committed && *pushed {
-                "Merged · committed & pushed".into()
-            } else {
-                "merged".into()
-            },
-            tint: BannerTint::Ok,
-            undoable: true,
-        },
-        Ok(ResolveOutcome::Done {
-            note: Some(note), ..
-        }) => OutcomeBanner {
-            text: format!("Merged · {note}").into(),
-            tint: BannerTint::Drift,
-            undoable: true,
-        },
-        Ok(ResolveOutcome::ProtectedSpan { detail }) => OutcomeBanner {
-            text: format!("This change touches a templated value · {detail}").into(),
-            tint: BannerTint::Drift,
-            undoable: false,
-        },
-        // Defensive: resolve_merged never reports this outcome.
-        Ok(ResolveOutcome::NeedsMergeEditor) => OutcomeBanner {
-            text: "Unexpected engine outcome · nothing was changed".into(),
-            tint: BannerTint::Drift,
-            undoable: false,
-        },
-        Err(e) => OutcomeBanner {
-            text: format!("save failed: {e}").into(),
-            tint: BannerTint::Conflict,
-            undoable: false,
-        },
-    }
-}
-
 /// Everything a loaded target carries: the inputs (Arc'd so the save task can
 /// own them), the editor model, and the pane rows precomputed once per load.
 pub(super) struct LoadedMerge {
@@ -987,8 +945,6 @@ pub struct MergeView {
     /// as a message-box state (spec §10).
     pub(super) error: Option<String>,
     pub(super) loaded: Option<LoadedMerge>,
-    /// `resolve_merged` in flight on the background executor.
-    pub(super) saving: bool,
     /// Banner for saves that STAY here (protected span, errors); successful
     /// saves hand their banner to Review instead.
     pub(super) banner: Option<OutcomeBanner>,
@@ -1068,7 +1024,6 @@ impl MergeView {
             loading: false,
             error: None,
             loaded: None,
-            saving: false,
             banner: None,
             cancel_armed: None,
             pane_scrolls: std::array::from_fn(|_| gpui::ScrollHandle::new()),
@@ -1108,7 +1063,6 @@ impl MergeView {
         self.error = None;
         self.banner = None;
         self.cancel_armed = None;
-        self.saving = false;
         self.editing = false;
         self.loaded = Some(LoadedMerge::new(inputs));
         self.seed_editor(cx);
@@ -1128,7 +1082,6 @@ impl MergeView {
         self.loading = true;
         self.error = None;
         self.loaded = None;
-        self.saving = false;
         self.banner = None;
         self.cancel_armed = None;
         self.editing = false;
@@ -1684,13 +1637,29 @@ impl MergeView {
             .ok();
     }
 
-    /// Save: `resolve_merged` on the background executor. On `Done` the
-    /// banner is handed to Review and the shell routes back there; protected
-    /// spans and errors keep the editor open with the banner shown here.
-    fn save(&mut self, cx: &mut Context<Self>) {
-        if self.saving {
-            return;
-        }
+    /// Save: record the resolution as a [`Decision`] on the Shell's queue and
+    /// hand the user straight back to Review.
+    ///
+    /// NOTHING RUNS HERE ANY MORE. The editor used to spawn `resolve_merged`
+    /// (or `resolve_repo_conflict`) itself, behind a `saving` boolean, beside
+    /// whatever the queue was draining — two writers on one git repository.
+    /// Now it is one more decision in the same serial queue, which also means
+    /// the Save no longer blocks: the user goes back to Review and answers
+    /// the next file while this one drains.
+    ///
+    /// No engine check either. A disconnected daemon PARKS the queue (the row
+    /// sits under PROCESSING until something reconnects) instead of throwing
+    /// the click away with "cannot save" — a decision the user made is
+    /// remembered, never discarded (spec §2.1).
+    ///
+    /// The hand-off runs OUTSIDE this view's own update, in the same
+    /// `cx.spawn` → `shell.update` shape the mid-merge path always used:
+    /// `merge_done` routes and banners through this same MergeView entity,
+    /// and nesting that panicked gpui ("already being updated", 2026-08-18).
+    ///
+    /// `pub(super)` so the render-smoke tests can press Save without a
+    /// synthetic mouse event — the same reason `ReviewView::run_action` is.
+    pub(super) fn save(&mut self, cx: &mut Context<Self>) {
         let Some(loaded) = &self.loaded else {
             return;
         };
@@ -1698,98 +1667,61 @@ impl MergeView {
             return;
         };
         let inputs = loaded.inputs.clone();
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            // The button was enabled before a disconnect — report, don't
-            // no-op silently (spec §10).
-            self.banner = Some(OutcomeBanner {
-                text: "Daemon not connected · cannot save".into(),
-                tint: BannerTint::Conflict,
-                undoable: false,
-            });
-            cx.notify();
-            return;
+        let target = inputs.target.clone();
+        // Mid-merge, the answer belongs in the merge's index (the working
+        // tree holds git's marker text, and chezmoi's reading of it is
+        // fiction); otherwise it is an ordinary merged write.
+        let decision = if self.repo_reconcile {
+            Decision::RepoConflict {
+                source_path: inputs.source_path.clone(),
+                resolved,
+            }
+        } else {
+            Decision::Merged { resolved, inputs }
         };
-        self.saving = true;
         self.banner = None;
         // Saving is the opposite of cancelling: an armed confirmation must
         // not survive to catch the next Cancel press unwarned.
         self.cancel_armed = None;
         cx.notify();
-        if self.repo_reconcile {
-            // Mid-merge conflict: write the SOURCE file + git add; the Shell
-            // concludes the merge if that was the last one open. The Shell
-            // hand-off happens OUTSIDE this view's update — it routes and
-            // banners through this same MergeView entity, and nesting that
-            // panicked gpui ("already being updated", 2026-08-18 crash).
-            let source_path = inputs.source_path.clone();
-            let shell = self.shell.clone();
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { engine.resolve_repo_conflict(&source_path, &resolved) })
-                    .await;
-                let advance = this
-                    .update(cx, |view, cx| {
-                        view.saving = false;
-                        let ok = result.is_ok();
-                        if let Err(e) = result {
-                            view.banner = Some(OutcomeBanner {
-                                text: format!("could not record the resolution: {e}").into(),
-                                tint: BannerTint::Conflict,
-                                undoable: false,
-                            });
-                        }
-                        cx.notify();
-                        ok
-                    })
-                    .unwrap_or(false);
-                if advance {
-                    let _ = cx.update(|cx| {
-                        shell
-                            .update(cx, |shell, cx| shell.repo_conflict_saved(cx))
-                            .ok();
-                    });
+
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.display().to_string());
+        let shell = self.shell.clone();
+        cx.spawn(async move |_this, cx| {
+            let _ = cx.update(|cx| {
+                if let Err(e) = shell.update(cx, |shell, cx| {
+                    shell.enqueue(
+                        QueuedAction {
+                            target,
+                            decision,
+                            // Review's banner and PROCESSING row report this
+                            // one; a desktop notification would be a second
+                            // copy of the same news.
+                            notify_on_done: false,
+                        },
+                        cx,
+                    );
+                    // The ONE place a save routes the user. What the save
+                    // actually DID arrives later, through the queue's
+                    // completion, and lands without moving them again.
+                    shell.merge_done(
+                        OutcomeBanner {
+                            text: format!("Save queued · {name}").into(),
+                            tint: BannerTint::Ok,
+                            undoable: false,
+                        },
+                        cx,
+                    );
+                }) {
+                    // The window is going away underneath the click. Nothing
+                    // can be shown to a user who has no view left, but a
+                    // resolution that went nowhere is never silent.
+                    tomte_core::log_error!("resolve", "the merge save was not queued: {e}");
                 }
-            })
-            .detach();
-            return;
-        }
-        let resolved_target = inputs.target.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { engine.resolve_merged(&inputs, &resolved) })
-                .await;
-            this.update(cx, |view, cx| {
-                view.saving = false;
-                let banner = merge_banner(&result);
-                if matches!(result, Ok(ResolveOutcome::Done { .. })) {
-                    view.shell
-                        .update(cx, |shell, cx| {
-                            shell.state.update(cx, |model, cx| {
-                                model.confirm_resolved(&resolved_target);
-                                cx.notify();
-                            });
-                            shell.merge_done(banner, cx);
-                            // An ordinary Save also goes through
-                            // `resolve_merged` → `ensure_merge_started`, so
-                            // it can strand a merge as readily as a review
-                            // row can.
-                            shell.refresh_pending_merge(cx);
-                        })
-                        .ok();
-                } else {
-                    view.banner = Some(banner);
-                    view.shell
-                        .update(cx, |shell, cx| shell.refresh_pending_merge(cx))
-                        .ok();
-                }
-                cx.notify();
-            })
-            .ok();
+            });
         })
         .detach();
     }
@@ -1936,30 +1868,25 @@ impl MergeView {
                 let (decided, total) = loaded.state.progress();
                 total - decided
             };
-            bar = bar.child(if self.saving {
-                div()
-                    .text_xs()
-                    .text_color(theme.text_muted)
-                    .child("saving…")
-                    .into_any_element()
-            } else {
-                let editing = self.editing;
-                self.save_button(
-                    loaded.state.assembled().is_some() && !editing,
-                    unresolved,
-                    editing,
-                    theme,
-                    cx,
-                )
-                .into_any_element()
-            });
+            // No "saving…" state to swap in any more: the Save records the
+            // decision and leaves for Review in the same frame, so there is
+            // no in-flight window here to render. The work's own progress is
+            // Review's PROCESSING row.
+            let editing = self.editing;
+            bar = bar.child(self.save_button(
+                loaded.state.assembled().is_some() && !editing,
+                unresolved,
+                editing,
+                theme,
+                cx,
+            ));
         }
         bar
     }
 
-    /// Save is enabled exactly when the document is fully resolved, no save
-    /// is in flight, and no edit session is pending (an open editor holds
-    /// text the resolution doesn't have yet — saving under it would lie).
+    /// Save is enabled exactly when the document is fully resolved and no
+    /// edit session is pending (an open editor holds text the resolution
+    /// doesn't have yet — saving under it would lie).
     fn save_button(
         &self,
         enabled: bool,
@@ -2823,18 +2750,14 @@ mod tests {
 
     use tomte_app::merge_inputs::MergeInputs;
     use tomte_app::merge_state::MergeState;
-    use tomte_app::resolve::{ResolveError, ResolveOutcome};
     use tomte_app::theme::Theme;
     use tomte_core::merge::{Choice, RegionKind};
     use tomte_core::template::{anchor::anchor, lexer::lex};
 
-    use super::super::review::BannerTint;
-    #[allow(unused_imports)]
-    use super::{};
     use super::{
         BASE_COL, LoadedMerge, ORIGIN_COL, OURS_COL, PaneSide, RegionDisplay, STRIP_ROWS,
-        THEIRS_COL, document_seed, edited_region_picks, line_at, map_line, merge_banner,
-        next_target, origin_projection, pane_lines, protected_line_info, region_at, region_display,
+        THEIRS_COL, document_seed, edited_region_picks, line_at, map_line, next_target,
+        origin_projection, pane_lines, protected_line_info, region_at, region_display,
         region_has_strip, region_seed_text, row_bg, strips_above_line,
     };
     use super::{MIN_PANE_W, PANE_COLS, fit_widths, fixed_cols};
@@ -3408,57 +3331,6 @@ mod tests {
             } => assert_eq!(lines, vec![(SharedString::from("B"), Some(Side::Ours))]),
             other => panic!("expected auto decision, got {other:?}"),
         }
-    }
-
-    fn done(committed: bool, pushed: bool, note: Option<&str>) -> ResolveOutcome {
-        ResolveOutcome::Done {
-            session: 9,
-            committed,
-            pushed,
-            note: note.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn merge_banner_full_success_is_ok_and_undoable() {
-        let b = merge_banner(&Ok(done(true, true, None)));
-        assert_eq!(b.text.as_ref(), "Merged · committed & pushed");
-        assert_eq!(b.tint, BannerTint::Ok);
-        assert!(b.undoable);
-
-        // apply-only convergence (nothing to commit) must not claim a push
-        let b = merge_banner(&Ok(done(true, false, None)));
-        assert_eq!(b.text.as_ref(), "merged");
-        assert_eq!(b.tint, BannerTint::Ok);
-    }
-
-    #[test]
-    fn merge_banner_degraded_commit_carries_the_note_in_drift_tint() {
-        let b = merge_banner(&Ok(done(true, false, Some("push failed: locked"))));
-        assert_eq!(b.text.as_ref(), "Merged · push failed: locked");
-        assert_eq!(b.tint, BannerTint::Drift);
-        assert!(b.undoable, "the merge itself succeeded");
-    }
-
-    #[test]
-    fn merge_banner_protected_span_and_error_stay_not_undoable() {
-        let b = merge_banner(&Ok(ResolveOutcome::ProtectedSpan {
-            detail: "edit at rendered bytes 8..13 touches a protected template span".into(),
-        }));
-        assert!(
-            b.text
-                .as_ref()
-                .starts_with("This change touches a templated value · "),
-            "text: {}",
-            b.text
-        );
-        assert_eq!(b.tint, BannerTint::Drift);
-        assert!(!b.undoable, "nothing was mutated");
-
-        let b = merge_banner(&Err(ResolveError::Failed("daemon gone".into())));
-        assert_eq!(b.text.as_ref(), "save failed: daemon gone");
-        assert_eq!(b.tint, BannerTint::Conflict);
-        assert!(!b.undoable);
     }
 
     #[test]
