@@ -614,9 +614,56 @@ impl Shell {
     /// ends the moment the choice is remembered, and the row it came from
     /// goes to "processing" instead of the click being discarded.
     pub fn enqueue(&mut self, action: QueuedAction, cx: &mut Context<Self>) {
+        // Every press that owes git work says so in the log, the same as a
+        // repo op's request does: the run can be seconds (a batch) or
+        // minutes (a queue) away, and the log is the only place a press and
+        // its outcome can be tied back together.
+        tomte_core::log_info!(
+            "resolve",
+            "queued {} for {}",
+            action.decision.label(),
+            action.target.display()
+        );
         self.queue.push(action);
         cx.notify();
         self.pump(cx);
+    }
+
+    /// Watch the shared model, and prune what a model change invalidates.
+    ///
+    /// Registered once, where the Shell is built. The re-render half is why
+    /// this observer has always existed (views read the model in `render`);
+    /// the pruning half is [`Self::model_changed`], and it lives in here
+    /// rather than at the call site so there is exactly one copy of the
+    /// wiring for the app and the tests to share.
+    pub fn observe_model(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        cx.observe(&state, |shell, _, cx| {
+            shell.model_changed(cx);
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// The model changed: forget failures for targets that are no longer
+    /// drifted.
+    ///
+    /// A failure outlives its action deliberately (spec §2.5 — the queue
+    /// moves on in milliseconds and a transient banner would go unseen), but
+    /// it must not outlive the DRIFT. A file that failed, then went back in
+    /// sync (the user fixed it in a terminal, or a later scan disagreed),
+    /// and then drifts again for an unrelated reason would otherwise come
+    /// back with the old message still attached to it.
+    pub fn model_changed(&mut self, cx: &mut Context<Self>) {
+        let drifted: std::collections::HashSet<PathBuf> = self
+            .state
+            .read(cx)
+            .drifted
+            .iter()
+            .map(|d| d.target.clone())
+            .collect();
+        self.queue
+            .retain_failures(|target| drifted.contains(target));
     }
 
     /// Start the next piece of git work if none is running: a deferred
@@ -1666,11 +1713,16 @@ mod render_smoke {
         // needles, this finds nothing and would pass vacuously.
         //
         // THREE, not the four this started at. Task 4 moved Review's two
-        // action paths onto the queue, where the single drain
-        // (`run_batch_inner`) runs the engine call and `batch_finished`
-        // owns the probe for all of them. What is left is the dashboard's
-        // quick actions, the merge editor's Save, and that drain — and
+        // action paths onto the queue. What is left is the dashboard's quick
+        // actions, the merge editor's Save, and the queue's own drain — and
         // Task 5 folds the first two in too.
+        //
+        // The drain (`run_batch_inner`) satisfies the needle by DELEGATION,
+        // not by probing: it runs on the background executor with no
+        // `Context` to probe from, and its doc names `batch_finished` as
+        // where `refresh_pending_merge` actually runs, on every path. That
+        // naming is what this crude scan reads. Whoever rewrites that doc
+        // must keep the reference, or move the probe.
         assert!(
             checked >= 3,
             "expected at least the three known action paths, found {checked} — \
@@ -2552,6 +2604,86 @@ mod render_smoke {
             Some(home.join(".gitconfig")),
             "and the selection advanced to the next row that still needs a decision"
         );
+    }
+
+    /// A failure has to outlive its action (spec §2.5) but NOT the drift.
+    /// Only a retry cleared one before this, so a file that failed, went
+    /// back in sync, and drifted again months later for an unrelated reason
+    /// came back with the old message still on its row — and `push` is the
+    /// one thing that clears failures, which a fresh drift does not call.
+    ///
+    /// Drives the real wiring: `observe_model` is what the app registers, so
+    /// the model's own notify is what has to do the pruning.
+    ///
+    /// MUTATION: drop `model_changed` from `observe_model`'s closure (or
+    /// `retain_failures`' body) → `/a` keeps its message.
+    #[gpui::test]
+    fn a_failure_is_forgotten_once_its_target_stops_being_drifted(cx: &mut TestAppContext) {
+        use std::path::Path;
+
+        let drift = |target: &str| tomte_proto::DriftSummary {
+            target: PathBuf::from(target),
+            class: "destination_drift".into(),
+            since_ts: Some(1),
+            origin_differs: false,
+        };
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            let mut shell = latch_shell(Route::Review, cx);
+            shell.observe_model(cx);
+            shell
+        });
+        let state = vis.update(|_window, cx| shell.read(cx).state.clone());
+
+        // Both files drifted, both with a failed decision on them.
+        vis.update(|_window, cx| {
+            state.update(cx, |model, cx| {
+                model.hydrate_status(vec![drift("/a"), drift("/b")], 1, None, false, None);
+                cx.notify();
+            });
+            shell.update(cx, |s, _cx| {
+                s.queue.finish_all(&[
+                    (
+                        PathBuf::from("/a"),
+                        Some("Keep disk failed: op timed out".into()),
+                    ),
+                    (
+                        PathBuf::from("/b"),
+                        Some("Keep disk failed: op timed out".into()),
+                    ),
+                ]);
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(
+                s.queue.failure(Path::new("/a")).is_some()
+                    && s.queue.failure(Path::new("/b")).is_some(),
+                "both rows show why they failed while both are still drifted"
+            );
+        });
+
+        // `/a` goes back in sync; `/b` is still drifted.
+        vis.update(|_window, cx| {
+            state.update(cx, |model, cx| {
+                model.hydrate_status(vec![drift("/b")], 2, None, false, None);
+                cx.notify();
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(
+                s.queue.failure(Path::new("/a")).is_none(),
+                "the message went with the drift — it must not wait to ambush the \
+                 file's next one"
+            );
+            assert!(
+                s.queue.failure(Path::new("/b")).is_some(),
+                "and a row that is still drifted keeps its failure: nobody has \
+                 retried it"
+            );
+        });
     }
 
     /// Undo is a repo op like the other two: it takes the latch, runs

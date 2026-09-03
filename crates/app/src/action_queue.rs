@@ -129,8 +129,9 @@ pub struct ActionQueue {
     /// in-flight resolve call.
     running: Vec<PathBuf>,
     /// Targets whose last queued action failed, with the message. Kept until
-    /// the user retries or the target stops being drifted — a failure that
-    /// vanished on the next render would be a failure nobody saw.
+    /// the user retries ([`Self::push`]) or the target stops being drifted
+    /// ([`Self::retain_failures`]) — a failure that vanished on the next
+    /// render would be a failure nobody saw.
     failed: BTreeMap<PathBuf, SharedString>,
 }
 
@@ -236,8 +237,19 @@ impl ActionQueue {
         self.failed.iter()
     }
 
-    pub fn clear_failure(&mut self, target: &Path) {
-        self.failed.remove(target);
+    /// Drop every remembered failure whose target `keep` says no to.
+    ///
+    /// The OTHER half of the promise on [`Self::failed`]. Retrying clears a
+    /// failure, but a row the user never retried has to lose its message
+    /// once the file stops being drifted — otherwise the row comes back
+    /// months later, on the file's next unrelated drift, still showing an
+    /// error from a decision that has nothing to do with it.
+    ///
+    /// A predicate rather than a target: the caller holds the drifted set
+    /// (the model), and asking it once per remembered failure keeps the
+    /// queue from having to know what "still drifted" means.
+    pub fn retain_failures(&mut self, keep: impl Fn(&Path) -> bool) {
+        self.failed.retain(|target, _| keep(target));
     }
 }
 

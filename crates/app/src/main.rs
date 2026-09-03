@@ -462,10 +462,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
         },
         |_, cx| {
             cx.new(|cx| {
-                // Views read the model in render; re-render this window
-                // whenever the entity notifies.
-                cx.observe(&state, |_, _, cx| cx.notify()).detach();
-                Shell {
+                let mut shell = Shell {
                     route,
                     state,
                     review: None,
@@ -482,7 +479,12 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     queue: Default::default(),
                     queue_pumping: false,
                     deferred_repo_op: None,
-                }
+                };
+                // Views read the model in render, so every model change
+                // re-renders this window — and prunes the queue state that
+                // change invalidated.
+                shell.observe_model(cx);
+                shell
             })
         },
     )

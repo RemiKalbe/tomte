@@ -808,13 +808,142 @@ impl QueueSnapshot {
             .map(|(_, s)| *s)
     }
 
+    /// Queued OR running: a decision is recorded for this target, so it does
+    /// not need answering and the auto-advance skips it.
     fn is_processing(&self, target: &Path) -> bool {
         self.status(target).is_some()
+    }
+
+    /// Under the latch RIGHT NOW, and so the one state that locks a row.
+    ///
+    /// A pending decision does NOT lock it: spec §2.4 says a re-queued
+    /// target replaces its pending choice, last one wins, and
+    /// `ActionQueue::push` implements exactly that. Locking a pending row
+    /// would make a mis-click uncorrectable for as long as the queue is
+    /// deep, which is precisely when correcting it matters.
+    fn is_running(&self, target: &Path) -> bool {
+        self.status(target) == Some(QueuedStatus::Running)
     }
 
     fn failure(&self, target: &Path) -> Option<&SharedString> {
         self.failures.get(target)
     }
+}
+
+/// What the outcome banner's trailing slot offers.
+///
+/// Split out of `banner_el` so the rule is a value a test can assert on:
+/// which of the three the banner shows is the whole of Undo's gating, and
+/// a render tree is not something a test can read back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UndoAffordance {
+    /// This outcome cannot be undone (a failure, a templated refusal, an
+    /// undo's own banner).
+    None,
+    Live,
+    /// Offered but inert: git work is owed, and "undo the last thing that
+    /// landed" is unambiguous only when nothing is landing.
+    Blocked,
+}
+
+/// Why the selected file's decision buttons (and its "Open merge editor")
+/// are inert, or `None` when they are live.
+///
+/// Both reasons are about THIS file — every other file's buttons stay live
+/// while this one's work drains, which is the whole point of the queue
+/// (spec §1.1) — and the queue reason is RUNNING, not merely queued: a
+/// pending decision can still be changed, and `ActionQueue::push` replaces
+/// it (spec §2.4). Pure so that rule is a value a test can assert, rather
+/// than something only a tooltip in a screenshot could show.
+pub(super) fn blocked_reason(
+    engine_ready: bool,
+    queue: &QueueSnapshot,
+    target: &Path,
+) -> Option<SharedString> {
+    if !engine_ready {
+        return Some("daemon not connected".into());
+    }
+    if queue.is_running(target) {
+        return Some("applying this file's decision now".into());
+    }
+    None
+}
+
+/// Undo's gate, in one place. Shown-but-inert rather than hidden: a button
+/// that vanishes teaches the user nothing about why.
+pub(super) fn undo_affordance(banner: &OutcomeBanner, queue: &QueueSnapshot) -> UndoAffordance {
+    match (banner.undoable, queue.busy) {
+        (false, _) => UndoAffordance::None,
+        (true, true) => UndoAffordance::Blocked,
+        (true, false) => UndoAffordance::Live,
+    }
+}
+
+/// One entry of the sidebar, in display order.
+///
+/// The list is built as data before it is built as elements, because the
+/// rule that a row appears EXACTLY ONCE — under PROCESSING while a decision
+/// is recorded for it, in its severity group otherwise — is invisible in a
+/// screenshot the moment it breaks (the duplicate looks like a second file)
+/// and unreachable from a render tree.
+// No `PartialEq`: `DriftSummary` has none, and the tests below assert on a
+// projection of these rows (label / file name / state) rather than on whole
+// summaries anyway.
+#[derive(Debug, Clone)]
+pub(super) enum SidebarRow {
+    Group(&'static str),
+    Target {
+        entry: DriftSummary,
+        queued: Option<QueuedStatus>,
+    },
+}
+
+/// Plan the sidebar: the PROCESSING group first (spec §2.1 — the row MOVES
+/// there), then the two severity groups minus whatever moved.
+///
+/// A queued target the model no longer lists (a rescan dropped it, say)
+/// still gets a row from a synthesised summary: it is answered-and-running,
+/// and hiding it would lose the only trace of that.
+pub(super) fn sidebar_rows(drifted: &[DriftSummary], queue: &QueueSnapshot) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+    if !queue.processing.is_empty() {
+        rows.push(SidebarRow::Group("PROCESSING"));
+        for (target, status) in &queue.processing {
+            let entry = drifted
+                .iter()
+                .find(|d| d.target == *target)
+                .cloned()
+                .unwrap_or_else(|| DriftSummary {
+                    target: target.clone(),
+                    class: String::new(),
+                    since_ts: None,
+                    origin_differs: false,
+                });
+            rows.push(SidebarRow::Target {
+                entry,
+                queued: Some(*status),
+            });
+        }
+    }
+    let (needs_you, one_click) = severity_groups(drifted);
+    for (label, group) in [
+        ("NEEDS A DECISION", &needs_you),
+        ("SAFE TO RESOLVE", &one_click),
+    ] {
+        let mut group = group
+            .iter()
+            .filter(|d| !queue.is_processing(&d.target))
+            .peekable();
+        if group.peek().is_none() {
+            continue;
+        }
+        rows.push(SidebarRow::Group(label));
+        rows.extend(group.map(|entry| SidebarRow::Target {
+            entry: entry.clone(),
+            queued: None,
+        }));
+    }
+    rows
 }
 
 pub struct ReviewView {
@@ -1123,18 +1252,23 @@ impl ReviewView {
     /// secondary action it is (2026-08-25).
     fn merge_editor_button(
         &self,
-        enabled: bool,
+        blocked: Option<SharedString>,
         is_conflict: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        if !enabled {
+        // Inert while this file's decision is RUNNING, for the same reason
+        // the quick actions are: the editor's Save is another decision about
+        // a file whose last one is mid-flight. A merely QUEUED decision
+        // leaves it open — after Task 5 a save there enqueues too, and
+        // `ActionQueue::push` replaces the pending choice.
+        if let Some(why) = blocked {
             return ui::disabled_button(
                 theme,
                 "open-merge-editor",
                 "Open merge editor".into(),
                 ui::ButtonSize::Sm,
-                Some("daemon not connected".into()),
+                Some(why),
             );
         }
         // Deliberately UNcoloured: "Keep disk" and "Keep source" own the
@@ -1274,8 +1408,9 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) -> Div {
         let color = banner.tint.color(theme);
-        let undo = banner.undoable.then(|| {
-            if queue.busy {
+        let undo = match undo_affordance(banner, queue) {
+            UndoAffordance::None => None,
+            UndoAffordance::Blocked => Some(
                 ui::disabled_button(
                     theme,
                     "outcome-undo",
@@ -1283,7 +1418,9 @@ impl ReviewView {
                     ui::ButtonSize::Micro,
                     Some("finishing queued decisions first".into()),
                 )
-            } else {
+                .into_any_element(),
+            ),
+            UndoAffordance::Live => Some(
                 ui::button(
                     theme,
                     "outcome-undo",
@@ -1292,9 +1429,9 @@ impl ReviewView {
                     ui::ButtonSize::Micro,
                     cx.listener(|view, _ev, _window, cx| view.run_undo(cx)),
                 )
-            }
-            .into_any_element()
-        });
+                .into_any_element(),
+            ),
+        };
         ui::banner(theme, banner.tint, banner.text.clone(), undo)
     }
 
@@ -1307,62 +1444,28 @@ impl ReviewView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let (needs_you, one_click) = severity_groups(drifted);
         let mut ix = 0usize;
         let mut rows: Vec<AnyElement> = Vec::new();
-        // Processing leads: a decision the user has made is no longer a
-        // question, and spec §2.1 has the row MOVE here rather than sit in
-        // its severity group with inert buttons — one file, one row.
-        if !queue.processing.is_empty() {
-            rows.push(group_header("PROCESSING", theme).into_any_element());
-            for (target, status) in &queue.processing {
-                // A queued target the model no longer lists (a rescan
-                // dropped it, say) still has work owed and still gets a row:
-                // it is answered-and-running, and hiding it would lose the
-                // only trace of that.
-                let entry = drifted
-                    .iter()
-                    .find(|d| d.target == *target)
-                    .cloned()
-                    .unwrap_or_else(|| DriftSummary {
-                        target: target.clone(),
-                        class: String::new(),
-                        since_ts: None,
-                        origin_differs: false,
-                    });
-                rows.push(
-                    self.target_row(ix, &entry, now, Some(*status), None, theme, cx)
+        for row in sidebar_rows(drifted, queue) {
+            match row {
+                SidebarRow::Group(label) => {
+                    rows.push(group_header(label, theme).into_any_element())
+                }
+                SidebarRow::Target { entry, queued } => {
+                    rows.push(
+                        self.target_row(
+                            ix,
+                            &entry,
+                            now,
+                            queued,
+                            queue.failure(&entry.target),
+                            theme,
+                            cx,
+                        )
                         .into_any_element(),
-                );
-                ix += 1;
-            }
-        }
-        for (label, group) in [
-            ("NEEDS A DECISION", &needs_you),
-            ("SAFE TO RESOLVE", &one_click),
-        ] {
-            let group: Vec<&DriftSummary> = group
-                .iter()
-                .filter(|d| !queue.is_processing(&d.target))
-                .collect();
-            if group.is_empty() {
-                continue;
-            }
-            rows.push(group_header(label, theme).into_any_element());
-            for entry in group {
-                rows.push(
-                    self.target_row(
-                        ix,
-                        entry,
-                        now,
-                        None,
-                        queue.failure(&entry.target),
-                        theme,
-                        cx,
-                    )
-                    .into_any_element(),
-                );
-                ix += 1;
+                    );
+                    ix += 1;
+                }
             }
         }
         if rows.is_empty() {
@@ -1437,11 +1540,13 @@ impl ReviewView {
     /// One sidebar row.
     ///
     /// `queued` is `Some` for a row under PROCESSING: the whole row recedes
-    /// to muted and stops being a click target, because a decision is
-    /// already recorded for it and there is nothing to answer. `failure` is
-    /// the message the last decision for this row came back with — it stays
-    /// on the row (spec §2.5) and the row stays live, because choosing again
-    /// IS the retry.
+    /// to muted, because a decision is already recorded for it. It stops
+    /// being a click target only once that decision is RUNNING — while it
+    /// is merely queued, selecting it and choosing again replaces the
+    /// pending choice (spec §2.4, `ActionQueue::push`), which is the only
+    /// way to correct a mis-click before it lands. `failure` is the message
+    /// the last decision came back with — it stays on the row (spec §2.5)
+    /// and the row stays live, because choosing again IS the retry.
     #[allow(clippy::too_many_arguments)]
     fn target_row(
         &self,
@@ -1454,6 +1559,10 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let selected = self.selected.as_deref() == Some(entry.target.as_path());
+        // Same rule as `QueueSnapshot::is_running`, which is what
+        // `blocked_reason` gates the buttons on: running locks, queued does
+        // not (spec §2.4).
+        let locked = queued == Some(QueuedStatus::Running);
         // A processing row carries no severity: the question it was asking
         // has been answered. Its class tint would still read as "decide me".
         let color = if queued.is_some() {
@@ -1486,7 +1595,7 @@ impl ReviewView {
             .flex()
             .flex_col()
             .gap_0p5()
-            .when(queued.is_none(), |el| el.cursor_pointer())
+            .when(!locked, |el| el.cursor_pointer())
             .when(selected, |el| el.bg(theme.surface))
             .child(
                 div()
@@ -1528,7 +1637,7 @@ impl ReviewView {
                     ui::StatusTone::Conflict,
                 ))
             }))
-            .when(queued.is_none(), |el| {
+            .when(!locked, |el| {
                 el.on_click(cx.listener(move |view, _ev, _window, cx| {
                     view.select(target.clone(), cx);
                 }))
@@ -1569,16 +1678,7 @@ impl ReviewView {
         // yet observed) case where the two disagreed about the file.
         // Authoritative: origin's LOADED content, not the scan's hint.
         let split = self.origin_diffs.is_some();
-        // The ONLY reasons a decision button is inert. Both are about THIS
-        // file: every other file's buttons stay live while this one's work
-        // drains, which is the whole point of the queue (spec §1.1).
-        let blocked: Option<SharedString> = if !engine_ready {
-            Some("daemon not connected".into())
-        } else if queue.is_processing(selected) {
-            Some("already queued — the decision is recorded".into())
-        } else {
-            None
-        };
+        let blocked = blocked_reason(engine_ready, queue, selected);
         let mut header_actions: Vec<AnyElement> = Vec::new();
         header_actions.push(
             self.action_button(ResolveAction::KeepDisk, split, blocked.clone(), theme, cx)
@@ -1612,7 +1712,7 @@ impl ReviewView {
             );
         }
         header_actions.push(
-            self.merge_editor_button(engine_ready, is_conflict, theme, cx)
+            self.merge_editor_button(blocked.clone(), is_conflict, theme, cx)
                 .flex_shrink_0()
                 .into_any_element(),
         );
@@ -2029,16 +2129,17 @@ fn preview_decors(lines: &[DiffLine], theme: Theme) -> Vec<ui::text_area::LineDe
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tomte_app::resolve::{ResolveError, ResolveOutcome};
     use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind};
     use tomte_proto::DriftSummary;
 
     use super::{
-        BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, ResolveAction, flatten_document,
+        BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
+        QueuedStatus, ResolveAction, SidebarRow, UndoAffordance, blocked_reason, flatten_document,
         next_after, origin_diffs, origin_hint, outcome_banner, per_line_ranges, preview_decors,
-        severity_groups, source_actions, undo_banner,
+        severity_groups, sidebar_rows, source_actions, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -2208,6 +2309,176 @@ mod tests {
         assert_eq!(diffs.seen, "a=origin\n");
     }
 
+    /// A queue pose: `running` are under the latch, `waiting` behind it.
+    fn posed_queue(running: &[&str], waiting: &[&str], busy: bool) -> QueueSnapshot {
+        QueueSnapshot {
+            processing: running
+                .iter()
+                .map(|t| (PathBuf::from(*t), QueuedStatus::Running))
+                .chain(
+                    waiting
+                        .iter()
+                        .map(|t| (PathBuf::from(*t), QueuedStatus::Waiting)),
+                )
+                .collect(),
+            failures: Default::default(),
+            busy,
+        }
+    }
+
+    /// The sidebar plan as one line per row: a header's label, or a row's
+    /// target with the state it renders in.
+    fn plan(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                SidebarRow::Group(label) => (*label).to_string(),
+                SidebarRow::Target { entry, queued } => format!(
+                    "{} [{}]",
+                    entry.target.display(),
+                    match queued {
+                        Some(QueuedStatus::Running) => "running",
+                        Some(QueuedStatus::Waiting) => "queued",
+                        None => "answerable",
+                    }
+                ),
+            })
+            .collect()
+    }
+
+    /// A file gets EXACTLY ONE row. Spec §2.1 has the row move to
+    /// PROCESSING; leaving it in its severity group as well renders the same
+    /// file twice — once inert, once live — which reads as two files and
+    /// invites answering a decision that is already recorded.
+    ///
+    /// MUTATION: drop the `!queue.is_processing(…)` filter from
+    /// `sidebar_rows` → `/a` appears under PROCESSING and again under NEEDS
+    /// A DECISION.
+    #[test]
+    fn a_processing_row_moves_out_of_its_severity_group_instead_of_doubling() {
+        let drifted = vec![s("/a", "conflict"), s("/b", "destination_drift")];
+
+        // Nothing queued: the two groups, no PROCESSING header.
+        assert_eq!(
+            plan(&sidebar_rows(&drifted, &QueueSnapshot::default())),
+            [
+                "NEEDS A DECISION",
+                "/a [answerable]",
+                "SAFE TO RESOLVE",
+                "/b [answerable]",
+            ]
+        );
+
+        // `/a` answered: it moves, and its group goes with it.
+        assert_eq!(
+            plan(&sidebar_rows(&drifted, &posed_queue(&["/a"], &[], true))),
+            [
+                "PROCESSING",
+                "/a [running]",
+                "SAFE TO RESOLVE",
+                "/b [answerable]",
+            ]
+        );
+
+        // Both answered: running first, then waiting, and no severity group
+        // is left to head.
+        assert_eq!(
+            plan(&sidebar_rows(
+                &drifted,
+                &posed_queue(&["/a"], &["/b"], true)
+            )),
+            ["PROCESSING", "/a [running]", "/b [queued]"]
+        );
+    }
+
+    /// A queued target the model has stopped listing still gets its row:
+    /// work is owed on it, and the PROCESSING group is the only trace of
+    /// that.
+    #[test]
+    fn a_processing_row_survives_the_model_dropping_it() {
+        let rows = sidebar_rows(&[], &posed_queue(&["/gone"], &[], true));
+        assert_eq!(plan(&rows), ["PROCESSING", "/gone [running]"]);
+    }
+
+    /// Spec §2.4 has to be REACHABLE: a decision that has not started yet
+    /// can be changed, so the row's buttons stay live while it is merely
+    /// queued and go inert only once it is running. Gating on "processing"
+    /// instead made a mis-click uncorrectable for as long as the queue was
+    /// deep — exactly when correcting it matters.
+    ///
+    /// MUTATION: gate `blocked_reason` on `is_processing` instead of
+    /// `is_running` → the queued case reports a reason and the buttons go
+    /// dead. MUTATION: have `is_running` accept `Waiting` → same.
+    #[test]
+    fn only_a_running_decision_locks_its_file_out_of_being_re_chosen() {
+        let a = Path::new("/a");
+        assert_eq!(
+            blocked_reason(true, &QueueSnapshot::default(), a),
+            None,
+            "nothing owed: live"
+        );
+        assert_eq!(
+            blocked_reason(true, &posed_queue(&[], &["/a"], true), a),
+            None,
+            "queued but not started: still answerable, and choosing again replaces it"
+        );
+        assert_eq!(
+            blocked_reason(true, &posed_queue(&["/a"], &[], true), a)
+                .map(|r| r.to_string())
+                .unwrap_or_default(),
+            "applying this file's decision now"
+        );
+        // Another file's work never blocks this one — the user's complaint.
+        assert_eq!(
+            blocked_reason(true, &posed_queue(&["/other"], &["/third"], true), a),
+            None
+        );
+        // No daemon still outranks everything: nothing can run at all.
+        assert_eq!(
+            blocked_reason(false, &QueueSnapshot::default(), a)
+                .map(|r| r.to_string())
+                .unwrap_or_default(),
+            "daemon not connected"
+        );
+        // The row's own lock reads the same rule.
+        let queue = posed_queue(&["/a"], &["/b"], true);
+        assert!(queue.is_running(a));
+        assert!(!queue.is_running(Path::new("/b")));
+        assert!(
+            queue.is_processing(Path::new("/b")),
+            "a queued row is still listed under PROCESSING and skipped by the advance"
+        );
+    }
+
+    /// Undo is offered-but-inert while ANY git work is owed, never hidden:
+    /// "undo the last thing that landed" is unambiguous only when nothing is
+    /// landing, and a button that vanishes says nothing about why.
+    ///
+    /// MUTATION: drop the busy arm from `undo_affordance` (always `Live`
+    /// when undoable) → the second case fails, and the banner would offer an
+    /// Undo whose target depends on which queued decision finishes first.
+    #[test]
+    fn undo_is_shown_inert_while_the_queue_owes_work() {
+        let landed = OutcomeBanner {
+            text: "Kept disk version · committed & pushed".into(),
+            tint: BannerTint::Ok,
+            undoable: true,
+        };
+        let failed = OutcomeBanner {
+            text: "Keep disk failed: daemon gone".into(),
+            tint: BannerTint::Conflict,
+            undoable: false,
+        };
+        let idle = QueueSnapshot::default();
+        let busy = posed_queue(&[], &["/a"], true);
+
+        assert_eq!(undo_affordance(&landed, &idle), UndoAffordance::Live);
+        assert_eq!(undo_affordance(&landed, &busy), UndoAffordance::Blocked);
+        // An outcome that cannot be undone offers nothing either way — the
+        // busy state must not turn a non-offer into an inert offer.
+        assert_eq!(undo_affordance(&failed, &idle), UndoAffordance::None);
+        assert_eq!(undo_affordance(&failed, &busy), UndoAffordance::None);
+    }
+
     /// Spec §2.6: confirming advances the selection, so a sweep is one click
     /// per file with no re-targeting click between.
     ///
@@ -2217,8 +2488,6 @@ mod tests {
     /// inert.
     #[test]
     fn next_after_prefers_the_following_row_then_the_preceding_one_and_skips_processing() {
-        use std::path::PathBuf;
-
         let order: Vec<PathBuf> = ["/a", "/b", "/c", "/d"].iter().map(PathBuf::from).collect();
         let none = |_: &Path| false;
         assert_eq!(
