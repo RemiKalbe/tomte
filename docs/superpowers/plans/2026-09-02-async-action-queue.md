@@ -942,10 +942,11 @@ git commit -m "fix(shell): merge finish and abort wait their turn behind the que
 **Files:**
 - Modify: `crates/app/src/views/review.rs`
 - Modify: `crates/app/src/views/fixtures.rs` (add `review-processing`, `review-failed`)
+- Modify: `crates/app/src/views/mod.rs` (small: `PendingRepoOp::UndoLast`, `Shell::undo_last`, `Shell::is_busy` — see Step 3.1)
 
 **Interfaces:**
-- Consumes: `Shell::enqueue`, `Shell::queue` (Task 3), `Decision` (Task 2).
-- Produces: `ReviewView::action_in_flight` REMOVED; `fn advance_after(&mut self, resolved: &Path, cx)`.
+- Consumes: `Shell::enqueue`, `Shell::queue`, `Shell::queue_pumping` (Task 3); `Decision::{KeepDisk, KeepSourceLocal, KeepSourceOrigin{seen}, Merged{resolved, inputs}}` (Task 2); `PendingRepoOp`, `Shell::request_repo_op`, `Shell::deferred_repo_op`, `Shell::pump`, `Shell::merge_done(banner, cx)` (Task 3b).
+- Produces: `ReviewView::action_in_flight` REMOVED; `fn next_after(...)`; `PendingRepoOp::UndoLast`; `pub fn Shell::undo_last(&mut self, cx)`; `pub fn Shell::is_busy(&self) -> bool`.
 
 - [ ] **Step 1: Write the failing unit test for auto-advance**
 
@@ -981,10 +982,27 @@ fn next_after_prefers_the_following_row_then_the_preceding_one_and_skips_process
 
 1. Delete `action_in_flight` and every read/write of it (`review.rs:796,
    828, 910, 927, 938, 968, 977, 985, 1009, 1018, 1195, 1390`). `run_action`,
-   `run_undo` and `run_keep_both` no longer spawn: they build a
-   `QueuedAction` and call `self.shell.update(cx, |s, cx| s.enqueue(a, cx))`.
-   Undo is not a queued decision — keep it as it is but drop its guard, and
-   disable the Undo button while `shell.queue.depth() > 0` instead.
+   `run_action` and `run_keep_both` no longer spawn: they build a
+   `QueuedAction` (keep-both is `Decision::Merged { resolved: assembled,
+   inputs }`) and call `self.shell.update(cx, |s, cx| s.enqueue(a, cx))`.
+   `run_undo` no longer spawns either — Undo is a git mutation, and after
+   Task 3b EVERY app-initiated git mutation runs under the Shell latch.
+   Undo is not per-target, so it is a repo op, not a decision: add
+   `PendingRepoOp::UndoLast` in `mod.rs`, `pub fn Shell::undo_last(&mut self, cx)`
+   that calls `request_repo_op(PendingRepoOp::UndoLast, cx)`, and a
+   `run_undo(engine, cx)` arm in `pump` mirroring `run_finish`: background
+   `engine.undo_last()` under `catching_panics`, completion clears the latch,
+   hands `undo_banner(&result)` to the review view through `merge_done`
+   (route is already Review — Undo is only pressed there; move `undo_banner`
+   to `pub(super)` so `mod.rs` can call it), re-selects the current row from
+   inside that review update, then `pump`s. Precedence: `UndoLast` never
+   displaces a pending finish or abort and is dropped with a `log_info!` if
+   one is pending. Add `pub fn Shell::is_busy(&self) -> bool { self.queue_pumping || self.queue.depth() > 0 || self.deferred_repo_op.is_some() }`
+   and disable the Undo button while `shell.is_busy()` — "undo the last
+   thing that landed" is only unambiguous when nothing is landing. Test in
+   `mod.rs`: `undo_last` while idle takes the latch and, on the `EngineLab`
+   with nothing to undo, lands a banner and clears the latch; while a
+   `FinishMerge` is pending it is dropped and the finish stays.
 2. After enqueueing, compute `ordered` from `severity_groups(&model.drifted)`
    (needs_you then one_click), call `next_after`, and `self.select(next, cx)`
    when `Some`.
@@ -1020,8 +1038,8 @@ state must be unchanged.
 Gate as before (the `every_gallery_state_builds_and_renders` test covers the
 new states automatically). Then:
 ```bash
-git add crates/app/src/views/review.rs crates/app/src/views/fixtures.rs
-git commit -m "feat(review): decisions enqueue; Processing section; failure chips; auto-advance"
+git add crates/app/src/views/review.rs crates/app/src/views/fixtures.rs crates/app/src/views/mod.rs
+git commit -m "feat(review): decisions enqueue; undo behind the latch; Processing section; failure chips; auto-advance"
 ```
 
 ---
