@@ -2017,7 +2017,7 @@ mod render_smoke {
                 );
                 assert_eq!(s.queue.depth(), 2, "both remembered");
                 assert!(
-                    s.queue.is_processing(Path::new("/b")),
+                    s.queue.processing().contains(&PathBuf::from("/b")),
                     "the second was not discarded"
                 );
             });
@@ -2594,7 +2594,8 @@ mod render_smoke {
             let s = shell.read(cx);
             assert!(
                 s.queue
-                    .is_processing(&home.join(".config/zed/settings.json")),
+                    .processing()
+                    .contains(&home.join(".config/zed/settings.json")),
                 "the decision is recorded on the Shell's queue, not discarded"
             );
             assert_eq!(s.queue.depth(), 1);

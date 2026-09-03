@@ -782,6 +782,24 @@ impl QueuedStatus {
             Self::Waiting => "queued",
         }
     }
+
+    /// Is this decision past changing?
+    ///
+    /// THE ONE HOME OF THAT RULE. A row is locked out of being re-selected
+    /// and its buttons go inert exactly when its decision is already under
+    /// the latch; a decision that has not started can still be replaced
+    /// (spec §2.4, `ActionQueue::push`), and re-choosing it is the only way
+    /// to correct a mis-click — the selection has already advanced off the
+    /// row by then, so the row click is the only route back to its buttons.
+    ///
+    /// Both readers of that rule call this: [`blocked_reason`] through
+    /// [`QueueSnapshot::locks_row`] for the header's buttons, and
+    /// `ReviewView::target_row` for the row's own `cursor_pointer` and
+    /// `on_click`. Spelling the comparison out a second time is how round
+    /// 1's fix silently regressed on one line.
+    fn locks_row(self) -> bool {
+        matches!(self, Self::Running)
+    }
 }
 
 /// The Shell's action queue as one render pass needs to see it.
@@ -814,15 +832,10 @@ impl QueueSnapshot {
         self.status(target).is_some()
     }
 
-    /// Under the latch RIGHT NOW, and so the one state that locks a row.
-    ///
-    /// A pending decision does NOT lock it: spec §2.4 says a re-queued
-    /// target replaces its pending choice, last one wins, and
-    /// `ActionQueue::push` implements exactly that. Locking a pending row
-    /// would make a mis-click uncorrectable for as long as the queue is
-    /// deep, which is precisely when correcting it matters.
-    fn is_running(&self, target: &Path) -> bool {
-        self.status(target) == Some(QueuedStatus::Running)
+    /// Is this target's decision past changing — see
+    /// [`QueuedStatus::locks_row`], which is the rule itself.
+    fn locks_row(&self, target: &Path) -> bool {
+        self.status(target).is_some_and(QueuedStatus::locks_row)
     }
 
     fn failure(&self, target: &Path) -> Option<&SharedString> {
@@ -863,7 +876,7 @@ pub(super) fn blocked_reason(
     if !engine_ready {
         return Some("daemon not connected".into());
     }
-    if queue.is_running(target) {
+    if queue.locks_row(target) {
         return Some("applying this file's decision now".into());
     }
     None
@@ -895,6 +908,16 @@ pub(super) enum SidebarRow {
     Target {
         entry: DriftSummary,
         queued: Option<QueuedStatus>,
+        /// Past changing: not a click target, and its buttons are inert.
+        ///
+        /// A FIELD, not something the row recomputes. It is derived from
+        /// `queued` through [`QueuedStatus::locks_row`] right here, in the
+        /// one function a test can read, and `ReviewView::target_row` then
+        /// uses it verbatim. Deriving it a second time at the render site is
+        /// exactly how round 1's fix regressed on one untested line — so
+        /// this apparent redundancy is the point, not something to tidy
+        /// away.
+        locked: bool,
     },
 }
 
@@ -922,6 +945,7 @@ pub(super) fn sidebar_rows(drifted: &[DriftSummary], queue: &QueueSnapshot) -> V
             rows.push(SidebarRow::Target {
                 entry,
                 queued: Some(*status),
+                locked: status.locks_row(),
             });
         }
     }
@@ -941,6 +965,7 @@ pub(super) fn sidebar_rows(drifted: &[DriftSummary], queue: &QueueSnapshot) -> V
         rows.extend(group.map(|entry| SidebarRow::Target {
             entry: entry.clone(),
             queued: None,
+            locked: false,
         }));
     }
     rows
@@ -1451,13 +1476,18 @@ impl ReviewView {
                 SidebarRow::Group(label) => {
                     rows.push(group_header(label, theme).into_any_element())
                 }
-                SidebarRow::Target { entry, queued } => {
+                SidebarRow::Target {
+                    entry,
+                    queued,
+                    locked,
+                } => {
                     rows.push(
                         self.target_row(
                             ix,
                             &entry,
                             now,
                             queued,
+                            locked,
                             queue.failure(&entry.target),
                             theme,
                             cx,
@@ -1540,13 +1570,15 @@ impl ReviewView {
     /// One sidebar row.
     ///
     /// `queued` is `Some` for a row under PROCESSING: the whole row recedes
-    /// to muted, because a decision is already recorded for it. It stops
-    /// being a click target only once that decision is RUNNING — while it
-    /// is merely queued, selecting it and choosing again replaces the
-    /// pending choice (spec §2.4, `ActionQueue::push`), which is the only
-    /// way to correct a mis-click before it lands. `failure` is the message
-    /// the last decision came back with — it stays on the row (spec §2.5)
-    /// and the row stays live, because choosing again IS the retry.
+    /// to muted, because a decision is already recorded for it. `locked`
+    /// says whether that decision is past changing, and comes from
+    /// [`sidebar_rows`] rather than being re-derived here — while a
+    /// decision is merely queued, selecting the row and choosing again
+    /// replaces the pending choice (spec §2.4, `ActionQueue::push`), which
+    /// is the only way to correct a mis-click once the selection has moved
+    /// on. `failure` is the message the last decision came back with — it
+    /// stays on the row (spec §2.5) and the row stays live, because
+    /// choosing again IS the retry.
     #[allow(clippy::too_many_arguments)]
     fn target_row(
         &self,
@@ -1554,15 +1586,12 @@ impl ReviewView {
         entry: &DriftSummary,
         now: u64,
         queued: Option<QueuedStatus>,
+        locked: bool,
         failure: Option<&SharedString>,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let selected = self.selected.as_deref() == Some(entry.target.as_path());
-        // Same rule as `QueueSnapshot::is_running`, which is what
-        // `blocked_reason` gates the buttons on: running locks, queued does
-        // not (spec §2.4).
-        let locked = queued == Some(QueuedStatus::Running);
         // A processing row carries no severity: the question it was asking
         // has been answered. Its class tint would still read as "decide me".
         let color = if queued.is_some() {
@@ -2327,18 +2356,37 @@ mod tests {
     }
 
     /// The sidebar plan as one line per row: a header's label, or a row's
-    /// target with the state it renders in.
+    /// target, the state it renders in, and whether it is still a click
+    /// target.
+    ///
+    /// The lock is in here because it is what makes §2.4 reachable: the
+    /// selection has advanced off the row by the time a decision is queued,
+    /// so the row click is the ONLY route back to its live buttons. It is
+    /// read off the row's own `locked` flag — the very bool `target_row`
+    /// renders from — so this projection moves when that rule moves, and
+    /// the render site has no second rule to drift into.
     fn plan(rows: &[SidebarRow]) -> Vec<String> {
         rows.iter()
             .map(|row| match row {
                 SidebarRow::Group(label) => (*label).to_string(),
-                SidebarRow::Target { entry, queued } => format!(
+                SidebarRow::Target {
+                    entry,
+                    queued,
+                    locked,
+                } => format!(
                     "{} [{}]",
                     entry.target.display(),
                     match queued {
-                        Some(QueuedStatus::Running) => "running",
-                        Some(QueuedStatus::Waiting) => "queued",
-                        None => "answerable",
+                        None => "answerable".to_string(),
+                        Some(status) => format!(
+                            "{}, {}",
+                            match status {
+                                QueuedStatus::Running => "running",
+                                QueuedStatus::Waiting => "queued",
+                            },
+                            // The row's OWN flag, not a re-derivation.
+                            if *locked { "locked" } else { "selectable" }
+                        ),
                     }
                 ),
             })
@@ -2352,7 +2400,10 @@ mod tests {
     ///
     /// MUTATION: drop the `!queue.is_processing(…)` filter from
     /// `sidebar_rows` → `/a` appears under PROCESSING and again under NEEDS
-    /// A DECISION.
+    /// A DECISION. MUTATION: widen `QueuedStatus::locks_row` to
+    /// `matches!(self, Running | Waiting)` (or spell the comparison out as
+    /// `queued.is_some()` in `target_row`) → the queued row reads `locked`,
+    /// and the only route back to a mis-clicked file's buttons is gone.
     #[test]
     fn a_processing_row_moves_out_of_its_severity_group_instead_of_doubling() {
         let drifted = vec![s("/a", "conflict"), s("/b", "destination_drift")];
@@ -2373,7 +2424,7 @@ mod tests {
             plan(&sidebar_rows(&drifted, &posed_queue(&["/a"], &[], true))),
             [
                 "PROCESSING",
-                "/a [running]",
+                "/a [running, locked]",
                 "SAFE TO RESOLVE",
                 "/b [answerable]",
             ]
@@ -2386,7 +2437,13 @@ mod tests {
                 &drifted,
                 &posed_queue(&["/a"], &["/b"], true)
             )),
-            ["PROCESSING", "/a [running]", "/b [queued]"]
+            [
+                "PROCESSING",
+                "/a [running, locked]",
+                // The whole of §2.4's reachability, in one word: a decision
+                // that has not started yet can still be re-chosen.
+                "/b [queued, selectable]",
+            ]
         );
     }
 
@@ -2396,7 +2453,7 @@ mod tests {
     #[test]
     fn a_processing_row_survives_the_model_dropping_it() {
         let rows = sidebar_rows(&[], &posed_queue(&["/gone"], &[], true));
-        assert_eq!(plan(&rows), ["PROCESSING", "/gone [running]"]);
+        assert_eq!(plan(&rows), ["PROCESSING", "/gone [running, locked]"]);
     }
 
     /// Spec §2.4 has to be REACHABLE: a decision that has not started yet
@@ -2439,10 +2496,15 @@ mod tests {
                 .unwrap_or_default(),
             "daemon not connected"
         );
-        // The row's own lock reads the same rule.
+        // The rule itself, which the row and the header both read.
+        assert!(QueuedStatus::Running.locks_row());
+        assert!(
+            !QueuedStatus::Waiting.locks_row(),
+            "a queued decision has not started; re-choosing it replaces it"
+        );
         let queue = posed_queue(&["/a"], &["/b"], true);
-        assert!(queue.is_running(a));
-        assert!(!queue.is_running(Path::new("/b")));
+        assert!(queue.locks_row(a));
+        assert!(!queue.locks_row(Path::new("/b")));
         assert!(
             queue.is_processing(Path::new("/b")),
             "a queued row is still listed under PROCESSING and skipped by the advance"

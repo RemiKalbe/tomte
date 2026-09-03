@@ -200,13 +200,6 @@ impl ActionQueue {
         }
     }
 
-    /// Is this target queued or running? Such a row renders under
-    /// "processing" and its buttons are inert — the only row in the app whose
-    /// buttons are.
-    pub fn is_processing(&self, target: &Path) -> bool {
-        self.running.iter().any(|r| r == target) || self.pending.iter().any(|p| p.target == target)
-    }
-
     /// Targets currently executing, in the order [`Self::take_batch`] took
     /// them.
     pub fn running(&self) -> &[PathBuf] {
@@ -216,6 +209,13 @@ impl ActionQueue {
     /// Everything queued or running, in the order the user chose it: the
     /// running batch first (in the order it was taken), then the rest still
     /// pending.
+    ///
+    /// These are the rows the UI renders under "Processing". Being here does
+    /// NOT make a row inert: only a RUNNING decision cannot be changed any
+    /// more. A row whose decision is still pending stays selectable and
+    /// re-choosable, and [`Self::push`] replaces the pending choice — spec
+    /// §2.4, "a re-queued target replaces its pending choice". Use
+    /// [`Self::running`] for the ones that are past changing.
     pub fn processing(&self) -> Vec<PathBuf> {
         self.running
             .iter()
@@ -257,6 +257,14 @@ impl ActionQueue {
 mod tests {
     use super::*;
 
+    /// Queued or running, as the sidebar asks it. A free function here
+    /// rather than a method: production renders the whole
+    /// [`ActionQueue::processing`] list, so a one-target query would be a
+    /// public API with no caller outside these tests.
+    fn is_processing(q: &ActionQueue, target: &str) -> bool {
+        q.processing().contains(&PathBuf::from(target))
+    }
+
     fn action(target: &str, decision: Decision) -> QueuedAction {
         QueuedAction {
             target: PathBuf::from(target),
@@ -294,7 +302,7 @@ mod tests {
 
         q.push(action("/b", Decision::KeepSourceLocal));
         assert!(
-            q.is_processing(Path::new("/b")),
+            is_processing(&q, "/b"),
             "the second decision is remembered, not dropped"
         );
         assert!(
@@ -348,7 +356,7 @@ mod tests {
             Some("op timed out")
         );
         assert!(
-            !q.is_processing(Path::new("/a")),
+            !is_processing(&q, "/a"),
             "a failed target is not still processing — it is answerable again"
         );
 
@@ -444,7 +452,7 @@ mod tests {
         );
         assert_eq!(q.running(), [PathBuf::from("/a")]);
         assert!(
-            q.is_processing(Path::new("/a")) && q.is_processing(Path::new("/b")),
+            is_processing(&q, "/a") && is_processing(&q, "/b"),
             "/a is running, /b still pending — both count as processing"
         );
     }
