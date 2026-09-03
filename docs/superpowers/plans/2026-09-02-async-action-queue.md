@@ -1056,12 +1056,12 @@ from the Task 3/3b reviews (marked **Ruling** below).
 - Modify: `crates/app/src/views/merge.rs` (`save` ~:1690, `saving` :991, 1071, 1111, 1131, 1691, 1715)
 - Modify: `crates/app/src/views/dashboard.rs` (`quick_action_button` ~:951, `run_quick_action` ~:990, the Finish button ~:396-411, the snapshot struct ~:175)
 - Modify: `crates/app/src/views/mod.rs` (`repo_conflict_saved` — DELETE; `dashboard_action_in_flight` — DELETE; the `route = Route::Review` inside `pump`'s `RepoConflictStaged` path ~:631 — DELETE; `request_repo_op`; new `running_repo_op`; the dashboard snapshot copy ~:895)
-- Modify: `crates/app/src/action_queue.rs` (add `notify_on_done` to `QueuedAction`; add `fail_pending_where`)
+- Modify: `crates/app/src/action_queue.rs` (add `notify_on_done` to `QueuedAction`; `running` becomes `Vec<QueuedAction>`; add `fail_pending_where`, `decision_label`; add `Decision::KeepBoth`)
 - Modify: `crates/app/src/views/review.rs` (`outcome_banner` :547 → `pub(super)`; a banner setter that does not route)
 
 **Interfaces:**
 - Consumes: `Shell::enqueue`, `Decision::{Merged, RepoConflict, KeepDisk, KeepSourceLocal}`, `PendingRepoOp`, `Shell::request_repo_op`, `Shell::deferred_repo_op`, `Shell::merge_done`, `ActionQueue`.
-- Produces: `MergeView::saving` REMOVED; `Shell::dashboard_action_in_flight` REMOVED; `run_quick_action` REMOVED; `Shell::repo_conflict_saved` REMOVED; `QueuedAction { target, decision, pub notify_on_done: bool }`; `ActionQueue::fail_pending_where(&mut self, pred: impl Fn(&QueuedAction) -> bool, msg: &str) -> Vec<PathBuf>`; `#[derive(Clone, Copy, PartialEq, Debug)] pub(super) enum RepoOpKind { Finish, Abort, Undo }` with `PendingRepoOp::kind(&self) -> RepoOpKind`; `Shell::running_repo_op: Option<RepoOpKind>` (set by `pump` when it picks an op up, cleared by that op's completion); `Shell::show_outcome(&mut self, banner: OutcomeBanner, cx)` — sets the review view's `last_outcome` WITHOUT touching `route`.
+- Produces: `MergeView::saving` REMOVED; `Shell::dashboard_action_in_flight` REMOVED; `run_quick_action` REMOVED; `Shell::repo_conflict_saved` REMOVED; `QueuedAction { target, decision, pub notify_on_done: bool }`; `ActionQueue::running` holds `Vec<QueuedAction>` (`running() -> &[QueuedAction]`; callers that want paths map it); `ActionQueue::decision_label(&self, target: &Path) -> Option<&'static str>` over running then pending; `Decision::KeepBoth { resolved: String, inputs: Arc<MergeInputs> }` (label "Keep both", not batchable, runs exactly as `Merged`); `ActionQueue::fail_pending_where(&mut self, pred: impl Fn(&QueuedAction) -> bool, msg: &str) -> Vec<PathBuf>`; `#[derive(Clone, Copy, PartialEq, Debug)] pub(super) enum RepoOpKind { Finish, Abort, Undo }` with `PendingRepoOp::kind(&self) -> RepoOpKind`; `Shell::running_repo_op: Option<RepoOpKind>` (set by `pump` when it picks an op up, cleared by that op's completion); `Shell::show_outcome(&mut self, banner: OutcomeBanner, cx)` — sets the review view's `last_outcome` WITHOUT touching `route`.
 
 - [ ] **Step 1: Merge editor**
 
@@ -1099,6 +1099,24 @@ inputs are only known to the review view, add a sibling
 rather than threading view state through the queue. Deliver it with
 `show_outcome`. The user must still see "committed & pushed" when it lands,
 now without being yanked.
+
+- [ ] **Step 1b: The queue remembers what it is running (Rulings 33, 34)**
+
+Task 4 could not show a processing row's decision because `take_batch`
+keeps only paths for `running` and `pending` has no accessor, so rows say
+"running…" / "queued". `notify_on_done` has the same need — it must
+survive to `batch_finished` — so fix both at the type: `running:
+Vec<QueuedAction>` (`take_batch` clones the batch into it; `finish_all`
+still clears it wholesale; `is_processing`/`processing`/`depth` unchanged
+in meaning), plus `decision_label(target)` searching running then pending.
+`run_batch` and `batch_finished` read `notify_on_done` from the running
+entry. In `review.rs`'s processing rows, show `"{label} · running…"` /
+`"{label} · queued"`. Add `Decision::KeepBoth { resolved, inputs }` and have
+Review's keep-both enqueue it, so a failure reads "Keep both failed", not
+"Save failed". Update Task 2's tests that touch `running()`; add one for
+`decision_label` (running beats pending for the same target — which
+cannot happen after `push`'s replace, so assert the pending case and the
+running case separately).
 
 - [ ] **Step 2: Dashboard quick actions**
 
