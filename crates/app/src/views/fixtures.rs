@@ -367,6 +367,8 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         merge_finish_in_flight: false,
         pending_merge_probed: false,
         changelog: None,
+        queue: Default::default(),
+        queue_pumping: false,
     };
 
     // Component previews: bare Shell routed at the preview (no posed data).

@@ -479,6 +479,8 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
+                    queue: Default::default(),
+                    queue_pumping: false,
                 }
             })
         },

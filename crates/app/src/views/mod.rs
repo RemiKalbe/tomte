@@ -14,8 +14,9 @@ use gpui::{
     AppContext as _, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px,
 };
 
+use tomte_app::action_queue::{ActionQueue, Decision, QueuedAction};
 use tomte_app::model::{SyncModel, time_ago};
-use tomte_app::resolve::MergeConclusion;
+use tomte_app::resolve::{BatchItem, MergeConclusion, ResolveEngine, ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
 use tomte_ui::components as ui;
 
@@ -86,6 +87,17 @@ pub struct Shell {
     pub pending_merge_probed: bool,
     /// Gallery-only changelog view, kept so its scroll position survives.
     pub changelog: Option<Entity<changelog::ChangelogView>>,
+    /// Every decision the user has made that is not finished yet, plus the
+    /// failures nobody has acknowledged. Lives on the Shell because it
+    /// outlives any one view: a decision made in the merge editor is still
+    /// owed work after the editor has been left, and Review's rows have to
+    /// render as "processing" for decisions the dashboard queued.
+    pub queue: ActionQueue,
+    /// A batch from [`Self::queue`] is on the background executor right now.
+    /// The latch that keeps the drain SERIAL — one batch in flight, because
+    /// every decision mutates the same git repository — and the reason
+    /// [`Self::pump`] is safe to call from anywhere.
+    pub queue_pumping: bool,
 }
 
 impl Shell {
@@ -375,6 +387,119 @@ impl Shell {
         cx.notify();
     }
 
+    /// Record a decision and start draining if nothing is in flight.
+    ///
+    /// Returns immediately, always. This is the whole difference from the
+    /// `if in_flight { return }` guards it replaces: the interface's job
+    /// ends the moment the choice is remembered, and the row it came from
+    /// goes to "processing" instead of the click being discarded.
+    // Only this file's tests call it yet — Tasks 4-5 of this plan replace
+    // the views' blocking `action_in_flight` / `saving` flags with it. The
+    // queue and its drain land (and are tested) as one piece rather than
+    // half a mechanism.
+    #[allow(dead_code)]
+    pub fn enqueue(&mut self, action: QueuedAction, cx: &mut Context<Self>) {
+        self.queue.push(action);
+        cx.notify();
+        self.pump(cx);
+    }
+
+    /// Start the next batch if none is running. Idempotent and cheap, so it
+    /// is safe to call from `enqueue`, from the end of every batch, and from
+    /// the connect latch in `render`.
+    fn pump(&mut self, cx: &mut Context<Self>) {
+        if self.queue_pumping {
+            return;
+        }
+        let Some(engine) = cx
+            .try_global::<crate::EngineSlot>()
+            .and_then(|slot| slot.0.clone())
+        else {
+            // Disconnected: PARK. Everything stays queued and every row
+            // stays "processing" — these are the user's decisions, and
+            // dropping them here would be exactly the discarded click the
+            // queue exists to stop. The connect latch in `render` calls
+            // this again once an engine exists.
+            return;
+        };
+        let batch = self.queue.take_batch();
+        if batch.is_empty() {
+            return;
+        }
+        self.queue_pumping = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move { run_batch(&engine, batch) })
+                .await;
+            this.update(cx, |shell, cx| shell.batch_finished(results, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// A batch came back: record every result, then take the next one.
+    ///
+    /// EVERY report lands somewhere. A success drops its row from the model
+    /// at once (the daemon's next scan would agree, seconds later);
+    /// everything else becomes a failure string on the queue, against the
+    /// target it belongs to. A decision whose result went nowhere is a
+    /// decision the user believes was applied.
+    ///
+    /// Runs as a Shell update, so it may touch `self.state` and call Shell
+    /// methods — but it must never nest an update of a view that is itself
+    /// mid-update, which is why the merge hand-off below goes through
+    /// [`Self::repo_conflict_saved`] (which spawns its own task) rather than
+    /// reaching into the merge view from here.
+    fn batch_finished(&mut self, results: Vec<DecisionReport>, cx: &mut Context<Self>) {
+        self.queue_pumping = false;
+        let mut finished: Vec<(PathBuf, Option<SharedString>)> = Vec::with_capacity(results.len());
+        let mut staged_repo_conflict = false;
+        for (target, label, result) in results {
+            let failure: Option<SharedString> = match result {
+                Ok(BatchResult::Resolved(ResolveOutcome::Done { .. })) => {
+                    self.state.update(cx, |model, cx| {
+                        model.confirm_resolved(&target);
+                        cx.notify();
+                    });
+                    None
+                }
+                Ok(BatchResult::Resolved(ResolveOutcome::NeedsMergeEditor)) => {
+                    Some("templated · use the merge editor".into())
+                }
+                Ok(BatchResult::Resolved(ResolveOutcome::ProtectedSpan { detail })) => {
+                    Some(format!("touches a templated value: {detail}").into())
+                }
+                // Not a resolve session: the answer went into the merge's
+                // index, so there is no session id and nothing for
+                // `confirm_resolved` to retire. The merge's own conclusion
+                // (and the rescan behind it) is what drops the row.
+                Ok(BatchResult::RepoConflictStaged) => {
+                    staged_repo_conflict = true;
+                    None
+                }
+                // The label is the user's own words for the choice, so a
+                // failure minutes later still names the button they pressed.
+                Err(e) => Some(format!("{label} failed: {e}").into()),
+            };
+            finished.push((target, failure));
+        }
+        self.queue.finish_all(&finished);
+        if staged_repo_conflict {
+            // Conclude the merge if that was the last conflict open. It ends
+            // with `refresh_pending_merge` itself, so the probe still runs.
+            self.repo_conflict_saved(cx);
+        } else {
+            // Any decision above can have started a merge with origin and
+            // then failed to commit it, leaving nothing conflicted and so no
+            // row to try again from.
+            self.refresh_pending_merge(cx);
+        }
+        cx.notify();
+        self.pump(cx);
+    }
+
     fn nav_item(
         &self,
         theme: &Theme,
@@ -499,6 +624,90 @@ impl Shell {
     }
 }
 
+/// One decision's fate, as [`run_batch`] reports it: the target it was
+/// about, the label of the choice the user pressed (kept so a failure
+/// minutes later still names the button and not just the file), and what
+/// running it produced.
+pub(crate) type DecisionReport = (PathBuf, &'static str, Result<BatchResult, ResolveError>);
+
+/// What running one decision produced.
+///
+/// A staged repo conflict is deliberately NOT dressed up as a
+/// [`ResolveOutcome`]: `resolve_repo_conflict` writes the source file and
+/// stages it inside an open merge without opening a journal session at all,
+/// so there is no session id to report and nothing for `confirm_resolved` to
+/// retire. A fabricated `Done { session: 0 }` would travel straight into the
+/// journal-backed undo UI as a lie about a session that never existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BatchResult {
+    /// A full resolve ran; the outcome is exactly what the engine returned.
+    Resolved(ResolveOutcome),
+    /// One mid-merge source conflict is answered and staged in the index.
+    RepoConflictStaged,
+}
+
+/// Run one batch to completion. Called on the background executor and
+/// touches no gpui state, so `pub(crate)` for the headless driver too.
+///
+/// A run of batchable decisions goes through
+/// [`ResolveEngine::resolve_batch`]: one `re-add`/`apply`, one commit and one
+/// push for the whole run instead of that tail per file. Every other
+/// decision needs the repo to itself and goes through its own single-file
+/// engine method.
+pub(crate) fn run_batch(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<DecisionReport> {
+    // Every arm below can reach `ensure_merge_started` and so leave a merge
+    // with origin resolved but uncommitted. It cannot probe for one from
+    // here — the background executor has no `Context` — so the completion
+    // this feeds, `Shell::batch_finished`, is where `refresh_pending_merge`
+    // runs, on every path, batch or single.
+    if batch.iter().all(|a| a.decision.batchable()) {
+        let labels: Vec<&'static str> = batch.iter().map(|a| a.decision.label()).collect();
+        let items: Vec<BatchItem> = batch
+            .into_iter()
+            .map(|a| BatchItem {
+                target: a.target,
+                decision: a
+                    .decision
+                    .as_batch()
+                    .expect("`batchable` just said every decision here has a batch form"),
+            })
+            .collect();
+        return engine
+            .resolve_batch(items)
+            .per_target
+            .into_iter()
+            .zip(labels)
+            .map(|((target, result), label)| (target, label, result.map(BatchResult::Resolved)))
+            .collect();
+    }
+    // `take_batch` hands out exactly ONE non-batchable decision, so this
+    // loop normally runs once. It still reports every item it was given
+    // rather than only the first: a caller that passes more must not have
+    // the rest silently disappear.
+    let mut reports = Vec::with_capacity(batch.len());
+    for QueuedAction { target, decision } in batch {
+        let label = decision.label();
+        let result = match decision {
+            Decision::KeepDisk => engine.keep_disk(&target).map(BatchResult::Resolved),
+            Decision::KeepSourceLocal => engine.keep_source(&target).map(BatchResult::Resolved),
+            Decision::KeepSourceOrigin { seen } => engine
+                .keep_source_origin(&target, &seen)
+                .map(BatchResult::Resolved),
+            Decision::Merged { resolved, inputs } => engine
+                .resolve_merged(&inputs, &resolved)
+                .map(BatchResult::Resolved),
+            Decision::RepoConflict {
+                source_path,
+                resolved,
+            } => engine
+                .resolve_repo_conflict(&source_path, &resolved)
+                .map(|()| BatchResult::RepoConflictStaged),
+        };
+        reports.push((target, label, result));
+    }
+    reports
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
@@ -516,6 +725,10 @@ impl Render for Shell {
         {
             self.pending_merge_probed = true;
             self.refresh_pending_merge(cx);
+            // A queue parked by a disconnect resumes here. `pump` is
+            // idempotent and this arm is latched to once per connection
+            // epoch, so it cannot loop on itself.
+            self.pump(cx);
         }
         // The changelog is a popup: no sidebar, no chrome, just the document.
         // Created ONCE and kept — building the view per frame reset the
@@ -743,6 +956,8 @@ mod render_smoke {
                     merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
+                    queue: Default::default(),
+                    queue_pumping: false,
                 }
             });
             vis.run_until_parked();
@@ -804,6 +1019,8 @@ mod render_smoke {
                     merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
+                    queue: Default::default(),
+                    queue_pumping: false,
                 }
             });
             vis.run_until_parked();
@@ -826,6 +1043,8 @@ mod render_smoke {
                 merge_finish_in_flight: false,
                 pending_merge_probed: false,
                 changelog: None,
+                queue: Default::default(),
+                queue_pumping: false,
             }
         });
         vis.run_until_parked();
@@ -880,6 +1099,8 @@ mod render_smoke {
                 merge_finish_in_flight: false,
                 pending_merge_probed: false,
                 changelog: None,
+                queue: Default::default(),
+                queue_pumping: false,
             }
         });
         vis.run_until_parked();
@@ -978,6 +1199,8 @@ mod render_smoke {
                     merge_finish_in_flight: finishing,
                     pending_merge_probed: true,
                     changelog: None,
+                    queue: Default::default(),
+                    queue_pumping: false,
                 }
             });
             vis.run_until_parked();
@@ -1033,6 +1256,8 @@ mod render_smoke {
                 merge_finish_in_flight: false,
                 pending_merge_probed: true,
                 changelog: None,
+                queue: Default::default(),
+                queue_pumping: false,
             }
         });
         vis.run_until_parked();
@@ -1074,6 +1299,8 @@ mod render_smoke {
                     merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
+                    queue: Default::default(),
+                    queue_pumping: false,
                 }
             });
             vis.run_until_parked();
@@ -1190,9 +1417,71 @@ mod render_smoke {
                     merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
+                    queue: Default::default(),
+                    queue_pumping: false,
                 }
             });
             vis.run_until_parked();
         }
+    }
+
+    /// The point of the whole queue: a second decision is accepted while the
+    /// first is still owed work, so no surface ever has to answer a click
+    /// with "busy". This test app publishes no `EngineSlot` (it never
+    /// connects), which is also the disconnected case — `pump` must then
+    /// PARK the queue: both decisions stay remembered, both rows stay
+    /// "processing", and nothing panics. A decision dropped here is the very
+    /// discarded click the queue exists to stop.
+    #[gpui::test]
+    fn enqueue_never_blocks_and_drains_in_order(cx: &mut TestAppContext) {
+        use std::path::Path;
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review", smoke_paths(), cx).expect("review fixture")
+        });
+        vis.run_until_parked();
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.enqueue(
+                    QueuedAction {
+                        target: PathBuf::from("/a"),
+                        decision: Decision::KeepDisk,
+                    },
+                    cx,
+                );
+                s.enqueue(
+                    QueuedAction {
+                        target: PathBuf::from("/b"),
+                        decision: Decision::KeepDisk,
+                    },
+                    cx,
+                );
+                assert_eq!(s.queue.depth(), 2, "both remembered");
+                assert!(
+                    s.queue.is_processing(Path::new("/b")),
+                    "the second was not discarded"
+                );
+            });
+        });
+        // Render and let anything spawned settle: nothing may run, and
+        // nothing may vanish.
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let shell = shell.read(cx);
+            assert_eq!(
+                shell.queue.depth(),
+                2,
+                "with no engine the queue parks — a parked decision is not a dropped one"
+            );
+            assert!(
+                !shell.queue_pumping,
+                "nothing is in flight, so a reconnect is free to pump"
+            );
+            assert!(
+                shell.queue.failure(Path::new("/a")).is_none(),
+                "parking is not a failure to report"
+            );
+        });
     }
 }
