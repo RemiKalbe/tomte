@@ -1150,20 +1150,89 @@ git commit -m "fix(chezmoi): retry a transient 1Password failure, bounded and lo
 ### Task 7: End-to-end: a sweep of three files is three clicks and one push
 
 **Files:**
-- Test: `crates/app/tests/resolve_e2e.rs`
+- Test: `crates/app/src/views/mod.rs` (its `#[cfg(test)] mod tests` — views are bin-only, so `crates/app/tests/resolve_e2e.rs` cannot reach `Shell`; Task 3b's `EngineLab::publish(cx)` builds the whole stack inside the bin's tests, and that is where this story lives)
 - Modify: `CHANGELOG.md` (an `## Unreleased` section; the release task bumps it)
 
 **Interfaces:**
-- Consumes: everything above.
+- Consumes: `EngineLab { s: Scratch, engine: Arc<ResolveEngine>, journal_path }` with `publish(cx)`, `target()`, `source_file()` (Task 3b, mod.rs tests); `Shell::enqueue(QueuedAction, cx)` (Task 3); `Decision::KeepDisk`, `ActionQueue::{depth, failure, running}` (Task 2); `Shell::pump` and `queue_pumping` (Task 3).
 
-- [ ] **Step 1: The story**
+- [ ] **Step 1: The story — through the user's own path**
 
-Drive the queue's `run_batch` path (Task 3) headlessly: build a `DriftLab`
-with three drifted files and `chezmoi_commits_and_pushes_for_itself`, call
-`run_batch(&lab.engine, vec![KeepDisk × 3])` directly (make it `pub(crate)`
-or move it beside `resolve_batch`), and assert: three `Done` outcomes with
-three distinct sessions; origin's commit count rose by exactly one; all
-three sources hold the disk content; the repo is not mid-merge.
+Drive `Shell::enqueue`, not `run_batch`: the point is that three clicks
+produce the right number of pushes, and only the real entry point knows
+where batch boundaries fall. On the lab's scratch, do what `resolve_e2e.rs`
+does for its batch stories — copy `chezmoi_commits_and_pushes_for_itself`
+(writes autoCommit/autoPush into the scratch's `chezmoi.toml`; without it
+the fixture is blind to the push the user's config performs) and the setup
+that adds two more managed files beside `.testrc` and diverges all three on
+disk (search `resolve_e2e.rs` for `MANAGED_BASE`). `origin_commit_count`
+is `git rev-list --count main` in `lab.s.bare` via `std::process::Command`
+(Task 1's idiom). "Not mid-merge" is whatever `resolve_e2e.rs` asserts after
+its batch stories (search it for `MERGE_HEAD`).
+
+Two stories, because `enqueue` pumps synchronously and so the FIRST click
+always drains alone — batching only ever joins decisions made *while* one is
+running. Pin both halves honestly; do not fudge a count to match the title:
+
+```rust
+#[gpui::test]
+fn three_decisions_queued_before_the_drain_are_one_push(cx: &mut TestAppContext) {
+    let lab = EngineLab::publish(cx);
+    // chezmoi_commits_and_pushes_for_itself(&lab.s); two more managed files; all three drifted on disk
+    let before = origin_commit_count(&lab);
+    let shell = /* fresh Shell as Task 3b's tests build one */;
+    shell.update(cx, |s, cx| {
+        for t in &targets {
+            s.queue.push(QueuedAction { target: t.clone(), decision: Decision::KeepDisk });
+        }
+        s.pump(cx); // one drain, one batch of three
+        assert_eq!(s.queue.running().len(), 3);
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.queue.depth(), 0);
+        assert!(!s.queue_pumping);
+        for t in &targets {
+            assert!(s.queue.failure(t).is_none(), "{t:?}: {:?}", s.queue.failure(t));
+        }
+    });
+    for (src, want) in sources.iter().zip(&disk_contents) {
+        assert_eq!(std::fs::read(src).unwrap(), *want);
+    }
+    assert_eq!(origin_commit_count(&lab), before + 1, "three decisions, ONE push");
+    assert!(!mid_merge(&lab));
+    // Per-file undo (§2.3): three DISTINCT finished sessions in the journal —
+    // open `lab.journal_path` with `Journal::open_read_only` and count the
+    // way `resolve_e2e.rs`'s batch story does.
+}
+
+#[gpui::test]
+fn clicks_during_a_drain_join_the_next_batch(cx: &mut TestAppContext) {
+    // Same lab. enqueue(a) starts a drain of ONE; enqueue(b), enqueue(c)
+    // land while it runs and must drain together afterwards: exactly TWO
+    // pushes for three clicks, never three.
+    let lab = EngineLab::publish(cx);
+    let before = origin_commit_count(&lab);
+    let shell = /* fresh Shell */;
+    shell.update(cx, |s, cx| {
+        s.enqueue(QueuedAction { target: a.clone(), decision: Decision::KeepDisk }, cx);
+        assert_eq!(s.queue.running(), &[a.clone()]);
+        s.enqueue(QueuedAction { target: b.clone(), decision: Decision::KeepDisk }, cx);
+        s.enqueue(QueuedAction { target: c.clone(), decision: Decision::KeepDisk }, cx);
+        assert_eq!(s.queue.depth(), 3);
+        assert_eq!(s.queue.running().len(), 1, "b and c wait for a's batch");
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| assert_eq!(s.queue.depth(), 0));
+    assert_eq!(origin_commit_count(&lab), before + 2, "one push for a, one for b+c");
+}
+```
+
+If `run_until_parked` returns before the second batch has been taken
+(because `batch_finished` → `pump` → spawn happens inside the same
+foreground update), call it again and note in the test why. If either count
+comes out different from what is written here, the test is telling you how
+the queue actually behaves: report it rather than adjusting the assertion.
 
 - [ ] **Step 2: Run, gate, screenshot the whole gallery once**
 
@@ -1177,15 +1246,19 @@ Look at `review`, `review-processing`, `review-failed`, `merge`, `dashboard`.
 - [ ] **Step 3: Changelog**
 
 Under a new `## Unreleased` heading at the top of `CHANGELOG.md`, in the
-existing voice, cover: decisions no longer block each other; consecutive
-one-click decisions share one re-add / commit / push; failures stay on the
-row; the selection advances; transient 1Password failures retry.
+existing voice, cover: decisions no longer block each other — confirm one,
+move on, it runs in the background; decisions made while one is running
+share a single re-add, commit and push (say it that way — the first click
+of a sweep drains alone, and the entry must not promise one push per
+sweep); failures stay on the row; the selection advances; a merge finish or
+roll-back pressed during a drain waits its turn; transient 1Password
+failures retry.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/app/tests/resolve_e2e.rs CHANGELOG.md
-git commit -m "test: a sweep of decisions is one push; changelog"
+git add crates/app/src/views/mod.rs CHANGELOG.md
+git commit -m "test: a sweep of decisions shares one push; changelog"
 ```
 
 ---
