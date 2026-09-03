@@ -1046,66 +1046,139 @@ git commit -m "feat(review): decisions enqueue; undo behind the latch; Processin
 
 ### Task 5: Merge editor and dashboard enqueue too
 
+After this task NOTHING outside `Shell::pump` spawns git work. The Task 3b
+review listed the remaining doors: `MergeView::save`, the dashboard quick
+actions, and `Shell::repo_conflict_saved` (a merge commit+push that still
+runs outside the latch). This task closes all three and applies four rulings
+from the Task 3/3b reviews (marked **Ruling** below).
+
 **Files:**
-- Modify: `crates/app/src/views/merge.rs` (`save`, `saving`)
-- Modify: `crates/app/src/views/dashboard.rs` (`run_quick_action`, `dashboard_action_in_flight`)
+- Modify: `crates/app/src/views/merge.rs` (`save` ~:1690, `saving` :991, 1071, 1111, 1131, 1691, 1715)
+- Modify: `crates/app/src/views/dashboard.rs` (`quick_action_button` ~:951, `run_quick_action` ~:990, the Finish button ~:396-411, the snapshot struct ~:175)
+- Modify: `crates/app/src/views/mod.rs` (`repo_conflict_saved` — DELETE; `dashboard_action_in_flight` — DELETE; the `route = Route::Review` inside `pump`'s `RepoConflictStaged` path ~:631 — DELETE; `request_repo_op`; new `running_repo_op`; the dashboard snapshot copy ~:895)
+- Modify: `crates/app/src/action_queue.rs` (add `notify_on_done` to `QueuedAction`; add `fail_pending_where`)
+- Modify: `crates/app/src/views/review.rs` (`outcome_banner` :547 → `pub(super)`; a banner setter that does not route)
 
 **Interfaces:**
-- Consumes: `Shell::enqueue`, `Decision::{Merged, RepoConflict, KeepDisk, KeepSourceLocal}`.
-- Produces: `MergeView::saving` REMOVED; `Shell::dashboard_action_in_flight` REMOVED; `run_quick_action` REMOVED.
+- Consumes: `Shell::enqueue`, `Decision::{Merged, RepoConflict, KeepDisk, KeepSourceLocal}`, `PendingRepoOp`, `Shell::request_repo_op`, `Shell::deferred_repo_op`, `Shell::merge_done`, `ActionQueue`.
+- Produces: `MergeView::saving` REMOVED; `Shell::dashboard_action_in_flight` REMOVED; `run_quick_action` REMOVED; `Shell::repo_conflict_saved` REMOVED; `QueuedAction { target, decision, pub notify_on_done: bool }`; `ActionQueue::fail_pending_where(&mut self, pred: impl Fn(&QueuedAction) -> bool, msg: &str) -> Vec<PathBuf>`; `#[derive(Clone, Copy, PartialEq, Debug)] pub(super) enum RepoOpKind { Finish, Abort, Undo }` with `PendingRepoOp::kind(&self) -> RepoOpKind`; `Shell::running_repo_op: Option<RepoOpKind>` (set by `pump` when it picks an op up, cleared by that op's completion); `Shell::show_outcome(&mut self, banner: OutcomeBanner, cx)` — sets the review view's `last_outcome` WITHOUT touching `route`.
 
 - [ ] **Step 1: Merge editor**
 
-`save()` (merge.rs:1690) builds `Decision::RepoConflict { source_path, resolved }`
+`save()` (merge.rs ~:1690) builds `Decision::RepoConflict { source_path, resolved }`
 when `self.repo_reconcile`, else `Decision::Merged { resolved, inputs }`,
-enqueues via `self.shell.update(...)`, then hands back to Review exactly as
-the `Done` branch does today (`shell.merge_done(banner, cx)` with a banner
-reading `"Save queued · {file}"`, tint `BannerTint::Ok`, `undoable: false`).
-The outcome banner for the actual result arrives through the queue's
-completion (Task 3) — extend that completion to call
-`shell.review.update(|r| r.last_outcome = Some(outcome_banner(...)))` for
-the target, so the user still sees "committed & pushed" when it lands.
-Delete `saving` (merge.rs:991, 1071, 1111, 1131, 1691, 1715).
+and enqueues it — from OUTSIDE the merge view's own update, in the same
+`cx.spawn` → `shell.update` shape the current hand-off uses (a 2026-08-18
+crash is why). Then hand back to Review exactly as the `Done` branch does
+today: `shell.merge_done(banner, cx)` with a banner reading
+`"Save queued · {file}"`, tint `BannerTint::Ok`, `undoable: false`. That
+`merge_done` is the ONE place the save routes the user. Delete `saving`.
 
-- [ ] **Step 2: Dashboard**
+**Delete `Shell::repo_conflict_saved`.** The queue's `RepoConflictStaged`
+completion already concludes the merge under the latch through
+`conclude_staged_merge`; the detached copy is the last merge commit+push
+outside it. Its only caller goes away with `save()`'s rewrite (grep to be
+sure).
+
+**Ruling (T3 deferred minor):** a queued decision that lands must NOT
+change the route — the user was routed at Save time and may have gone
+anywhere since. Delete the `shell.route = Route::Review` inside `pump`'s
+`RepoConflictStaged` path (mod.rs ~:631) and make sure `conclude_staged_merge`
+reached from the QUEUE delivers its banner through the new
+`Shell::show_outcome` (no route change), while the same method reached
+from a deferred `FinishMerge` keeps using `merge_done` (the dashboard's
+finish button has always shown its result in Review). Pass a flag or split
+the method — say which in the report.
+
+The outcome banner for the actual result arrives through the queue's
+completion: make `outcome_banner` (review.rs:547) `pub(super)` and, in
+`batch_finished`, build the banner for each landed target from what the
+completion has (`label`, `ResolveOutcome`/error); if `outcome_banner`'s
+inputs are only known to the review view, add a sibling
+`queued_outcome_banner(label, target, &result) -> OutcomeBanner` beside it
+rather than threading view state through the queue. Deliver it with
+`show_outcome`. The user must still see "committed & pushed" when it lands,
+now without being yanked.
+
+- [ ] **Step 2: Dashboard quick actions**
 
 `quick_action_button`'s handler calls
-`shell.update(cx, |s, cx| s.enqueue(QueuedAction { target, decision }, cx))`
+`shell.update(cx, |s, cx| s.enqueue(QueuedAction { target, decision, notify_on_done: true }, cx))`
 where `decision` is `Decision::KeepDisk` / `Decision::KeepSourceLocal` from
 the `ResolveAction`. Delete `run_quick_action` and
-`Shell::dashboard_action_in_flight` (mod.rs) and every read of it. Keep
-`quick_action_body` + `notify`: call them from the queue completion
-(Task 3) when the decision originated from the dashboard — add a
-`pub notify_on_done: bool` to `QueuedAction`, `false` from Review, `true`
-from the dashboard.
+`Shell::dashboard_action_in_flight` and every read of it. Keep
+`quick_action_body` + `notify`: call them from `batch_finished` when
+`notify_on_done` is true (Review enqueues with `false`). `notify` blocks on
+`osascript`: call it from the background executor, never inside the Shell
+update, and never in tests (the Task 3b implementer hit this).
 
-- [ ] **Step 3: Tests**
+- [ ] **Step 3: The dashboard's Finish button tells the truth (Rulings 24 + 29)**
+
+Add `RepoOpKind` + `PendingRepoOp::kind()` and `Shell::running_repo_op`
+(set in `pump`'s deferred-op arm, cleared in each op's completion right
+where `queue_pumping` is cleared). Copy `deferred_repo_op.map(|op| op.kind())`
+and `running_repo_op` into the dashboard snapshot beside
+`merge_finish_in_flight` (~mod.rs:895, dashboard.rs:175). The Finish button:
+- an abort pending OR running → label "Rolling back…", disabled (a finish
+  press can then never reach the guard that drops it — that guard stays as
+  the last line of defence);
+- a finish pending (deferred behind a batch) → "Finish merge · queued", disabled;
+- a finish running → "Finishing…" as today;
+- else the normal label.
+
+- [ ] **Step 4: An abort fails-fast the saves it would orphan (Ruling 23)**
+
+Add `ActionQueue::fail_pending_where(pred, msg)`: removes every PENDING
+item matching `pred` and records `msg` as its failure; returns the targets.
+(Running items are untouched — they are in flight under the latch.) In
+`request_repo_op`, when the op is `AbortMerge`, call it with
+`|a| matches!(a.decision, Decision::RepoConflict { .. })` and
+`"merge rolled back before this save ran — save again"`. `Merged`,
+`KeepDisk`, `KeepSourceLocal`, `KeepSourceOrigin` stay pending: they do not
+depend on the merge and run correctly against the rolled-back repo. Log the
+targets failed.
+
+- [ ] **Step 5: Tests**
 
 - `the_dashboards_own_action_can_strand_a_merge` (resolve_e2e.rs) still
   passes — it drives the engine directly.
-- Add to `views/mod.rs` tests: a `#[gpui::test]` that enqueues a
-  `Decision::Merged` then a `Decision::KeepDisk` and asserts `depth() == 2`
-  and both are `is_processing` — the merge editor's Save no longer blocks a
-  review decision.
+- `views/mod.rs`: a `#[gpui::test]` that enqueues a `Decision::Merged` then
+  a `Decision::KeepDisk` (no engine → parked) and asserts `depth() == 2` and
+  both `is_processing` — the merge editor's Save no longer blocks a review
+  decision. MUTATION: reinstate a `saving`-style early return → fails.
+- `views/mod.rs`: with a `RepoConflict` and a `KeepDisk` pending and the
+  latch held, `abort_origin_merge(..)` leaves the `KeepDisk` pending, records
+  the failure on the `RepoConflict` target with the message above, and
+  keeps `AbortMerge` deferred. MUTATION: remove the `fail_pending_where`
+  call → fails.
+- `views/mod.rs`: `running_repo_op` is `Some(Finish)` between pickup and
+  completion of a deferred finish on the `EngineLab`, and `None` after.
+- `action_queue.rs`: `fail_pending_where` on `[pending a(RepoConflict), pending b(KeepDisk)]` with one running `c` returns `[a]`, leaves `b` pending and `c` running, and `failure(a)` is the message.
+- `dashboard.rs` (pure fn): the Finish button label/enabled for the four
+  states above. Extract the label choice into a `fn finish_button_state(pending: Option<RepoOpKind>, running: Option<RepoOpKind>, finish_in_flight: bool) -> (&'static str, bool)` so it is testable without a window.
 
-- [ ] **Step 4: Gate, screenshots (`merge`, `dashboard` unchanged), commit**
+- [ ] **Step 6: Gate, screenshots (`merge`, `dashboard` unchanged; add `dashboard-rolling-back` posing an abort pending), commit**
 
 ```bash
-git add crates/app/src/views/merge.rs crates/app/src/views/dashboard.rs crates/app/src/views/mod.rs
-git commit -m "feat: merge-editor Save and dashboard quick actions go through the queue"
+git add crates/app/src/views/merge.rs crates/app/src/views/dashboard.rs crates/app/src/views/mod.rs crates/app/src/views/review.rs crates/app/src/action_queue.rs crates/app/src/views/fixtures.rs
+git commit -m "feat: merge-editor Save and dashboard quick actions go through the queue; nothing spawns git outside it"
 ```
 
 ---
 
-### Task 6: Retry transient 1Password failures
+### Task 6: Retry transient 1Password failures; a failed abort says so
 
 **Files:**
 - Modify: `crates/core/src/chezmoi.rs` (`run_ok_with_timeout`)
 - Test: `crates/core/src/chezmoi.rs` `mod tests`
+- Modify: `crates/core/src/git.rs` (`merge_abort` :415-417)
+- Modify: `crates/app/src/resolve.rs` (`abort_repo_reconcile` :1188)
+- Modify: `crates/app/src/views/mod.rs` (`AbortOutcome`, `abort_banner`, `run_abort`, `request_repo_op`)
 
 **Interfaces:**
 - Produces: bounded retry inside `run_ok_with_timeout` on
-  `EvalFailureKind::OnePasswordAuth` only.
+  `EvalFailureKind::OnePasswordAuth` only; `GitClient::merge_abort(&self) -> Result<(), GitError>` (whatever `run` returns); `ResolveEngine::abort_repo_reconcile(&self) -> Result<(), ResolveError>`; `AbortOutcome::AbortFailed(ResolveError)`.
+- Consumes: `Shell::running_repo_op: Option<RepoOpKind>` (Task 5).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1156,11 +1229,48 @@ attempts; on `classify_eval_stderr(..) == Some(kind)` with
 "1Password not ready (attempt {n}/3) for `chezmoi {}`: retrying", …)`,
 sleep 250ms, retry. Any other failure returns immediately as today.
 
-- [ ] **Step 4: Run, gate, commit**
+- [ ] **Step 4: A failed abort says so (Ruling 30, from the Task 3b re-review)**
+
+`GitClient::merge_abort` (git.rs:415-417) discards its own result with
+`let _`, so `abort_repo_reconcile` (resolve.rs:1188) cannot fail, so
+`AbortOutcome::RolledBack(Ok(..))` and the banner "Merge with origin rolled
+back" are reported for a rollback that did not happen — e.g. under the
+index.lock contention `85fec09` met elsewhere. That lie also bounds the
+finish-never-outranks-abort guard: a finish deferred behind a RUNNING abort
+runs after it and is harmless only because `finish_merge_if_resolved` then
+sees `merge_in_progress() == false`.
+
+1. `merge_abort` returns `run`'s result. `abort_repo_reconcile` first checks
+   `merge_in_progress()`: not merging → `log_info!("reconcile", "nothing to abort")`
+   and `Ok(())` (idempotent — the Task 3b tests abort a non-merging lab and
+   must keep passing); merging → run the abort and propagate `Err` with
+   `log_error!`.
+2. `run_abort`: an `Err` from the abort becomes `AbortOutcome::AbortFailed(e)`
+   whose banner says the roll-back FAILED and the merge is still in
+   progress (tint `Conflict`, `undoable: false`), then `refresh_pending_merge`
+   as the other arms do. Do not rescan on that arm — nothing changed.
+3. `request_repo_op(FinishMerge)`: also dropped (logged, surfaced as the
+   pending-abort case is) when `self.running_repo_op == Some(RepoOpKind::Abort)`.
+   A finish never outranks an abort, pending OR in flight.
+
+Tests (name the mutation each catches):
+- `git.rs`: `merge_abort` on a repo with no merge in progress returns `Err`
+  (git says "There is no merge to abort"). MUTATION: `let _` back → fails.
+- `resolve.rs` or `resolve_e2e.rs`: `abort_repo_reconcile` on a non-merging
+  lab returns `Ok(())`; on a lab mid-merge (`diverge_with_conflicts` then
+  `ensure_merge_started`) it returns `Ok(())` AND `merge_in_progress()` is
+  false afterwards.
+- `views/mod.rs`: `abort_banner(&AbortOutcome::AbortFailed(..))` never
+  contains "rolled back" (reuse the Task 3b test's fixed-prefix check the
+  other way round); finish requested while `running_repo_op == Some(Abort)`
+  and the latch is held is dropped, not deferred. MUTATION: remove the
+  running check → `deferred_repo_op` becomes `Some(FinishMerge)` → fails.
+
+- [ ] **Step 5: Run, gate, commit**
 
 ```bash
-git add crates/core/src/chezmoi.rs
-git commit -m "fix(chezmoi): retry a transient 1Password failure, bounded and logged"
+git add crates/core/src/chezmoi.rs crates/core/src/git.rs crates/app/src/resolve.rs crates/app/src/views/mod.rs
+git commit -m "fix: retry a transient 1Password failure, bounded; a failed merge abort says so"
 ```
 
 ---
