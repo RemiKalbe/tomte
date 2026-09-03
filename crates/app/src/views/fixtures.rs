@@ -369,6 +369,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         changelog: None,
         queue: Default::default(),
         queue_pumping: false,
+        deferred_repo_op: None,
     };
 
     // Component previews: bare Shell routed at the preview (no posed data).

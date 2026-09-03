@@ -45,6 +45,22 @@ pub enum Route {
     Component(&'static str),
 }
 
+/// A repo-level operation the user asked for; runs when the latch is free.
+///
+/// Neither of these is about ONE file, so neither can live in the action
+/// queue: they answer the whole merge with origin that the queue's decisions
+/// are being staged into. They still take their turn behind the same latch,
+/// because they write the same git repository.
+#[derive(Debug)]
+pub(super) enum PendingRepoOp {
+    /// Commit the merge the dashboard banner is reporting.
+    FinishMerge,
+    /// Abandon the merge with origin, rolling the source repo back. Carries
+    /// what the editor told the user it would discard, so the banner
+    /// afterwards names the same thing the confirmation did.
+    AbortMerge(merge::Rollback),
+}
+
 pub struct Shell {
     pub route: Route,
     /// The shared sync model; the window observes it (wired in `open_shell`)
@@ -94,11 +110,36 @@ pub struct Shell {
     /// owed work after the editor has been left, and Review's rows have to
     /// render as "processing" for decisions the dashboard queued.
     pub queue: ActionQueue,
-    /// A batch from [`Self::queue`] is on the background executor right now.
-    /// The latch that keeps the drain SERIAL — one batch in flight, because
-    /// every decision mutates the same git repository — and the reason
+    /// TRUE WHILE ANY GIT MUTATION [`Self::pump`] STARTED IS RUNNING: a
+    /// queue batch, that batch's staged-merge conclusion, a merge finish, or
+    /// a merge abort.
+    ///
+    /// The latch that keeps all of that SERIAL — one mutation in flight,
+    /// because every one of them writes the same git repository (index,
+    /// merge state, chezmoi's own autoCommit/autoPush) — and the reason
     /// [`Self::pump`] is safe to call from anywhere.
+    ///
+    /// The rule it exists to enforce is "everything that mutates the repo
+    /// enters through [`Self::pump`]", and this task closed the Shell's own
+    /// two remaining doors: a finish and an abort now take their turn behind
+    /// it instead of spawning a commit+push, or a merge abort, beside a
+    /// draining batch. NOT YET behind it — they are still the views' own
+    /// spawns, each guarded by its own `action_in_flight` / `saving`
+    /// boolean: `ReviewView`'s and the dashboard's quick actions,
+    /// `MergeView::save`, and the merge conclusion
+    /// [`Self::repo_conflict_saved`] spawns for it. Tasks 4-5 of this plan
+    /// route those through [`Self::enqueue`]; only then does this latch
+    /// describe the whole app.
     pub queue_pumping: bool,
+    /// A finish or abort the user pressed that has not run yet, because the
+    /// latch was held or no engine existed. [`Self::pump`] runs it BEFORE it
+    /// takes the next batch.
+    ///
+    /// One slot, not a queue: pressing "Finish merge" twice means one
+    /// finish, and an abort pressed after it supersedes it — these are
+    /// answers about a single merge, and the last answer is the one the user
+    /// means.
+    pub(super) deferred_repo_op: Option<PendingRepoOp>,
 }
 
 impl Shell {
@@ -256,24 +297,42 @@ impl Shell {
     /// the daemon's last scan saw in their merged form, and a review list
     /// describing a repo state that no longer exists is how the user came to
     /// believe an undone decision had stuck.
+    ///
+    /// The abort itself waits for the latch ([`Self::queue_pumping`]): it is
+    /// a merge abort on the very repository a draining batch is writing, and
+    /// the two overlapping is how a decision comes to look kept when it was
+    /// rolled back. The user leaves the editor NOW either way — decisions
+    /// they make in Review meanwhile queue BEHIND the rollback and run
+    /// against the rolled-back repo, which is what "abort" means.
     pub fn abort_origin_merge(&mut self, rolled_back: merge::Rollback, cx: &mut Context<Self>) {
         self.route = Route::Review;
-        cx.notify();
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            return;
-        };
+        self.request_repo_op(PendingRepoOp::AbortMerge(rolled_back), cx);
+    }
+
+    /// The abort, running with the latch already taken. Only [`Self::pump`]
+    /// calls this.
+    fn run_abort(
+        &mut self,
+        engine: std::sync::Arc<ResolveEngine>,
+        rolled_back: merge::Rollback,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let rescanned = cx
                 .background_executor()
                 .spawn(async move {
-                    engine.abort_repo_reconcile();
-                    engine.request_rescan()
+                    catching_panics(
+                        "a merge abort",
+                        internal_error,
+                        AssertUnwindSafe(|| {
+                            engine.abort_repo_reconcile();
+                            engine.request_rescan()
+                        }),
+                    )
                 })
                 .await;
             this.update(cx, |shell, cx| {
+                shell.queue_pumping = false;
                 let mut text = format!(
                     "Merge with origin rolled back — {} returned to their pre-merge content. \
                      Destination files and journal entries were not touched.",
@@ -296,6 +355,10 @@ impl Shell {
                     },
                     cx,
                 );
+                cx.notify();
+                // Whatever queued behind the rollback, now against the
+                // repo the rollback restored.
+                shell.pump(cx);
             })
             .ok();
         })
@@ -336,25 +399,48 @@ impl Shell {
     /// Commit the merge the banner is reporting. The same
     /// `finish_merge_if_resolved` a last decision would have run — this just
     /// asks it without a decision to carry.
+    ///
+    /// A REQUEST, not the work: the commit and push it runs land on the
+    /// repository a draining batch is already writing, so it takes its turn
+    /// behind [`Self::queue_pumping`] like everything else that mutates the
+    /// repo. No `in_flight` guard any more — the latch is the guard.
     pub fn finish_pending_merge(&mut self, cx: &mut Context<Self>) {
-        if self.merge_finish_in_flight {
-            return;
+        self.request_repo_op(PendingRepoOp::FinishMerge, cx);
+    }
+
+    /// Remember a repo-level operation and try to run it right away.
+    ///
+    /// Returns immediately, always: if the latch is held (or nothing is
+    /// connected yet) the op waits in [`Self::deferred_repo_op`] and
+    /// [`Self::pump`] picks it up — the click is remembered, never
+    /// discarded.
+    fn request_repo_op(&mut self, op: PendingRepoOp, cx: &mut Context<Self>) {
+        if let Some(prev) = self.deferred_repo_op.replace(op) {
+            tomte_core::log_info!("reconcile", "{prev:?} superseded before it ran");
         }
-        let Some(engine) = cx
-            .try_global::<crate::EngineSlot>()
-            .and_then(|slot| slot.0.clone())
-        else {
-            return;
-        };
+        cx.notify();
+        self.pump(cx);
+    }
+
+    /// The finish, running with the latch already taken. Only [`Self::pump`]
+    /// calls this.
+    fn run_finish(&mut self, engine: std::sync::Arc<ResolveEngine>, cx: &mut Context<Self>) {
         self.merge_finish_in_flight = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { engine.finish_merge_if_resolved() })
+                .spawn(async move {
+                    catching_panics(
+                        "a merge finish",
+                        internal_error,
+                        AssertUnwindSafe(|| engine.finish_merge_if_resolved()),
+                    )
+                })
                 .await;
             this.update(cx, |shell, cx| {
                 shell.merge_finish_in_flight = false;
+                shell.queue_pumping = false;
                 match result {
                     Ok(MergeConclusion::Committed { pushed, note }) => {
                         shell.origin_merge_finished(pushed, note, cx);
@@ -381,6 +467,8 @@ impl Shell {
                 }
                 shell.refresh_pending_merge(cx);
                 cx.notify();
+                // Whatever queued while the finish ran.
+                shell.pump(cx);
             })
             .ok();
         })
@@ -420,9 +508,18 @@ impl Shell {
         self.pump(cx);
     }
 
-    /// Start the next batch if none is running. Idempotent and cheap, so it
-    /// is safe to call from `enqueue`, from the end of every batch, and from
-    /// the connect latch in `render`.
+    /// Start the next piece of git work if none is running: a deferred
+    /// finish/abort first, then the next batch. Idempotent and cheap, so it
+    /// is safe to call from `enqueue`, from `request_repo_op`, from the end
+    /// of every batch and every repo op, and from the connect latch in
+    /// `render`.
+    ///
+    /// The one door for the SHELL's git work: nothing on `Shell` spawns a
+    /// mutation except through here, which is what makes
+    /// [`Self::queue_pumping`] a real serial latch rather than a flag only
+    /// the queue respects. The views' own action paths do not come through
+    /// here yet — [`Self::queue_pumping`] lists them and the tasks that
+    /// close them.
     fn pump(&mut self, cx: &mut Context<Self>) {
         if self.queue_pumping {
             return;
@@ -431,19 +528,37 @@ impl Shell {
             .try_global::<crate::EngineSlot>()
             .and_then(|slot| slot.0.clone())
         else {
-            // No engine to run with: PARK. Everything stays queued and every
-            // row stays "processing" — these are the user's decisions, and
-            // dropping them here would be exactly the discarded click the
-            // queue exists to stop.
+            // No engine to run with: PARK. Everything stays queued, every
+            // row stays "processing", and `deferred_repo_op` stays SET —
+            // these are the user's decisions, and dropping them here would
+            // be exactly the discarded click the queue exists to stop.
             //
-            // `EngineSlot` is written once, when the app first connects
-            // (`main.rs`), so this is reached before that publish or when
-            // building the engine failed. A daemon that goes away LATER
-            // leaves the engine in place: the batch then runs and fails
-            // honestly against the repo rather than parking. The connect
-            // latch in `render` calls this again once the slot is filled.
+            // `EngineSlot` is REPUBLISHED ON EVERY (RE)CONNECT (`main.rs`'s
+            // reconnect loop), and a reconnect whose `build_engine` fails
+            // publishes `EngineSlot(None)`. So this arm is reached before
+            // the first connect AND after a reconnect that could not build
+            // an engine; the queue then waits, rows at "processing" and its
+            // deferred op intact, until a later connect publishes an engine
+            // — at which point the connect latch in `render` pumps. A daemon
+            // that goes away WITHOUT a reconnect attempt leaves the last
+            // engine in place: the batch then runs and fails honestly at
+            // `SessionStart` rather than parking.
             return;
         };
+        // A finish or an abort the user pressed goes FIRST. It is a
+        // repo-level answer about the very merge the queued decisions would
+        // otherwise be staged into, so it has to land before the next batch
+        // starts writing: a finish presses the merge the batch was going to
+        // extend, an abort throws it away.
+        if let Some(op) = self.deferred_repo_op.take() {
+            self.queue_pumping = true;
+            cx.notify();
+            match op {
+                PendingRepoOp::FinishMerge => self.run_finish(engine, cx),
+                PendingRepoOp::AbortMerge(rolled_back) => self.run_abort(engine, rolled_back, cx),
+            }
+            return;
+        }
         let batch = self.queue.take_batch();
         if batch.is_empty() {
             return;
@@ -476,7 +591,13 @@ impl Shell {
                 .ok();
                 Some(
                     cx.background_executor()
-                        .spawn(async move { engine.finish_merge_if_resolved() })
+                        .spawn(async move {
+                            catching_panics(
+                                "a staged merge's conclusion",
+                                internal_error,
+                                AssertUnwindSafe(|| engine.finish_merge_if_resolved()),
+                            )
+                        })
                         .await,
                 )
             } else {
@@ -708,47 +829,67 @@ pub(crate) fn run_batch(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec
         .iter()
         .map(|a| (a.target.clone(), a.decision.label()))
         .collect();
-    catching_panics(owed, AssertUnwindSafe(|| run_batch_inner(engine, batch)))
+    let what = format!("a queued batch of {} file(s)", owed.len());
+    catching_panics(
+        &what,
+        |_detail| panicked_batch(owed),
+        AssertUnwindSafe(|| run_batch_inner(engine, batch)),
+    )
 }
 
-/// Run `work`, turning a panic inside it into one failure report per target
-/// it was owed.
+/// One failure report per target a panicking batch was owed. `finish_all`
+/// records these against the rows they belong to, so every row is
+/// answerable again instead of frozen at "processing".
+fn panicked_batch(owed: Vec<(PathBuf, &'static str)>) -> Vec<DecisionReport> {
+    owed.into_iter()
+        .map(|(target, label)| {
+            (
+                target,
+                label,
+                Err(ResolveError::Failed(
+                    "internal error — see the log".to_string(),
+                )),
+            )
+        })
+        .collect()
+}
+
+/// The `on_panic` fallback for a background git closure that reports a
+/// `Result`: an ordinary failure, which its completion already knows how to
+/// report. So the completion still runs, the latch still clears, and the
+/// user still hears about it.
+fn internal_error<T>(detail: String) -> Result<T, ResolveError> {
+    Err(ResolveError::Failed(format!(
+        "internal error — see the log: {detail}"
+    )))
+}
+
+/// Run `work`, turning a panic inside it into `on_panic`'s value.
 ///
-/// The queue has to be UN-WEDGEABLE. A panic escaping the drain would leave
-/// `queue_pumping` set and the batch stuck in `running` forever: every later
+/// EVERY git closure [`Shell::pump`] starts goes through here, because the
+/// latch has to be UN-WEDGEABLE. A panic escaping one would leave `queue_pumping` set
+/// — and, for a batch, its targets stuck in `running` — forever: every later
 /// decision would pile up behind it, every row would sit at "processing",
-/// and nothing would ever clear it — not even the connect latch, since
-/// `pump` returns early on that latch. So the panic becomes ordinary
-/// per-target failures instead, which `finish_all` records against the rows
-/// they belong to and the user can retry.
-fn catching_panics(
-    owed: Vec<(PathBuf, &'static str)>,
-    work: impl FnOnce() -> Vec<DecisionReport> + std::panic::UnwindSafe,
-) -> Vec<DecisionReport> {
+/// and nothing would ever clear it, not even the connect latch, since `pump`
+/// returns early on that latch. So the panic becomes an ordinary value the
+/// completion already knows how to report: per-target failures for a batch
+/// ([`panicked_batch`]), an `Err` for a finish, a conclusion or an abort
+/// ([`internal_error`]).
+fn catching_panics<T>(
+    what: &str,
+    on_panic: impl FnOnce(String) -> T,
+    work: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> T {
     match std::panic::catch_unwind(work) {
-        Ok(reports) => reports,
+        Ok(value) => value,
         Err(payload) => {
             let detail = payload
                 .downcast_ref::<&'static str>()
                 .map(|s| (*s).to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            tomte_core::log_error!(
-                "resolve",
-                "a queued batch of {} file(s) panicked: {detail}",
-                owed.len()
-            );
-            owed.into_iter()
-                .map(|(target, label)| {
-                    (
-                        target,
-                        label,
-                        Err(ResolveError::Failed(
-                            "internal error — see the log".to_string(),
-                        )),
-                    )
-                })
-                .collect()
+            tomte_core::log_error!("resolve", "{what} panicked: {detail}");
+            on_panic(detail)
         }
     }
 }
@@ -831,10 +972,14 @@ impl Render for Shell {
         {
             self.pending_merge_probed = true;
             self.refresh_pending_merge(cx);
-            // Resume a queue parked because no engine existed yet: the
-            // first decision can be made while the app is still connecting,
-            // and a reconnect re-arms this arm. `pump` is idempotent and
-            // this fires once per connection epoch, so it cannot loop.
+            // Resume anything parked because no engine existed yet — a
+            // queued decision, or a Finish/Discard the user pressed while
+            // the app was still connecting. This arm is re-armed by every
+            // disconnect, and `EngineSlot` is republished by every
+            // (re)connect, so a connection that could not build an engine
+            // (`EngineSlot(None)`) leaves the work parked and the NEXT
+            // successful connect releases it. `pump` is idempotent and this
+            // fires once per connection epoch, so it cannot loop.
             self.pump(cx);
         }
         // The changelog is a popup: no sidebar, no chrome, just the document.
@@ -1065,6 +1210,7 @@ mod render_smoke {
                     changelog: None,
                     queue: Default::default(),
                     queue_pumping: false,
+                    deferred_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1128,6 +1274,7 @@ mod render_smoke {
                     changelog: None,
                     queue: Default::default(),
                     queue_pumping: false,
+                    deferred_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1152,6 +1299,7 @@ mod render_smoke {
                 changelog: None,
                 queue: Default::default(),
                 queue_pumping: false,
+                deferred_repo_op: None,
             }
         });
         vis.run_until_parked();
@@ -1208,6 +1356,7 @@ mod render_smoke {
                 changelog: None,
                 queue: Default::default(),
                 queue_pumping: false,
+                deferred_repo_op: None,
             }
         });
         vis.run_until_parked();
@@ -1308,6 +1457,7 @@ mod render_smoke {
                     changelog: None,
                     queue: Default::default(),
                     queue_pumping: false,
+                    deferred_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1365,6 +1515,7 @@ mod render_smoke {
                 changelog: None,
                 queue: Default::default(),
                 queue_pumping: false,
+                deferred_repo_op: None,
             }
         });
         vis.run_until_parked();
@@ -1408,6 +1559,7 @@ mod render_smoke {
                     changelog: None,
                     queue: Default::default(),
                     queue_pumping: false,
+                    deferred_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1526,6 +1678,7 @@ mod render_smoke {
                     changelog: None,
                     queue: Default::default(),
                     queue_pumping: false,
+                    deferred_repo_op: None,
                 }
             });
             vis.run_until_parked();
@@ -1620,7 +1773,11 @@ mod render_smoke {
             (PathBuf::from("/a"), "Keep disk"),
             (PathBuf::from("/b"), "Keep source · this machine"),
         ];
-        let reports = catching_panics(owed, AssertUnwindSafe(|| panic!("index out of bounds")));
+        let reports = catching_panics(
+            "a test batch",
+            |_detail| panicked_batch(owed),
+            AssertUnwindSafe(|| panic!("index out of bounds")),
+        );
 
         assert_eq!(
             reports
@@ -1668,5 +1825,356 @@ mod render_smoke {
             q.failure(Path::new("/a")).is_some() && q.failure(Path::new("/b")).is_some(),
             "and each row shows why it failed rather than sitting at \"processing\""
         );
+    }
+
+    fn now_ts() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Scratch home + bare origin + file-backed journal + in-process daemon +
+    /// connected `ResolveEngine`, PUBLISHED as the app's `EngineSlot` so
+    /// `pump` runs for real.
+    ///
+    /// Copied from `tests/resolve_e2e.rs`'s `DriftLab` rather than shared
+    /// with it: views are bin-only (`lib.rs`'s header), so an integration
+    /// test cannot reach `Shell` at all. `tomte-daemon` and `tomte-core`'s
+    /// `test-support` are dev-dependencies of the BIN, which is what lets
+    /// the whole stack be built here instead.
+    pub(crate) struct EngineLab {
+        pub s: tomte_core::testsupport::Scratch,
+        /// These tests drive the engine through the published `EngineSlot`;
+        /// the handle is kept for the stories that call it directly.
+        #[allow(dead_code)]
+        pub engine: std::sync::Arc<ResolveEngine>,
+        /// Kept for journal assertions (the daemon is the single writer, so
+        /// asserting means opening this path read-only).
+        #[allow(dead_code)]
+        pub journal_path: PathBuf,
+    }
+
+    impl EngineLab {
+        pub(crate) fn publish(cx: &mut TestAppContext) -> Self {
+            use std::sync::{Arc, Mutex};
+            use tomte_app::ipc::IpcClient;
+            use tomte_core::cmd::SystemRunner;
+            use tomte_core::git::GitClient;
+            use tomte_core::testsupport::Scratch;
+            use tomte_daemon::core::DaemonCore;
+            use tomte_daemon::server::{ServeCtx, serve};
+            use tomte_journal::Journal;
+
+            // `Scratch::new` writes the repo-LOCAL identity and
+            // `commit.gpgsign = false` the production `GitClient` needs: it
+            // runs plain `git`, without testsupport's per-invocation `-c`
+            // overrides, so without that it would inherit the developer's
+            // global signing config.
+            let s = Scratch::new();
+            let journal_path = s.root.path().join("journal.db");
+            let journal = Journal::open(&journal_path, "shell-test").expect("journal opens");
+            let core = Arc::new(Mutex::new(
+                DaemonCore::new(
+                    s.chezmoi(),
+                    GitClient::new(Arc::new(SystemRunner), s.source.clone()),
+                    journal,
+                    "origin/main".into(),
+                )
+                .expect("daemon core builds over the scratch home"),
+            ));
+            let sock = s.root.path().join("d.sock");
+            let listener =
+                std::os::unix::net::UnixListener::bind(&sock).expect("scratch socket binds");
+            std::thread::spawn(move || {
+                serve(listener, ServeCtx::ready(core, now_ts, Arc::new(|| {})))
+            });
+            let ipc = Arc::new(IpcClient::connect(&sock).expect("the daemon accepts the app"));
+            let engine = Arc::new(ResolveEngine {
+                // The SCRATCH clients — mutations must hit the scratch home.
+                chezmoi: s.chezmoi(),
+                git: GitClient::new(Arc::new(SystemRunner), s.source.clone()),
+                ipc,
+                journal_path: journal_path.clone(),
+            });
+            // One drifted managed file, so a `KeepDisk` on `target()` has
+            // real work to do: the scratch source holds `dot_testrc` =
+            // "a=1\n" and the destination now says something else.
+            std::fs::write(s.home.join(".testrc"), b"a=local\n").expect("drift the target");
+            cx.set_global(crate::EngineSlot(Some(engine.clone())));
+            Self {
+                s,
+                engine,
+                journal_path,
+            }
+        }
+
+        /// The managed destination file, `~/.testrc` in the scratch home.
+        pub(crate) fn target(&self) -> PathBuf {
+            self.s.home.join(".testrc")
+        }
+
+        /// Its source: `<source>/dot_testrc`.
+        pub(crate) fn source_file(&self) -> PathBuf {
+            self.s.source.join("dot_testrc")
+        }
+    }
+
+    /// A Shell with an EMPTY model, so the latch tests are about the latch
+    /// and not about rows. Safe because `SyncModel::confirm_resolved` is a
+    /// no-op on a target the model never heard of — it retains a list that
+    /// never contained it, and only counts a move when that list actually
+    /// shrank — and `batch_finished` is the only thing here that calls it.
+    /// The model is also NOT connected, so `render`'s connect latch never
+    /// pumps behind these tests' backs.
+    fn latch_shell(route: Route, cx: &mut Context<Shell>) -> Shell {
+        Shell {
+            route,
+            state: cx.new(|_| SyncModel::default()),
+            review: None,
+            settings: None,
+            merge: None,
+            paths: smoke_paths(),
+            expanded_scans: HashSet::new(),
+            dashboard_action_in_flight: false,
+            unlock_in_flight: false,
+            pending_merge: false,
+            merge_finish_in_flight: false,
+            pending_merge_probed: false,
+            changelog: None,
+            queue: Default::default(),
+            queue_pumping: false,
+            deferred_repo_op: None,
+        }
+    }
+
+    /// The queue's REAL path, end to end: `enqueue` → `pump` → `run_batch`
+    /// against a live engine, and the decision actually lands on disk.
+    ///
+    /// Finding 4 of the Task 3 re-review: no test published an `EngineSlot`,
+    /// so `pump` always parked and nothing below it ever ran — deleting the
+    /// staged-merge conclusion await, or `catching_panics` itself, left all
+    /// 335 tests green.
+    ///
+    /// MUTATION: make `pump` return before it spawns the batch → this fails
+    /// (the queue never drains, and the source file keeps "a=1\n").
+    #[gpui::test]
+    fn a_batch_really_drains_through_pump(cx: &mut TestAppContext) {
+        let lab = EngineLab::publish(cx);
+        let target = lab.target();
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+
+        let queued = target.clone();
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.enqueue(
+                    QueuedAction {
+                        target: queued,
+                        decision: Decision::KeepDisk,
+                    },
+                    cx,
+                );
+                assert!(s.queue_pumping, "the batch took the latch straight away");
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(
+                s.queue.failure(&target).is_none(),
+                "{:?}",
+                s.queue.failure(&target)
+            );
+            assert_eq!(s.queue.depth(), 0, "the batch drained");
+            assert!(!s.queue_pumping, "and the latch is free again");
+        });
+        assert_eq!(
+            std::fs::read(lab.source_file()).expect("source file readable"),
+            b"a=local\n",
+            "keep-disk really re-added the drifted content into the source"
+        );
+    }
+
+    /// A finish pressed while a batch drains runs AFTER that batch lands and
+    /// BEFORE the next batch starts — the merge commit and the next
+    /// decision's writes never overlap on the one repository.
+    ///
+    /// MUTATION: in `pump`, take the batch before checking
+    /// `deferred_repo_op` → the probe below sees `running()` non-empty and
+    /// `merge_finish_in_flight` false.
+    #[gpui::test]
+    fn a_finish_pressed_mid_drain_runs_before_the_next_batch(cx: &mut TestAppContext) {
+        let lab = EngineLab::publish(cx);
+        let target = lab.target();
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Dashboard, cx));
+
+        let queued = target.clone();
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                // Stand in for a batch that is already draining.
+                s.queue_pumping = true;
+                s.queue.push(QueuedAction {
+                    target: queued,
+                    decision: Decision::KeepDisk,
+                });
+                s.finish_pending_merge(cx); // pressed while draining
+                assert!(matches!(
+                    s.deferred_repo_op,
+                    Some(PendingRepoOp::FinishMerge)
+                ));
+                assert!(
+                    !s.merge_finish_in_flight,
+                    "nothing may run while the latch is held"
+                );
+                assert!(
+                    s.queue.running().is_empty(),
+                    "and no batch may start either"
+                );
+            });
+        });
+        // The stand-in batch lands with nothing to report.
+        vis.update(|_window, cx| shell.update(cx, |s, cx| s.batch_finished(Vec::new(), None, cx)));
+        // PROBE before anything is polled: the finish took the latch; the
+        // pending batch did NOT.
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(
+                s.deferred_repo_op.is_none(),
+                "the finish was taken, not left"
+            );
+            assert!(s.merge_finish_in_flight, "and it is what started");
+            assert!(s.queue_pumping);
+            assert!(
+                s.queue.running().is_empty(),
+                "the batch is still waiting its turn"
+            );
+            assert_eq!(s.queue.depth(), 1);
+        });
+        vis.run_until_parked(); // the finish (NotMerging here), then the batch
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(!s.merge_finish_in_flight);
+            assert!(!s.queue_pumping);
+            assert_eq!(s.queue.depth(), 0, "and the batch ran after it");
+            assert!(
+                s.queue.failure(&target).is_none(),
+                "{:?}",
+                s.queue.failure(&target)
+            );
+        });
+        assert_eq!(
+            std::fs::read(lab.source_file()).expect("source file readable"),
+            b"a=local\n"
+        );
+    }
+
+    /// The abort is the case the ordering exists for: the user leaves the
+    /// editor NOW, but the rollback waits for the latch, and the decisions
+    /// queued behind it run against the ROLLED-BACK repo instead of being
+    /// staged into a merge that has just been discarded.
+    ///
+    /// MUTATION: in `pump`, take the batch before checking
+    /// `deferred_repo_op` → the probe below sees `running()` non-empty.
+    /// MUTATION: drop the `self.route = Route::Review` from
+    /// `abort_origin_merge` → the first assertion fails.
+    #[gpui::test]
+    fn an_abort_pressed_mid_drain_routes_now_and_runs_later(cx: &mut TestAppContext) {
+        let lab = EngineLab::publish(cx);
+        let target = lab.target();
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Merge, cx));
+
+        let queued = target.clone();
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.queue_pumping = true;
+                s.queue.push(QueuedAction {
+                    target: queued,
+                    decision: Decision::KeepDisk,
+                });
+                // Exactly what `MergeView::discard_merge` hands over.
+                s.abort_origin_merge(merge::Rollback::Files(2), cx);
+                assert_eq!(s.route, Route::Review, "the editor is left immediately");
+                assert!(matches!(
+                    s.deferred_repo_op,
+                    Some(PendingRepoOp::AbortMerge(_))
+                ));
+                assert!(
+                    s.queue.running().is_empty(),
+                    "nothing started under the latch"
+                );
+            });
+        });
+        vis.update(|_window, cx| shell.update(cx, |s, cx| s.batch_finished(Vec::new(), None, cx)));
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(s.deferred_repo_op.is_none(), "the abort was taken …");
+            assert!(s.queue_pumping, "… and holds the latch");
+            assert!(
+                s.queue.running().is_empty(),
+                "the queued decision waits behind the rollback"
+            );
+            assert_eq!(s.queue.depth(), 1);
+        });
+        vis.run_until_parked(); // the abort, then the decision behind it
+        let banner = vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(!s.queue_pumping);
+            assert_eq!(
+                s.queue.depth(),
+                0,
+                "the decision ran against the rolled-back repo"
+            );
+            s.review.clone()
+        });
+        let banner = banner.expect("the abort's banner made a review view");
+        let banner = vis.update(|_window, cx| banner.read(cx).last_outcome.clone());
+        let banner = banner.expect("the rollback is reported, never silent");
+        assert!(
+            banner.text.contains("rolled back"),
+            "the banner names the rollback: {}",
+            banner.text
+        );
+    }
+
+    /// A press made while the app is still connecting is not a discarded
+    /// click either. No `EngineSlot` is published here, so `pump` PARKS —
+    /// and a parked queue keeps its deferred op until something runs it.
+    ///
+    /// MUTATION: have `pump` take `deferred_repo_op` before the engine
+    /// lookup → the second assertion fails.
+    #[gpui::test]
+    fn a_deferred_op_survives_a_parked_queue(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Dashboard, cx));
+        vis.update(|_window, cx| shell.update(cx, |s, cx| s.finish_pending_merge(cx)));
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert!(
+                !s.queue_pumping,
+                "nothing ran, so a reconnect is free to pump"
+            );
+            assert!(matches!(
+                s.deferred_repo_op,
+                Some(PendingRepoOp::FinishMerge)
+            ));
+            assert!(
+                !s.merge_finish_in_flight,
+                "and the banner button does not claim to be working"
+            );
+        });
+    }
+
+    /// `catching_panics` now guards four different closures with four
+    /// different return types, so its fallback must travel with the caller
+    /// rather than being baked into the catch.
+    ///
+    /// MUTATION: have `catching_panics` re-raise (drop the `catch_unwind`)
+    /// → the first case panics instead of returning.
+    #[test]
+    fn catching_panics_hands_back_the_fallback_for_any_type() {
+        let v: Result<u8, String> = catching_panics("t", Err, || panic!("boom"));
+        assert!(matches!(v, Err(ref d) if d.contains("boom")), "{v:?}");
+        let v: Result<u8, String> = catching_panics("t", Err, || Ok(7));
+        assert_eq!(v, Ok(7), "and a closure that returns is left alone");
     }
 }

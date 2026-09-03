@@ -481,6 +481,7 @@ fn open_shell(cx: &mut App, route: Route, state: Entity<SyncModel>, paths: Setti
                     changelog: None,
                     queue: Default::default(),
                     queue_pumping: false,
+                    deferred_repo_op: None,
                 }
             })
         },
