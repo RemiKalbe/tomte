@@ -10,10 +10,11 @@ version without one.
 
 - **Confirming a file no longer blocks every other file.** A decision — a
   quick action or a merge-editor save — is recorded the instant you make it
-  and runs in the background. Its row moves to **Processing**, the selection
-  advances to the next file that still needs an answer, and you carry on.
-  Until now one confirmation disabled every other row's buttons, and the
-  clicks you made while you waited were discarded rather than remembered.
+  and runs in the background. In Review its row moves to **Processing** and
+  the selection advances to the next file that still needs an answer, and you
+  carry on. Until now one confirmation disabled every other row's buttons,
+  and the clicks you made while you waited were discarded rather than
+  remembered.
 - **Decisions made while one is running share a single re-add, commit and
   push.** The slow part of a decision is per invocation, not per file:
   `chezmoi re-add` around 2.5 s and `git push` around 1.5 s, however long
@@ -31,6 +32,13 @@ version without one.
   queued decisions first, rather than reverting a file a decision is still
   on its way to. Discarding a merge also throws away the merge-editor saves
   still queued for it, and says how many went with it.
+- **A decision made while the daemon is away is remembered, not refused.** All
+  three surfaces used to turn the click down when nothing was connected: a
+  review row's buttons and the dashboard's quick actions went dead with
+  "daemon not connected", and the merge editor's Save answered "Daemon not
+  connected · cannot save" over work you had already done. The decision is
+  now recorded, the row reads as processing, and it runs on reconnect —
+  including the finish, roll-back or Undo you pressed in the meantime.
 
 ### Fixed
 
@@ -48,7 +56,7 @@ version without one.
   file that reads a secret through `onepasswordRead` failed the whole
   decision when `op` was slow to answer, and retrying by hand worked — so
   the failure was never really the answer. Those are now retried a bounded
-  number of times, each attempt in the log. Having more than one 1Password
+  number of times, each retry logged. Having more than one 1Password
   account configured is not transient, and is still reported at once.
 - **The banner above Undo always names the file Undo would revert.** Undo
   reverts the last file that landed, which after a sweep is not necessarily

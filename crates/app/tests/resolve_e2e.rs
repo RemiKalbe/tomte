@@ -2252,7 +2252,10 @@ fn the_dashboards_own_action_can_strand_a_merge() {
     std::fs::write(&lab.target, DRIFTED).unwrap();
     unsignable(&lab.s.source);
 
-    // Exactly what `run_quick_action` runs on that surface.
+    // The dashboard's quick action enqueues a `Decision::KeepDisk`
+    // (`dashboard.rs`'s `quick_action_button`); this is the engine call the
+    // batch that takes it ends up making here, where the repo is diverged
+    // and the shared tail falls back to the single-file paths.
     let outcome = lab.engine.keep_disk(&lab.target).unwrap();
     let ResolveOutcome::Done {
         committed, note, ..

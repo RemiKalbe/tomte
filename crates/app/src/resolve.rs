@@ -411,10 +411,16 @@ impl ResolveEngine {
                     .collect();
                 Ok(self.commit_batch(&targets))
             }
+            // No keep-disk targets in this batch, so there was no `re_add`
+            // to succeed or fail. The value is inert: Phase 3 only reads a
+            // group's outcome for the files in it, and this group is empty.
             None => Ok((false, false, None)),
         };
         let source_outcome: Result<(), String> = match applied {
             Some(Err(e)) => Err(e.to_string()),
+            // `Some(Ok(()))` and `None` alike: applied, or no keep-source
+            // targets to apply. Same reason as above — with the group empty
+            // Phase 3 never reads this, so the two need not be told apart.
             _ => Ok(()),
         };
 

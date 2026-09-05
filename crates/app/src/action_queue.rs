@@ -283,12 +283,21 @@ impl ActionQueue {
     /// re-choosable, and [`Self::push`] replaces the pending choice — spec
     /// §2.4, "a re-queued target replaces its pending choice". Use
     /// [`Self::running`] for the ones that are past changing.
+    ///
+    /// DEDUPED, running first: a target that is running and is then
+    /// re-chosen (merge-editor Save on a file whose batch already started)
+    /// holds two entries, and the UI renders one row per target — without
+    /// this it drew that file twice, both "Processing". [`Self::depth`] is
+    /// deliberately NOT deduped: two entries really are two units of work
+    /// still owed.
     pub fn processing(&self) -> Vec<PathBuf> {
-        self.running
-            .iter()
-            .chain(self.pending.iter())
-            .map(|a| a.target.clone())
-            .collect()
+        let mut seen: Vec<PathBuf> = Vec::with_capacity(self.depth());
+        for action in self.running.iter().chain(self.pending.iter()) {
+            if !seen.contains(&action.target) {
+                seen.push(action.target.clone());
+            }
+        }
+        seen
     }
 
     /// How many decisions are still owed work, including any running.
@@ -306,7 +315,7 @@ impl ActionQueue {
 
     /// Drop every remembered failure whose target `keep` says no to.
     ///
-    /// The OTHER half of the promise on [`Self::failed`]. Retrying clears a
+    /// The OTHER half of the promise on `Self::failed`. Retrying clears a
     /// failure, but a row the user never retried has to lose its message
     /// once the file stops being drifted — otherwise the row comes back
     /// months later, on the file's next unrelated drift, still showing an
@@ -486,6 +495,47 @@ mod tests {
             q.processing(),
             vec![PathBuf::from("/a"), PathBuf::from("/b")],
             "the running one leads; the rest follow in the order chosen"
+        );
+    }
+
+    /// A running target re-chosen holds TWO entries — and is still one row.
+    ///
+    /// Reachable for real: the merge editor's Save on a file whose batch has
+    /// already started. `processing` is what the UI renders rows from, so
+    /// without the dedupe Review drew that file twice, both "Processing".
+    /// MUTATION: drop the `seen.contains` guard in `processing` and this
+    /// fails with `["/a", "/a"]`. `depth` stays 2 on purpose — two entries
+    /// are two units of work still owed — and the running entry is the one
+    /// that survives, because it is what is actually happening to the file.
+    #[test]
+    fn processing_lists_a_re_chosen_running_target_once() {
+        let mut q = ActionQueue::default();
+        q.push(action("/a", Decision::KeepDisk));
+        q.take_batch();
+        q.push(action(
+            "/a",
+            Decision::Merged {
+                resolved: "x".into(),
+                inputs: fake_inputs("/a"),
+            },
+        ));
+
+        assert_eq!(
+            q.processing(),
+            vec![PathBuf::from("/a")],
+            "one row per target, however many decisions it owes"
+        );
+        assert_eq!(q.depth(), 2, "but two units of work are still owed");
+        assert!(is_processing(&q, "/a"));
+        assert_eq!(
+            targets(q.running()),
+            [Path::new("/a")],
+            "the running batch is untouched"
+        );
+        assert_eq!(
+            q.decision_label(Path::new("/a")),
+            Some(Decision::KeepDisk.label()),
+            "and the running choice is the one the row names"
         );
     }
 

@@ -168,8 +168,10 @@ pub struct Shell {
     /// [`Self::pump`] is safe to call from anywhere.
     ///
     /// The rule it exists to enforce is "everything that mutates the repo
-    /// enters through [`Self::pump`]", and as of Task 5 that rule is WHOLE:
-    /// no surface in this app spawns git work of its own any more.
+    /// enters through [`Self::pump`]", and as of Task 5 it holds for every
+    /// VIEW surface: Review's quick actions and "Keep both", the merge
+    /// editor's Save, the dashboard's quick actions, and a finish, a
+    /// roll-back or an Undo all come through here.
     ///
     /// Task 3b closed the Shell's own two doors (a finish and an abort now
     /// take their turn behind it instead of spawning a commit+push, or a
@@ -183,6 +185,16 @@ pub struct Shell {
     /// owes (a merge commit and a push) is awaited inside the batch's own
     /// in-flight window, before this clears — it used to be spawned beside
     /// the drain by a `Shell::repo_conflict_saved` that no longer exists.
+    ///
+    /// ONE door is still open, and it predates this work: the tray's "Sync
+    /// all" (`main.rs`'s `run_sync_all`) spawns `engine.sync_all()` —
+    /// `chezmoi update`, which is a git pull plus an apply — without
+    /// consulting this latch. It is reachable beside a pending finish,
+    /// because Sync all is gated on nothing being drifted, which is exactly
+    /// the stranded-merge state where the dashboard's Finish is live.
+    /// Routing it as a [`PendingRepoOp`] is a follow-up rather than part of
+    /// this change: the tray handler holds `&mut App` with no `Shell` handle
+    /// to pump.
     ///
     /// Anything added later that writes the source repo, the index, or a
     /// managed destination file belongs behind this latch too: as a
@@ -411,6 +423,14 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 shell.queue_pumping = false;
                 shell.running_repo_op = None;
+                // ROUTES, like the finish arm at `run_finish`: `merge_done`
+                // sends the banner to Review, so a roll-back that lands
+                // minutes later can pull the user out of Settings. That is
+                // the intent. The user pressed Discard and is owed the
+                // answer wherever they went — and above all the `AbortFailed`
+                // arm MUST be seen: it says the merge is still sitting there
+                // with their answers staged in it, which is not a thing to
+                // learn later from a banner nobody routed.
                 shell.merge_done(abort_banner(outcome, &rolled_back, &dropped), cx);
                 // On EVERY arm. A rollback that completed ended the merge the
                 // dashboard banner was reporting; one that FAILED left it
@@ -876,12 +896,14 @@ impl Shell {
     /// of every batch and every repo op, and from the connect latch in
     /// `render`.
     ///
-    /// The one door for the SHELL's git work: nothing on `Shell` spawns a
+    /// The one door for the app's git work: nothing on `Shell` spawns a
     /// mutation except through here, which is what makes
     /// [`Self::queue_pumping`] a real serial latch rather than a flag only
-    /// the queue respects. The views' own action paths do not come through
-    /// here yet — [`Self::queue_pumping`] lists them and the tasks that
-    /// close them.
+    /// the queue respects. The views' own action paths all come through here
+    /// too — Review, the merge editor's Save, the dashboard's quick actions,
+    /// and finish / roll-back / Undo. The one surface that does not is the
+    /// tray's "Sync all"; [`Self::queue_pumping`] says why it is still
+    /// outside.
     fn pump(&mut self, cx: &mut Context<Self>) {
         if self.queue_pumping {
             return;
@@ -2580,10 +2602,6 @@ mod render_smoke {
     /// the whole stack be built here instead.
     pub(crate) struct EngineLab {
         pub s: tomte_core::testsupport::Scratch,
-        /// These tests drive the engine through the published `EngineSlot`;
-        /// the handle is kept for the stories that call it directly.
-        #[allow(dead_code)]
-        pub engine: std::sync::Arc<ResolveEngine>,
         /// Kept for journal assertions (the daemon is the single writer, so
         /// asserting means opening this path read-only).
         pub journal_path: PathBuf,
@@ -2650,10 +2668,12 @@ mod render_smoke {
             // real work to do: the scratch source holds `dot_testrc` =
             // "a=1\n" and the destination now says something else.
             std::fs::write(s.home.join(".testrc"), b"a=local\n").expect("drift the target");
-            cx.set_global(crate::EngineSlot(Some(engine.clone())));
+            // The published global is the only handle these tests need —
+            // they drive the engine through `pump` — and it is what keeps
+            // this `Arc` alive for the length of the test.
+            cx.set_global(crate::EngineSlot(Some(engine)));
             Self {
                 s,
-                engine,
                 journal_path,
                 engine_git_calls,
             }

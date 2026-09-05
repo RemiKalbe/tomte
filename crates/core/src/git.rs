@@ -128,7 +128,7 @@ impl GitClient {
         Ok(String::from_utf8_lossy(&self.run(args, Duration::from_secs(30))?).into_owned())
     }
 
-    /// Like [`Self::run`] but does not turn a non-zero exit into
+    /// Like `Self::run` but does not turn a non-zero exit into
     /// `GitError::Exit` — for probes where a specific non-zero code IS the
     /// answer (e.g. [`Self::merge_tree_conflicts`]'s "conflicts found").
     /// `failure_is_expected` makes the command chokepoint log a non-zero
@@ -417,7 +417,7 @@ impl GitClient {
     /// `abort_repo_reconcile` could not fail, so the app reported "Merge with
     /// origin rolled back" for a roll-back that never happened. The everyday
     /// way it does not happen is the one `85fec09` met elsewhere — an
-    /// `index.lock` the daemon's scan is holding past [`Self::run`]'s six
+    /// `index.lock` the daemon's scan is holding past `Self::run`'s six
     /// retries — and the merge is then still open with the user's answers
     /// still staged in it.
     ///

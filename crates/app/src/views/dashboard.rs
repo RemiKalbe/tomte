@@ -1030,27 +1030,14 @@ fn quick_actions(
         ))
 }
 
-/// One inline quick action: record the decision on the Shell's queue and be
-/// done with it.
-///
-/// The click used to spawn the engine call itself, behind a shell-wide
-/// `dashboard_action_in_flight` boolean — beside whatever the queue was
-/// draining, on the same git repository. Now it is a [`Decision`] like every
-/// other, and the press returns the instant the choice is remembered.
-///
-/// ONE thing makes a button inert: this target's decision is already RUNNING
-/// — the same rule as `review::QueuedStatus::locks_row`, for the same reason.
-/// `ActionQueue::push` replaces a PENDING choice, but it cannot recall one
-/// that is in flight, so a second press would queue a duplicate. That
-/// duplicate is not harmless — it re-adds identical content, commits and
-/// pushes again, and opens a SECOND journal session, which is then the one
-/// Undo reverts. See [`quick_action_blocked`], including why a missing daemon
-/// is not on that list.
 /// Why this row's quick actions are inert, or `None` when they are live.
 ///
 /// ONE rule, the same one `review::blocked_reason` applies and in the same
 /// words: this file's decision is already RUNNING, so a second press could
-/// not replace it, only duplicate it.
+/// not replace it, only duplicate it. MERELY QUEUED is not the same thing —
+/// `ActionQueue::push` replaces a pending choice, so that row stays live and
+/// re-choosable (spec §2.4) — and every OTHER file's buttons stay live
+/// throughout, which is the whole point of the queue.
 ///
 /// A MISSING DAEMON IS NOT A REASON, on this surface either. Parking is the
 /// queue's model: `Shell::pump` leaves everything queued when no engine is
@@ -1067,6 +1054,19 @@ pub(super) fn quick_action_blocked(running: bool) -> Option<SharedString> {
     None
 }
 
+/// One inline quick action: record the decision on the Shell's queue and be
+/// done with it.
+///
+/// The click used to spawn the engine call itself, behind a shell-wide
+/// `dashboard_action_in_flight` boolean — beside whatever the queue was
+/// draining, on the same git repository. Now it is a [`Decision`] like every
+/// other, and the press returns the instant the choice is remembered.
+///
+/// The one thing that makes a button inert, and why a missing daemon is not
+/// on that list, both live in [`quick_action_blocked`] — the duplicate a
+/// second press would queue is not harmless: it re-adds identical content,
+/// commits and pushes again, and opens a SECOND journal session, which is
+/// then the one Undo reverts.
 fn quick_action_button(
     ix: usize,
     action: QuickAction,

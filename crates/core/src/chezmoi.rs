@@ -451,15 +451,13 @@ impl ChezmoiClient {
         self.run_ok(&["execute-template"], Some(input.to_vec()))
     }
 
-    /// Apply the target (or everything). Passes `--force`: a drifted
-    /// destination is by definition "modified since chezmoi last wrote it",
-    /// and chezmoi would otherwise prompt `(diff/overwrite/…)?` — which under
-    /// `--no-tty` dies with `EOF`. Callers apply only on an explicit user
-    /// decision, so overwriting is exactly the contract.
-    /// Apply one or more destinations in ONE invocation. Same per-invocation
-    /// economics as [`Self::re_add`], and the same refusal: an empty slice
-    /// keeps chezmoi's own meaning — apply the ENTIRE source state over the
-    /// destination — so callers must not hand one over by accident.
+    /// Apply EXACTLY the listed destinations, in ONE invocation. Same
+    /// per-invocation economics as [`Self::re_add`].
+    ///
+    /// An empty slice is REFUSED rather than passed through: with no targets
+    /// chezmoi applies the ENTIRE source state over the destination, which is
+    /// never what a caller with an empty list meant. Use [`Self::apply`] with
+    /// `None` to ask for that on purpose.
     pub fn apply_many(&self, targets: &[PathBuf]) -> Result<(), ChezmoiError> {
         if targets.is_empty() {
             return Err(ChezmoiError::Failed(
@@ -475,6 +473,11 @@ impl ChezmoiClient {
         Ok(())
     }
 
+    /// Apply the target (or, with `None`, everything). Passes `--force`: a
+    /// drifted destination is by definition "modified since chezmoi last
+    /// wrote it", and chezmoi would otherwise prompt `(diff/overwrite/…)?`
+    /// — which under `--no-tty` dies with `EOF`. Callers apply only on an
+    /// explicit user decision, so overwriting is exactly the contract.
     pub fn apply(&self, target: Option<&Path>) -> Result<(), ChezmoiError> {
         match target {
             Some(t) => self.run_ok(&["apply", "--force", &t.to_string_lossy()], None)?,
@@ -483,9 +486,13 @@ impl ChezmoiClient {
         Ok(())
     }
 
-    /// Re-add a modified target into the source state. NOTE: chezmoi silently
-    /// ignores templated sources — callers must pre-detect `.tmpl` and refuse.
-    /// Re-add one or more destinations into the source, in ONE invocation.
+    /// Re-add EXACTLY the listed destinations into the source, in ONE
+    /// invocation. An empty slice is REFUSED, for the same reason
+    /// [`Self::apply_many`] refuses one: with no targets chezmoi re-adds
+    /// EVERY modified file.
+    ///
+    /// NOTE: chezmoi silently ignores templated sources — callers must
+    /// pre-detect `.tmpl` and refuse.
     ///
     /// chezmoi takes `target...` and re-adds every one, which matters far
     /// more than it looks: a single `re-add` costs ~2.5s on a real setup
