@@ -4,6 +4,56 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## Unreleased
+
+### Changed
+
+- **Confirming a file no longer blocks every other file.** A decision — a
+  quick action or a merge-editor save — is recorded the instant you make it
+  and runs in the background. Its row moves to **Processing**, the selection
+  advances to the next file that still needs an answer, and you carry on.
+  Until now one confirmation disabled every other row's buttons, and the
+  clicks you made while you waited were discarded rather than remembered.
+- **Decisions made while one is running share a single re-add, commit and
+  push.** The slow part of a decision is per invocation, not per file:
+  `chezmoi re-add` around 2.5 s and `git push` around 1.5 s, however long
+  the list. So decisions that pile up behind a running one drain together
+  and pay that tail once. The first click of a sweep still runs on its own —
+  there is nothing to join it to yet — so answering thirty files costs two
+  of those tails rather than thirty. Undo stays per file: each decision
+  keeps its own journal session and reverts on its own.
+- **A merge finish, a roll-back or an Undo pressed while decisions are
+  draining waits its turn.** All three rewrite the very repository those
+  decisions are writing, so they run between batches, never beside one. You
+  still leave the merge editor the moment you press it, and the decisions
+  queued behind a roll-back run against the rolled-back repo. Undo stays
+  visible but disabled while the queue owes work, and says it is finishing
+  queued decisions first, rather than reverting a file a decision is still
+  on its way to. Discarding a merge also throws away the merge-editor saves
+  still queued for it, and says how many went with it.
+
+### Fixed
+
+- **A failed decision stays on its row, with its message.** The queue moves
+  on within milliseconds of an error, so a banner would have vanished before
+  you looked up — which is how the 1Password flake became "random". The row
+  keeps the message in place, its buttons re-enable, and choosing again
+  retries.
+- **A roll-back that failed no longer reports success.** Git can refuse to
+  abort a merge — an `index.lock` held past its retries, most often — and
+  the banner said "Merge with origin rolled back" over a merge that was
+  still sitting there with your answers staged in it. A refused abort now
+  says so.
+- **A 1Password hiccup no longer fails the decision outright.** A templated
+  file that reads a secret through `onepasswordRead` failed the whole
+  decision when `op` was slow to answer, and retrying by hand worked — so
+  the failure was never really the answer. Those are now retried a bounded
+  number of times, each attempt in the log. Having more than one 1Password
+  account configured is not transient, and is still reported at once.
+- **The banner above Undo always names the file Undo would revert.** Undo
+  reverts the last file that landed, which after a sweep is not necessarily
+  the one you were last looking at.
+
 ## 0.1.17 — 2026-09-01
 
 ### Fixed

@@ -279,6 +279,22 @@ impl ChezmoiClient {
     /// property of this specific failure kind, not of retrying in general —
     /// which is the other reason the guard tests the kind and not merely
     /// "some eval failure happened".
+    ///
+    /// "That entry" is the precise scope, and a BATCHED invocation is why it
+    /// has to be said: one call carries many targets, so an attempt that
+    /// failed on the fourth entry may already have written the three before
+    /// it. The example is [`Self::apply_many`] — `resolve.rs`'s
+    /// `resolve_batch` hands it the whole keep-source group, and it renders
+    /// entry by entry. NOT [`Self::re_add`], whose batch cannot reach this at
+    /// all: `resolve_batch`'s pre-flight refuses a templated keep-disk before
+    /// the batch is formed, so a batched `re-add` never carries a target with
+    /// a template to evaluate.
+    ///
+    /// Safety is unchanged, and for the reasons above rather than by luck:
+    /// the retry rewrites identical bytes from the same source, and `apply`
+    /// never touches the source repo — so the entries already written are
+    /// destination files, with nothing for `autoCommit` to have committed and
+    /// so nothing for a retry to double-commit.
     fn run_ok_with_timeout(
         &self,
         args: &[&str],

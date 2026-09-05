@@ -2537,6 +2537,38 @@ mod render_smoke {
             .unwrap_or(0)
     }
 
+    /// Every argv handed to one `GitClient`, in order — the shared log a
+    /// [`RecordingRunner`] writes into and [`EngineLab::git_invocations`]
+    /// reads.
+    type GitCallLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    /// A `CommandRunner` that writes down each argv and then runs it for
+    /// real through `SystemRunner`.
+    ///
+    /// Why a recorder and not a count of commits at origin: a `git push`
+    /// costs ~1.5 s per INVOCATION whatever it carries, and a push with
+    /// nothing new to send leaves no trace at origin at all. So counting
+    /// commits cannot see a tail that pushed once per file — which is the
+    /// half of "one push" the user is actually waiting on. Only the argv log
+    /// can.
+    struct RecordingRunner {
+        inner: tomte_core::cmd::SystemRunner,
+        calls: GitCallLog,
+    }
+
+    impl tomte_core::cmd::CommandRunner for RecordingRunner {
+        fn run(
+            &self,
+            req: tomte_core::cmd::CommandRequest,
+        ) -> Result<tomte_core::cmd::CommandOutput, tomte_core::cmd::CommandError> {
+            self.calls
+                .lock()
+                .expect("the git call log is not poisoned")
+                .push(req.args.clone());
+            self.inner.run(req)
+        }
+    }
+
     /// Scratch home + bare origin + file-backed journal + in-process daemon +
     /// connected `ResolveEngine`, PUBLISHED as the app's `EngineSlot` so
     /// `pump` runs for real.
@@ -2554,8 +2586,11 @@ mod render_smoke {
         pub engine: std::sync::Arc<ResolveEngine>,
         /// Kept for journal assertions (the daemon is the single writer, so
         /// asserting means opening this path read-only).
-        #[allow(dead_code)]
         pub journal_path: PathBuf,
+        /// The ENGINE's git calls only. The daemon keeps a plain
+        /// `SystemRunner`, so its own scans and probes never land in here to
+        /// be mistaken for work a decision did.
+        engine_git_calls: GitCallLog,
     }
 
     impl EngineLab {
@@ -2593,10 +2628,21 @@ mod render_smoke {
                 serve(listener, ServeCtx::ready(core, now_ts, Arc::new(|| {})))
             });
             let ipc = Arc::new(IpcClient::connect(&sock).expect("the daemon accepts the app"));
+            // The engine's git goes through the recorder so a story can count
+            // INVOCATIONS, not just their effects. Behaviour is unchanged:
+            // `RecordingRunner` delegates every call to the same
+            // `SystemRunner` the daemon above uses.
+            let engine_git_calls: GitCallLog = Arc::new(Mutex::new(Vec::new()));
             let engine = Arc::new(ResolveEngine {
                 // The SCRATCH clients — mutations must hit the scratch home.
                 chezmoi: s.chezmoi(),
-                git: GitClient::new(Arc::new(SystemRunner), s.source.clone()),
+                git: GitClient::new(
+                    Arc::new(RecordingRunner {
+                        inner: SystemRunner,
+                        calls: engine_git_calls.clone(),
+                    }),
+                    s.source.clone(),
+                ),
                 ipc,
                 journal_path: journal_path.clone(),
             });
@@ -2609,7 +2655,34 @@ mod render_smoke {
                 s,
                 engine,
                 journal_path,
+                engine_git_calls,
             }
+        }
+
+        /// Every argv the ENGINE's `GitClient` has run so far, in order.
+        ///
+        /// Not the daemon's, and not chezmoi's: chezmoi runs its OWN git from
+        /// inside `re-add` when `autoCommit`/`autoPush` are on, as a
+        /// subprocess of the chezmoi subprocess, and nothing here can see it.
+        /// This is the git Tomte itself decided to run — which is exactly the
+        /// set whose size Tomte controls.
+        pub(crate) fn git_invocations(&self) -> Vec<Vec<String>> {
+            self.engine_git_calls
+                .lock()
+                .expect("the git call log is not poisoned")
+                .clone()
+        }
+
+        /// How many `git push` invocations the engine has made.
+        ///
+        /// `GitClient::push` is the only method that pushes and it always
+        /// leads with `push` (`git.rs:307` — `["push", "--quiet", remote]`),
+        /// so the first argument is the whole test.
+        pub(crate) fn engine_pushes(&self) -> usize {
+            self.git_invocations()
+                .iter()
+                .filter(|argv| argv.first().map(String::as_str) == Some("push"))
+                .count()
         }
 
         /// The managed destination file, `~/.testrc` in the scratch home.
@@ -2917,6 +2990,371 @@ mod render_smoke {
              reports — it is what Undo reverts"
         );
         assert!(banner.undoable);
+    }
+
+    /// Pristine content of the extra managed files a sweep story adds.
+    const SWEEP_BASE: &[u8] = b"x=1\n";
+
+    /// Turn on the chezmoi git automation the way the real user's is.
+    ///
+    /// `Scratch::config_path` writes an EMPTY `chezmoi.toml`, so without this
+    /// a fixture is blind to what chezmoi does on a machine that has
+    /// `autoCommit`/`autoPush` on: it runs its OWN git from inside `re-add`,
+    /// committing and pushing without asking Tomte. That blindness is how the
+    /// 0.1.15 field bug shipped green — and here it would make the push
+    /// counts below measure nothing at all.
+    ///
+    /// Copied from `tests/resolve_e2e.rs` rather than shared with it: views
+    /// are bin-only (`lib.rs`'s header), so an integration test cannot reach
+    /// `Shell` and nothing can live in one place for both.
+    fn chezmoi_commits_and_pushes_for_itself(s: &tomte_core::testsupport::Scratch) {
+        std::fs::write(
+            s.root.path().join("chezmoi.toml"),
+            "[git]\nautoCommit = true\nautoPush = true\n",
+        )
+        .expect("the scratch chezmoi config is writable");
+    }
+
+    /// Extra managed files beside `.testrc`: `dot_<name>` = [`SWEEP_BASE`],
+    /// committed, pushed and applied — so `~/.<name>` exists and is in sync,
+    /// ready to be drifted.
+    ///
+    /// Applied in ONE pass, and BEFORE any drift is seeded: `apply(None)` is
+    /// repo-wide and `--force`, so applying between drifts would wash the
+    /// earlier ones straight back out — including the `.testrc` drift
+    /// [`EngineLab::publish`] leaves behind, which is why both stories below
+    /// re-drift every file after calling this.
+    fn more_managed_files(lab: &EngineLab, names: &[&str]) {
+        use tomte_core::testsupport::git;
+
+        for name in names {
+            std::fs::write(lab.s.source.join(format!("dot_{name}")), SWEEP_BASE)
+                .expect("the scratch source is writable");
+        }
+        git(&lab.s.source, &["add", "."]);
+        git(&lab.s.source, &["commit", "-m", "more managed files"]);
+        git(&lab.s.source, &["push"]);
+        lab.s
+            .chezmoi()
+            .apply(None)
+            .expect("apply the newly managed files");
+    }
+
+    /// Commits on the bare origin's `main` — how many pushes the fixture has
+    /// actually seen.
+    ///
+    /// A plain subprocess, the way `resolve_e2e.rs`'s `commit_count` does it:
+    /// counting commits is an assertion about the fixture, not a capability
+    /// the production `GitClient` needs.
+    fn origin_commit_count(lab: &EngineLab) -> usize {
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", "main"])
+            .current_dir(&lab.s.bare)
+            .output()
+            .expect("git rev-list runs");
+        assert!(
+            out.status.success(),
+            "rev-list in {}: {}",
+            lab.s.bare.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("rev-list --count prints a number")
+    }
+
+    /// Is the source repo sitting in a merge nobody concluded?
+    ///
+    /// The shared batch tail stages the whole index, so a sweep that left a
+    /// merge open would be a sweep that could commit conflicts the user never
+    /// answered. `resolve_e2e.rs`'s batch stories assert the same thing the
+    /// same way.
+    fn mid_merge(lab: &EngineLab) -> bool {
+        use std::sync::Arc;
+        use tomte_core::cmd::SystemRunner;
+        use tomte_core::git::GitClient;
+
+        GitClient::new(Arc::new(SystemRunner), lab.s.source.clone()).merge_in_progress()
+    }
+
+    /// The journal's FINISHED sessions, as `(id, summary)`, newest first.
+    ///
+    /// `Journal::last_finished_session` — what `resolve_e2e.rs` reaches for —
+    /// reports only the newest, and its batch story counts sessions from the
+    /// `BatchOutcome` instead. Through the Shell there is no `BatchOutcome`
+    /// to read: `batch_finished` receives targets and messages, no session
+    /// ids. So this counts the daemon's own record instead. The server emits
+    /// exactly one `session_end` event per `end_session` that SUCCEEDED, with
+    /// the id and summary in its `meta`, which is the same "finished" the
+    /// undo path means.
+    fn finished_sessions(lab: &EngineLab) -> Vec<(i64, String)> {
+        use tomte_journal::Journal;
+
+        let journal = Journal::open_read_only(&lab.journal_path, "assert")
+            .expect("the daemon's journal opens read-only");
+        journal
+            .timeline(200, None)
+            .expect("the timeline reads")
+            .into_iter()
+            .filter(|row| row.kind == "session_end")
+            .map(|row| {
+                let meta = row.meta.expect("a session_end event carries its meta");
+                (
+                    meta["session"].as_i64().expect("meta.session is an id"),
+                    meta["summary"]
+                        .as_str()
+                        .expect("meta.summary is a string")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The three files a sweep story decides, as
+    /// `(destination, source, content the user left on disk)`.
+    ///
+    /// `.testrc` is the lab's own managed file; `.a` and `.b` come from
+    /// [`more_managed_files`]. Distinct bodies per file so an assertion
+    /// cannot pass on the wrong one's content.
+    fn sweep_targets(lab: &EngineLab) -> [(PathBuf, PathBuf, &'static [u8]); 3] {
+        [
+            (lab.target(), lab.source_file(), b"a=from-the-disk\n"),
+            (
+                lab.s.home.join(".a"),
+                lab.s.source.join("dot_a"),
+                b"a=disk\n",
+            ),
+            (
+                lab.s.home.join(".b"),
+                lab.s.source.join("dot_b"),
+                b"b=disk\n",
+            ),
+        ]
+    }
+
+    /// Three managed files, all drifted on disk, with chezmoi's own git
+    /// automation on. Returns what [`sweep_targets`] describes.
+    fn a_sweep_of_three_drifted_files(lab: &EngineLab) -> [(PathBuf, PathBuf, &'static [u8]); 3] {
+        chezmoi_commits_and_pushes_for_itself(&lab.s);
+        more_managed_files(lab, &["a", "b"]);
+        let files = sweep_targets(lab);
+        // Every drift AFTER the apply inside `more_managed_files`, which is
+        // repo-wide and `--force`.
+        for (target, _, body) in &files {
+            std::fs::write(target, body).expect("drift the target");
+        }
+        files
+    }
+
+    /// SPEC §2.2, the sweep the spec is about: three one-click decisions that
+    /// were all made before the drain started cost ONE re-add, ONE commit and
+    /// ONE push, and still leave three separate Undos.
+    ///
+    /// Driven through the queue and `pump` rather than
+    /// `ResolveEngine::resolve_batch` (`resolve_e2e.rs`'s batch stories cover
+    /// that): only the Shell's own path knows where batch boundaries fall,
+    /// and where they fall is the whole claim.
+    ///
+    /// `push` then ONE `pump`, not three `enqueue`s, and that is not a
+    /// shortcut around the real entry point — it is the state `enqueue`
+    /// reaches from its SECOND click onwards, because `enqueue` pumps
+    /// synchronously. Its sibling below drives `enqueue` itself and measures
+    /// what the real sequence costs.
+    ///
+    /// MUTATION: make `take_batch` hand out one item at a time → the
+    /// `running().len() == 3` assertion fails, and the commit count comes
+    /// back `before + 3`. MUTATION: open one shared journal session for a
+    /// batch instead of one per file → `finished_sessions` finds one, not
+    /// three. MUTATION: have `resolve_batch` call `commit_batch` once per
+    /// target (`resolve.rs`'s phase 2) → the commit count stays `before + 1`
+    /// and only the push-INVOCATION assertion fails, which is the finding
+    /// that assertion exists for.
+    #[gpui::test]
+    fn three_decisions_queued_before_the_drain_are_one_push(cx: &mut TestAppContext) {
+        let lab = EngineLab::publish(cx);
+        let files = a_sweep_of_three_drifted_files(&lab);
+        let before = origin_commit_count(&lab);
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                for (target, _, _) in &files {
+                    s.queue.push(QueuedAction {
+                        target: target.clone(),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    });
+                }
+                s.pump(cx);
+                assert_eq!(
+                    s.queue.running().len(),
+                    3,
+                    "one batch took all three, not one of them"
+                );
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 0, "the sweep drained");
+            assert!(!s.queue_pumping, "and the latch is free again");
+            for (target, _, _) in &files {
+                assert!(
+                    s.queue.failure(target).is_none(),
+                    "{}: {:?}",
+                    target.display(),
+                    s.queue.failure(target)
+                );
+            }
+        });
+
+        // Filesystem truth, not just an empty queue: each source carries what
+        // its own destination held.
+        for (target, source, body) in &files {
+            assert_eq!(
+                std::fs::read(source).expect("source file readable"),
+                *body,
+                "{} must carry the disk content the sweep chose",
+                target.display()
+            );
+        }
+        assert_eq!(
+            origin_commit_count(&lab),
+            before + 1,
+            "three decisions, ONE commit reaching origin"
+        );
+        // And ONE push INVOCATION, which is the half of the claim the commit
+        // count above cannot see. With chezmoi's `autoCommit` on it is
+        // chezmoi's own push that carries the commit, so Tomte's tail pushes
+        // a repo with nothing new — free at origin, ~1.5 s on the wire, and
+        // invisible to `origin_commit_count`. A tail that ran once per file
+        // would therefore cost three of those and still add one commit.
+        assert_eq!(
+            lab.engine_pushes(),
+            1,
+            "three decisions, ONE `git push` invocation: {:?}",
+            lab.git_invocations()
+        );
+        assert!(
+            !mid_merge(&lab),
+            "a sweep must not leave a merge for the next one to commit blind"
+        );
+
+        // Undo stays per file (§2.3): three DISTINCT finished sessions, one
+        // naming each file — never one session the batch shared, which would
+        // make Undo revert the whole sweep.
+        let sessions = finished_sessions(&lab);
+        let ids: std::collections::BTreeSet<i64> = sessions.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "three files, three sessions — undo is per file: {sessions:?}"
+        );
+        for name in [".testrc", ".a", ".b"] {
+            assert!(
+                sessions
+                    .iter()
+                    .any(|(_, summary)| summary == &format!("keep_disk {name}")),
+                "no finished session for {name}: {sessions:?}"
+            );
+        }
+    }
+
+    /// The same sweep through the button the user actually presses — and the
+    /// honest count that comes out of it.
+    ///
+    /// `enqueue` pumps synchronously, so the FIRST click of a sweep always
+    /// drains ALONE. The clicks made while it runs join one batch behind it:
+    /// three clicks, TWO pushes, never three. This is why the changelog says
+    /// "decisions made while one is running share a single re-add, commit and
+    /// push" and does not promise one push per sweep.
+    ///
+    /// The second batch is taken from inside `batch_finished` (`pump` at its
+    /// end), which runs in a foreground update spawned by the first batch's
+    /// completion — so ONE `run_until_parked` drains both, exactly as
+    /// `a_finish_pressed_mid_drain_runs_before_the_next_batch` relies on.
+    ///
+    /// MUTATION: drop the `self.pump(cx)` from `enqueue` → the first
+    /// assertion fails (nothing started on the first click). MUTATION: make
+    /// `take_batch` hand out one item at a time → three commits and three
+    /// push invocations where two of each were owed.
+    #[gpui::test]
+    fn clicks_during_a_drain_join_the_next_batch(cx: &mut TestAppContext) {
+        use std::path::Path;
+
+        let lab = EngineLab::publish(cx);
+        let files = a_sweep_of_three_drifted_files(&lab);
+        let before = origin_commit_count(&lab);
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                fn click(target: &Path, s: &mut Shell, cx: &mut Context<Shell>) {
+                    s.enqueue(
+                        QueuedAction {
+                            target: target.to_path_buf(),
+                            decision: Decision::KeepDisk,
+                            notify_on_done: false,
+                        },
+                        cx,
+                    );
+                }
+                click(&files[0].0, s, cx);
+                assert_eq!(
+                    s.queue
+                        .running()
+                        .iter()
+                        .map(|a| a.target.clone())
+                        .collect::<Vec<_>>(),
+                    vec![files[0].0.clone()],
+                    "the first click drains alone — `enqueue` pumps"
+                );
+                click(&files[1].0, s, cx);
+                click(&files[2].0, s, cx);
+                assert_eq!(s.queue.depth(), 3, "nothing was discarded");
+                assert_eq!(
+                    s.queue.running().len(),
+                    1,
+                    "the other two wait for the first click's batch"
+                );
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 0, "both batches drained");
+            assert!(!s.queue_pumping);
+            for (target, _, _) in &files {
+                assert!(
+                    s.queue.failure(target).is_none(),
+                    "{}: {:?}",
+                    target.display(),
+                    s.queue.failure(target)
+                );
+            }
+        });
+
+        for (target, source, body) in &files {
+            assert_eq!(
+                std::fs::read(source).expect("source file readable"),
+                *body,
+                "{} must carry the disk content the sweep chose",
+                target.display()
+            );
+        }
+        assert_eq!(
+            origin_commit_count(&lab),
+            before + 2,
+            "one commit for the first click, one for the two behind it"
+        );
+        assert_eq!(
+            lab.engine_pushes(),
+            2,
+            "two batches, TWO `git push` invocations — not one per file: {:?}",
+            lab.git_invocations()
+        );
+        assert!(!mid_merge(&lab));
     }
 
     /// A press made while the app is still connecting is not a discarded
