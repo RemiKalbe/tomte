@@ -2218,7 +2218,7 @@ fn aborting_rolls_back_recorded_resolutions_but_not_their_destinations() {
         "the answered file must be named as at risk, got {rollback:?}"
     );
 
-    lab.engine.abort_repo_reconcile();
+    lab.engine.abort_repo_reconcile().unwrap();
 
     // A's SOURCE went back; A's DESTINATION did not. That divergence between
     // what the user was told and what is true is the whole reason Cancel has
@@ -2283,5 +2283,57 @@ fn the_dashboards_own_action_can_strand_a_merge() {
         std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
         DRIFTED,
         "the disk content the quick action chose is what got committed"
+    );
+}
+
+/// `abort_repo_reconcile` answers honestly in both directions, and the
+/// idempotent half is not a nicety: Cancel is reachable with no merge running
+/// (the editor open on a file the merge already concluded, a second Discard
+/// landing behind the first), and `git merge --abort` answers that with a
+/// hard error. Reporting that as a failed roll-back would raise a red banner
+/// about a merge that is simply gone.
+///
+/// The merging half is the one that used to be unprovable at all: before
+/// Task 6 `merge_abort` discarded its own result, so this function returned
+/// `()` and could not distinguish "rolled back" from "did not".
+///
+/// MUTATION: drop the `merge_in_progress()` guard → the first call returns
+/// `Err` ("There is no merge to abort") and the assertion fails. MUTATION:
+/// `let _ = self.git.merge_abort()` (the pre-Task-6 shape) → the compile
+/// fails, which is the point of returning the result.
+#[test]
+fn aborting_is_idempotent_when_there_is_nothing_to_abort_and_real_when_there_is() {
+    let lab = DriftLab::new();
+    let git_c = lab.source_git();
+
+    // Nothing to abort: the repo is ALREADY where the caller wants it.
+    assert!(!git_c.merge_in_progress(), "no merge to start with");
+    assert!(
+        lab.engine.abort_repo_reconcile().is_ok(),
+        "a repo with no merge is already rolled back; saying otherwise would \
+         put a red banner over a merge that does not exist"
+    );
+    let head_before = git_c.head_sha().unwrap();
+
+    // And with a real merge open, it really rolls it back.
+    diverge_on_the_managed_file(&lab);
+    assert!(
+        lab.engine.ensure_merge_started().unwrap(),
+        "the fixture must actually enter a merge"
+    );
+    assert!(git_c.merge_in_progress());
+
+    lab.engine
+        .abort_repo_reconcile()
+        .expect("an abort of a real merge succeeds");
+    assert!(
+        !git_c.merge_in_progress(),
+        "and the merge is really gone, not merely reported gone"
+    );
+    assert_ne!(
+        git_c.head_sha().unwrap(),
+        head_before,
+        "sanity: the fixture moved HEAD, so `merge_in_progress` is not just \
+         answering about an untouched repo"
     );
 }

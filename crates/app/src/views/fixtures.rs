@@ -374,7 +374,6 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         expanded_scans: HashSet::new(),
         unlock_in_flight: false,
         pending_merge: false,
-        merge_finish_in_flight: false,
         pending_merge_probed: false,
         changelog: None,
         queue: Default::default(),

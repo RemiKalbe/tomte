@@ -146,8 +146,6 @@ pub struct Shell {
     /// the only way back in. Probed on connect and after every decision that
     /// could have stranded one.
     pub pending_merge: bool,
-    /// That banner's "Finish merge" is running on the background executor.
-    pub merge_finish_in_flight: bool,
     /// Whether the pending-merge probe has already run for this connection.
     /// Cleared on disconnect, so reconnecting (or a daemon restart) asks
     /// again — a merge can be stranded while the app is not even running.
@@ -406,8 +404,7 @@ impl Shell {
                 .background_executor()
                 .spawn(async move {
                     abort_outcome(AssertUnwindSafe(|| {
-                        engine.abort_repo_reconcile();
-                        AbortOutcome::RolledBack(engine.request_rescan())
+                        abort_outcome_of(engine.abort_repo_reconcile(), || engine.request_rescan())
                     }))
                 })
                 .await;
@@ -415,14 +412,17 @@ impl Shell {
                 shell.queue_pumping = false;
                 shell.running_repo_op = None;
                 shell.merge_done(abort_banner(outcome, &rolled_back, &dropped), cx);
-                // On BOTH arms. A rollback that completed ended the merge the
-                // dashboard banner was reporting, and one that panicked left
-                // whether a merge is in progress unknown — either way what is
-                // on screen is a guess until it is re-probed.
+                // On EVERY arm. A rollback that completed ended the merge the
+                // dashboard banner was reporting; one that FAILED left it
+                // open, which is exactly when that banner has to be up; and
+                // one that panicked left whether a merge is in progress
+                // unknown. In all three what is on screen is a guess until it
+                // is re-probed — and this probe is one `rev-parse
+                // MERGE_HEAD`, not the daemon rescan the failed arm skips.
                 shell.refresh_pending_merge(cx);
                 cx.notify();
-                // Whatever queued behind the rollback, now against the
-                // repo the rollback restored.
+                // Whatever queued behind the rollback, now against the repo
+                // the rollback restored — or, if it failed, did not.
                 shell.pump(cx);
             })
             .ok();
@@ -548,6 +548,17 @@ impl Shell {
     /// by a stray click, and a click that does nothing must not do it
     /// silently.
     ///
+    /// PENDING **OR** RUNNING. An abort that is halfway through rewriting the
+    /// source tree is `running_repo_op`, not `deferred_repo_op`, and dropping
+    /// only the pending case left that window open: the finish would sit in
+    /// the slot, `pump` would take it the moment the abort's completion let
+    /// go of the latch, and it would run against whatever the abort left. It
+    /// was harmless only by accident — `finish_merge_if_resolved` would find
+    /// `merge_in_progress() == false` after a roll-back that WORKED. Now that
+    /// an abort can honestly fail ([`AbortOutcome::AbortFailed`]) the merge
+    /// can still be there, and that accident becomes the exact commit the
+    /// user confirmed throwing away. A finish never outranks an abort.
+    ///
     /// An UNDO displaces neither of them. It is about the last journal
     /// session, not about this merge, and running it ahead of a finish or an
     /// abort would restore destination files on top of a repo state that is
@@ -567,15 +578,16 @@ impl Shell {
             );
             return;
         }
-        if matches!(op, PendingRepoOp::FinishMerge)
-            && matches!(
-                self.deferred_repo_op,
-                Some(PendingRepoOp::AbortMerge { .. })
-            )
-        {
+        let abort_queued = matches!(
+            self.deferred_repo_op,
+            Some(PendingRepoOp::AbortMerge { .. })
+        );
+        let abort_running = self.running_repo_op == Some(RepoOpKind::Abort);
+        if matches!(op, PendingRepoOp::FinishMerge) && (abort_queued || abort_running) {
             tomte_core::log_info!(
                 "reconcile",
-                "finish ignored: a confirmed roll-back of this merge is already queued"
+                "finish ignored: a confirmed roll-back of this merge is already {}",
+                if abort_queued { "queued" } else { "running" }
             );
             self.merge_done(
                 OutcomeBanner {
@@ -609,11 +621,21 @@ impl Shell {
         // merge left it conflicted stops being drifted the moment the
         // roll-back lands, and `model_changed` then prunes its message along
         // with its row. The roll-back's own banner is what outlives both.
+        //
+        // THE MESSAGE IS ABOUT THE REQUEST, NOT THE ROLL-BACK, and that is
+        // Ruling 30 again. These rows are failed HERE, when Discard is
+        // pressed — minutes before the abort runs, and whatever it then does.
+        // On the [`AbortOutcome::AbortFailed`] arm the merge is NOT rolled
+        // back and these rows SURVIVE (their files are still conflicted), so
+        // a message saying "merge rolled back" would have every row assert
+        // exactly what the banner had just stopped asserting. "A roll-back
+        // was requested" is true on all three arms, and it is the fact that
+        // actually explains why the save is gone.
         let mut op = op;
         if let PendingRepoOp::AbortMerge { dropped, .. } = &mut op {
             let mut orphaned = self.queue.fail_pending_where(
                 |a| matches!(a.decision, Decision::RepoConflict { .. }),
-                "merge rolled back before this save ran — save again",
+                "dropped: a roll-back was requested before this save ran — save again",
             );
             if !orphaned.is_empty() {
                 tomte_core::log_info!(
@@ -674,9 +696,13 @@ impl Shell {
 
     /// The finish, running with the latch already taken. Only [`Self::pump`]
     /// calls this.
+    ///
+    /// "A finish is running" is [`Self::running_repo_op`] `== Some(Finish)`,
+    /// which `pump` set immediately above the call to this. There used to be
+    /// a `merge_finish_in_flight` bool set here as well, over exactly the
+    /// same window — two sources of truth for one fact, and the dashboard
+    /// read both (Ruling 41).
     fn run_finish(&mut self, engine: std::sync::Arc<ResolveEngine>, cx: &mut Context<Self>) {
-        self.merge_finish_in_flight = true;
-        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -689,7 +715,6 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |shell, cx| {
-                shell.merge_finish_in_flight = false;
                 shell.queue_pumping = false;
                 shell.running_repo_op = None;
                 match result {
@@ -1079,7 +1104,6 @@ impl Shell {
             expanded_scans: self.expanded_scans.clone(),
             unlock_in_flight: self.unlock_in_flight,
             pending_merge: self.pending_merge,
-            merge_finish_in_flight: self.merge_finish_in_flight,
             pending_repo_op: self.deferred_repo_op.as_ref().map(|op| op.kind()),
             running_repo_op: self.running_repo_op,
             running: self
@@ -1272,15 +1296,27 @@ fn panicked_batch(owed: Vec<(PathBuf, &'static str)>) -> Vec<DecisionReport> {
 
 /// What [`Shell::run_abort`]'s background closure came back with.
 ///
-/// Deliberately NOT a `Result`: a panic and a failed rescan mean opposite
-/// things about the one fact the banner asserts. A rescan failure happens
-/// AFTER `merge_abort` ran, so the rollback did happen and only the list on
-/// screen is suspect. A panic can land before or inside `merge_abort`, so
-/// nothing is known about the merge at all.
+/// Deliberately NOT a `Result`: the three ways this can go say three
+/// different things about the one fact the banner asserts.
+///
+/// A rescan failure happens AFTER the abort ran, so the rollback did happen
+/// and only the list on screen is suspect. An abort that FAILED means the
+/// merge is still open with the user's answers still staged in it — the
+/// opposite fact. And a panic can land before or inside the abort, so nothing
+/// is known about the merge at all.
 #[derive(Debug)]
 enum AbortOutcome {
-    /// `merge_abort` ran; the rescan behind it succeeded, or failed like this.
+    /// The abort ran; the rescan behind it succeeded, or failed like this.
     RolledBack(Result<(), ResolveError>),
+    /// `abort_repo_reconcile` came back `Err`: git would not roll the merge
+    /// back (an `index.lock` held past its retries, most often). Nothing was
+    /// undone and the merge is still in progress.
+    ///
+    /// Reportable at all only since Task 6: `GitClient::merge_abort` used to
+    /// discard its own result, so this arm's reality was delivered as
+    /// [`Self::RolledBack`] — "Merge with origin rolled back" over a merge
+    /// that was still sitting there.
+    AbortFailed(ResolveError),
     /// The closure panicked partway, with this detail.
     Panicked(String),
 }
@@ -1303,6 +1339,35 @@ fn abort_outcome(work: impl FnOnce() -> AbortOutcome + std::panic::UnwindSafe) -
         AbortOutcome::Panicked,
         work,
     )
+}
+
+/// Which [`AbortOutcome`] an abort's own `Result` earns, and whether the
+/// daemon is asked to rescan behind it.
+///
+/// A SEAM, for the same reason [`abort_outcome`] is one and not for a
+/// different one. `abort_banner` can be tested against every outcome, and
+/// that proves the banner mapping — but nothing about which outcome the abort
+/// HANDS it, which is exactly where Ruling 30's bug lived: routing an `Err`
+/// through `RolledBack(Err(..))` (the pre-Task-6 shape) makes a roll-back
+/// that git REFUSED report as one that ran with only a failed rescan behind
+/// it. `run_abort`'s closure is a background `cx.spawn` over a live engine,
+/// so nothing there is assertable; this is.
+///
+/// `rescan` is a closure, not a `Result`, because WHETHER IT RUNS is the
+/// second half of the decision. It belongs on the `Ok` arm only: a rescan is
+/// what makes the list on screen describe the RESTORED repo, and after a
+/// failed abort nothing was restored — asking the daemon to re-walk the tree
+/// would cost ~17 s of held core lock to confirm the very repo its last scan
+/// already described. Passing it as a closure is what lets a test prove it
+/// was never called.
+fn abort_outcome_of(
+    abort: Result<(), ResolveError>,
+    rescan: impl FnOnce() -> Result<(), ResolveError>,
+) -> AbortOutcome {
+    match abort {
+        Ok(()) => AbortOutcome::RolledBack(rescan()),
+        Err(e) => AbortOutcome::AbortFailed(e),
+    }
 }
 
 /// The banner one abort outcome earns.
@@ -1346,6 +1411,37 @@ fn abort_banner(
             OutcomeBanner {
                 text: text.into(),
                 tint: review::BannerTint::Drift,
+                undoable: false,
+            }
+        }
+        AbortOutcome::AbortFailed(e) => {
+            tomte_core::log_error!("reconcile", "the roll-back failed: {e}");
+            // NOT the word "rolled back", in any arrangement. This is the one
+            // outcome where the merge is definitely STILL THERE, and the
+            // sentence has to be readable by someone who only skims it.
+            // The remedy names where Cancel actually IS. This completion
+            // leaves `route == Review`, and Cancel lives in the merge
+            // editor's header — telling the user to "try Cancel again" from
+            // a screen that has no Cancel is the same class of defect as the
+            // sentence above it.
+            let mut text = format!(
+                "The roll-back failed ({e}). The merge with origin is still in progress and \
+                 nothing was undone — the answers you had already given are still staged in \
+                 it. Open one of its files in the merge editor and press Cancel there to try \
+                 again, or finish the merge from the dashboard banner."
+            );
+            // Dropped when the roll-back was REQUESTED, so they are gone
+            // whether or not it ran — and here the user is being told the
+            // rest did not happen, which makes the silence worse.
+            if !dropped.is_empty() {
+                text.push_str(&format!(
+                    " {} queued save(s) were dropped when it was requested — save again.",
+                    dropped.len()
+                ));
+            }
+            OutcomeBanner {
+                text: text.into(),
+                tint: review::BannerTint::Conflict,
                 undoable: false,
             }
         }
@@ -1731,7 +1827,6 @@ mod render_smoke {
                     expanded_scans,
                     unlock_in_flight: false,
                     pending_merge: false,
-                    merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
                     queue: Default::default(),
@@ -1836,7 +1931,6 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     unlock_in_flight: false,
                     pending_merge: false,
-                    merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
                     queue,
@@ -1875,7 +1969,6 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     unlock_in_flight: false,
                     pending_merge: false,
-                    merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
                     queue,
@@ -1933,7 +2026,6 @@ mod render_smoke {
                 expanded_scans: HashSet::new(),
                 unlock_in_flight: false,
                 pending_merge: false,
-                merge_finish_in_flight: false,
                 pending_merge_probed: false,
                 changelog: None,
                 queue: Default::default(),
@@ -2058,13 +2150,15 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     unlock_in_flight: false,
                     pending_merge: true,
-                    merge_finish_in_flight: finishing,
                     pending_merge_probed: true,
                     changelog: None,
                     queue: Default::default(),
-                    queue_pumping: false,
+                    queue_pumping: finishing,
                     deferred_repo_op: None,
-                    running_repo_op: None,
+                    // The in-flight state the banner has to render is now
+                    // exactly this — `merge_finish_in_flight` was a second
+                    // bool over the same window (Ruling 41).
+                    running_repo_op: finishing.then_some(RepoOpKind::Finish),
                 }
             });
             vis.run_until_parked();
@@ -2116,7 +2210,6 @@ mod render_smoke {
                 expanded_scans: HashSet::new(),
                 unlock_in_flight: false,
                 pending_merge: false,
-                merge_finish_in_flight: false,
                 pending_merge_probed: true,
                 changelog: None,
                 queue: Default::default(),
@@ -2160,7 +2253,6 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     unlock_in_flight: false,
                     pending_merge: false,
-                    merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
                     queue: Default::default(),
@@ -2280,7 +2372,6 @@ mod render_smoke {
                     expanded_scans: HashSet::new(),
                     unlock_in_flight: false,
                     pending_merge: false,
-                    merge_finish_in_flight: false,
                     pending_merge_probed: false,
                     changelog: None,
                     queue: Default::default(),
@@ -2550,7 +2641,6 @@ mod render_smoke {
             expanded_scans: HashSet::new(),
             unlock_in_flight: false,
             pending_merge: false,
-            merge_finish_in_flight: false,
             pending_merge_probed: false,
             changelog: None,
             queue: Default::default(),
@@ -2614,7 +2704,7 @@ mod render_smoke {
     ///
     /// MUTATION: in `pump`, take the batch before checking
     /// `deferred_repo_op` → the probe below sees `running()` non-empty and
-    /// `merge_finish_in_flight` false.
+    /// `running_repo_op` `None`.
     #[gpui::test]
     fn a_finish_pressed_mid_drain_runs_before_the_next_batch(cx: &mut TestAppContext) {
         let lab = EngineLab::publish(cx);
@@ -2636,8 +2726,8 @@ mod render_smoke {
                     s.deferred_repo_op,
                     Some(PendingRepoOp::FinishMerge)
                 ));
-                assert!(
-                    !s.merge_finish_in_flight,
+                assert_eq!(
+                    s.running_repo_op, None,
                     "nothing may run while the latch is held"
                 );
                 assert!(
@@ -2656,7 +2746,11 @@ mod render_smoke {
                 s.deferred_repo_op.is_none(),
                 "the finish was taken, not left"
             );
-            assert!(s.merge_finish_in_flight, "and it is what started");
+            assert_eq!(
+                s.running_repo_op,
+                Some(RepoOpKind::Finish),
+                "and it is what started"
+            );
             assert!(s.queue_pumping);
             assert!(
                 s.queue.running().is_empty(),
@@ -2667,7 +2761,7 @@ mod render_smoke {
         vis.run_until_parked(); // the finish (NotMerging here), then the batch
         vis.update(|_window, cx| {
             let s = shell.read(cx);
-            assert!(!s.merge_finish_in_flight);
+            assert_eq!(s.running_repo_op, None);
             assert!(!s.queue_pumping);
             assert_eq!(s.queue.depth(), 0, "and the batch ran after it");
             assert!(
@@ -2688,10 +2782,17 @@ mod render_smoke {
     /// roll-back's own banner surviving to be read. Its sibling below covers
     /// the case where a decision lands after it and legitimately replaces it.
     ///
+    /// It also pins `run_abort`'s USE of [`abort_outcome_of`], which the unit
+    /// test of that seam cannot: the `Drift` tint and "2 source file(s)"
+    /// belong to the `RolledBack` arm alone, so a completion that stopped
+    /// delegating and hardcoded an arm lands here.
+    ///
     /// MUTATION: drop the `self.route = Route::Review` from
     /// `abort_origin_merge` → the first assertion fails. MUTATION: hand
     /// `abort_banner` `rolled_back` from anywhere but the confirmation → the
-    /// "2 source file(s)" assertion fails.
+    /// "2 source file(s)" assertion fails. MUTATION: have `run_abort` build
+    /// an `AbortOutcome` itself instead of calling `abort_outcome_of` → the
+    /// tint assertion fails.
     #[gpui::test]
     fn an_abort_reports_the_roll_back_it_confirmed(cx: &mut TestAppContext) {
         let _lab = EngineLab::publish(cx);
@@ -2839,8 +2940,8 @@ mod render_smoke {
                 s.deferred_repo_op,
                 Some(PendingRepoOp::FinishMerge)
             ));
-            assert!(
-                !s.merge_finish_in_flight,
+            assert_eq!(
+                s.running_repo_op, None,
                 "and the banner button does not claim to be working"
             );
         });
@@ -2919,6 +3020,59 @@ mod render_smoke {
                 );
             });
         });
+    }
+
+    /// PENDING **OR** RUNNING. `a_finish_never_displaces_a_confirmed_abort`
+    /// covers the abort that is still waiting; this covers the one that is
+    /// halfway through rewriting the source tree, where `deferred_repo_op` is
+    /// `None` and only `running_repo_op` knows.
+    ///
+    /// Without the running half the click is not dropped but DEFERRED: it
+    /// sits in the slot, `pump` takes it the instant the abort's completion
+    /// releases the latch, and it runs against whatever the abort left. That
+    /// was harmless only by accident — `finish_merge_if_resolved` finds no
+    /// merge after a roll-back that WORKED — and Task 6 removes the accident:
+    /// an abort can now honestly fail with the merge still open, and this
+    /// press would then commit the very merge the user confirmed discarding.
+    ///
+    /// MUTATION: drop the `running_repo_op == Some(Abort)` half of the guard
+    /// in `request_repo_op` → `deferred_repo_op` becomes `Some(FinishMerge)`
+    /// and the first assertion fails.
+    #[gpui::test]
+    fn a_finish_never_displaces_an_abort_that_is_already_running(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Dashboard, cx));
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                // The state `pump` leaves behind while `run_abort`'s
+                // background work is in flight: latch held, slot empty, the
+                // running kind the only witness.
+                s.queue_pumping = true;
+                s.running_repo_op = Some(RepoOpKind::Abort);
+                assert!(s.deferred_repo_op.is_none(), "nothing is merely waiting");
+
+                s.finish_pending_merge(cx);
+
+                assert!(
+                    s.deferred_repo_op.is_none(),
+                    "the click is DROPPED, not parked to run the moment the roll-back \
+                     lets go of the latch: {:?}",
+                    s.deferred_repo_op
+                );
+            });
+        });
+        // And dropped out loud, exactly as the pending case is.
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the explanation made a review view");
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("an ignored click is reported, never silently swallowed");
+        assert!(
+            banner.text.contains("Finish ignored") && banner.text.contains("Nothing was committed"),
+            "the banner says why the click did nothing: {}",
+            banner.text
+        );
     }
 
     /// The user's own acceptance bar, end to end: confirming a file records
@@ -3243,6 +3397,64 @@ mod render_smoke {
         );
     }
 
+    /// RULING 30. `merge_abort` used to discard its own result, so a
+    /// roll-back that git REFUSED — an `index.lock` a concurrent scan holds
+    /// past `run`'s six retries, the contention `85fec09` met elsewhere —
+    /// arrived here as `RolledBack(Ok(()))` and was reported as "Merge with
+    /// origin rolled back". The merge was still open, the user's answers were
+    /// still staged in it, and the banner said the opposite.
+    ///
+    /// The fixed-prefix check of
+    /// `a_panicked_abort_never_claims_the_roll_back_happened`, the other way
+    /// round: this arm must never contain the sentence that arm is allowed to.
+    ///
+    /// MUTATION: fold `AbortFailed` into the `RolledBack(Err(..))` arm (the
+    /// pre-Task-6 shape, where a failed abort was indistinguishable from a
+    /// failed rescan) → the first assertion fails. MUTATION: give it
+    /// `BannerTint::Drift` → the last fails: a merge still open over answers
+    /// the user was told were discarded is not a routine drift outcome.
+    #[test]
+    fn a_failed_abort_never_claims_the_roll_back_happened() {
+        let rolled_back = merge::Rollback::Files(2);
+        let failed = abort_banner(
+            AbortOutcome::AbortFailed(ResolveError::Failed(
+                "git exited with code 128: fatal: Unable to create index.lock: File exists".into(),
+            )),
+            &rolled_back,
+            &[PathBuf::from("/a")],
+        );
+        assert!(
+            !failed.text.contains("rolled back"),
+            "a roll-back that FAILED must never assert it happened: {}",
+            failed.text
+        );
+        assert!(
+            failed.text.contains("still in progress") && failed.text.contains("nothing was undone"),
+            "and must say what is true instead — the merge is still there: {}",
+            failed.text
+        );
+        assert!(
+            failed.text.contains("index.lock"),
+            "carrying git's own reason, so the user can act on it: {}",
+            failed.text
+        );
+        assert!(
+            failed.text.contains("1 queued save(s) were dropped"),
+            "the saves went at REQUEST time, so they are owed on this arm too: {}",
+            failed.text
+        );
+        assert_eq!(
+            failed.tint,
+            review::BannerTint::Conflict,
+            "a merge left open over answers the user was told were discarded is \
+             not a routine drift outcome"
+        );
+        assert!(
+            !failed.undoable,
+            "there is nothing to undo: nothing changed"
+        );
+    }
+
     /// `a_panicked_abort_never_claims_the_roll_back_happened` proves
     /// `abort_banner` maps the outcomes correctly. It cannot prove that the
     /// abort HANDS it the right one, and that is where the bug lived: a
@@ -3270,6 +3482,70 @@ mod render_smoke {
         // And an abort that returns is left exactly as it is.
         let done = abort_outcome(|| AbortOutcome::RolledBack(Ok(())));
         assert!(matches!(done, AbortOutcome::RolledBack(Ok(()))), "{done:?}");
+    }
+
+    /// And the OTHER half of that same gap: which outcome the abort's own
+    /// `Result` earns, and whether a rescan runs behind it.
+    ///
+    /// `a_failed_abort_never_claims_the_roll_back_happened` drives
+    /// `abort_banner` directly, so it proves the banner MAPPING and nothing
+    /// about the routing — and the routing is where Ruling 30's bug actually
+    /// lived. `run_abort`'s closure is a background spawn over a live engine
+    /// and cannot be asserted; [`abort_outcome_of`] can.
+    ///
+    /// The rescan is a closure precisely so "it did not run" is assertable.
+    /// A rescan on the failed arm is not a cosmetic slip: it is ~17 s of held
+    /// daemon core lock spent re-walking the tree to confirm the repo the
+    /// last scan already described, because nothing was restored.
+    ///
+    /// MUTATION: route `Err` through `RolledBack(Err(e))` — the exact
+    /// pre-Task-6 shape, where a roll-back git REFUSED reported as one that
+    /// ran with a failed rescan behind it → the first assertion fails.
+    /// MUTATION: call `rescan()` unconditionally (hoist it above the `match`,
+    /// or add it to the `Err` arm) → `rescans` is 1 on the failed arm and the
+    /// second assertion fails.
+    #[test]
+    fn a_failed_abort_is_routed_to_abort_failed_and_never_rescans() {
+        use std::cell::Cell;
+
+        // The abort FAILED: the merge is still open, nothing was restored.
+        let rescans = Cell::new(0);
+        let failed = abort_outcome_of(
+            Err(ResolveError::Failed("index.lock: File exists".into())),
+            || {
+                rescans.set(rescans.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(failed, AbortOutcome::AbortFailed(ref e) if e.to_string().contains("index.lock")),
+            "a roll-back git refused must NOT come back as `RolledBack` — that is the \
+             pre-Task-6 lie Ruling 30 removes, and it carries git's reason. Got: {failed:?}"
+        );
+        assert_eq!(
+            rescans.get(),
+            0,
+            "and nothing changed, so the daemon must not be asked to re-walk the tree"
+        );
+
+        // The abort WORKED: the list on screen describes the merged repo
+        // until a rescan replaces it, so that rescan is not optional.
+        let rescans = Cell::new(0);
+        let done = abort_outcome_of(Ok(()), || {
+            rescans.set(rescans.get() + 1);
+            Ok(())
+        });
+        assert!(matches!(done, AbortOutcome::RolledBack(Ok(()))), "{done:?}");
+        assert_eq!(rescans.get(), 1, "the restored repo has to be rescanned");
+
+        // A rescan that fails still means the roll-back happened — the
+        // distinction `AbortOutcome` exists to keep.
+        let failed_rescan =
+            abort_outcome_of(Ok(()), || Err(ResolveError::Failed("daemon gone".into())));
+        assert!(
+            matches!(failed_rescan, AbortOutcome::RolledBack(Err(_))),
+            "{failed_rescan:?}"
+        );
     }
 
     /// The merge editor's Save is a QUEUE entry now, and the whole reason
@@ -3395,7 +3671,7 @@ mod render_smoke {
 
                 assert_eq!(
                     s.queue.failure(Path::new("/staged")).map(|m| m.as_ref()),
-                    Some("merge rolled back before this save ran — save again"),
+                    Some("dropped: a roll-back was requested before this save ran — save again"),
                     "the orphaned save says so on its row, and says what to do"
                 );
                 assert_eq!(

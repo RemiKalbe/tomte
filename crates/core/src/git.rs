@@ -411,9 +411,21 @@ impl GitClient {
         .unwrap_or(false)
     }
 
-    /// Best-effort abort of an in-progress merge.
-    pub fn merge_abort(&self) {
-        let _ = self.run(&["merge", "--abort"], Duration::from_secs(30));
+    /// Abort an in-progress merge, and SAY whether it worked.
+    ///
+    /// It used to discard its own result with `let _`, and that lie travelled:
+    /// `abort_repo_reconcile` could not fail, so the app reported "Merge with
+    /// origin rolled back" for a roll-back that never happened. The everyday
+    /// way it does not happen is the one `85fec09` met elsewhere — an
+    /// `index.lock` the daemon's scan is holding past [`Self::run`]'s six
+    /// retries — and the merge is then still open with the user's answers
+    /// still staged in it.
+    ///
+    /// Callers that genuinely cannot act on a failure must still say so in
+    /// the log; none of them may claim the repo is back where it started.
+    pub fn merge_abort(&self) -> Result<(), GitError> {
+        self.run(&["merge", "--abort"], Duration::from_secs(30))?;
+        Ok(())
     }
 
     /// Probe whether a merge with `upstream` would conflict, computed

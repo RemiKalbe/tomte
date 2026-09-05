@@ -1728,11 +1728,7 @@ impl MergeView {
     fn header(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let (name, path): (SharedString, SharedString) = match &self.target {
             Some(target) => (
-                target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| target.display().to_string())
-                    .into(),
+                super::review::display_name(target),
                 super::dashboard::shorten_home(&target.display().to_string()).into(),
             ),
             None => ("merge editor".into(), "".into()),

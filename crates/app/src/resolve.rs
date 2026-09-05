@@ -1185,9 +1185,35 @@ impl ResolveEngine {
     }
 
     /// Bail out of an in-progress reconcile; the repo returns to pre-merge.
-    pub fn abort_repo_reconcile(&self) {
+    ///
+    /// IDEMPOTENT, THEN HONEST — in that order, and they are different
+    /// promises:
+    ///
+    /// - **Nothing to abort is not a failure.** Cancel is reachable when no
+    ///   merge is running (the editor is open on a file the merge already
+    ///   concluded, a second Discard lands behind the first), and `git merge
+    ///   --abort` answers that with a hard error. Saying `Ok(())` for a repo
+    ///   that is ALREADY where the caller wants it is the truthful answer,
+    ///   and it is what keeps a doubled press from producing a red banner
+    ///   about a merge that is simply gone.
+    /// - **A merge that refuses to roll back IS a failure.** This used to be
+    ///   unreportable: `merge_abort` swallowed its result, so every caller
+    ///   was told the roll-back happened. An `index.lock` held past
+    ///   `GitClient::run`'s retries (the contention `85fec09` met) leaves the
+    ///   merge open with the user's answers still staged in it, and the one
+    ///   thing they must not be told is that the repo is back where it
+    ///   started.
+    pub fn abort_repo_reconcile(&self) -> Result<(), ResolveError> {
+        if !self.git.merge_in_progress() {
+            tomte_core::log_info!("reconcile", "nothing to abort: no merge is in progress");
+            return Ok(());
+        }
+        if let Err(e) = self.git.merge_abort() {
+            tomte_core::log_error!("reconcile", "the merge could not be rolled back: {e}");
+            return Err(e.into());
+        }
         tomte_core::log_info!("reconcile", "aborted");
-        self.git.merge_abort();
+        Ok(())
     }
 
     /// Ask the daemon to rescan. Every mutating path here already ends with

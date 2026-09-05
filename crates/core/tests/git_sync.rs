@@ -227,10 +227,36 @@ fn merge_abort_restores_the_branch() {
         git.merge("origin/main").unwrap(),
         tomte_core::git::MergeStart::Conflicts(_)
     ));
-    git.merge_abort();
+    git.merge_abort().unwrap();
     assert_eq!(git.head_sha().unwrap(), sha);
     assert!(git.conflicted_files().unwrap().is_empty());
     assert!(!git.merge_in_progress());
+}
+
+/// An abort that does NOT abort must say so. `merge_abort` used to discard
+/// its own result, so the app reported "Merge with origin rolled back" for a
+/// roll-back that never ran — and the everyday cause is not a missing merge
+/// but an `index.lock` a concurrent scan holds past `run`'s retries, which
+/// leaves the user's answers staged in a merge the banner called gone.
+///
+/// "No merge to abort" is the shape a test can produce hermetically; the
+/// mechanism it proves — the result reaches the caller — is the same one.
+///
+/// MUTATION: `let _ = self.run(...)` back in `merge_abort` → `unwrap_err`
+/// panics, because the failure is thrown away exactly as it used to be.
+#[test]
+fn merge_abort_reports_a_failure_instead_of_swallowing_it() {
+    let scratch = Scratch::new();
+    let git = GitClient::new(Arc::new(SystemRunner), scratch.source.clone());
+    unsigned(&scratch.source);
+    assert!(!git.merge_in_progress(), "no merge to abort");
+
+    let err = git.merge_abort().unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("no merge to abort") || text.contains("MERGE_HEAD"),
+        "the error must carry git's own reason, not a shrug: {text}"
+    );
 }
 
 #[test]

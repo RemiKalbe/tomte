@@ -546,6 +546,49 @@ impl DaemonCore {
             .map_err(|e| format!("commit signer did not sign within {SIGNER_PROBE:?}: {e}"))
     }
 
+    /// Back out a merge NOBODY ASKED FOR (an auto-join that went wrong), and
+    /// report what the REPO says afterwards — never what the abort's exit
+    /// status said on its own.
+    ///
+    /// The two are different facts, and they come apart in both directions.
+    /// `git merge --abort` can exit non-zero having already cleared
+    /// `MERGE_HEAD` (it unwound the merge, then tripped on a checkout), and
+    /// it can exit ZERO with the merge still sitting there. So the
+    /// `merge_in_progress` probe decides which sentence is written and the
+    /// abort's own error only ever supplies the REASON. Reporting either one
+    /// without the other is how a log ends up asserting a repo state that
+    /// is not the case.
+    ///
+    /// Nothing here has a caller to propagate to — this runs inside the
+    /// fetch loop — so this log line IS the whole report, which is exactly
+    /// why it has to be true. The app's Finish/Cancel banner is the user's
+    /// way out of whatever is left.
+    fn abort_unwanted_merge(&self, what: &str) {
+        let aborted = self.git.merge_abort();
+        if self.git.merge_in_progress() {
+            tomte_core::log_warn!(
+                "fetch",
+                "…and {what} could not be aborted ({}); the app's Finish/Cancel banner now \
+                 owns it",
+                match &aborted {
+                    Err(why) => why.to_string(),
+                    Ok(()) => "git exited 0 but MERGE_HEAD is still there".into(),
+                }
+            );
+        } else if let Err(why) = &aborted {
+            tomte_core::log_info!(
+                "fetch",
+                "…and {what} was aborted despite git exiting non-zero ({why}); the repo is \
+                 back where it started"
+            );
+        } else {
+            tomte_core::log_info!(
+                "fetch",
+                "…and {what} was aborted; the repo is back where it started"
+            );
+        }
+    }
+
     pub fn handle_fetch(&mut self, now_ts: u64) -> Result<(), DaemonError> {
         match self.git.fetch("origin") {
             Ok(()) => {}
@@ -688,7 +731,9 @@ impl DaemonCore {
                                         "merge-tree said clean but {} path(s) conflicted; aborting",
                                         paths.len()
                                     );
-                                    self.git.merge_abort();
+                                    // `Conflicts` means the repo IS mid-merge,
+                                    // so this needs no guard of its own.
+                                    self.abort_unwanted_merge("that merge");
                                 }
                                 // A non-conflict failure — the signer passed
                                 // the pre-flight and then died on the real
@@ -701,21 +746,7 @@ impl DaemonCore {
                                 Err(e) => {
                                     tomte_core::log_warn!("fetch", "join failed: {e}");
                                     if self.git.merge_in_progress() {
-                                        self.git.merge_abort();
-                                        if self.git.merge_in_progress() {
-                                            tomte_core::log_warn!(
-                                                "fetch",
-                                                "…and the merge it left open could not be \
-                                                 aborted; the app's Finish/Cancel banner now \
-                                                 owns it"
-                                            );
-                                        } else {
-                                            tomte_core::log_info!(
-                                                "fetch",
-                                                "…and the merge it left open was aborted; the \
-                                                 repo is back where it started"
-                                            );
-                                        }
+                                        self.abort_unwanted_merge("the merge it left open");
                                     }
                                 }
                             }

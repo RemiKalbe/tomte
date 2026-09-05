@@ -87,22 +87,19 @@ enum Line {
 
 impl Line {
     fn event(row: &TimelineRow, now: u64, indented: bool, drifted: bool) -> Self {
-        let (name, dir) = match &row.target {
+        let (name, dir): (SharedString, Option<SharedString>) = match &row.target {
             Some(target) => (
-                target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| target.display().to_string()),
+                super::review::display_name(target),
                 target
                     .parent()
                     .map(|p| SharedString::from(shorten_home(&p.display().to_string()))),
             ),
-            None => (kind_label(&row.kind).to_string(), None),
+            None => (kind_label(&row.kind).into(), None),
         };
         Self::Event {
             time: time_ago(now, row.ts).into(),
             glyph: kind_glyph(&row.kind),
-            name: name.into(),
+            name,
             dir,
             chip: row
                 .class
@@ -168,8 +165,6 @@ pub struct DashboardView {
     /// but uncommitted, and nothing else can surface it — no conflicted file
     /// is left to be a review row.
     pub pending_merge: bool,
-    /// Copied from `Shell::merge_finish_in_flight`.
-    pub merge_finish_in_flight: bool,
     /// `Shell::deferred_repo_op`'s kind: a repo-level answer the user gave
     /// that has not started yet, because the latch is held.
     pub pending_repo_op: Option<RepoOpKind>,
@@ -198,10 +193,15 @@ pub struct DashboardView {
 /// app is broken. This stops the press from ever reaching that guard, and the
 /// guard stays as the last line of defence for the click that lands in the
 /// same frame as the confirmation.
+///
+/// ONE source of truth for "a finish is running": `running`. There used to be
+/// a third parameter, `Shell::merge_finish_in_flight`, set and cleared over
+/// exactly the window `running == Some(Finish)` already spans — so it could
+/// only ever agree, until the day something set one without the other
+/// (Ruling 41).
 pub(super) fn finish_button_state(
     pending: Option<RepoOpKind>,
     running: Option<RepoOpKind>,
-    finish_in_flight: bool,
 ) -> (&'static str, bool) {
     if pending == Some(RepoOpKind::Abort) || running == Some(RepoOpKind::Abort) {
         // Pending or running, the merge this banner is about is being thrown
@@ -214,7 +214,7 @@ pub(super) fn finish_button_state(
         // "Finish merge" still would invite a second press that does nothing.
         return ("Finish merge · queued", false);
     }
-    if running == Some(RepoOpKind::Finish) || finish_in_flight {
+    if running == Some(RepoOpKind::Finish) {
         return ("Finishing…", false);
     }
     ("Finish merge", true)
@@ -280,11 +280,8 @@ impl DashboardView {
         let running = Rc::new(self.running);
         let unlock_in_flight = self.unlock_in_flight;
         let pending_merge = self.pending_merge;
-        let (finish_label, finish_live) = finish_button_state(
-            self.pending_repo_op,
-            self.running_repo_op,
-            self.merge_finish_in_flight,
-        );
+        let (finish_label, finish_live) =
+            finish_button_state(self.pending_repo_op, self.running_repo_op);
 
         div()
             .flex()
@@ -1247,36 +1244,40 @@ mod tests {
     /// the third case offers "Finish merge" while the roll-back is actually
     /// rewriting the source tree. MUTATION: return `true` for the pending
     /// finish → the second case invites a press that can only be dropped.
+    /// MUTATION: make the "Finishing…" arm read `pending` instead of
+    /// `running` → the third case says "Finish merge" while a finish is under
+    /// way, which is the double-press this button exists to prevent.
     #[test]
     fn the_finish_button_says_what_is_happening_to_this_merge() {
         assert_eq!(
-            finish_button_state(None, None, false),
+            finish_button_state(None, None),
             ("Finish merge", true),
             "nothing owed: the banner's one way out is live"
         );
         assert_eq!(
-            finish_button_state(Some(RepoOpKind::Finish), None, false),
+            finish_button_state(Some(RepoOpKind::Finish), None),
             ("Finish merge · queued", false),
             "already pressed, waiting for the latch"
         );
         assert_eq!(
-            finish_button_state(None, Some(RepoOpKind::Finish), true),
-            ("Finishing…", false)
+            finish_button_state(None, Some(RepoOpKind::Finish)),
+            ("Finishing…", false),
+            "and running: `running_repo_op` alone says so now"
         );
         assert_eq!(
-            finish_button_state(Some(RepoOpKind::Abort), None, false),
+            finish_button_state(Some(RepoOpKind::Abort), None),
             ("Rolling back…", false),
             "a confirmed roll-back is queued: committing is the opposite answer"
         );
         assert_eq!(
-            finish_button_state(None, Some(RepoOpKind::Abort), false),
+            finish_button_state(None, Some(RepoOpKind::Abort)),
             ("Rolling back…", false),
             "and while it actually runs"
         );
         // An undo is about the journal, not about this merge: it defers the
         // finish behind itself like any other op, so the button stays live.
         assert_eq!(
-            finish_button_state(Some(RepoOpKind::Undo), None, false),
+            finish_button_state(Some(RepoOpKind::Undo), None),
             ("Finish merge", true)
         );
     }

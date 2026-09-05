@@ -652,13 +652,13 @@ mod tests {
 
         let failed = q.fail_pending_where(
             |a| matches!(a.decision, Decision::RepoConflict { .. }),
-            "merge rolled back before this save ran — save again",
+            "dropped: a roll-back was requested before this save ran — save again",
         );
 
         assert_eq!(failed, [PathBuf::from("/a")], "only the save it orphans");
         assert_eq!(
             q.failure(Path::new("/a")).map(|m| m.as_ref()),
-            Some("merge rolled back before this save ran — save again"),
+            Some("dropped: a roll-back was requested before this save ran — save again"),
             "and the row says why, in the user's terms"
         );
         assert_eq!(

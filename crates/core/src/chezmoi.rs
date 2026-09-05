@@ -140,6 +140,19 @@ pub enum ChezmoiError {
     Failed(String),
 }
 
+/// How many times a chezmoi call is attempted when 1Password answers
+/// "locked or signed out" — the first try plus two retries.
+///
+/// Bounded, and short. A vault that is genuinely locked must still fail, and
+/// fail SOON: an unbounded retry against a locked 1Password is
+/// indistinguishable from the interactive hang `--no-tty` exists to kill.
+const ONEPASSWORD_ATTEMPTS: u32 = 3;
+
+/// How long to wait between those attempts. Long enough for `op` to finish
+/// coming back (an unlock the user has just answered), short enough that the
+/// worst case — 2 × this — stays under the second a person will sit through.
+const ONEPASSWORD_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Classify stderr from a failed chezmoi invocation into a structured
 /// evaluation failure (spec §4 EvalFailed, §9 remediation hints).
 pub fn classify_eval_stderr(stderr: &str) -> Option<EvalFailure> {
@@ -229,7 +242,81 @@ impl ChezmoiClient {
         })
     }
 
+    /// Every chezmoi call goes through here, and a transient 1Password
+    /// failure is retried before it is believed (spec §1.3, §2.7).
+    ///
+    /// `op` hiccups: the vault is a moment from unlocked, the biometric
+    /// prompt has just been answered, the agent is restarting. Chezmoi
+    /// surfaces that as an ordinary template failure, so a single drifted
+    /// file used to come back "1Password locked or signed out" when trying
+    /// again by hand worked immediately. Same shape as `GitClient`'s
+    /// index.lock retry (0.1.16): bounded, logged per attempt, and NOT the
+    /// place to be clever — three attempts and half a second, then the honest
+    /// failure with its remediation hint.
+    ///
+    /// Only [`EvalFailureKind::OnePasswordAuth`]. `OnePasswordMultipleAccounts`
+    /// is a CONFIGURATION error whose fix is a setting, and every other
+    /// failure returns on the first attempt as it always has: retrying a
+    /// decided answer only delays it.
+    ///
+    /// WHAT A RETRY CAN REPEAT. Every subcommand reached through here is
+    /// idempotent for this purpose with ONE exception, and it is worth naming
+    /// rather than discovering: [`Self::update`] (the app's Sync all) is a
+    /// whole-tree pull-and-apply, so it RUNS SCRIPTS — a retry can re-run a
+    /// `run_` script the failed attempt already ran. That is inside chezmoi's
+    /// own contract, and indistinguishable from the user pressing Sync twice,
+    /// which `run_once_` / `run_onchange_` scripts already have to survive.
+    /// Everything else is a content copy that neither commits nor pushes:
+    /// `cat`, `status`, `managed`, `source-path`, `target-path`, `state dump`
+    /// and `execute-template` only read, and `apply`/`re-add` rewrite the
+    /// same bytes from the same source on a second attempt.
+    ///
+    /// The retry is also keyed on the ONE failure that says nothing ran:
+    /// `OnePasswordAuth` comes from template evaluation, which happens before
+    /// chezmoi writes anything for that entry. So an attempt that failed this
+    /// way did not produce the source change that would drive chezmoi's own
+    /// `autoCommit`/`autoPush`, and a retry cannot double-commit. That is a
+    /// property of this specific failure kind, not of retrying in general —
+    /// which is the other reason the guard tests the kind and not merely
+    /// "some eval failure happened".
     fn run_ok_with_timeout(
+        &self,
+        args: &[&str],
+        stdin: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ChezmoiError> {
+        let mut attempt = 1;
+        loop {
+            match self.run_ok_once(args, stdin.clone(), timeout) {
+                Err(ChezmoiError::Eval(eval))
+                    if eval.kind == EvalFailureKind::OnePasswordAuth
+                        && attempt < ONEPASSWORD_ATTEMPTS =>
+                {
+                    // Logged, not silent: a retry nobody can see is
+                    // indistinguishable from a hang, and this one costs real
+                    // wall-clock. The hint, not the raw stderr — chezmoi's
+                    // 1Password stderr quotes the failing `op://` secret
+                    // REFERENCE, and the log is a file users paste into
+                    // issues.
+                    crate::log_info!(
+                        "chezmoi",
+                        "1Password not ready (attempt {attempt}/{ONEPASSWORD_ATTEMPTS}) for \
+                         `chezmoi {}`: retrying in {}ms — {}",
+                        args.join(" "),
+                        ONEPASSWORD_BACKOFF.as_millis(),
+                        eval.hint
+                    );
+                    attempt += 1;
+                    std::thread::sleep(ONEPASSWORD_BACKOFF);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// One invocation, no retry — the body [`Self::run_ok_with_timeout`]
+    /// wraps.
+    fn run_ok_once(
         &self,
         args: &[&str],
         stdin: Option<Vec<u8>>,
@@ -455,6 +542,80 @@ mod tests {
             }
             other => panic!("expected Eval, got {other:?}"),
         }
+    }
+
+    /// A templated file rendered through `onepasswordRead` fails when `op`
+    /// hiccups, and retrying by hand works (spec §1.3) — so retry by machine,
+    /// bounded and logged, the way `GitClient` treats index.lock contention.
+    ///
+    /// MUTATION: drop the retry loop from `run_ok_with_timeout` (return the
+    /// first `Err`) → the `cat` fails and never sees the second response.
+    #[test]
+    fn a_transient_1password_failure_is_retried() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(1, "", "chezmoi: template: x.tmpl:1:1: executing at <onepasswordRead>: error calling onepasswordRead: op signin --raw: exit status 1\n");
+        fake.push_ok(0, "rendered\n", "");
+        let out = client(fake.clone())
+            .cat(Path::new("/Users/x/.zshrc"))
+            .unwrap();
+        assert_eq!(out, b"rendered\n");
+        assert_eq!(fake.calls().len(), 2, "retried once, then succeeded");
+    }
+
+    /// Multiple-accounts is a CONFIGURATION error, not a hiccup: retrying it
+    /// only delays the real hint ("select an account in Settings").
+    ///
+    /// MUTATION: key the retry on `classify_eval_stderr(..).is_some()` rather
+    /// than on `OnePasswordAuth` → three calls instead of one, and the user
+    /// waits half a second for an answer that was already known.
+    #[test]
+    fn a_multiple_accounts_failure_is_not_retried() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(1, "", "[ERROR] multiple accounts found. Use the --account flag or set the OP_ACCOUNT environment variable\n");
+        let err = client(fake.clone())
+            .cat(Path::new("/Users/x/.zshrc"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ChezmoiError::Eval(EvalFailure {
+                kind: EvalFailureKind::OnePasswordMultipleAccounts,
+                ..
+            })
+        ));
+        assert_eq!(fake.calls().len(), 1, "no retry");
+    }
+
+    /// BOUNDED. A 1Password that is locked and stays locked must still fail,
+    /// and fail soon: an unbounded retry is indistinguishable from a hang,
+    /// which is exactly the failure mode `--no-tty` was added to kill.
+    ///
+    /// MUTATION: drop the `attempt < ONEPASSWORD_ATTEMPTS` bound → the loop
+    /// eats all eight queued responses (and then panics on the ninth).
+    #[test]
+    fn a_persistent_1password_failure_still_fails_after_the_bounded_retries() {
+        let fake = Arc::new(FakeRunner::new());
+        for _ in 0..8 {
+            fake.push_ok(
+                1,
+                "",
+                "error calling onepasswordRead: op signin --raw: exit status 1\n",
+            );
+        }
+        let err = client(fake.clone())
+            .cat(Path::new("/Users/x/.zshrc"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ChezmoiError::Eval(EvalFailure {
+                kind: EvalFailureKind::OnePasswordAuth,
+                ..
+            })
+        ));
+        assert!(
+            fake.calls().len() <= 4,
+            "bounded: {} attempts",
+            fake.calls().len()
+        );
     }
 
     #[test]
