@@ -433,7 +433,10 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             let mut s = shell(Route::Dashboard, rich_model());
             s.pending_merge = true;
             s.queue_pumping = true; // a batch holds the latch, so the abort waits
-            s.deferred_repo_op = Some(PendingRepoOp::AbortMerge(Rollback::Files(2)));
+            s.deferred_repo_op = Some(PendingRepoOp::AbortMerge {
+                rolled_back: Rollback::Files(2),
+                dropped: Vec::new(),
+            });
             s
         }
         "review"
@@ -466,7 +469,11 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 "review-empty" => (None, false),
                 "review-banner" => (
                     Some(OutcomeBanner {
-                        text: "Kept disk version · committed & pushed".into(),
+                        // NOT the selected file: confirming `secrets.yaml`
+                        // advanced the selection to `settings.json`, which is
+                        // what the header shows. The name is what ties the
+                        // sentence — and its Undo button — to a file.
+                        text: "Kept disk version · secrets.yaml · committed & pushed".into(),
                         tint: BannerTint::Ok,
                         undoable: true,
                     }),

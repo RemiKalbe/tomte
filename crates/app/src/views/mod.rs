@@ -56,10 +56,22 @@ pub enum Route {
 pub(super) enum PendingRepoOp {
     /// Commit the merge the dashboard banner is reporting.
     FinishMerge,
-    /// Abandon the merge with origin, rolling the source repo back. Carries
-    /// what the editor told the user it would discard, so the banner
-    /// afterwards names the same thing the confirmation did.
-    AbortMerge(merge::Rollback),
+    /// Abandon the merge with origin, rolling the source repo back.
+    AbortMerge {
+        /// What the editor told the user it would discard, so the banner
+        /// afterwards names the same thing the confirmation did.
+        rolled_back: merge::Rollback,
+        /// Queued merge-editor saves this roll-back orphaned, filled in by
+        /// [`Shell::request_repo_op`] when the op is accepted.
+        ///
+        /// They travel WITH the op because their rows cannot be relied on to
+        /// carry the news: `fail_pending_where` puts the message on each row,
+        /// but a file that was a review row only BECAUSE the merge left it
+        /// conflicted stops being drifted the moment the merge is rolled
+        /// back, and `model_changed` then prunes the message with the row.
+        /// The banner is the one surface that outlives both.
+        dropped: Vec<PathBuf>,
+    },
     /// Restore the destination files of the last finished journal session.
     /// Not per-target — "the last thing that landed" is a property of the
     /// journal, not of the row the button sits under.
@@ -98,7 +110,7 @@ impl PendingRepoOp {
     pub(super) fn kind(&self) -> RepoOpKind {
         match self {
             Self::FinishMerge => RepoOpKind::Finish,
-            Self::AbortMerge(_) => RepoOpKind::Abort,
+            Self::AbortMerge { .. } => RepoOpKind::Abort,
             Self::UndoLast => RepoOpKind::Undo,
         }
     }
@@ -369,7 +381,15 @@ impl Shell {
     /// against the rolled-back repo, which is what "abort" means.
     pub fn abort_origin_merge(&mut self, rolled_back: merge::Rollback, cx: &mut Context<Self>) {
         self.route = Route::Review;
-        self.request_repo_op(PendingRepoOp::AbortMerge(rolled_back), cx);
+        self.request_repo_op(
+            PendingRepoOp::AbortMerge {
+                rolled_back,
+                // `request_repo_op` fills this: it is the one place that
+                // knows which queued saves the roll-back just took away.
+                dropped: Vec::new(),
+            },
+            cx,
+        );
     }
 
     /// The abort, running with the latch already taken. Only [`Self::pump`]
@@ -378,6 +398,7 @@ impl Shell {
         &mut self,
         engine: std::sync::Arc<ResolveEngine>,
         rolled_back: merge::Rollback,
+        dropped: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
@@ -393,7 +414,7 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 shell.queue_pumping = false;
                 shell.running_repo_op = None;
-                shell.merge_done(abort_banner(outcome, &rolled_back), cx);
+                shell.merge_done(abort_banner(outcome, &rolled_back, &dropped), cx);
                 // On BOTH arms. A rollback that completed ended the merge the
                 // dashboard banner was reporting, and one that panicked left
                 // whether a merge is in progress unknown — either way what is
@@ -547,7 +568,10 @@ impl Shell {
             return;
         }
         if matches!(op, PendingRepoOp::FinishMerge)
-            && matches!(self.deferred_repo_op, Some(PendingRepoOp::AbortMerge(_)))
+            && matches!(
+                self.deferred_repo_op,
+                Some(PendingRepoOp::AbortMerge { .. })
+            )
         {
             tomte_core::log_info!(
                 "reconcile",
@@ -579,8 +603,15 @@ impl Shell {
         // Pure queue mutation, deliberately: this runs inside the merge
         // view's own update (the Discard button), so it must not reach back
         // into any view.
-        if matches!(op, PendingRepoOp::AbortMerge(_)) {
-            let orphaned = self.queue.fail_pending_where(
+        //
+        // The targets travel ON the op, because their rows cannot be trusted
+        // to carry the news: a file that was a review row only because the
+        // merge left it conflicted stops being drifted the moment the
+        // roll-back lands, and `model_changed` then prunes its message along
+        // with its row. The roll-back's own banner is what outlives both.
+        let mut op = op;
+        if let PendingRepoOp::AbortMerge { dropped, .. } = &mut op {
+            let mut orphaned = self.queue.fail_pending_where(
                 |a| matches!(a.decision, Decision::RepoConflict { .. }),
                 "merge rolled back before this save ran — save again",
             );
@@ -596,6 +627,32 @@ impl Shell {
                         .join(", ")
                 );
             }
+            // A roll-back ALREADY waiting took its own orphans out of
+            // `pending` when it was requested, so the call above finds
+            // nothing for them — and this one is about to replace it. Carry
+            // them across, or the second Discard's banner would report zero
+            // while the first one's saves are just as gone. Reachable
+            // without contrivance: Discard, latch held, back to Review, open
+            // the editor on another file, Discard again.
+            if let Some(PendingRepoOp::AbortMerge {
+                dropped: earlier, ..
+            }) = &self.deferred_repo_op
+            {
+                let carried: Vec<PathBuf> = earlier
+                    .iter()
+                    .filter(|t| !orphaned.contains(t))
+                    .cloned()
+                    .collect();
+                if !carried.is_empty() {
+                    tomte_core::log_info!(
+                        "reconcile",
+                        "carrying {} save(s) dropped by the roll-back this one supersedes",
+                        carried.len()
+                    );
+                    orphaned.extend(carried);
+                }
+            }
+            *dropped = orphaned;
         }
         if let Some(prev) = self.deferred_repo_op.replace(op) {
             tomte_core::log_info!("reconcile", "{prev:?} superseded before it ran");
@@ -688,15 +745,37 @@ impl Shell {
     /// merge editor, or Settings since. The banner is waiting for them in
     /// Review either way.
     pub fn show_outcome(&mut self, banner: OutcomeBanner, cx: &mut Context<Self>) {
+        self.note_outcome(banner, cx);
+        self.reload_selected(cx);
+    }
+
+    /// The banner half of [`Self::show_outcome`]: set it, move nothing,
+    /// reload nothing.
+    ///
+    /// Separate because [`Self::batch_finished`] emits one banner PER LANDED
+    /// TARGET (the last wins, and it is the one Undo would revert), while the
+    /// preview reload below is a `chezmoi cat` plus a journal read. Doing that
+    /// once per file would fire thirty subprocess round trips at the end of a
+    /// thirty-file sweep to render one diff — so the banners go through here
+    /// and the reload happens once.
+    fn note_outcome(&mut self, banner: OutcomeBanner, cx: &mut Context<Self>) {
         let review = self.ensure_review(cx);
         review.update(cx, |view, cx| {
             view.last_outcome = Some(banner);
-            if let Some(target) = view.selected.clone() {
-                view.select(target, cx);
-            }
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// Reload the review view's preview so its diff reflects the converged
+    /// reality after something landed.
+    fn reload_selected(&mut self, cx: &mut Context<Self>) {
+        let review = self.ensure_review(cx);
+        review.update(cx, |view, cx| {
+            if let Some(target) = view.selected.clone() {
+                view.select(target, cx);
+            }
+        });
     }
 
     /// Deliver one banner the way its origin calls for.
@@ -819,7 +898,10 @@ impl Shell {
             cx.notify();
             match op {
                 PendingRepoOp::FinishMerge => self.run_finish(engine, cx),
-                PendingRepoOp::AbortMerge(rolled_back) => self.run_abort(engine, rolled_back, cx),
+                PendingRepoOp::AbortMerge {
+                    rolled_back,
+                    dropped,
+                } => self.run_abort(engine, rolled_back, dropped, cx),
                 PendingRepoOp::UndoLast => self.run_undo(engine, cx),
             }
             return;
@@ -918,7 +1000,7 @@ impl Shell {
                 announce.push(dashboard::quick_action_body(decision, &target, &result));
             }
             if let Some((decision, _)) = decision
-                && let Some(banner) = review::queued_outcome_banner(decision, &result)
+                && let Some(banner) = review::queued_outcome_banner(decision, &target, &result)
             {
                 landed.push(banner);
             }
@@ -949,19 +1031,24 @@ impl Shell {
             finished.push((target, failure));
         }
         self.queue.finish_all(&finished);
-        // A merge-editor Save reports itself, WITHOUT moving the user:
-        // `MergeView::save` left "Save queued · <file>" on screen and that
-        // claim has to be settled now, whichever way the save went.
-        // `queued_outcome_banner` decides which decisions those are — no
-        // other kind comes back with a banner, so a thirty-file sweep cannot
-        // quietly overwrite what the banner was saying.
+        // EVERY landed target updates the banner, in result order, so the
+        // LAST one wins — WITHOUT moving the user (the yank rule).
         //
-        // At most one in practice: `take_batch` hands out either a run of
-        // batchable one-click decisions (never banner-ed) or exactly one
-        // decision that runs alone, which is what a Save is. The `pop` is the
-        // last-wins rule for the case where that stops being true.
-        if let Some(banner) = landed.pop() {
-            self.show_outcome(banner, cx);
+        // Last-wins is what keeps Undo honest rather than a matter of taste.
+        // Undo is per file (spec §2.3) and `undo_last` reverts the last
+        // FINISHED journal session, which for a batch is its last item —
+        // `resolve_batch` ends one session per file in batch order and
+        // `per_target` comes back slot-indexed. So the banner above the Undo
+        // button has to name that same last item. Naming an earlier one (or
+        // leaving a merge save's banner standing over a later sweep) offers
+        // an Undo that reverts a different file than the sentence describes.
+        let landed_any = !landed.is_empty();
+        for banner in landed {
+            self.note_outcome(banner, cx);
+        }
+        // Once, not per banner: this is a `chezmoi cat` and a journal read.
+        if landed_any {
+            self.reload_selected(cx);
         }
         for body in announce {
             self.notify_in_background(body, cx);
@@ -975,6 +1062,33 @@ impl Shell {
         self.refresh_pending_merge(cx);
         cx.notify();
         self.pump(cx);
+    }
+
+    /// This Shell as the dashboard renders it, copied out once per render.
+    ///
+    /// A method rather than a struct literal inside `render` so the WIRING is
+    /// testable. `running` in particular joins the queue to the quick
+    /// actions' row lock, and that join is invisible everywhere else: the
+    /// buttons are `opacity(0.)` until the row is hovered, so no screenshot
+    /// can show it, and replacing this field with `Vec::new()` used to leave
+    /// every test green while the lock silently stopped working.
+    pub(super) fn dashboard_snapshot(&self) -> DashboardView {
+        DashboardView {
+            state: self.state.clone(),
+            now_ts: dashboard::system_now,
+            expanded_scans: self.expanded_scans.clone(),
+            unlock_in_flight: self.unlock_in_flight,
+            pending_merge: self.pending_merge,
+            merge_finish_in_flight: self.merge_finish_in_flight,
+            pending_repo_op: self.deferred_repo_op.as_ref().map(|op| op.kind()),
+            running_repo_op: self.running_repo_op,
+            running: self
+                .queue
+                .running()
+                .iter()
+                .map(|a| a.target.clone())
+                .collect(),
+        }
     }
 
     fn nav_item(
@@ -1197,7 +1311,11 @@ fn abort_outcome(work: impl FnOnce() -> AbortOutcome + std::panic::UnwindSafe) -
 /// inherit the rolled-back arm's sentence. Claiming "Merge with origin
 /// rolled back" after a panic would be a confident statement about the exact
 /// thing the panic took away.
-fn abort_banner(outcome: AbortOutcome, rolled_back: &merge::Rollback) -> OutcomeBanner {
+fn abort_banner(
+    outcome: AbortOutcome,
+    rolled_back: &merge::Rollback,
+    dropped: &[PathBuf],
+) -> OutcomeBanner {
     match outcome {
         AbortOutcome::RolledBack(rescanned) => {
             let mut text = format!(
@@ -1205,6 +1323,17 @@ fn abort_banner(outcome: AbortOutcome, rolled_back: &merge::Rollback) -> Outcome
                  Destination files and journal entries were not touched.",
                 rolled_back.phrase()
             );
+            // Said HERE, not only on the rows: a file that was a review row
+            // only because this merge left it conflicted stops being drifted
+            // the moment the roll-back lands, taking its row — and the
+            // failure message on it — with it. Without this line the user's
+            // save would have disappeared with nothing but a log entry.
+            if !dropped.is_empty() {
+                text.push_str(&format!(
+                    " {} queued save(s) were dropped with it — save again.",
+                    dropped.len()
+                ));
+            }
             if let Err(e) = rescanned {
                 // The list on screen still describes the merged repo. Never
                 // let that pass silently — it is exactly the mismatch that
@@ -1225,11 +1354,22 @@ fn abort_banner(outcome: AbortOutcome, rolled_back: &merge::Rollback) -> Outcome
                 "reconcile",
                 "the roll-back did not complete: {detail} — the merge may still be in progress"
             );
+            let mut text = "The roll-back did not complete (internal error — see the log). \
+                            The merge with origin may still be in progress, and this list \
+                            may describe the repo either before or after it."
+                .to_string();
+            // The saves were dropped when the roll-back was REQUESTED, so
+            // they are gone whether or not it completed. Silence here would
+            // lose them exactly when the user has least to go on.
+            if !dropped.is_empty() {
+                text.push_str(&format!(
+                    " {} queued save(s) were dropped when it was requested — save again.",
+                    dropped.len()
+                ));
+            }
+
             OutcomeBanner {
-                text: "The roll-back did not complete (internal error — see the log). \
-                       The merge with origin may still be in progress, and this list \
-                       may describe the repo either before or after it."
-                    .into(),
+                text: text.into(),
                 tint: review::BannerTint::Conflict,
                 undoable: false,
             }
@@ -1424,18 +1564,10 @@ impl Render for Shell {
                                 )
                             })
                             .into_any_element(),
-                        Route::Dashboard => DashboardView {
-                            state: self.state.clone(),
-                            now_ts: dashboard::system_now,
-                            expanded_scans: self.expanded_scans.clone(),
-                            unlock_in_flight: self.unlock_in_flight,
-                            pending_merge: self.pending_merge,
-                            merge_finish_in_flight: self.merge_finish_in_flight,
-                            pending_repo_op: self.deferred_repo_op.as_ref().map(|op| op.kind()),
-                            running_repo_op: self.running_repo_op,
-                        }
-                        .render(theme, cx)
-                        .into_any_element(),
+                        Route::Dashboard => self
+                            .dashboard_snapshot()
+                            .render(theme, cx)
+                            .into_any_element(),
                         Route::Review => self.ensure_review(cx).into_any_element(),
                         Route::Settings => {
                             let paths = self.paths.clone();
@@ -1715,31 +1847,45 @@ mod render_smoke {
             });
             vis.run_until_parked();
         }
-        // The dashboard route on the same model: its inline quick actions
-        // render (the drifted row is in the timeline) and stay LIVE — a
-        // decision draining elsewhere no longer makes them a no-op.
-        let (_view, vis) = cx.add_window_view(|_window, cx| {
-            let state = cx.new(|_| model_with_data());
-            Shell {
-                route: Route::Dashboard,
-                state,
-                review: None,
-                settings: None,
-                merge: None,
-                paths: smoke_paths(),
-                expanded_scans: HashSet::new(),
-                unlock_in_flight: false,
-                pending_merge: false,
-                merge_finish_in_flight: false,
-                pending_merge_probed: false,
-                changelog: None,
-                queue: Default::default(),
-                queue_pumping: false,
-                deferred_repo_op: None,
-                running_repo_op: None,
-            }
-        });
-        vis.run_until_parked();
+        // The dashboard route on the same model, whose timeline carries the
+        // drifted `.zshrc`, so its inline quick actions render. Twice: with
+        // nothing owed they stay LIVE (a decision draining on another file no
+        // longer makes them a no-op — that flag was defect §1.1), and with
+        // THAT file's decision running they render through the disabled path
+        // instead, so a second press cannot duplicate it.
+        for running_here in [false, true] {
+            let (_view, vis) = cx.add_window_view(|_window, cx| {
+                let state = cx.new(|_| model_with_data());
+                let mut queue = ActionQueue::default();
+                if running_here {
+                    queue.push(QueuedAction {
+                        target: PathBuf::from("/tmp/smoke/.zshrc"),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    });
+                    queue.take_batch();
+                }
+                Shell {
+                    route: Route::Dashboard,
+                    state,
+                    review: None,
+                    settings: None,
+                    merge: None,
+                    paths: smoke_paths(),
+                    expanded_scans: HashSet::new(),
+                    unlock_in_flight: false,
+                    pending_merge: false,
+                    merge_finish_in_flight: false,
+                    pending_merge_probed: false,
+                    changelog: None,
+                    queue,
+                    queue_pumping: running_here,
+                    deferred_repo_op: None,
+                    running_repo_op: None,
+                }
+            });
+            vis.run_until_parked();
+        }
     }
 
     /// The scan flag alone must never split the source action. A file added
@@ -2536,15 +2682,66 @@ mod render_smoke {
         );
     }
 
+    /// The roll-back reports itself, and names what the CONFIRMATION named.
+    ///
+    /// Nothing is queued behind it here, deliberately: this test is about the
+    /// roll-back's own banner surviving to be read. Its sibling below covers
+    /// the case where a decision lands after it and legitimately replaces it.
+    ///
+    /// MUTATION: drop the `self.route = Route::Review` from
+    /// `abort_origin_merge` → the first assertion fails. MUTATION: hand
+    /// `abort_banner` `rolled_back` from anywhere but the confirmation → the
+    /// "2 source file(s)" assertion fails.
+    #[gpui::test]
+    fn an_abort_reports_the_roll_back_it_confirmed(cx: &mut TestAppContext) {
+        let _lab = EngineLab::publish(cx);
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Merge, cx));
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                // Exactly what `MergeView::discard_merge` hands over.
+                s.abort_origin_merge(merge::Rollback::Files(2), cx);
+                assert_eq!(s.route, Route::Review, "the editor is left immediately");
+            });
+        });
+        vis.run_until_parked();
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the abort's banner made a review view");
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("the rollback is reported, never silent");
+        // Not just the format string's fixed prefix: the banner has to carry
+        // the size the CONFIRMATION named, and the roll-back tint rather
+        // than the panic arm's.
+        assert!(
+            banner.text.contains("2 source file(s)"),
+            "the banner names what the confirmation named: {}",
+            banner.text
+        );
+        assert_eq!(banner.tint, review::BannerTint::Drift);
+        assert!(
+            !banner.text.contains("dropped"),
+            "nothing was queued, so nothing was dropped with it: {}",
+            banner.text
+        );
+    }
+
     /// The abort is the case the ordering exists for: the user leaves the
     /// editor NOW, but the rollback waits for the latch, and the decisions
     /// queued behind it run against the ROLLED-BACK repo instead of being
     /// staged into a merge that has just been discarded.
     ///
+    /// The final banner is the DECISION's, not the roll-back's, and that is
+    /// correct: it landed after, and it is the one Undo would revert. The
+    /// roll-back's own banner is covered by the test above, with nothing
+    /// queued behind it.
+    ///
     /// MUTATION: in `pump`, take the batch before checking
     /// `deferred_repo_op` → the probe below sees `running()` non-empty.
-    /// MUTATION: drop the `self.route = Route::Review` from
-    /// `abort_origin_merge` → the first assertion fails.
+    /// MUTATION: stop banner-ing landed one-click decisions → the last
+    /// assertion fails and the banner still names the roll-back while Undo
+    /// would revert the keep-disk.
     #[gpui::test]
     fn an_abort_pressed_mid_drain_routes_now_and_runs_later(cx: &mut TestAppContext) {
         let lab = EngineLab::publish(cx);
@@ -2560,12 +2757,11 @@ mod render_smoke {
                     decision: Decision::KeepDisk,
                     notify_on_done: false,
                 });
-                // Exactly what `MergeView::discard_merge` hands over.
                 s.abort_origin_merge(merge::Rollback::Files(2), cx);
                 assert_eq!(s.route, Route::Review, "the editor is left immediately");
                 assert!(matches!(
                     s.deferred_repo_op,
-                    Some(PendingRepoOp::AbortMerge(_))
+                    Some(PendingRepoOp::AbortMerge { .. })
                 ));
                 assert!(
                     s.queue.running().is_empty(),
@@ -2610,17 +2806,16 @@ mod render_smoke {
             "and it really landed: keep-disk re-added the drifted content"
         );
         let review = review.expect("the abort's banner made a review view");
-        let banner = vis.update(|_window, cx| review.read(cx).last_outcome.clone());
-        let banner = banner.expect("the rollback is reported, never silent");
-        // Not just the format string's fixed prefix: the banner has to carry
-        // the size the CONFIRMATION named, and the roll-back tint rather
-        // than the panic arm's.
-        assert!(
-            banner.text.contains("2 source file(s)"),
-            "the banner names what the confirmation named: {}",
-            banner.text
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("the landing is reported, never silent");
+        assert_eq!(
+            banner.text.as_ref(),
+            "Kept disk version · .testrc · committed & pushed",
+            "the LAST thing to land owns the banner, and NAMES the file it \
+             reports — it is what Undo reverts"
         );
-        assert_eq!(banner.tint, review::BannerTint::Drift);
+        assert!(banner.undoable);
     }
 
     /// A press made while the app is still connecting is not a discarded
@@ -2689,7 +2884,7 @@ mod render_smoke {
                 // … then one unconfirmed click on the dashboard banner.
                 s.finish_pending_merge(cx);
                 assert!(
-                    matches!(s.deferred_repo_op, Some(PendingRepoOp::AbortMerge(_))),
+                    matches!(s.deferred_repo_op, Some(PendingRepoOp::AbortMerge { .. })),
                     "a finish must never commit a merge the user confirmed discarding"
                 );
             });
@@ -2719,7 +2914,7 @@ mod render_smoke {
                 ));
                 s.abort_origin_merge(merge::Rollback::Files(3), cx);
                 assert!(
-                    matches!(s.deferred_repo_op, Some(PendingRepoOp::AbortMerge(_))),
+                    matches!(s.deferred_repo_op, Some(PendingRepoOp::AbortMerge { .. })),
                     "an abort supersedes a pending finish — it is the later, confirmed answer"
                 );
             });
@@ -2938,11 +3133,14 @@ mod render_smoke {
         // The same holds for the abort, the other repo-level answer.
         vis.update(|_window, cx| {
             shell.update(cx, |s, cx| {
-                s.deferred_repo_op = Some(PendingRepoOp::AbortMerge(merge::Rollback::Files(1)));
+                s.deferred_repo_op = Some(PendingRepoOp::AbortMerge {
+                    rolled_back: merge::Rollback::Files(1),
+                    dropped: Vec::new(),
+                });
                 s.undo_last(cx);
                 assert!(matches!(
                     s.deferred_repo_op,
-                    Some(PendingRepoOp::AbortMerge(_))
+                    Some(PendingRepoOp::AbortMerge { .. })
                 ));
             });
         });
@@ -2991,7 +3189,7 @@ mod render_smoke {
     fn a_panicked_abort_never_claims_the_roll_back_happened() {
         let rolled_back = merge::Rollback::Files(2);
 
-        let done = abort_banner(AbortOutcome::RolledBack(Ok(())), &rolled_back);
+        let done = abort_banner(AbortOutcome::RolledBack(Ok(())), &rolled_back, &[]);
         assert!(
             done.text.contains("rolled back") && done.text.contains("2 source file(s)"),
             "{}",
@@ -3002,6 +3200,7 @@ mod render_smoke {
         let stale = abort_banner(
             AbortOutcome::RolledBack(Err(ResolveError::Failed("daemon gone".into()))),
             &rolled_back,
+            &[],
         );
         assert!(
             stale.text.contains("rolled back") && stale.text.contains("may be stale"),
@@ -3009,9 +3208,23 @@ mod render_smoke {
             stale.text
         );
 
+        // The dropped saves went at REQUEST time, so a panic partway through
+        // the roll-back does not give them back. Saying so here matters most:
+        // it is the arm where the user has least else to go on.
         let boom = abort_banner(
             AbortOutcome::Panicked("index out of bounds".into()),
             &rolled_back,
+            &[PathBuf::from("/a"), PathBuf::from("/b")],
+        );
+        assert!(
+            boom.text.contains("2 queued save(s) were dropped"),
+            "a panicked roll-back still owes the user its dropped saves: {}",
+            boom.text
+        );
+        assert!(
+            boom.text.contains("save again"),
+            "and what to do about them: {}",
+            boom.text
         );
         assert!(
             !boom.text.contains("rolled back"),
@@ -3192,7 +3405,7 @@ mod render_smoke {
                 );
                 assert_eq!(s.queue.depth(), 1);
                 assert!(
-                    matches!(s.deferred_repo_op, Some(PendingRepoOp::AbortMerge(_))),
+                    matches!(s.deferred_repo_op, Some(PendingRepoOp::AbortMerge { .. })),
                     "and the roll-back itself still waits for the latch"
                 );
             });
@@ -3288,5 +3501,477 @@ mod render_smoke {
         // take them to it.
         vis.update(|_window, cx| shell.update(cx, |s, cx| s.merge_done(banner(), cx)));
         vis.update(|_window, cx| assert_eq!(shell.read(cx).route, Route::Review));
+    }
+
+    /// The banner names the LAST target to land, and that is Undo's
+    /// correctness rather than a preference.
+    ///
+    /// The reviewer's trace: Save A in the merge editor, then keep-disk B, C,
+    /// D in Review. If only the save banners, the queue idles with "Merged ·
+    /// committed & pushed" on screen and `undo_affordance` turns Undo live —
+    /// but `undo_last` reverts the LAST FINISHED session, which is D. The
+    /// button would revert a different file than the sentence above it names.
+    ///
+    /// Driven through `batch_finished` with a batch's worth of reports rather
+    /// than a live engine: the rule under test is "one banner per landed
+    /// target, in result order", and reports are exactly what `run_batch`
+    /// hands it.
+    ///
+    /// MUTATION: `landed.pop()` instead of the loop (or a `queued_outcome_banner`
+    /// that only answers for a merge save) → the banner names A while Undo
+    /// reverts D. MUTATION: iterate `landed` in reverse → it names B.
+    #[gpui::test]
+    fn the_banner_names_the_last_target_to_land(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+
+        // Each of the three lands with a DIFFERENT sentence, so "the last
+        // one" is distinguishable from "the first" and from "any of them" —
+        // three identical successes would let a mutation that keeps the wrong
+        // one pass unnoticed.
+        let done = |note: Option<&str>| {
+            Ok(BatchResult::Resolved(ResolveOutcome::Done {
+                session: 1,
+                committed: note.is_none(),
+                pushed: note.is_none(),
+                note: note.map(str::to_owned),
+            }))
+        };
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                // A merge save landed first and set the banner it owed.
+                s.show_outcome(
+                    OutcomeBanner {
+                        text: "Merged · committed & pushed".into(),
+                        tint: review::BannerTint::Ok,
+                        undoable: true,
+                    },
+                    cx,
+                );
+                // Then a sweep of three, taken as one batch.
+                for (t, decision) in [
+                    ("/b", Decision::KeepDisk),
+                    ("/c", Decision::KeepSourceLocal),
+                    ("/d", Decision::KeepDisk),
+                ] {
+                    s.queue.push(QueuedAction {
+                        target: PathBuf::from(t),
+                        decision,
+                        notify_on_done: false,
+                    });
+                }
+                let batch = s.queue.take_batch();
+                assert_eq!(batch.len(), 3, "one batch, three targets");
+                let notes = [None, None, Some("push failed")];
+                s.batch_finished(
+                    batch
+                        .into_iter()
+                        .zip(notes)
+                        .map(|(a, note)| (a.target, a.decision.label(), done(note)))
+                        .collect(),
+                    None,
+                    cx,
+                );
+            });
+        });
+
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the banners made a review view");
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("a landing is never silent");
+        assert_eq!(
+            banner.text.as_ref(),
+            "Kept disk version · d · push failed",
+            "the sweep's LAST file owns the banner, BY NAME — not the merge \
+             save before the sweep, and not the first or middle file of it"
+        );
+        assert_eq!(
+            banner.tint,
+            review::BannerTint::Drift,
+            "and the tint is that landing's too, not a leftover Ok"
+        );
+        assert!(
+            banner.undoable,
+            "and it is undoable, because `undo_last` reverts exactly that session"
+        );
+    }
+
+    /// A roll-back that orphans queued saves has to SAY so, in the banner.
+    ///
+    /// The rows cannot be relied on for it: `fail_pending_where` puts the
+    /// message on each row, but a file that was a review row only because the
+    /// merge left it conflicted stops being drifted once the roll-back lands,
+    /// and `model_changed` prunes the message with the row. Without the
+    /// banner the user's save would vanish leaving only a log line.
+    ///
+    /// MUTATION: drop the `dropped` field from the op (or stop filling it in
+    /// `request_repo_op`) → the count never reaches the banner and the
+    /// assertion fails.
+    #[gpui::test]
+    fn a_roll_back_says_how_many_queued_saves_went_with_it(cx: &mut TestAppContext) {
+        let _lab = EngineLab::publish(cx);
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Merge, cx));
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.queue.push(QueuedAction {
+                    target: PathBuf::from("/staged"),
+                    decision: Decision::RepoConflict {
+                        source_path: PathBuf::from("/src/staged"),
+                        resolved: "x".into(),
+                    },
+                    notify_on_done: false,
+                });
+                s.abort_origin_merge(merge::Rollback::Files(2), cx);
+            });
+        });
+        vis.run_until_parked();
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the abort's banner made a review view");
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("the rollback is reported, never silent");
+        assert!(
+            banner.text.contains("1 queued save(s) were dropped"),
+            "the banner has to carry what the rows will not keep: {}",
+            banner.text
+        );
+        assert!(
+            banner.text.contains("save again"),
+            "and say what to do about it: {}",
+            banner.text
+        );
+    }
+
+    /// A decision made while the daemon is away is QUEUED, not refused.
+    ///
+    /// Parking is the queue's model: `pump` leaves everything queued when no
+    /// engine is published and `render`'s connect latch releases it on the
+    /// next (re)connect. Refusing the press instead would be the same mistake
+    /// the `in_flight` booleans were — declining to remember a decision
+    /// because it cannot run this second.
+    ///
+    /// No `EngineSlot` is published here, which is exactly the disconnected
+    /// case. Both surfaces are checked: Review's buttons and the dashboard's
+    /// quick actions have to be LIVE, and the press has to land on the queue
+    /// without being taken out of it.
+    ///
+    /// MUTATION: reinstate the `!engine_ready` arm in `review::blocked_reason`
+    /// or in `dashboard::quick_action_blocked` → the first two assertions
+    /// fail and the click can never be made at all.
+    #[gpui::test]
+    fn a_decision_made_while_disconnected_is_queued_not_refused(cx: &mut TestAppContext) {
+        use review::ResolveAction;
+        use std::path::Path;
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review", smoke_paths(), cx).expect("review fixture")
+        });
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the fixture poses a review view");
+
+        // Nothing is connected and nothing is owed, so neither surface has a
+        // reason to be inert.
+        assert_eq!(
+            review::blocked_reason(&Default::default(), Path::new("/anything")),
+            None,
+            "Review's decision buttons stay live with no daemon: the press parks"
+        );
+        assert_eq!(
+            dashboard::quick_action_blocked(false),
+            None,
+            "and so do the dashboard's quick actions"
+        );
+
+        let selected = vis
+            .update(|_window, cx| review.read(cx).selected.clone())
+            .expect("the fixture selects a file");
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| view.run_action(ResolveAction::KeepDisk, cx))
+        });
+        vis.run_until_parked();
+
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 1, "the decision is remembered");
+            assert!(
+                s.queue.running().is_empty(),
+                "and still PENDING — parked, not taken out of the queue and lost"
+            );
+            assert_eq!(
+                s.queue.decision_label(&selected),
+                Some("Keep disk"),
+                "the row says which decision is waiting"
+            );
+            assert!(
+                s.queue.failure(&selected).is_none(),
+                "parking is not a failure to report"
+            );
+            assert!(
+                !s.queue_pumping,
+                "nothing is in flight, so the next connect is free to pump"
+            );
+        });
+    }
+
+    /// A FAILED landing keeps its row chip and leaves the banner alone.
+    ///
+    /// Spec §2.5: the queue moves on within milliseconds of an error, so a
+    /// transient banner would vanish unseen — the row is where a failure
+    /// lives, and choosing again there is the retry. The banner is for
+    /// SUCCESSES, because it is what carries Undo and has to name what Undo
+    /// reverts. So a failure landing after a success must not clear that
+    /// success's banner, and a failure landing last must not claim it.
+    ///
+    /// MUTATION: banner the `Err` arm of `queued_outcome_banner` → the first
+    /// batch's banner names `/b`'s failure instead of `/c`'s landing, and the
+    /// second batch loses `/a`'s undoable banner to a failure that has its
+    /// own row.
+    #[gpui::test]
+    fn a_failed_landing_keeps_its_row_and_leaves_the_banner_alone(cx: &mut TestAppContext) {
+        use std::path::Path;
+
+        let landed = |note: Option<&str>| {
+            Ok(BatchResult::Resolved(ResolveOutcome::Done {
+                session: 1,
+                committed: note.is_none(),
+                pushed: note.is_none(),
+                note: note.map(str::to_owned),
+            }))
+        };
+        let failed = || Err(ResolveError::Failed("op timed out".into()));
+
+        // [Done a, Err b, Done c] — c is the last thing that landed.
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                for t in ["/a", "/b", "/c"] {
+                    s.queue.push(QueuedAction {
+                        target: PathBuf::from(t),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    });
+                }
+                s.queue.take_batch();
+                s.batch_finished(
+                    vec![
+                        (PathBuf::from("/a"), "Keep disk", landed(None)),
+                        (PathBuf::from("/b"), "Keep disk", failed()),
+                        (
+                            PathBuf::from("/c"),
+                            "Keep disk",
+                            landed(Some("push failed")),
+                        ),
+                    ],
+                    None,
+                    cx,
+                );
+            });
+        });
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the landing made a review view");
+        vis.update(|_window, cx| {
+            let banner = review
+                .read(cx)
+                .last_outcome
+                .clone()
+                .expect("a landing is never silent");
+            assert_eq!(
+                banner.text.as_ref(),
+                "Kept disk version · c · push failed",
+                "the banner names the last thing that LANDED, not the failure between"
+            );
+            assert!(banner.undoable, "and it is what Undo would revert");
+            let s = shell.read(cx);
+            assert_eq!(
+                s.queue.failure(Path::new("/b")).map(|m| m.as_ref()),
+                Some("Keep disk failed: op timed out"),
+                "the failure is on its row, where choosing again is the retry"
+            );
+            assert!(
+                s.queue.failure(Path::new("/c")).is_none(),
+                "and only on the row it belongs to"
+            );
+        });
+
+        // [Done a, Err b] — the failure lands LAST and still must not take
+        // the banner from the success before it.
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                for t in ["/a", "/b"] {
+                    s.queue.push(QueuedAction {
+                        target: PathBuf::from(t),
+                        decision: Decision::KeepSourceLocal,
+                        notify_on_done: false,
+                    });
+                }
+                s.queue.take_batch();
+                s.batch_finished(
+                    vec![
+                        (
+                            PathBuf::from("/a"),
+                            "Keep source · this machine",
+                            landed(None),
+                        ),
+                        (PathBuf::from("/b"), "Keep source · this machine", failed()),
+                    ],
+                    None,
+                    cx,
+                );
+            });
+        });
+        vis.update(|_window, cx| {
+            let banner = review
+                .read(cx)
+                .last_outcome
+                .clone()
+                .expect("the success still owns the banner");
+            assert_eq!(
+                banner.text.as_ref(),
+                "Restored chezmoi's version · a · committed & pushed",
+                "the success still owns the banner, and still names its file"
+            );
+            assert!(banner.undoable);
+            assert_eq!(
+                shell
+                    .read(cx)
+                    .queue
+                    .failure(Path::new("/b"))
+                    .map(|m| m.as_ref()),
+                Some("Keep source · this machine failed: op timed out"),
+            );
+        });
+    }
+
+    /// The dashboard's row lock is WIRED to the queue.
+    ///
+    /// `quick_action_blocked` is a pure rule with its own test, but nothing
+    /// tied it to the Shell: replacing `dashboard_snapshot`'s `running` field
+    /// with `Vec::new()` left every test green and no screenshot could catch
+    /// it — the quick actions are `opacity(0.)` until the row is hovered. So
+    /// this drives the join: a decision RUNNING on one file makes that file's
+    /// buttons inert and leaves every other file's alone.
+    ///
+    /// MUTATION: `running: Vec::new()` in `dashboard_snapshot` (or mapping
+    /// `processing()` instead of `running()`) → the first assertion fails, or
+    /// the third does when a merely queued row goes dead.
+    #[gpui::test]
+    fn the_dashboard_row_lock_is_wired_to_the_queue(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Dashboard, cx));
+        let running = PathBuf::from("/running");
+        let queued = PathBuf::from("/queued");
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, _cx| {
+                s.queue.push(QueuedAction {
+                    target: running.clone(),
+                    decision: Decision::KeepDisk,
+                    notify_on_done: false,
+                });
+                s.queue.take_batch(); // under the latch now
+                s.queue.push(QueuedAction {
+                    target: queued.clone(),
+                    decision: Decision::KeepDisk,
+                    notify_on_done: false,
+                });
+            });
+        });
+
+        let snapshot = vis.update(|_window, cx| shell.read(cx).dashboard_snapshot());
+        let blocked = |t: &PathBuf| {
+            dashboard::quick_action_blocked(snapshot.running.iter().any(|r| r == t))
+                .map(|r| r.to_string())
+        };
+        assert_eq!(
+            blocked(&running),
+            Some("applying this file's decision now".to_string()),
+            "the running file's quick actions are inert: a second press could \
+             only duplicate a decision already in flight"
+        );
+        assert_eq!(
+            blocked(&PathBuf::from("/elsewhere")),
+            None,
+            "and no other file is touched — that is the whole point of the queue"
+        );
+        assert_eq!(
+            blocked(&queued),
+            None,
+            "a merely QUEUED decision can still be replaced (spec §2.4), so its \
+             row stays live"
+        );
+    }
+
+    /// A second Discard must not lose the first one's dropped saves.
+    ///
+    /// The first request drains the orphaned saves out of `pending`, so the
+    /// second's `fail_pending_where` finds nothing — and the second op is the
+    /// one that runs and banners. Without carrying them across, the banner
+    /// would report zero dropped saves while the user's saves are just as
+    /// gone. Reachable with no contrivance: Discard, latch held, back to
+    /// Review, open the editor on another file, Discard again.
+    ///
+    /// MUTATION: drop the carry-across from `request_repo_op` → the
+    /// superseding op's `dropped` is empty and the banner says nothing.
+    #[gpui::test]
+    fn a_superseding_roll_back_keeps_the_saves_the_first_one_dropped(cx: &mut TestAppContext) {
+        let _lab = EngineLab::publish(cx);
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Merge, cx));
+
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                // The latch is held, so both requests only ever sit in the
+                // slot — the second replaces the first.
+                s.queue_pumping = true;
+                s.queue.push(QueuedAction {
+                    target: PathBuf::from("/staged"),
+                    decision: Decision::RepoConflict {
+                        source_path: PathBuf::from("/src/staged"),
+                        resolved: "x".into(),
+                    },
+                    notify_on_done: false,
+                });
+                s.abort_origin_merge(merge::Rollback::Files(2), cx);
+                // Nothing left pending for the second request to find.
+                s.abort_origin_merge(merge::Rollback::Files(3), cx);
+
+                let Some(PendingRepoOp::AbortMerge { dropped, .. }) = &s.deferred_repo_op else {
+                    panic!("the roll-back is still the pending op");
+                };
+                assert_eq!(
+                    dropped,
+                    &[PathBuf::from("/staged")],
+                    "the save the FIRST roll-back dropped travels to the one that replaces it"
+                );
+            });
+        });
+
+        // And it reaches the user, in the banner of the op that actually ran.
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                s.queue_pumping = false;
+                s.pump(cx);
+            })
+        });
+        vis.run_until_parked();
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the roll-back's banner made a review view");
+        let banner = vis
+            .update(|_window, cx| review.read(cx).last_outcome.clone())
+            .expect("the roll-back is reported, never silent");
+        assert!(
+            banner.text.contains("1 queued save(s) were dropped"),
+            "the superseding roll-back still owes the user that save: {}",
+            banner.text
+        );
+        assert!(
+            banner.text.contains("3 source file(s)"),
+            "and names what the SECOND confirmation named: {}",
+            banner.text
+        );
     }
 }

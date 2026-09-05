@@ -350,15 +350,6 @@ impl ResolveAction {
             Self::KeepSourceOrigin => theme.remote,
         }
     }
-
-    /// Past-tense verb for success messages.
-    pub(super) fn verb(self) -> &'static str {
-        match self {
-            Self::KeepDisk => "Kept disk version",
-            Self::KeepSourceLocal => "Restored chezmoi's version",
-            Self::KeepSourceOrigin => "Restored origin's version",
-        }
-    }
 }
 
 /// Which two contents the diff compares. Origin is a content state of its
@@ -507,145 +498,115 @@ pub(crate) struct OutcomeBanner {
     pub(crate) undoable: bool,
 }
 
-/// Map an action result onto its banner. Tint policy: a `note` means the
-/// resolution succeeded locally but commit/push degraded (drift tint, note
-/// shown); no note is full success (ok tint); engine errors are conflicts.
+/// A managed file as the UI names it: the file name, not the path.
+///
+/// One function because the name has to MATCH across surfaces — the sidebar
+/// row, the detail header, the merge editor's title, the landed banner and
+/// the desktop notification all say the same word for the same file, and a
+/// banner that named it differently from the row would read as a different
+/// file. Falls back to the whole path only for a target with no final
+/// component, which no managed destination has.
+pub(super) fn display_name(target: &Path) -> SharedString {
+    target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| target.display().to_string())
+        .into()
+}
+
+/// The banner for a click this view REFUSES before it can become a
+/// [`Decision`] at all.
+///
+/// All that is left of a function that used to map every action RESULT onto a
+/// banner. Results come back through the queue now, minutes later, and are
+/// keyed by the decision that ran rather than by the button — see
+/// [`queued_outcome_banner`]. What only this view can answer is a press it
+/// cannot turn into a decision in the first place, and there is exactly one:
+/// "keep source · origin" with no origin text loaded, which the engine would
+/// refuse anyway (`ResolveEngine::keep_source_origin` will not write content
+/// the user was never shown).
+///
 /// `split` is whether the source action was split in two when the user
-/// pressed it: with two "Keep source …" buttons on screen, a failure that
-/// says only "Keep source failed" leaves them guessing which one it was.
-fn outcome_banner(
-    action: ResolveAction,
-    split: bool,
-    result: &Result<ResolveOutcome, ResolveError>,
-) -> OutcomeBanner {
-    match result {
-        Ok(ResolveOutcome::Done {
-            note: None,
-            committed,
-            pushed,
-            ..
-        }) => OutcomeBanner {
-            // keep_source runs no commit phase, so only advertise the
-            // commit/push when they actually happened.
-            text: if *committed && *pushed {
-                format!("{} · committed & pushed", action.verb()).into()
-            } else {
-                action.verb().into()
-            },
-            tint: BannerTint::Ok,
-            undoable: true,
-        },
-        Ok(ResolveOutcome::Done {
-            note: Some(note), ..
-        }) => OutcomeBanner {
-            text: format!("{} · {note}", action.verb()).into(),
-            tint: BannerTint::Drift,
-            undoable: true,
-        },
-        Ok(ResolveOutcome::NeedsMergeEditor) => OutcomeBanner {
-            text: "Templated file · use the merge editor".into(),
-            tint: BannerTint::Drift,
-            undoable: false,
-        },
-        // Defensive: only `resolve_merged` produces this, and the merge
-        // editor (Plan 7 Task 3) reports it through its own flow.
-        Ok(ResolveOutcome::ProtectedSpan { .. }) => OutcomeBanner {
-            text: "This change touches a templated value · open the merge editor".into(),
-            tint: BannerTint::Drift,
-            undoable: false,
-        },
-        Err(e) => OutcomeBanner {
-            text: format!("{} failed: {e}", action.button_label(split)).into(),
-            tint: BannerTint::Conflict,
-            undoable: false,
-        },
+/// pressed it: with two "Keep source …" buttons on screen, a refusal that
+/// says only "Keep source failed" leaves them guessing which one it was. Same
+/// sentence shape as the queue's own failures, so the two read alike wherever
+/// they land.
+fn refused_banner(action: ResolveAction, split: bool, why: &str) -> OutcomeBanner {
+    OutcomeBanner {
+        text: format!("{} failed: {why}", action.button_label(split)).into(),
+        tint: BannerTint::Conflict,
+        undoable: false,
     }
 }
 
-/// The banner a decision earns when it LANDS out of the queue, or `None` for
-/// one that has no business banner-ing.
+/// The banner a decision earns when it LANDS — or `None`, which is most of
+/// the possible answers.
 ///
-/// EXACTLY THE MERGE EDITOR'S SAVE, and for one reason: it is the only
-/// decision that leaves a claim on screen that this has to come back and
-/// settle. `MergeView::save` routes the user to Review under "Save queued ·
-/// <file>", and that sentence is still true only until the queue gets to it —
-/// after that it is stale whichever way the save went, so success, refusal
-/// and failure all have to replace it.
+/// SUCCESSES ONLY, and that is what the banner is FOR: it carries the Undo
+/// button, and its sentence has to name what that button would revert. Undo
+/// is per file (spec §2.3) and `ResolveEngine::undo_last` reverts the LAST
+/// FINISHED journal session, which for a batch is its last item
+/// (`resolve_batch` ends one session per file in batch order). So
+/// [`super::Shell::batch_finished`] emits one of these per landed target, in
+/// result order, and the last wins — naming an earlier one would put the
+/// button over the wrong file's name.
 ///
-/// Every other decision gets `None`, and that is not an oversight:
-/// - a one-click decision's ROW is its feedback. It leaves the list when it
-///   lands, and by then the user is three files further on (the reason Task 4
-///   dropped the banner for these in the first place). Banner-ing them again
-///   would also mean the last file of a sweep silently overwrites whatever
-///   the banner was saying — a roll-back report, an undo's result;
-/// - a FAILURE sticks to its row (spec §2.5), where choosing again is the
-///   retry;
-/// - a dashboard quick action says so out of band, where its user is.
+/// A FAILURE — an `Err`, a templated refusal, a protected span — gets `None`.
+/// Its home is the row (spec §2.5: "a failed row shows the message in place,
+/// its buttons re-enable, and choosing again retries"), which is where the
+/// retry is and where it survives until the file is answered or stops
+/// drifting. Putting it in the banner as well would give it a second, shorter
+/// life AND take the banner away from the last thing that really landed,
+/// leaving Undo pointing at a file the sentence above it does not name.
 ///
-/// The staged repo conflict is the one arm that comes back `None` from inside
-/// the merge editor's own decisions: it has not landed anywhere yet, and the
-/// merge's own conclusion ([`Shell::conclude_staged_merge`]) is its banner.
+/// A staged repo conflict is `None` too: it has not landed anywhere yet, and
+/// its merge's own conclusion ([`super::Shell::conclude_staged_merge`]) is
+/// the banner for it.
 ///
-/// [`Shell::conclude_staged_merge`]: super::Shell
+/// Keyed by [`Decision`] rather than by [`ResolveAction`] — half the
+/// decisions the queue runs (a merge-editor Save, "Keep both") are not one of
+/// Review's three buttons at all. [`Decision::verb`] is the shared
+/// vocabulary: what the choice DID, in the user's own words.
 pub(super) fn queued_outcome_banner(
     decision: &Decision,
+    target: &Path,
     result: &Result<super::BatchResult, ResolveError>,
 ) -> Option<OutcomeBanner> {
-    if !matches!(
-        decision,
-        Decision::Merged { .. } | Decision::RepoConflict { .. }
-    ) {
+    let Ok(super::BatchResult::Resolved(ResolveOutcome::Done {
+        committed,
+        pushed,
+        note,
+        ..
+    })) = result
+    else {
         return None;
-    }
-    let outcome = match result {
-        Ok(super::BatchResult::Resolved(outcome)) => outcome,
-        // Recorded into the merge's index. What that MEANT — committed,
-        // still conflicted — is the merge's conclusion to report.
-        Ok(super::BatchResult::RepoConflictStaged) => return None,
-        Err(e) => {
-            return Some(OutcomeBanner {
-                // The user's own word for the button, as the row uses it: the
-                // banner still says "Save queued" until this replaces it.
-                text: format!("{} failed: {e}", decision.label()).into(),
-                tint: BannerTint::Conflict,
-                undoable: false,
-            });
-        }
     };
-    Some(match outcome {
-        ResolveOutcome::Done {
-            note: None,
-            committed,
-            pushed,
-            ..
-        } => OutcomeBanner {
-            // An apply-only convergence commits nothing, so only advertise
-            // the commit and the push when they actually happened.
+    // NAMES THE FILE, always. The banner renders under the SELECTED file's
+    // header, and spec §2.6 makes the two different by design: confirming a
+    // file advances the selection to the next one that still needs an answer,
+    // so by the time this lands the user is looking at a different file
+    // entirely. Without the name, "Kept disk version · committed & pushed"
+    // above a live Undo reads as a statement about whatever is on screen —
+    // while Undo reverts the file this sentence is actually about.
+    let name = display_name(target);
+    Some(match note {
+        // An apply-only convergence commits nothing, so only advertise the
+        // commit and the push when they actually happened.
+        None => OutcomeBanner {
             text: if *committed && *pushed {
-                format!("{} · committed & pushed", decision.verb()).into()
+                format!("{} · {name} · committed & pushed", decision.verb()).into()
             } else {
-                decision.verb().to_lowercase().into()
+                format!("{} · {name}", decision.verb()).into()
             },
             tint: BannerTint::Ok,
             undoable: true,
         },
-        ResolveOutcome::Done {
-            note: Some(note), ..
-        } => OutcomeBanner {
-            text: format!("{} · {note}", decision.verb()).into(),
+        // The resolution landed; the commit or push degraded. Still undoable
+        // — the session exists either way.
+        Some(note) => OutcomeBanner {
+            text: format!("{} · {name} · {note}", decision.verb()).into(),
             tint: BannerTint::Drift,
             undoable: true,
-        },
-        ResolveOutcome::ProtectedSpan { detail } => OutcomeBanner {
-            text: format!("This change touches a templated value · {detail}").into(),
-            tint: BannerTint::Drift,
-            undoable: false,
-        },
-        // Defensive: `resolve_merged` never reports this outcome.
-        ResolveOutcome::NeedsMergeEditor => OutcomeBanner {
-            text: "Unexpected engine outcome · nothing was changed".into(),
-            tint: BannerTint::Drift,
-            undoable: false,
         },
     })
 }
@@ -946,20 +907,22 @@ pub(super) enum UndoAffordance {
 /// Why the selected file's decision buttons (and its "Open merge editor")
 /// are inert, or `None` when they are live.
 ///
-/// Both reasons are about THIS file — every other file's buttons stay live
-/// while this one's work drains, which is the whole point of the queue
-/// (spec §1.1) — and the queue reason is RUNNING, not merely queued: a
-/// pending decision can still be changed, and `ActionQueue::push` replaces
-/// it (spec §2.4). Pure so that rule is a value a test can assert, rather
-/// than something only a tooltip in a screenshot could show.
-pub(super) fn blocked_reason(
-    engine_ready: bool,
-    queue: &QueueSnapshot,
-    target: &Path,
-) -> Option<SharedString> {
-    if !engine_ready {
-        return Some("daemon not connected".into());
-    }
+/// ONE reason, and it is about THIS file: its decision is already RUNNING.
+/// Every other file's buttons stay live while this one's work drains, which
+/// is the whole point of the queue (spec §1.1), and RUNNING is not the same
+/// as queued — a pending decision can still be changed, and
+/// `ActionQueue::push` replaces it (spec §2.4).
+///
+/// A MISSING DAEMON IS NOT A REASON. It was, and that was the same mistake
+/// the `in_flight` booleans were: refusing to remember a decision because it
+/// cannot run this second. Parking is the queue's model — `Shell::pump`
+/// leaves everything queued when no engine is published and the connect latch
+/// in `Shell::render` releases it on the next (re)connect — so the press is
+/// recorded, the row reads "queued", and it runs when the daemon is back.
+///
+/// Pure so that rule is a value a test can assert, rather than something only
+/// a tooltip in a screenshot could show.
+pub(super) fn blocked_reason(queue: &QueueSnapshot, target: &Path) -> Option<SharedString> {
     if queue.locks_row(target) {
         return Some("applying this file's decision now".into());
     }
@@ -1216,14 +1179,10 @@ impl ReviewView {
                     // The button only exists when origin's content loaded,
                     // so this is structural — and still reported rather than
                     // dropped, in the same words the engine would use.
-                    self.last_outcome = Some(outcome_banner(
+                    self.last_outcome = Some(refused_banner(
                         action,
                         true,
-                        &Err(ResolveError::Failed(
-                            "no origin version was loaded for this file — open it in \
-                             Review first"
-                                .into(),
-                        )),
+                        "no origin version was loaded for this file — open it in Review first",
                     ));
                     cx.notify();
                     return;
@@ -1375,9 +1334,25 @@ impl ReviewView {
             .ok();
     }
 
-    /// "Open merge editor" — live when the engine global exists (`detail()`
-    /// already implies a selection). Goes through the shared button so it
-    /// obeys the surface rule like everything else; it was hand-rolled with
+    /// "Open merge editor" — live unless this file's decision is running
+    /// (`detail()` already implies a selection).
+    ///
+    /// No daemon check, and that is a real trade-off rather than an
+    /// oversight. `MergeView::load` DOES use the engine when one exists: it
+    /// asks whether an open merge with origin left this file conflicted, and
+    /// if so reads the panes from the merge's index stages instead of from a
+    /// working tree holding git's marker text. With no engine that question
+    /// cannot be asked, so on a stranded mid-merge repo the editor opens with
+    /// panes derived from the markers — fiction. It is CONTAINED, not
+    /// harmless: the Save that fiction would produce is refused by
+    /// `ResolveEngine::resolve_merged`, which re-checks `is_mid_merge_conflict`
+    /// and fails the decision on its row with "reopen it in the merge editor".
+    /// Nothing is written. Gating the button instead would refuse every
+    /// ordinary merge for a state that requires both an open merge AND no
+    /// daemon.
+    ///
+    /// Goes through the shared button so it obeys the surface rule like
+    /// everything else; it was hand-rolled with
     /// a full-strength `theme.text` outline, which read far louder than the
     /// secondary action it is (2026-08-25).
     fn merge_editor_button(
@@ -1704,12 +1679,7 @@ impl ReviewView {
         } else {
             theme.class_color(&entry.class)
         };
-        let name: SharedString = entry
-            .target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| entry.target.display().to_string())
-            .into();
+        let name = display_name(&entry.target);
         // A processing row's trailing column goes BLANK: how long the file
         // has been drifted stopped being the interesting fact about it the
         // moment a decision was recorded, and what replaced it — the choice
@@ -1807,17 +1777,10 @@ impl ReviewView {
         let Some(selected) = self.selected.as_deref() else {
             return centered_note(theme, "select a file to review".into(), theme.text_muted);
         };
-        let name: SharedString = selected
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| selected.display().to_string())
-            .into();
+        let name = display_name(selected);
         let path: SharedString =
             super::dashboard::shorten_home(&selected.display().to_string()).into();
 
-        let engine_ready = cx
-            .try_global::<crate::EngineSlot>()
-            .is_some_and(|slot| slot.0.is_some());
         let is_conflict = self
             .state
             .read(cx)
@@ -1831,7 +1794,7 @@ impl ReviewView {
         // yet observed) case where the two disagreed about the file.
         // Authoritative: origin's LOADED content, not the scan's hint.
         let split = self.origin_diffs.is_some();
-        let blocked = blocked_reason(engine_ready, queue, selected);
+        let blocked = blocked_reason(queue, selected);
         let mut header_actions: Vec<AnyElement> = Vec::new();
         header_actions.push(
             self.action_button(ResolveAction::KeepDisk, split, blocked.clone(), theme, cx)
@@ -2294,9 +2257,9 @@ mod tests {
     use super::{
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
         QueuedDecision, QueuedStatus, ResolveAction, SidebarRow, UndoAffordance, blocked_reason,
-        flatten_document, next_after, origin_diffs, origin_hint, outcome_banner, per_line_ranges,
-        preview_decors, queued_outcome_banner, severity_groups, sidebar_rows, source_actions,
-        undo_affordance, undo_banner,
+        display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
+        preview_decors, queued_outcome_banner, refused_banner, severity_groups, sidebar_rows,
+        source_actions, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -2412,30 +2375,29 @@ mod tests {
         assert_eq!(DiffPair::LocalVsOrigin.tint(theme), theme.remote);
     }
 
+    /// A press this view refuses outright names the button that was pressed —
+    /// and with two "Keep source …" buttons on screen, WHICH one.
     #[test]
-    fn a_failed_source_action_names_the_button_that_failed() {
-        let gone = || Err(ResolveError::Failed("daemon gone".into()));
+    fn a_refused_source_action_names_the_button_that_was_pressed() {
+        let why = "daemon gone";
         // Unsplit: one "Keep source" button, so the plain name is unambiguous.
         assert_eq!(
-            outcome_banner(ResolveAction::KeepSourceLocal, false, &gone())
+            refused_banner(ResolveAction::KeepSourceLocal, false, why)
                 .text
                 .as_ref(),
             "Keep source failed: daemon gone"
         );
-        // Split: two "Keep source …" buttons were on screen — the banner has
-        // to say which one the user pressed.
+        // Split: two were on screen — the banner has to disambiguate.
         assert_eq!(
-            outcome_banner(ResolveAction::KeepSourceLocal, true, &gone())
+            refused_banner(ResolveAction::KeepSourceLocal, true, why)
                 .text
                 .as_ref(),
             "Keep source · this machine failed: daemon gone"
         );
-        assert_eq!(
-            outcome_banner(ResolveAction::KeepSourceOrigin, true, &gone())
-                .text
-                .as_ref(),
-            "Keep source · origin failed: daemon gone"
-        );
+        let b = refused_banner(ResolveAction::KeepSourceOrigin, true, why);
+        assert_eq!(b.text.as_ref(), "Keep source · origin failed: daemon gone");
+        assert_eq!(b.tint, BannerTint::Conflict);
+        assert!(!b.undoable, "nothing ran, so there is nothing to undo");
     }
 
     #[test]
@@ -2667,32 +2629,25 @@ mod tests {
     fn only_a_running_decision_locks_its_file_out_of_being_re_chosen() {
         let a = Path::new("/a");
         assert_eq!(
-            blocked_reason(true, &QueueSnapshot::default(), a),
+            blocked_reason(&QueueSnapshot::default(), a),
             None,
             "nothing owed: live"
         );
         assert_eq!(
-            blocked_reason(true, &posed_queue(&[], &["/a"], true), a),
+            blocked_reason(&posed_queue(&[], &["/a"], true), a),
             None,
             "queued but not started: still answerable, and choosing again replaces it"
         );
         assert_eq!(
-            blocked_reason(true, &posed_queue(&["/a"], &[], true), a)
+            blocked_reason(&posed_queue(&["/a"], &[], true), a)
                 .map(|r| r.to_string())
                 .unwrap_or_default(),
             "applying this file's decision now"
         );
         // Another file's work never blocks this one — the user's complaint.
         assert_eq!(
-            blocked_reason(true, &posed_queue(&["/other"], &["/third"], true), a),
+            blocked_reason(&posed_queue(&["/other"], &["/third"], true), a),
             None
-        );
-        // No daemon still outranks everything: nothing can run at all.
-        assert_eq!(
-            blocked_reason(false, &QueueSnapshot::default(), a)
-                .map(|r| r.to_string())
-                .unwrap_or_default(),
-            "daemon not connected"
         );
         // The rule itself, which the row and the header both read.
         assert!(QueuedStatus::Running.locks_row());
@@ -3000,23 +2955,26 @@ mod tests {
 
     /// What the QUEUE says when a decision lands, minutes after the click.
     ///
-    /// Only the merge editor's Save gets a banner, and it must: that surface
-    /// left "Save queued · <file>" on screen, and that sentence goes stale
-    /// the moment the queue reaches it — whichever way it went. Everything
-    /// else stays silent, because its row IS its report and because the last
-    /// file of a thirty-file sweep would otherwise silently overwrite
-    /// whatever the banner was saying (a roll-back's result, an undo's).
+    /// A SUCCESS reports itself, whichever surface made it, in that
+    /// decision's own words — and undoably, because the banner carries the
+    /// Undo button and `undo_last` reverts exactly that session.
     ///
-    /// MUTATION: return a banner for `Decision::KeepDisk` too → the last two
-    /// assertions fail, and a keep-disk landing after a roll-back would
-    /// replace "Merge with origin rolled back" with "Kept disk version".
-    /// MUTATION: return `None` for the `Err` arm → a failed save leaves
-    /// "Save queued" up forever, claiming something that did not happen.
+    /// EVERYTHING ELSE stays silent here. A failure's home is its row (spec
+    /// §2.5), which is where the retry is; banner-ing it as well would take
+    /// the banner away from the last thing that really landed and leave Undo
+    /// pointing at a file the sentence above it does not name.
+    ///
+    /// MUTATION: banner the `Err` arm (or the templated / protected-span
+    /// arms) → the `None` assertions below fail, and a failure landing after
+    /// a success would clear that success's undoable banner.
+    /// MUTATION: return `None` for `Decision::KeepDisk` (the narrowing that
+    /// was rejected) → the one-click cases fail, and a sweep after a merge
+    /// save would leave the save's banner over an Undo that reverts the
+    /// sweep's last file.
     #[test]
-    fn only_a_merge_save_reports_itself_when_it_lands() {
-        let merged = || Decision::Merged {
-            resolved: "x".into(),
-            inputs: std::sync::Arc::new(tomte_app::merge_inputs::MergeInputs {
+    fn a_landed_success_reports_itself_and_a_failure_stays_on_its_row() {
+        let inputs = || {
+            std::sync::Arc::new(tomte_app::merge_inputs::MergeInputs {
                 target: PathBuf::from("/a"),
                 ours: String::new(),
                 theirs: String::new(),
@@ -3026,67 +2984,121 @@ mod tests {
                 template: None,
                 span_map: None,
                 origin: None,
-            }),
+            })
+        };
+        let merged = || Decision::Merged {
+            resolved: "x".into(),
+            inputs: inputs(),
         };
         let ok = |o: ResolveOutcome| Ok(BatchResult::Resolved(o));
+        // A file whose name is NOT the one the banner renders under: the
+        // auto-advance (spec §2.6) has moved the selection on by the time
+        // this lands, so the name is the only thing tying the sentence — and
+        // the Undo button under it — to a file.
+        let t = Path::new("/Users/x/.config/nushell/env.nu");
 
-        let b = queued_outcome_banner(&merged(), &ok(done(true, true, None)))
-            .expect("the save that left \"Save queued\" up has to settle it");
-        assert_eq!(b.text.as_ref(), "Merged · committed & pushed");
+        // The merge editor's Save.
+        let b = queued_outcome_banner(&merged(), t, &ok(done(true, true, None))).expect("landed");
+        assert_eq!(b.text.as_ref(), "Merged · env.nu · committed & pushed");
         assert_eq!(b.tint, BannerTint::Ok);
         assert!(b.undoable);
 
-        let b = queued_outcome_banner(&merged(), &ok(done(true, false, Some("push failed"))))
-            .expect("a degraded commit is still a landing");
-        assert_eq!(b.text.as_ref(), "Merged · push failed");
+        // A one-click decision reports itself too: its row is gone from the
+        // model by the time this is read, so the banner is the only place
+        // "committed & pushed" is ever said — and the only honest home for
+        // the Undo button that reverts it.
+        let b = queued_outcome_banner(&Decision::KeepDisk, t, &ok(done(true, true, None)))
+            .expect("landed");
+        assert_eq!(
+            b.text.as_ref(),
+            "Kept disk version · env.nu · committed & pushed"
+        );
+        assert!(b.undoable, "its session is exactly what Undo reverts");
+
+        // Keep-source applies and commits nothing: no claim of a push, and
+        // the name still has to be there.
+        let b = queued_outcome_banner(&Decision::KeepSourceLocal, t, &ok(done(false, false, None)))
+            .expect("landed");
+        assert_eq!(b.text.as_ref(), "Restored chezmoi's version · env.nu");
+
+        // keep_source_origin routes through `resolve_merged`, so it DOES have
+        // a commit phase — unlike its local twin.
+        let b = queued_outcome_banner(
+            &Decision::KeepSourceOrigin {
+                seen: "a=origin\n".into(),
+            },
+            t,
+            &ok(done(true, true, None)),
+        )
+        .expect("landed");
+        assert_eq!(
+            b.text.as_ref(),
+            "Restored origin's version · env.nu · committed & pushed"
+        );
+
+        // A degraded commit still landed, so it is still undoable — and the
+        // note goes AFTER the name, so the file is never buried.
+        let b = queued_outcome_banner(&merged(), t, &ok(done(true, false, Some("push failed"))))
+            .expect("landed");
+        assert_eq!(b.text.as_ref(), "Merged · env.nu · push failed");
         assert_eq!(b.tint, BannerTint::Drift);
         assert!(b.undoable, "the merge itself succeeded");
 
-        let b = queued_outcome_banner(
-            &merged(),
-            &ok(ResolveOutcome::ProtectedSpan {
-                detail: "edit at rendered bytes 8..13 touches a protected template span".into(),
-            }),
-        )
-        .expect("a refusal must replace the queued claim too");
+        // The name is the row's, never the path.
+        assert_eq!(display_name(t).as_ref(), "env.nu");
+
+        // Nothing landed: every one of these lives on its row instead.
         assert!(
-            b.text
-                .starts_with("This change touches a templated value · "),
-            "text: {}",
-            b.text
+            queued_outcome_banner(
+                &merged(),
+                t,
+                &Err(ResolveError::Failed("daemon gone".into()))
+            )
+            .is_none(),
+            "a failure belongs on its row, where the retry is (spec §2.5)"
         );
-        assert!(!b.undoable, "nothing was mutated");
-
-        let b = queued_outcome_banner(&merged(), &Err(ResolveError::Failed("daemon gone".into())))
-            .expect("a failed save must not leave \"Save queued\" standing");
-        assert_eq!(b.text.as_ref(), "Save failed: daemon gone");
-        assert_eq!(b.tint, BannerTint::Conflict);
-        assert!(!b.undoable);
-
-        // A staged repo conflict has not landed anywhere: the merge's own
-        // conclusion is what reports it.
+        assert!(
+            queued_outcome_banner(
+                &Decision::KeepBoth {
+                    resolved: "x".into(),
+                    inputs: inputs(),
+                },
+                t,
+                &Err(ResolveError::Failed("daemon gone".into())),
+            )
+            .is_none()
+        );
+        assert!(
+            queued_outcome_banner(
+                &Decision::KeepDisk,
+                t,
+                &ok(ResolveOutcome::NeedsMergeEditor)
+            )
+            .is_none(),
+            "a templated file's refusal is a row message, not a landing"
+        );
+        assert!(
+            queued_outcome_banner(
+                &merged(),
+                t,
+                &ok(ResolveOutcome::ProtectedSpan {
+                    detail: "edit at rendered bytes 8..13 touches a protected span".into(),
+                }),
+            )
+            .is_none(),
+            "nothing was mutated, so there is nothing to report as landed"
+        );
         assert!(
             queued_outcome_banner(
                 &Decision::RepoConflict {
                     source_path: PathBuf::from("/src/a"),
                     resolved: "x".into(),
                 },
+                t,
                 &Ok(BatchResult::RepoConflictStaged),
             )
-            .is_none()
-        );
-
-        // The one-click decisions: their row leaving the list is the report.
-        assert!(
-            queued_outcome_banner(&Decision::KeepDisk, &ok(done(true, true, None))).is_none(),
-            "a one-click decision must not banner: by the time it lands the \
-             user is three files on, and it would overwrite whatever the \
-             banner was actually saying"
-        );
-        assert!(
-            queued_outcome_banner(&Decision::KeepDisk, &Err(ResolveError::Failed("x".into())))
-                .is_none(),
-            "its failure sticks to its row (spec §2.5), where choosing again is the retry"
+            .is_none(),
+            "staged into the merge: its conclusion is the banner for it"
         );
     }
 
@@ -3097,108 +3109,6 @@ mod tests {
             pushed,
             note: note.map(str::to_owned),
         }
-    }
-
-    #[test]
-    fn outcome_banner_full_success_is_ok_tinted_and_undoable() {
-        // keep_disk: commit phase ran and fully succeeded
-        let b = outcome_banner(ResolveAction::KeepDisk, false, &Ok(done(true, true, None)));
-        assert_eq!(b.text.as_ref(), "Kept disk version · committed & pushed");
-        assert_eq!(b.tint, BannerTint::Ok);
-        assert!(b.undoable);
-
-        // keep_source: no commit phase — the banner must not claim one
-        let b = outcome_banner(
-            ResolveAction::KeepSourceLocal,
-            false,
-            &Ok(done(false, false, None)),
-        );
-        assert_eq!(b.text.as_ref(), "Restored chezmoi's version");
-        assert_eq!(b.tint, BannerTint::Ok);
-        assert!(b.undoable);
-    }
-
-    #[test]
-    fn outcome_banner_names_origin_when_origin_won() {
-        // keep_source_origin routes through resolve_merged, so it DOES have
-        // a commit phase — unlike its local twin.
-        let b = outcome_banner(
-            ResolveAction::KeepSourceOrigin,
-            true,
-            &Ok(done(true, true, None)),
-        );
-        assert_eq!(
-            b.text.as_ref(),
-            "Restored origin's version · committed & pushed"
-        );
-        assert_eq!(b.tint, BannerTint::Ok);
-        assert!(b.undoable);
-
-        let b = outcome_banner(
-            ResolveAction::KeepSourceOrigin,
-            true,
-            &Err(ResolveError::Failed(
-                ".zshrc has no version at origin/main that differs from this machine's source"
-                    .into(),
-            )),
-        );
-        assert_eq!(
-            b.text.as_ref(),
-            "Keep source · origin failed: .zshrc has no version at origin/main that \
-             differs from this machine's source"
-        );
-        assert_eq!(b.tint, BannerTint::Conflict);
-        assert!(!b.undoable);
-    }
-
-    #[test]
-    fn outcome_banner_degraded_commit_shows_note_in_drift_tint() {
-        let b = outcome_banner(
-            ResolveAction::KeepDisk,
-            false,
-            &Ok(done(true, false, Some("push failed: locked"))),
-        );
-        assert_eq!(b.text.as_ref(), "Kept disk version · push failed: locked");
-        assert_eq!(b.tint, BannerTint::Drift);
-        assert!(b.undoable, "the resolution itself succeeded");
-    }
-
-    #[test]
-    fn outcome_banner_templated_and_error_are_not_undoable() {
-        let b = outcome_banner(
-            ResolveAction::KeepDisk,
-            false,
-            &Ok(ResolveOutcome::NeedsMergeEditor),
-        );
-        assert_eq!(b.text.as_ref(), "Templated file · use the merge editor");
-        assert_eq!(b.tint, BannerTint::Drift);
-        assert!(!b.undoable);
-
-        let b = outcome_banner(
-            ResolveAction::KeepSourceLocal,
-            false,
-            &Err(ResolveError::Failed("daemon gone".into())),
-        );
-        assert_eq!(b.text.as_ref(), "Keep source failed: daemon gone");
-        assert_eq!(b.tint, BannerTint::Conflict);
-        assert!(!b.undoable);
-    }
-
-    #[test]
-    fn outcome_banner_protected_span_uses_the_plan_copy() {
-        let b = outcome_banner(
-            ResolveAction::KeepDisk,
-            false,
-            &Ok(ResolveOutcome::ProtectedSpan {
-                detail: "edit at rendered bytes 8..13 touches a protected template span".into(),
-            }),
-        );
-        assert_eq!(
-            b.text.as_ref(),
-            "This change touches a templated value · open the merge editor"
-        );
-        assert_eq!(b.tint, BannerTint::Drift);
-        assert!(!b.undoable, "nothing was mutated — nothing to undo");
     }
 
     #[test]

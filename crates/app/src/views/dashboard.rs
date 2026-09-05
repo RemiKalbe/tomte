@@ -175,6 +175,15 @@ pub struct DashboardView {
     pub pending_repo_op: Option<RepoOpKind>,
     /// `Shell::running_repo_op`: the one that IS running.
     pub running_repo_op: Option<RepoOpKind>,
+    /// The targets whose decision is in flight under the latch, from
+    /// `Shell::queue.running()`. Their quick actions go inert — a second press
+    /// cannot replace a decision that has already started, it can only queue a
+    /// duplicate (see `quick_action_button`).
+    ///
+    /// Copied, like everything else here: the dashboard body is rebuilt from
+    /// Shell state on every render and cannot borrow the Shell entity from
+    /// inside its own render.
+    pub running: Vec<PathBuf>,
 }
 
 /// The Finish button's label and whether it is live, for one repo-op state.
@@ -260,15 +269,15 @@ impl DashboardView {
 
         let lines: Rc<Vec<Line>> = Rc::new(build_lines(model, now, &expanded));
         let shell = cx.weak_entity();
-        // Resolve engine for the inline quick actions: None (disconnected /
-        // not yet built) renders them disabled.
+        // The engine, for the two things on this screen that still call it
+        // directly: the origin tile's "Fetch now" and the degraded banner's
+        // 1Password unlock. NOT the quick actions — those record a
+        // `Decision` on the queue and never touch the engine, which is why
+        // they stay live with no daemon (the press parks).
         let engine = cx
             .try_global::<crate::EngineSlot>()
             .and_then(|slot| slot.0.clone());
-        // The quick actions no longer RUN anything, so they need the engine
-        // only as a readiness flag: with nothing connected a decision could
-        // only park, and this surface has no processing row to show that.
-        let engine_ready = engine.is_some();
+        let running = Rc::new(self.running);
         let unlock_in_flight = self.unlock_in_flight;
         let pending_merge = self.pending_merge;
         let (finish_label, finish_live) = finish_button_state(
@@ -543,9 +552,7 @@ impl DashboardView {
                     lines.len(),
                     move |range, _window, _cx| {
                         range
-                            .map(|ix| {
-                                render_line(ix, &lines[ix], theme, shell.clone(), engine_ready)
-                            })
+                            .map(|ix| render_line(ix, &lines[ix], theme, shell.clone(), &running))
                             .collect()
                     },
                 )
@@ -770,7 +777,7 @@ fn render_line(
     line: &Line,
     theme: Theme,
     shell: WeakEntity<Shell>,
-    engine_ready: bool,
+    running: &[PathBuf],
 ) -> gpui::AnyElement {
     match line {
         Line::Group {
@@ -844,7 +851,15 @@ fn render_line(
             let quick = (*drifted)
                 .then_some(target.as_ref())
                 .flatten()
-                .map(|target| quick_actions(ix, target, theme, engine_ready, shell.clone()));
+                .map(|target| {
+                    quick_actions(
+                        ix,
+                        target,
+                        theme,
+                        running.iter().any(|r| r == target),
+                        shell.clone(),
+                    )
+                });
             let base = div()
                 .h_7()
                 .w_full()
@@ -937,6 +952,40 @@ fn render_line(
     }
 }
 
+/// The two decisions this surface is able to make.
+///
+/// A TYPE, not a `ResolveAction` with a wildcard arm. Everything here is
+/// built from a timeline row: no file content has been loaded, so "keep
+/// source · origin" — which needs origin's text exactly as it was SHOWN, and
+/// refuses without it — cannot be offered honestly. Spelling that as
+/// `_ => Decision::KeepSourceLocal` would mean the day a third button is
+/// added it silently writes THIS MACHINE's source over the user's file, with
+/// no compile error anywhere. Here a third button is a third variant, and
+/// [`Self::decision`] does not compile until it says what that variant writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuickAction {
+    KeepDisk,
+    KeepSourceLocal,
+}
+
+impl QuickAction {
+    /// The shared button vocabulary — label, id, and the words a failure uses.
+    fn action(self) -> ResolveAction {
+        match self {
+            Self::KeepDisk => ResolveAction::KeepDisk,
+            Self::KeepSourceLocal => ResolveAction::KeepSourceLocal,
+        }
+    }
+
+    /// What this button writes. Total: no wildcard, by construction.
+    fn decision(self) -> Decision {
+        match self {
+            Self::KeepDisk => Decision::KeepDisk,
+            Self::KeepSourceLocal => Decision::KeepSourceLocal,
+        }
+    }
+}
+
 /// The inline quick-action cluster for one drifted row: keep-disk /
 /// keep-source buttons. Outcomes surface as an osascript notification (the
 /// dashboard is transient — no banner, and no processing group either).
@@ -949,7 +998,7 @@ fn quick_actions(
     ix: usize,
     target: &Path,
     theme: Theme,
-    engine_ready: bool,
+    running: bool,
     shell: WeakEntity<Shell>,
 ) -> Div {
     // Ghost until the row is hovered (Zed idiom): the chip carries the
@@ -963,10 +1012,10 @@ fn quick_actions(
         .group_hover("activity-row", |el| el.opacity(1.))
         .child(quick_action_button(
             ix,
-            ResolveAction::KeepDisk,
+            QuickAction::KeepDisk,
             target,
             theme,
-            engine_ready,
+            running,
             shell.clone(),
         ))
         // Row actions carry no origin split: nothing here has loaded the
@@ -976,10 +1025,10 @@ fn quick_actions(
         // does load the content, is where that decision is offered.
         .child(quick_action_button(
             ix,
-            ResolveAction::KeepSourceLocal,
+            QuickAction::KeepSourceLocal,
             target,
             theme,
-            engine_ready,
+            running,
             shell,
         ))
 }
@@ -992,25 +1041,51 @@ fn quick_actions(
 /// draining, on the same git repository. Now it is a [`Decision`] like every
 /// other, and the press returns the instant the choice is remembered.
 ///
-/// `engine_ready` still disables the buttons when nothing is connected,
-/// matching Review's own gating: with no daemon the decision would only park,
-/// and this surface has no processing row to show that it did.
+/// ONE thing makes a button inert: this target's decision is already RUNNING
+/// — the same rule as `review::QueuedStatus::locks_row`, for the same reason.
+/// `ActionQueue::push` replaces a PENDING choice, but it cannot recall one
+/// that is in flight, so a second press would queue a duplicate. That
+/// duplicate is not harmless — it re-adds identical content, commits and
+/// pushes again, and opens a SECOND journal session, which is then the one
+/// Undo reverts. See [`quick_action_blocked`], including why a missing daemon
+/// is not on that list.
+/// Why this row's quick actions are inert, or `None` when they are live.
+///
+/// ONE rule, the same one `review::blocked_reason` applies and in the same
+/// words: this file's decision is already RUNNING, so a second press could
+/// not replace it, only duplicate it.
+///
+/// A MISSING DAEMON IS NOT A REASON, on this surface either. Parking is the
+/// queue's model: `Shell::pump` leaves everything queued when no engine is
+/// published, and the connect latch releases it on the next (re)connect. The
+/// press is recorded and runs when the daemon is back — refusing it would be
+/// the discarded click this whole plan exists to remove.
+///
+/// Pure so the rule is a value a test can assert rather than something only a
+/// tooltip in a screenshot could show.
+pub(super) fn quick_action_blocked(running: bool) -> Option<SharedString> {
+    if running {
+        return Some("applying this file's decision now".into());
+    }
+    None
+}
+
 fn quick_action_button(
     ix: usize,
-    action: ResolveAction,
+    action: QuickAction,
     target: &Path,
     theme: Theme,
-    engine_ready: bool,
+    running: bool,
     shell: WeakEntity<Shell>,
 ) -> Stateful<Div> {
-    let id = ElementId::named_usize(action.button_id(), ix);
-    if !engine_ready {
+    let id = ElementId::named_usize(action.action().button_id(), ix);
+    if let Some(reason) = quick_action_blocked(running) {
         return ui::disabled_button(
             theme,
             id,
-            action.label().into(),
+            action.action().label().into(),
             ui::ButtonSize::Micro,
-            Some("daemon not connected".into()),
+            Some(reason),
         )
         .flex_none();
     }
@@ -1018,26 +1093,19 @@ fn quick_action_button(
     ui::button(
         theme,
         id,
-        action.label().into(),
+        action.action().label().into(),
         ui::ButtonVariant::Tonal(theme.accent),
         ui::ButtonSize::Micro,
         move |_event, _window, cx| {
             // The row underneath opens Review on click — quick actions must
             // not also navigate.
             cx.stop_propagation();
-            // No origin split on this surface: nothing here has loaded the
-            // file's content (see `quick_actions`), so the two decisions it
-            // can make are the two that need none.
-            let decision = match action {
-                ResolveAction::KeepDisk => Decision::KeepDisk,
-                _ => Decision::KeepSourceLocal,
-            };
             let target = target.clone();
             let _ = shell.update(cx, |shell, cx| {
                 shell.enqueue(
                     QueuedAction {
                         target,
-                        decision,
+                        decision: action.decision(),
                         // The one surface that asks to be told: this row just
                         // stops being drifted, there is no banner here, and
                         // the answer can be minutes away.
@@ -1063,10 +1131,7 @@ pub(super) fn quick_action_body(
     target: &Path,
     result: &Result<super::BatchResult, ResolveError>,
 ) -> String {
-    let name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| target.display().to_string());
+    let name = super::review::display_name(target);
     let outcome = match result {
         Ok(super::BatchResult::Resolved(outcome)) => outcome,
         // Defensive: only a merge-editor Save stages a repo conflict, and
@@ -1100,7 +1165,10 @@ mod tests {
     use tomte_app::resolve::{ResolveError, ResolveOutcome};
 
     use super::super::{BatchResult, RepoOpKind};
-    use super::{DegradedRemedy, degraded_remedy, finish_button_state, quick_action_body};
+    use super::{
+        DegradedRemedy, QuickAction, degraded_remedy, finish_button_state, quick_action_blocked,
+        quick_action_body,
+    };
 
     fn done(note: Option<&str>) -> Result<BatchResult, ResolveError> {
         Ok(BatchResult::Resolved(ResolveOutcome::Done {
@@ -1210,6 +1278,70 @@ mod tests {
         assert_eq!(
             finish_button_state(Some(RepoOpKind::Undo), None, false),
             ("Finish merge", true)
+        );
+    }
+
+    /// A second press on a target whose decision is already RUNNING must not
+    /// be possible. `ActionQueue::push` replaces a PENDING choice, but it
+    /// cannot recall one in flight, so the press would queue a DUPLICATE: a
+    /// no-op re-add, a second commit and push, and a second journal session —
+    /// which is then the one Undo reverts. Review locks such a row
+    /// (`QueuedStatus::locks_row`); this surface has to do the same.
+    ///
+    /// Only RUNNING, not merely queued: a pending decision can still be
+    /// changed, and re-choosing it is how a mis-click is corrected (spec
+    /// §2.4). The dashboard passes `running` from `Shell::queue.running()`,
+    /// which holds exactly the batch under the latch.
+    ///
+    /// MUTATION: drop the `running` arm → the second case goes live and a
+    /// double press duplicates the decision. MUTATION: pass the whole
+    /// `processing` list instead of `running` → a queued row goes dead and a
+    /// mis-click becomes uncorrectable.
+    #[test]
+    fn a_quick_action_is_inert_while_that_files_decision_is_running() {
+        assert_eq!(quick_action_blocked(false), None, "idle: live");
+        assert_eq!(
+            quick_action_blocked(true).map(|r| r.to_string()),
+            Some("applying this file's decision now".to_string()),
+            "in flight under the latch: a second press could only duplicate it"
+        );
+    }
+
+    /// The dashboard offers exactly the two decisions it can make HONESTLY,
+    /// and each writes what its label says.
+    ///
+    /// This surface builds its buttons from a timeline row and has loaded no
+    /// file content, so "keep source · origin" — which needs origin's text as
+    /// it was SHOWN, and refuses without it — cannot be among them. The
+    /// mapping used to be `_ => Decision::KeepSourceLocal`: a third button
+    /// added later would have silently written THIS MACHINE's source over the
+    /// user's file, with no compile error anywhere.
+    ///
+    /// THE EXHAUSTIVENESS GUARD IS THE COMPILER'S, NOT THIS TEST'S. Neither
+    /// `action` nor `decision` has a wildcard arm, so a new `QuickAction`
+    /// variant is `error[E0004]` at both sites until it says what it renders
+    /// and what it writes. A wildcard added back would compile and pass here,
+    /// and no test can change that — what this test pins is the OTHER half:
+    /// that the two variants which exist map to the decision their label
+    /// promises, so a mapping swapped by hand is caught.
+    ///
+    /// MUTATION: swap the two arms of `decision` (or route either through a
+    /// wildcard that changes what it writes) → this fails.
+    #[test]
+    fn the_dashboards_two_quick_actions_write_what_their_labels_say() {
+        assert!(matches!(
+            QuickAction::KeepDisk.decision(),
+            Decision::KeepDisk
+        ));
+        assert_eq!(QuickAction::KeepDisk.action().label(), "Keep disk");
+        assert!(matches!(
+            QuickAction::KeepSourceLocal.decision(),
+            Decision::KeepSourceLocal
+        ));
+        assert_eq!(
+            QuickAction::KeepSourceLocal.action().label(),
+            "Keep source",
+            "the row has no origin split to disambiguate against"
         );
     }
 }

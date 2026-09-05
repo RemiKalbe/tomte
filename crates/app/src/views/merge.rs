@@ -35,7 +35,7 @@ use tomte_core::template::anchor::{SpanMap, SpanOrigin};
 use tomte_ui::components as ui;
 
 use super::review::{
-    BannerTint, OutcomeBanner, centered_note, display_text, journal_path, message_box,
+    BannerTint, OutcomeBanner, centered_note, display_name, display_text, journal_path, message_box,
 };
 use super::{Route, Shell};
 
@@ -1685,10 +1685,7 @@ impl MergeView {
         self.cancel_armed = None;
         cx.notify();
 
-        let name = target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| target.display().to_string());
+        let name = display_name(&target);
         let shell = self.shell.clone();
         cx.spawn(async move |_this, cx| {
             let _ = cx.update(|cx| {
