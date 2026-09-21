@@ -4,7 +4,7 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
-## Unreleased
+## 0.1.20 — 2026-09-21
 
 ### Fixed
 
