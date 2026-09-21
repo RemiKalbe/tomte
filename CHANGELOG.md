@@ -4,6 +4,28 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## Unreleased
+
+### Fixed
+
+- **Keep disk works on templated files.** A file whose source is a `.tmpl`
+  answered every "Keep disk" with "templated · use the merge editor", so a
+  program rewriting its own config sent you into the editor to click "disk"
+  on each region by hand. Keep disk now does what those clicks do: the
+  on-disk text is written back into the template's literal segments,
+  verified by re-rendering, then committed and pushed — in the same batch
+  and the same commit as the plain files around it. What is refused now is
+  only what the template's literal text cannot express — a disk edit inside
+  a templated value (an expression's rendered text), or one with no literal
+  home to land in — and the row says which; the merge editor remains the
+  place to decide those. Keep source never needed the editor for a template
+  and still does not.
+- **Undo reverts the last thing that landed.** A write-back the app refused
+  left a finished journal entry behind, and Undo, which took the newest
+  entry, would "revert" that no-op instead of the last real change —
+  shadowing it. Refused attempts are now skipped, so Undo always names and
+  reverts the file the banner shows.
+
 ## 0.1.18 — 2026-09-04
 
 ### Changed

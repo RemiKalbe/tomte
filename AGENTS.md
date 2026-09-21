@@ -224,6 +224,11 @@ Hard rules, each one learned the expensive way.
   `single_chezmoi_factory.rs` fails the build on a bypass.
 - `chezmoi re-add` / `apply` with an empty target list means EVERY file;
   `re_add(&[])` and `apply_many(&[])` are hard errors. Keep them so.
+- A templated source (`.tmpl`) is never `re-add`ed: chezmoi silently ignores
+  it. Keep disk on one goes through the template write-back
+  (`resolve_merged_as`), which refuses with `ProtectedSpan` only when the
+  disk text cannot be expressed in the template's literal segments. Undo
+  skips such refused attempts and reverts the last session that landed.
 - Never swallow an error or return a confident zero. Failures are logged
   (`tomte_core::log_error!`) and reach the user: row chip, banner, or
   notification. Degraded says why and what to do; scanning never claims

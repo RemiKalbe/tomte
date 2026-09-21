@@ -75,6 +75,35 @@ pub fn load(
     journal_path: &Path,
     target: &Path,
 ) -> Result<MergeInputs, MergeInputsError> {
+    load_inner(
+        chezmoi,
+        journal_path,
+        target,
+        |source_path, templated, theirs| {
+            load_origin(chezmoi, git, remote_ref, source_path, templated, theirs)
+        },
+    )
+}
+
+/// [`load`] without origin's pane (`origin` is `None`): for the paths that
+/// never read it — a one-click keep-disk on a templated file hands the disk
+/// text to the write-back and looks at nothing else. Saves the `git cat-file`
+/// and, for a template, the render that the origin pane costs per file,
+/// which is what makes it affordable inside a batch.
+pub fn load_local(
+    chezmoi: &ChezmoiClient,
+    journal_path: &Path,
+    target: &Path,
+) -> Result<MergeInputs, MergeInputsError> {
+    load_inner(chezmoi, journal_path, target, |_, _, _| None)
+}
+
+fn load_inner(
+    chezmoi: &ChezmoiClient,
+    journal_path: &Path,
+    target: &Path,
+    origin: impl FnOnce(&Path, bool, &str) -> Option<String>,
+) -> Result<MergeInputs, MergeInputsError> {
     let source_path = chezmoi.source_path(target)?;
     let theirs = String::from_utf8(chezmoi.cat(target)?).map_err(|_| MergeInputsError::Binary)?;
     let ours_bytes = match std::fs::read(target) {
@@ -94,7 +123,7 @@ pub fn load(
     } else {
         (None, None)
     };
-    let origin = load_origin(chezmoi, git, remote_ref, &source_path, templated, &theirs);
+    let origin = origin(&source_path, templated, &theirs);
     Ok(MergeInputs {
         target: target.to_path_buf(),
         ours,

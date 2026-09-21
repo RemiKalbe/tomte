@@ -1143,11 +1143,9 @@ pub(super) fn quick_action_body(
         ResolveOutcome::Done {
             note: Some(note), ..
         } => format!("{}: {name} · {note}", decision.verb()),
-        ResolveOutcome::NeedsMergeEditor => {
-            format!("{name} is templated · use the merge editor")
-        }
-        // Defensive: quick actions never run `resolve_merged`, the only
-        // producer of this outcome.
+        // A templated keep-disk whose on-disk edit changed a templated VALUE:
+        // the write-back refused it, and only the merge editor can say what
+        // that value should be.
         ResolveOutcome::ProtectedSpan { .. } => {
             format!("{name}: this change touches a templated value · open the merge editor")
         }
@@ -1204,14 +1202,6 @@ mod tests {
         assert_eq!(
             quick_action_body(&Decision::KeepSourceLocal, t, &done(Some("push failed"))),
             "Restored chezmoi's version: .zshrc · push failed"
-        );
-        assert_eq!(
-            quick_action_body(
-                &Decision::KeepDisk,
-                t,
-                &Ok(BatchResult::Resolved(ResolveOutcome::NeedsMergeEditor))
-            ),
-            ".zshrc is templated · use the merge editor"
         );
         assert_eq!(
             quick_action_body(

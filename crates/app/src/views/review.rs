@@ -15,9 +15,9 @@
 //! retry — no banner, because by then the user is three files further on.
 //! Undo is a repo-level op on the Shell for the same reason (it writes the
 //! destination files a draining batch reads), and its outcome IS a banner:
-//! it is not about the selected row. "Open merge editor" (conflicts,
-//! templated files) hands the selected target to the Shell's full-window
-//! merge editor (plan 7 Task 3).
+//! it is not about the selected row. "Open merge editor" (conflicts, disk
+//! edits inside a templated value) hands the selected target to the Shell's
+//! full-window merge editor (plan 7 Task 3).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -551,7 +551,7 @@ fn refused_banner(action: ResolveAction, split: bool, why: &str) -> OutcomeBanne
 /// result order, and the last wins — naming an earlier one would put the
 /// button over the wrong file's name.
 ///
-/// A FAILURE — an `Err`, a templated refusal, a protected span — gets `None`.
+/// A FAILURE — an `Err` or a protected-span refusal — gets `None`.
 /// Its home is the row (spec §2.5: "a failed row shows the message in place,
 /// its buttons re-enable, and choosing again retries"), which is where the
 /// retry is and where it survives until the file is answered or stops
@@ -895,7 +895,7 @@ impl QueueSnapshot {
 /// a render tree is not something a test can read back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UndoAffordance {
-    /// This outcome cannot be undone (a failure, a templated refusal, an
+    /// This outcome cannot be undone (a failure, a protected-span refusal, an
     /// undo's own banner).
     None,
     Live,
@@ -2964,8 +2964,8 @@ mod tests {
     /// the banner away from the last thing that really landed and leave Undo
     /// pointing at a file the sentence above it does not name.
     ///
-    /// MUTATION: banner the `Err` arm (or the templated / protected-span
-    /// arms) → the `None` assertions below fail, and a failure landing after
+    /// MUTATION: banner the `Err` arm (or the protected-span
+    /// arm) → the `None` assertions below fail, and a failure landing after
     /// a success would clear that success's undoable banner.
     /// MUTATION: return `None` for `Decision::KeepDisk` (the narrowing that
     /// was rejected) → the one-click cases fail, and a sweep after a merge
@@ -3072,10 +3072,12 @@ mod tests {
             queued_outcome_banner(
                 &Decision::KeepDisk,
                 t,
-                &ok(ResolveOutcome::NeedsMergeEditor)
+                &ok(ResolveOutcome::ProtectedSpan {
+                    detail: "touches a protected template span".into()
+                })
             )
             .is_none(),
-            "a templated file's refusal is a row message, not a landing"
+            "a protected-span refusal is a row message, not a landing"
         );
         assert!(
             queued_outcome_banner(

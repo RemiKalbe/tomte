@@ -437,6 +437,33 @@ impl Journal {
         }
     }
 
+    /// The newest `limit` finished sessions, newest first, as
+    /// `(id, decisions JSON array)`. "Newest" is by id, which is START order:
+    /// a batch starts every item's session before any of them lands, so a
+    /// caller that needs "the last session that actually did something" has
+    /// to read the decisions, not just take the head. Unfinished sessions
+    /// never appear, for the same reason as [`Self::last_finished_session`].
+    pub fn finished_sessions_desc(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(i64, serde_json::Value)>, JournalError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, decisions FROM sessions
+             WHERE finished_ts IS NOT NULL ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, decisions) = row?;
+            let value: serde_json::Value = serde_json::from_str(&decisions)
+                .map_err(|e| JournalError::Corrupt(format!("session {id} decisions: {e}")))?;
+            out.push((id, value));
+        }
+        Ok(out)
+    }
+
     pub fn gc_blobs(&self) -> Result<u32, JournalError> {
         let n = self.conn.execute(
             "DELETE FROM blobs WHERE hash NOT IN (
@@ -643,6 +670,33 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["action"], "keep_source");
         assert_eq!(arr[0]["target"], "/y");
+    }
+
+    /// MUTATION: `ORDER BY id ASC`, or dropping the `finished_ts` filter, or
+    /// ignoring `limit` → fails.
+    #[test]
+    fn finished_sessions_desc_lists_newest_first_finished_only_and_bounded() {
+        let j = Journal::open_in_memory("m").unwrap();
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let s = j.begin_session(10 + n).unwrap();
+            j.add_decision(s, &serde_json::json!({"action": "keep_disk", "n": n}))
+                .unwrap();
+            j.end_session(s, 20 + n, "done").unwrap();
+            ids.push(s);
+        }
+        let _unfinished = j.begin_session(50).unwrap();
+
+        let all = j.finished_sessions_desc(10).unwrap();
+        assert_eq!(
+            all.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![ids[2], ids[1], ids[0]],
+            "newest first, the unfinished one absent"
+        );
+        assert_eq!(all[0].1[0]["n"], 2);
+        let two = j.finished_sessions_desc(2).unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].0, ids[2]);
     }
 
     #[test]

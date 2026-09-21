@@ -78,14 +78,13 @@ pub enum ResolveOutcome {
         pushed: bool,
         note: Option<String>,
     },
-    /// Templated source: one-click is unsafe (chezmoi re-add silently ignores
-    /// templates); the merge editor (Plan 7) is required.
-    NeedsMergeEditor,
-    /// Merge-editor write-back rejected: the resolved text touches a
-    /// protected template span (or the new template failed re-render
-    /// verification). Nothing was mutated — the rejection itself is
-    /// journaled. UI copy: "this change touches a templated value — open in
-    /// editor".
+    /// Template write-back rejected — from the merge editor's Save, "keep
+    /// origin", or a one-click keep-disk on a templated file: the wanted
+    /// text touches a protected template span, or cannot be placed in the
+    /// template's literal text (a repeated block, an edit with no literal
+    /// home), or the new template failed re-render verification. `detail`
+    /// says which. Nothing was mutated — the rejection itself is journaled.
+    /// UI copy: "this change touches a templated value — open in editor".
     ProtectedSpan { detail: String },
 }
 
@@ -115,12 +114,15 @@ pub struct BatchOutcome {
 }
 
 /// A batch item that survived [`ResolveEngine::resolve_batch`]'s pre-flight:
-/// its source path is known and a templated keep-disk has already been
-/// refused. Not yet journaled — nothing has been touched.
+/// its source path is known. Not yet journaled — nothing has been touched.
 struct Candidate {
     target: PathBuf,
     source: PathBuf,
     decision: BatchDecision,
+    /// `source` is a `.tmpl`. A templated keep-disk cannot ride `re-add`
+    /// (chezmoi ignores templates there); its source is written by the
+    /// template write-back instead, and it still shares the batch's commit.
+    templated: bool,
     /// Index of this item's entry in [`BatchOutcome::per_target`], carried so
     /// its result lands in INPUT order however many siblings were refused.
     slot: usize,
@@ -147,14 +149,24 @@ pub struct ResolveEngine {
 impl ResolveEngine {
     /// Keep the on-disk version: re-add it into the source state.
     ///
-    /// Templated sources return `Ok(NeedsMergeEditor)` without touching
-    /// anything — `chezmoi re-add` silently ignores templates, and pretending
-    /// success would be a lie.
+    /// A templated source cannot be re-added — `chezmoi re-add` silently
+    /// ignores templates — so it takes the merge editor's own route instead:
+    /// the on-disk text is written back into the template's literal segments
+    /// and verified by re-render ([`Self::resolve_merged`], spec §6.2), which
+    /// is exactly what saving the editor with "disk" chosen on every region
+    /// does, minus the clicks. The one thing that path refuses is a disk edit
+    /// inside a templated VALUE, and it says so (`ProtectedSpan`) rather than
+    /// sending every templated file to the editor unasked.
     pub fn keep_disk(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "keep_disk {}", target.display());
         let source = self.chezmoi.source_path(target)?;
         if is_templated(&source) {
-            return Ok(ResolveOutcome::NeedsMergeEditor);
+            // Checked here as well as inside `resolve_merged_as`: a source
+            // full of conflict markers may not even render, and that raw
+            // template error would hide the one answer that helps.
+            self.refuse_mid_merge_conflict(&source, target)?;
+            let inputs = self.load_inputs(target)?;
+            return self.resolve_merged_as("keep_disk", &inputs, &inputs.ours);
         }
         let session = self.session_start()?;
         let hashes = self.snapshot_blobs(vec![target.to_path_buf(), source.clone()])?;
@@ -285,33 +297,28 @@ impl ResolveEngine {
         let mut per_target: Vec<(PathBuf, Result<ResolveOutcome, ResolveError>)> =
             Vec::with_capacity(items.len());
 
-        // Pre-flight — refuse what must be refused BEFORE touching the repo.
-        // A templated keep-disk is refused exactly as `keep_disk` refuses it,
-        // and it happens HERE rather than after the catch-up below so that a
-        // batch of nothing but templated files really does touch nothing: it
-        // must not be the reason a merge with origin gets started.
+        // Pre-flight — resolve every item's source path BEFORE touching the
+        // repo, so a batch that cannot even name its files touches nothing.
         let mut candidates: Vec<Candidate> = Vec::new();
         for item in items {
             let slot = per_target.len();
             match self.chezmoi.source_path(&item.target) {
-                Ok(source) if item.decision == BatchDecision::KeepDisk && is_templated(&source) => {
-                    per_target.push((item.target, Ok(ResolveOutcome::NeedsMergeEditor)));
-                }
                 Ok(source) => {
                     // Overwritten below for EVERY candidate. An honest error
-                    // rather than `NeedsMergeEditor` so that if a future edit
-                    // ever let one leak, the caller reads a failure instead of
-                    // a bogus "open the merge editor".
+                    // so that if a future edit ever let one leak, the caller
+                    // reads a failure instead of a bogus success.
                     per_target.push((
                         item.target.clone(),
                         Err(ResolveError::Failed(
                             "internal: the batch never reported this file".into(),
                         )),
                     ));
+                    let templated = is_templated(&source);
                     candidates.push(Candidate {
                         target: item.target,
                         source,
                         decision: item.decision,
+                        templated,
                         slot,
                     });
                 }
@@ -387,61 +394,125 @@ impl ResolveEngine {
             return BatchOutcome { per_target };
         }
 
-        let readds = self.batch_targets(&prepared, BatchDecision::KeepDisk);
+        // Phase 2a — templated keep-disks write their SOURCE first. `re-add`
+        // ignores templates, so each of these goes through the template
+        // write-back instead: the disk text is mapped into the literal
+        // segments and proven to re-render (spec §6.2), then written. A
+        // verified write is an ordinary dirty file the shared commit below
+        // picks up — still one commit for the batch. A rejection (a disk
+        // edit inside a templated VALUE) ends that file's own session right
+        // here, attempt and rejection journaled exactly as `resolve_merged`
+        // journals them; the file drops out of the tail and its slot says
+        // `ProtectedSpan`.
+        let mut written: Vec<usize> = Vec::new(); // indices into `prepared`
+        for (ix, p) in prepared.iter().enumerate() {
+            if !(p.candidate.decision == BatchDecision::KeepDisk && p.candidate.templated) {
+                continue;
+            }
+            let target = p.candidate.target.as_path();
+            per_target[p.candidate.slot].1 = match self.write_back_disk_text(p) {
+                Ok(WriteBackAttempt::Verified(new_template)) => {
+                    match std::fs::write(&p.candidate.source, new_template) {
+                        Ok(()) => {
+                            written.push(ix);
+                            continue;
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                }
+                Ok(WriteBackAttempt::Rejected(detail)) => self
+                    .journal_rejection(p.session, "keep_disk", target, &detail)
+                    .map(|()| ResolveOutcome::ProtectedSpan { detail }),
+                Err(e) => Err(e),
+            };
+        }
+
+        let readds: Vec<PathBuf> = prepared
+            .iter()
+            .filter(|p| p.candidate.decision == BatchDecision::KeepDisk && !p.candidate.templated)
+            .map(|p| p.candidate.target.clone())
+            .collect();
         // Guarded, never called empty: an empty target list keeps chezmoi's
         // own meaning — EVERY modified file — and both `re_add` and
         // `apply_many` refuse one outright rather than let that happen.
         let readd = (!readds.is_empty()).then(|| self.chezmoi.re_add(&readds));
         let applies = self.batch_targets(&prepared, BatchDecision::KeepSourceLocal);
         let applied = (!applies.is_empty()).then(|| self.chezmoi.apply_many(&applies));
+        // A verified template write leaves the destination already saying
+        // what the template now renders; this apply is for chezmoi's own
+        // record of what it last wrote, exactly as `resolve_merged` applies
+        // after its write. Its own invocation, so a failure here is charged
+        // to these files and not to the keep-source group.
+        let tmpl_targets: Vec<PathBuf> = written
+            .iter()
+            .map(|&ix| prepared[ix].candidate.target.clone())
+            .collect();
+        let applied_tmpl =
+            (!tmpl_targets.is_empty()).then(|| self.chezmoi.apply_many(&tmpl_targets));
 
-        // Only keep-disk writes reach the SOURCE repo, so the commit and push
-        // belong to that group alone, and run only if its re-add landed. A
-        // keep-source-only batch therefore commits nothing and pushes
-        // nothing, and reports `false/false` exactly as single-file
-        // `keep_source` does — rather than counting a clean repo as
-        // "committed" and pushing a no-op.
-        let disk_outcome: Result<(bool, bool, Option<String>), String> = match readd {
-            Some(Err(e)) => Err(e.to_string()),
-            Some(Ok(())) => {
-                let targets: Vec<&Path> = prepared
-                    .iter()
-                    .filter(|p| p.candidate.decision == BatchDecision::KeepDisk)
-                    .map(|p| p.candidate.target.as_path())
-                    .collect();
-                Ok(self.commit_batch(&targets))
-            }
-            // No keep-disk targets in this batch, so there was no `re_add`
-            // to succeed or fail. The value is inert: Phase 3 only reads a
-            // group's outcome for the files in it, and this group is empty.
-            None => Ok((false, false, None)),
-        };
-        let source_outcome: Result<(), String> = match applied {
-            Some(Err(e)) => Err(e.to_string()),
-            // `Some(Ok(()))` and `None` alike: applied, or no keep-source
-            // targets to apply. Same reason as above — with the group empty
-            // Phase 3 never reads this, so the two need not be told apart.
-            _ => Ok(()),
+        // Only keep-disk writes reach the SOURCE repo — `re-add` for the plain
+        // files, the write-back for the templated ones — so the commit and
+        // push belong to those and run if EITHER landed: a failed re-add must
+        // not leave verified template writes sitting dirty for the next
+        // catch-up to sweep into a commit nobody named. A keep-source-only
+        // batch commits nothing and pushes nothing, and reports `false/false`
+        // exactly as single-file `keep_source` does — rather than counting a
+        // clean repo as "committed" and pushing a no-op.
+        let plain_landed = matches!(readd, Some(Ok(())));
+        let landed_disk: Vec<usize> = prepared
+            .iter()
+            .enumerate()
+            .filter(|(ix, p)| {
+                p.candidate.decision == BatchDecision::KeepDisk
+                    && if p.candidate.templated {
+                        written.contains(ix)
+                    } else {
+                        plain_landed
+                    }
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+        let commit: (bool, bool, Option<String>) = if landed_disk.is_empty() {
+            // Nothing reached the source repo, so there is nothing to commit.
+            // The value is inert: Phase 3 only reads it for landed keep-disk
+            // files, and there are none.
+            (false, false, None)
+        } else {
+            let targets: Vec<&Path> = landed_disk
+                .iter()
+                .map(|&ix| prepared[ix].candidate.target.as_path())
+                .collect();
+            self.commit_batch(&targets)
         };
 
         // Phase 3 — per file again: end its own session, report its own
         // group's result.
-        for p in &prepared {
-            let (label, landed) = match p.candidate.decision {
-                BatchDecision::KeepDisk => (
-                    "keep_disk",
-                    disk_outcome
-                        .as_ref()
-                        .map(|(c, pu, note)| (*c, *pu, note.clone()))
-                        .map_err(|e| format!("the batch re-add failed: {e}")),
-                ),
-                BatchDecision::KeepSourceLocal => (
-                    "keep_source",
-                    source_outcome
-                        .as_ref()
-                        .map(|()| (false, false, None))
-                        .map_err(|e| format!("the batch apply failed: {e}")),
-                ),
+        for (ix, p) in prepared.iter().enumerate() {
+            let landed: Result<(bool, bool, Option<String>), String> = match p.candidate.decision {
+                BatchDecision::KeepDisk if p.candidate.templated => {
+                    // Rejected or failed in Phase 2a: its slot is already
+                    // reported and its session already closed (or, on an
+                    // error, left as the other groups leave theirs).
+                    if !written.contains(&ix) {
+                        continue;
+                    }
+                    match &applied_tmpl {
+                        Some(Err(e)) => Err(format!("the batch apply failed: {e}")),
+                        _ => Ok(commit.clone()),
+                    }
+                }
+                BatchDecision::KeepDisk => match &readd {
+                    Some(Err(e)) => Err(format!("the batch re-add failed: {e}")),
+                    _ => Ok(commit.clone()),
+                },
+                BatchDecision::KeepSourceLocal => match &applied {
+                    Some(Err(e)) => Err(format!("the batch apply failed: {e}")),
+                    _ => Ok((false, false, None)),
+                },
+            };
+            let label = match p.candidate.decision {
+                BatchDecision::KeepDisk => "keep_disk",
+                BatchDecision::KeepSourceLocal => "keep_source",
             };
             per_target[p.candidate.slot].1 = match landed {
                 Ok((committed, pushed, note)) => self
@@ -546,17 +617,7 @@ impl ResolveEngine {
         origin_seen: &str,
     ) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "keep_source_origin {}", target.display());
-        // Same derivation as the daemon's and `recover_rejected_push`'s: an
-        // unreadable branch degrades to "main" rather than failing.
-        let branch = self.git.head_branch().unwrap_or_else(|_| "main".into());
-        let remote_ref = format!("origin/{branch}");
-        let inputs = crate::merge_inputs::load(
-            &self.chezmoi,
-            &self.git,
-            &remote_ref,
-            &self.journal_path,
-            target,
-        )?;
+        let (inputs, remote_ref) = self.load_inputs_with_origin(target)?;
         let Some(origin) = inputs.origin.clone() else {
             return Err(ResolveError::Failed(format!(
                 "{} has no version at {remote_ref} that differs from this machine's source",
@@ -571,6 +632,110 @@ impl ResolveEngine {
             )));
         }
         self.resolve_merged_as("keep_source_origin", &inputs, &origin)
+    }
+
+    /// The merge editor's inputs for `target`, loaded NOW — `chezmoi cat`, the
+    /// destination, the journal's last-written base, and the template span
+    /// map when the source is a `.tmpl` — WITHOUT origin's pane. Every
+    /// one-click path that rewrites a SOURCE file through the write-after-
+    /// verify route loads them here rather than trusting content the UI
+    /// loaded earlier. Origin is left out because these callers never read
+    /// it, and it costs a `git cat-file` plus a render per file.
+    fn load_inputs(&self, target: &Path) -> Result<MergeInputs, ResolveError> {
+        Ok(crate::merge_inputs::load_local(
+            &self.chezmoi,
+            &self.journal_path,
+            target,
+        )?)
+    }
+
+    /// [`Self::load_inputs`] plus origin's pane, for the one caller that acts
+    /// on it. Also returns the `origin/<branch>` ref it was loaded against,
+    /// for the messages that name it.
+    fn load_inputs_with_origin(
+        &self,
+        target: &Path,
+    ) -> Result<(MergeInputs, String), ResolveError> {
+        // Same derivation as the daemon's and `recover_rejected_push`'s: an
+        // unreadable branch degrades to "main" rather than failing.
+        let branch = self.git.head_branch().unwrap_or_else(|_| "main".into());
+        let remote_ref = format!("origin/{branch}");
+        let inputs = crate::merge_inputs::load(
+            &self.chezmoi,
+            &self.git,
+            &remote_ref,
+            &self.journal_path,
+            target,
+        )?;
+        Ok((inputs, remote_ref))
+    }
+
+    /// A merge already running with THIS file conflicted means its
+    /// working-tree source is git's conflict-marker text, and anything read
+    /// from that file describes nothing that exists. Writing a resolution
+    /// derived from it would persist the markers. The way in is the merge
+    /// editor's repo-conflict mode, which reads the index stages instead
+    /// (see [`Self::repo_conflict_for`]).
+    fn refuse_mid_merge_conflict(
+        &self,
+        source_path: &Path,
+        target: &Path,
+    ) -> Result<(), ResolveError> {
+        if self.is_mid_merge_conflict(source_path)? {
+            return Err(ResolveError::Failed(format!(
+                "{} is mid-merge with origin — reopen it in the merge editor, \
+                 which reads the two sides from the merge itself",
+                display_name(target)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Journal a write-back rejection and close its session: the attempt
+    /// happened, nothing was mutated (spec §8: the journal is truth).
+    fn journal_rejection(
+        &self,
+        session: i64,
+        action: &str,
+        target: &Path,
+        detail: &str,
+    ) -> Result<(), ResolveError> {
+        self.session_decision(
+            session,
+            serde_json::json!({
+                "action": format!("{action}_rejected"),
+                "target": target.to_string_lossy(),
+                "detail": detail,
+            }),
+        )?;
+        self.session_end(
+            session,
+            &format!(
+                "{action} rejected (protected span) {}",
+                display_name(target)
+            ),
+        )
+    }
+
+    /// The in-memory write-back of one templated keep-disk in a batch: load
+    /// the merge inputs (the render, the span map) and map the destination's
+    /// text into the template's literal segments. Nothing is written here.
+    fn write_back_disk_text(&self, p: &Prepared) -> Result<WriteBackAttempt, ResolveError> {
+        let inputs = self.load_inputs(&p.candidate.target)?;
+        let Some(span_map) = &inputs.span_map else {
+            return Err(ResolveError::Failed(format!(
+                "templated merge inputs for {} carry no span map",
+                display_name(&p.candidate.target)
+            )));
+        };
+        let template = std::fs::read_to_string(&inputs.source_path)?;
+        write_back_verified(
+            &self.chezmoi,
+            &template,
+            span_map,
+            &inputs.theirs,
+            &inputs.ours,
+        )
     }
 
     /// Persist a merge-editor resolution: write the resolved text into the
@@ -604,19 +769,9 @@ impl ResolveEngine {
     ) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "{action} {}", inputs.target.display());
         let target = inputs.target.as_path();
-        // A merge already running with THIS file conflicted means its
-        // working-tree source is git's conflict-marker text, and `inputs`
-        // — read from that file — describes nothing that exists. Writing a
-        // resolution derived from it would persist the markers. The way in
-        // is the merge editor's repo-conflict mode, which reads the index
-        // stages instead (see [`Self::repo_conflict_for`]).
-        if self.is_mid_merge_conflict(&inputs.source_path)? {
-            return Err(ResolveError::Failed(format!(
-                "{} is mid-merge with origin — reopen it in the merge editor, \
-                 which reads the two sides from the merge itself",
-                display_name(target)
-            )));
-        }
+        // `inputs` was read from the working-tree source: refuse if that is
+        // git's conflict-marker text (see `refuse_mid_merge_conflict`).
+        self.refuse_mid_merge_conflict(&inputs.source_path, target)?;
         let session = self.session_start()?;
         let hashes =
             self.snapshot_blobs(vec![inputs.target.clone(), inputs.source_path.clone()])?;
@@ -647,21 +802,7 @@ impl ResolveEngine {
             match attempt {
                 WriteBackAttempt::Verified(new_template) => new_template,
                 WriteBackAttempt::Rejected(detail) => {
-                    self.session_decision(
-                        session,
-                        serde_json::json!({
-                            "action": format!("{action}_rejected"),
-                            "target": target.to_string_lossy(),
-                            "detail": detail,
-                        }),
-                    )?;
-                    self.session_end(
-                        session,
-                        &format!(
-                            "{action} rejected (protected span) {}",
-                            display_name(target)
-                        ),
-                    )?;
+                    self.journal_rejection(session, action, target, &detail)?;
                     return Ok(ResolveOutcome::ProtectedSpan { detail });
                 }
             }
@@ -719,10 +860,19 @@ impl ResolveEngine {
         })
     }
 
-    /// Restore the destination files of the LAST finished session from their
-    /// journaled blobs, journal the undo as a new session, and rescan.
+    /// Restore the destination files of the last session that LANDED from
+    /// their journaled blobs, journal the undo as a new session, and rescan.
     /// Returns the id of the session that was undone, or `Ok(None)` when no
-    /// finished session exists.
+    /// such session exists.
+    ///
+    /// "Landed" excludes a finished session that recorded a rejection: the
+    /// write-back refused before any write, so it mutated nothing by
+    /// construction and reverting it would rewrite the same bytes — while
+    /// shadowing the real last landing. The journal orders sessions by id,
+    /// which is START order, and a batch starts every item's session before
+    /// any of them lands, so a rejected last item would otherwise outrank a
+    /// landed sibling and Undo would revert something other than what the
+    /// banner names.
     ///
     /// Source-side revert (rolling back the source-repo commit a `keep_disk`
     /// produced) is deferred to Plan 7's merge tooling — this only restores
@@ -730,7 +880,11 @@ impl ResolveEngine {
     pub fn undo_last(&self) -> Result<Option<i64>, ResolveError> {
         tomte_core::log_info!("resolve", "undo_last");
         let journal = Journal::open_read_only(&self.journal_path, RO_MACHINE)?;
-        let Some((of, decisions)) = journal.last_finished_session()? else {
+        let Some((of, decisions)) = journal
+            .finished_sessions_desc(UNDO_LOOKBACK)?
+            .into_iter()
+            .find(|(_, decisions)| session_landed(decisions))
+        else {
             return Ok(None);
         };
         let restores = parse_undo_restores(&decisions);
@@ -1328,9 +1482,10 @@ fn write_back_verified(
     }
 }
 
-/// Whether a source path is a chezmoi template (`.tmpl` extension). Templated
-/// sources must never be one-click re-added: `chezmoi re-add` silently
-/// ignores them.
+/// Whether a source path is a chezmoi template (`.tmpl` extension). A
+/// templated source cannot be re-added — `chezmoi re-add` silently ignores
+/// them — so a one-click keep-disk on one goes through the template
+/// write-back instead of `re-add`.
 pub fn is_templated(source_path: &Path) -> bool {
     source_path.extension().is_some_and(|ext| ext == "tmpl")
 }
@@ -1369,6 +1524,42 @@ fn build_decision(
         );
     }
     decision
+}
+
+/// How many finished sessions `undo_last` walks back looking for one that
+/// landed. Rejections come one per refused attempt, so a handful is plenty;
+/// the bound keeps a pathological journal from being read whole.
+const UNDO_LOOKBACK: usize = 64;
+
+/// Whether a finished session's decisions describe something that was
+/// actually done. A `<action>_rejected` decision is the journaled record of
+/// a refused write-back — the attempt, then the refusal, nothing mutated for
+/// that file — so a session is skipped only when EVERY file it decided was
+/// refused. A session that refused one file and landed another still landed;
+/// one with no rejection at all (an undo session included) is taken as is.
+fn session_landed(decisions: &serde_json::Value) -> bool {
+    let Some(arr) = decisions.as_array() else {
+        return true;
+    };
+    let rejected: std::collections::BTreeSet<&str> = arr
+        .iter()
+        .filter(|d| decision_action(d).is_some_and(|a| a.ends_with("_rejected")))
+        .filter_map(decision_target)
+        .collect();
+    if rejected.is_empty() {
+        return true;
+    }
+    arr.iter().any(|d| {
+        d.get("dest_blob").is_some() && decision_target(d).is_some_and(|t| !rejected.contains(t))
+    })
+}
+
+fn decision_action(d: &serde_json::Value) -> Option<&str> {
+    d.get("action").and_then(|a| a.as_str())
+}
+
+fn decision_target(d: &serde_json::Value) -> Option<&str> {
+    d.get("target").and_then(|t| t.as_str())
 }
 
 /// Extract `(target, dest_blob)` pairs from a session's decisions array.
@@ -1562,6 +1753,35 @@ mod tests {
                 (PathBuf::from("/Users/x/.testrc"), "abc123".to_string()),
             ]
         );
+    }
+
+    /// MUTATION: make `session_landed` return `true` for a rejected session
+    /// (drop the `_rejected` check) → the second and third assertions fail;
+    /// make it `false` for ANY session with a rejection → the mixed one fails.
+    #[test]
+    fn session_landed_is_false_for_a_rejected_attempt_and_true_otherwise() {
+        assert!(session_landed(&serde_json::json!([
+            { "action": "keep_disk", "target": "/a", "dest_blob": "h" }
+        ])));
+        // Refused one file, landed another: the session landed.
+        assert!(session_landed(&serde_json::json!([
+            { "action": "keep_disk", "target": "/a", "dest_blob": "h" },
+            { "action": "keep_disk_rejected", "target": "/a", "detail": "protected" },
+            { "action": "keep_disk", "target": "/b", "dest_blob": "k" }
+        ])));
+        assert!(!session_landed(&serde_json::json!([
+            { "action": "keep_disk", "target": "/a", "dest_blob": "h" },
+            { "action": "keep_disk_rejected", "target": "/a", "detail": "protected" }
+        ])));
+        assert!(!session_landed(&serde_json::json!([
+            { "action": "merge", "target": "/a", "dest_blob": "h" },
+            { "action": "merge_rejected", "target": "/a", "detail": "protected" }
+        ])));
+        // An undo session and a malformed one are not rejections.
+        assert!(session_landed(
+            &serde_json::json!([{ "action": "undo", "of": 3 }])
+        ));
+        assert!(session_landed(&serde_json::json!({"not": "array"})));
     }
 
     #[test]

@@ -652,20 +652,23 @@ fn story_r_a_keep_source_only_batch_commits_and_pushes_nothing() {
     }
 }
 
-/// A templated keep-disk is refused (chezmoi's `re-add` silently ignores
-/// templates), and the refusal must keep its SLOT: `per_target` is one entry
-/// per item in INPUT order, whatever gets refused in the middle.
+/// A templated keep-disk rides the batch like any other keep-disk: its
+/// write-back lands in the same commit and push as its plain sibling, its
+/// slot is kept, and — because the shared tail ends sessions in input order —
+/// the last item to land is the last finished session, which is what the
+/// banner names and Undo reverts.
 #[test]
-fn story_s_a_templated_keep_disk_keeps_its_slot_and_its_sibling_still_lands() {
-    const TEMPLATE: &[u8] = b"a={{ \"tpl\" }}\n";
+fn story_s_a_templated_keep_disk_shares_the_batch_commit_with_its_sibling() {
     let lab = DriftLab::new();
+    std::fs::write(lab.s.config_path(), "[data]\ntestvalue = \"tpl\"\n").unwrap();
     git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
-    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TEMPLATE).unwrap();
-    more_managed_files(&lab, &["a"]); // commits and pushes the rename too
-    assert_eq!(std::fs::read(&lab.target).unwrap(), b"a=tpl\n");
+    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TPL_SOURCE).unwrap();
+    more_managed_files(&lab, &["a"]); // commits and pushes the template too, then applies
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_RENDERED);
 
-    std::fs::write(&lab.target, DRIFTED).unwrap();
+    std::fs::write(&lab.target, TPL_LITERAL_DRIFT).unwrap();
     std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    let commits_before = commit_count(&lab.s.bare);
 
     let outcome = lab.engine.resolve_batch(vec![
         BatchItem {
@@ -678,37 +681,189 @@ fn story_s_a_templated_keep_disk_keeps_its_slot_and_its_sibling_still_lands() {
     assert_eq!(outcome.per_target.len(), 2, "one entry per item");
     assert_eq!(
         outcome.per_target[0].0, lab.target,
-        "the refused item keeps slot 0"
+        "slot 0 is the templated item"
     );
+    let (tmpl_session, c0, p0, _) = done(&outcome, 0);
+    let (plain_session, c1, p1, _) = done(&outcome, 1);
+    assert!(c0 && p0 && c1 && p1, "both landed on the shared tail");
     assert_eq!(
-        outcome.per_target[0].1.as_ref().unwrap(),
-        &ResolveOutcome::NeedsMergeEditor
+        commit_count(&lab.s.bare) - commits_before,
+        1,
+        "ONE commit and push for the two of them"
     );
 
-    // The sibling still landed, on the shared tail.
-    let (_, committed, pushed, _) = done(&outcome, 1);
-    assert!(committed && pushed);
+    assert_eq!(
+        std::fs::read_to_string(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        "a=local\nvalue={{ .testvalue }}\n"
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_LITERAL_DRIFT);
     assert_eq!(
         std::fs::read(lab.s.source.join("dot_a")).unwrap(),
         b"a=disk\n"
     );
 
-    // The template and its drifted destination are untouched — the refusal
-    // costs the sibling nothing and the template nothing.
-    assert_eq!(
-        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
-        TEMPLATE
-    );
-    assert_eq!(std::fs::read(&lab.target).unwrap(), DRIFTED);
+    // Per-file sessions (§2.3), ended in input order: the last slot is the
+    // last finished session — the one Undo reverts and the banner names.
+    assert_ne!(tmpl_session, plain_session);
+    let (last, _) = lab.journal().last_finished_session().unwrap().unwrap();
+    assert_eq!(last, plain_session);
+
+    // Daemon truth: in sync. The batch applied the templated target after
+    // writing its source, so chezmoi's own record of what it last wrote
+    // moved with the template; without that apply the daemon would report
+    // the file as a conflict right after a successful batch.
+    assert!(lab.rescan_and_settle().is_empty());
 }
 
-/// The templated refusal happens BEFORE the catch-up with origin, so a batch
-/// of nothing but templated files really does touch nothing. It must not be
-/// the reason the repo enters a merge with origin — that merge writes
-/// conflict markers into every file the two sides disagree on, and this batch
-/// decided nothing that could justify it.
+/// An all-templated batch has no `re-add` at all, so its commit must be
+/// driven by the write-backs alone. Without that, the batch would report
+/// `committed: false` with the template sitting dirty and uncommitted —
+/// a silent lie the next catch-up would sweep into an unnamed commit.
 #[test]
-fn story_t_an_all_templated_batch_does_not_even_start_a_merge() {
+fn story_s3_an_all_templated_batch_commits_and_pushes_its_write_backs() {
+    let lab = DriftLab::new();
+    templatize_and_drift(&lab, TPL_LITERAL_DRIFT);
+    let head_before = lab.source_git().head_sha().unwrap();
+
+    let outcome = lab.engine.resolve_batch(vec![BatchItem {
+        target: lab.target.clone(),
+        decision: BatchDecision::KeepDisk,
+    }]);
+
+    let (_, committed, pushed, note) = done(&outcome, 0);
+    assert!(committed && pushed, "the write-back is a source change");
+    assert_eq!(note, None);
+    let head_after = lab.source_git().head_sha().unwrap();
+    assert_ne!(head_after, head_before);
+    assert_eq!(lab.bare_git().head_sha().unwrap(), head_after, "pushed");
+    assert!(lab.source_git().dirty_files().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        "a=local\nvalue={{ .testvalue }}\n"
+    );
+    assert!(lab.rescan_and_settle().is_empty());
+}
+
+/// The rejected item in the LAST slot. Its finished session has the highest
+/// id, and the journal orders by id — so "newest finished session" would be
+/// the rejection, and Undo would "revert" a no-op while the banner names
+/// the plain sibling that actually landed. Undo has to skip rejections.
+#[test]
+fn story_s4_undo_after_a_batch_skips_the_rejected_last_item_and_reverts_the_landed_one() {
+    let lab = DriftLab::new();
+    std::fs::write(lab.s.config_path(), "[data]\ntestvalue = \"tpl\"\n").unwrap();
+    git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
+    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TPL_SOURCE).unwrap();
+    more_managed_files(&lab, &["a"]);
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_RENDERED);
+
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    std::fs::write(&lab.target, TPL_VALUE_DRIFT).unwrap();
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+        BatchItem {
+            target: lab.target.clone(),
+            decision: BatchDecision::KeepDisk,
+        },
+    ]);
+    let (plain_session, committed, _, _) = done(&outcome, 0);
+    assert!(committed);
+    assert!(
+        matches!(
+            outcome.per_target[1].1,
+            Ok(ResolveOutcome::ProtectedSpan { .. })
+        ),
+        "{:?}",
+        outcome.per_target[1].1
+    );
+
+    // The rejection's session is the newest finished one by id…
+    let journal = lab.journal();
+    let (newest, _) = journal.last_finished_session().unwrap().unwrap();
+    assert!(
+        newest > plain_session,
+        "premise: the rejection outranks by id"
+    );
+
+    // …and Undo still reverts the plain sibling, the last thing that landed.
+    let undone = lab.engine.undo_last().unwrap();
+    assert_eq!(undone, Some(plain_session));
+    let (_, decisions) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(decisions[0]["action"], "undo");
+    assert_eq!(decisions[0]["of"], plain_session);
+}
+
+/// A templated keep-disk the write-back must reject keeps its SLOT, reports
+/// the precise refusal, and costs its plain sibling nothing: the sibling
+/// still lands on the shared tail, in the batch's one commit.
+#[test]
+fn story_s2_a_rejected_templated_keep_disk_keeps_its_slot_and_its_sibling_still_lands() {
+    let lab = DriftLab::new();
+    std::fs::write(lab.s.config_path(), "[data]\ntestvalue = \"tpl\"\n").unwrap();
+    git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
+    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TPL_SOURCE).unwrap();
+    more_managed_files(&lab, &["a"]);
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_RENDERED);
+
+    std::fs::write(&lab.target, TPL_VALUE_DRIFT).unwrap();
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    let commits_before = commit_count(&lab.s.bare);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        BatchItem {
+            target: lab.target.clone(),
+            decision: BatchDecision::KeepDisk,
+        },
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+    ]);
+
+    assert_eq!(outcome.per_target.len(), 2);
+    assert_eq!(
+        outcome.per_target[0].0, lab.target,
+        "the refused item keeps slot 0"
+    );
+    let Ok(ResolveOutcome::ProtectedSpan { detail }) = &outcome.per_target[0].1 else {
+        panic!("expected ProtectedSpan, got {:?}", outcome.per_target[0].1);
+    };
+    assert!(detail.contains("protected"), "detail: {detail}");
+    let (plain_session, committed, pushed, _) = done(&outcome, 1);
+    assert!(committed && pushed);
+    assert_eq!(commit_count(&lab.s.bare) - commits_before, 1);
+
+    // The template and its drifted destination are untouched.
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        TPL_SOURCE
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_VALUE_DRIFT);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_a")).unwrap(),
+        b"a=disk\n"
+    );
+
+    // Journal truth: the rejection closed its own session (attempt +
+    // rejection). The sibling's session has the higher id here only because
+    // it is the later slot — see `story_s4` for the other order, where Undo
+    // has to look past the rejection.
+    let journal = lab.journal();
+    let (last, _) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(last, plain_session);
+    let timeline = journal.timeline(50, None).unwrap();
+    assert!(
+        timeline.iter().any(|e| e.kind == "session_end"),
+        "the rejected item's session was ended"
+    );
+}
+
+/// A templated keep-disk is a decision like any other, so a batch of nothing
+/// but templated files DOES catch up with origin first. When that catch-up
+/// conflicts on the template itself, the item cannot be written from a source
+/// full of conflict markers: it reports the merge editor as the way in, and
+/// the merge it started stays open for that editor to conclude (spec §6.1),
+/// exactly as a plain file's keep-disk does in `story_o`.
+#[test]
+fn story_t_an_all_templated_batch_catches_up_and_reports_a_conflicted_template_honestly() {
     const BASE_TPL: &[u8] = b"a={{ \"base\" }}\n";
     const ORIGIN_TPL: &[u8] = b"a={{ \"origin\" }}\n";
     const LOCAL_TPL: &[u8] = b"a={{ \"local\" }}\n";
@@ -721,10 +876,8 @@ fn story_t_an_all_templated_batch_does_not_even_start_a_merge() {
     diverge_with_conflicts(&lab, &[("dot_testrc.tmpl", ORIGIN_TPL, LOCAL_TPL)]);
 
     let git_c = lab.source_git();
-    let head_before = git_c.head_sha().unwrap();
-    let behind_before = git_c.divergence("origin/main").unwrap().behind;
     assert!(
-        behind_before > 0,
+        git_c.divergence("origin/main").unwrap().behind > 0,
         "premise: a merge is waiting to be started"
     );
     std::fs::write(&lab.target, DRIFTED).unwrap();
@@ -734,28 +887,23 @@ fn story_t_an_all_templated_batch_does_not_even_start_a_merge() {
         decision: BatchDecision::KeepDisk,
     }]);
 
-    assert_eq!(
-        outcome.per_target[0].1.as_ref().unwrap(),
-        &ResolveOutcome::NeedsMergeEditor
+    let err = outcome.per_target[0]
+        .1
+        .as_ref()
+        .expect_err("a source full of conflict markers cannot be written back")
+        .to_string();
+    assert!(
+        err.contains("is mid-merge with origin") && err.contains("merge editor"),
+        "{err}"
     );
     assert!(
-        !git_c.merge_in_progress(),
-        "a batch that refused every item must not have started a merge"
-    );
-    assert_eq!(
-        git_c.head_sha().unwrap(),
-        head_before,
-        "and must not have committed anything"
-    );
-    assert_eq!(
-        git_c.divergence("origin/main").unwrap().behind,
-        behind_before,
-        "the divergence is exactly as it was"
+        git_c.merge_in_progress(),
+        "the decision started the merge; it is the editor's to conclude"
     );
     assert_eq!(
         std::fs::read(&lab.target).unwrap(),
         DRIFTED,
-        "the drift is still there to be answered in the merge editor"
+        "the destination is untouched"
     );
 }
 
@@ -1059,44 +1207,141 @@ fn story_d_undo_restores_drifted_content_and_reports_drift_again() {
     assert_eq!(drifted[0].class, "destination_drift");
 }
 
+/// A templated keep-disk is not a refusal: the on-disk text is written back
+/// into the template's literal segments and verified by re-render — the same
+/// write-after-verify path the merge editor's Save and "keep origin" already
+/// use — then committed and pushed like any other keep-disk. Before this it
+/// answered a blanket "use the merge editor", which sent the user into the
+/// editor to click "disk" on every region by hand.
 #[test]
-fn story_e_templated_source_needs_merge_editor_and_touches_nothing() {
-    const TEMPLATE: &[u8] = b"a={{ \"tpl\" }}\n";
+fn story_e_templated_keep_disk_writes_the_disk_text_back_and_lands() {
     let lab = DriftLab::new();
+    templatize_and_drift(&lab, TPL_LITERAL_DRIFT);
+    let head_before = lab.source_git().head_sha().unwrap();
 
-    // Convert the managed file into a template and level the state with it.
-    git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
-    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TEMPLATE).unwrap();
-    git(&lab.s.source, &["add", "."]);
-    git(&lab.s.source, &["commit", "-m", "templatize"]);
-    lab.s.chezmoi().apply(None).unwrap();
-    assert_eq!(std::fs::read(&lab.target).unwrap(), b"a=tpl\n");
-
-    // Drift the destination…
-    std::fs::write(&lab.target, DRIFTED).unwrap();
-
-    // …one-click keep-disk must refuse: chezmoi re-add silently ignores
-    // templates, and pretending success would be a lie.
     let outcome = lab.engine.keep_disk(&lab.target).unwrap();
-    assert_eq!(outcome, ResolveOutcome::NeedsMergeEditor);
-
-    // NOTHING changed: template intact, dest still drifted, repo clean.
+    let ResolveOutcome::Done {
+        session,
+        committed,
+        pushed,
+        note,
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(committed && pushed, "a template write is a source change");
+    assert_eq!(note, None);
+    let head_after = lab.source_git().head_sha().unwrap();
+    assert_ne!(head_after, head_before, "one commit for the write");
     assert_eq!(
-        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
-        TEMPLATE
+        lab.bare_git().head_sha().unwrap(),
+        head_after,
+        "and it reached origin"
     );
-    assert_eq!(std::fs::read(&lab.target).unwrap(), DRIFTED);
+
+    // Filesystem truth: the literal line took the disk edit, the expression
+    // survived verbatim, the destination still says what it said.
+    assert_eq!(
+        std::fs::read_to_string(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        "a=local\nvalue={{ .testvalue }}\n"
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_LITERAL_DRIFT);
     assert!(lab.source_git().dirty_files().unwrap().is_empty());
 
-    // Journal truth: the refusal happens before SessionStart — no session
-    // exists, not even an unfinished one.
+    // Journal truth: filed as keep_disk — not as a hand-made merge — with
+    // both blobs, so undo restores the destination AND the pre-write template.
     let journal = lab.journal();
-    assert!(journal.last_finished_session().unwrap().is_none());
-    let timeline = journal.timeline(50, None).unwrap();
-    assert!(
-        timeline.iter().all(|e| e.kind != "session_start"),
-        "keep_disk on a template must not open a session"
+    let (id, decisions) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(id, session);
+    let arr = decisions.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["action"], "keep_disk");
+    assert_eq!(
+        journal
+            .get_blob(arr[0]["dest_blob"].as_str().unwrap())
+            .unwrap()
+            .unwrap(),
+        TPL_LITERAL_DRIFT
     );
+    assert_eq!(
+        journal
+            .get_blob(arr[0]["source_blob"].as_str().unwrap())
+            .unwrap()
+            .unwrap(),
+        TPL_SOURCE
+    );
+
+    // Daemon truth: in sync after the rescan.
+    lab.wait_scan_done();
+    assert!(lab.settled_status().is_empty());
+}
+
+/// The one refusal that remains for a templated keep-disk is the precise one:
+/// the disk edit changed the RENDERED VALUE of a template expression, which
+/// no literal write-back can express. `ProtectedSpan` names it; nothing is
+/// mutated; the attempt and the rejection are journaled.
+#[test]
+fn story_e2_templated_keep_disk_touching_a_value_is_rejected_and_touches_nothing() {
+    let lab = DriftLab::new();
+    templatize_and_drift(&lab, TPL_VALUE_DRIFT);
+    let head_before = lab.source_git().head_sha().unwrap();
+
+    let outcome = lab.engine.keep_disk(&lab.target).unwrap();
+    let ResolveOutcome::ProtectedSpan { detail } = outcome else {
+        panic!("expected ProtectedSpan, got {outcome:?}");
+    };
+    assert!(detail.contains("protected"), "detail: {detail}");
+
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        TPL_SOURCE
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_VALUE_DRIFT);
+    assert!(lab.source_git().dirty_files().unwrap().is_empty());
+    assert_eq!(lab.source_git().head_sha().unwrap(), head_before);
+
+    let journal = lab.journal();
+    let (_, decisions) = journal.last_finished_session().unwrap().unwrap();
+    let arr = decisions.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["action"], "keep_disk");
+    assert_eq!(arr[1]["action"], "keep_disk_rejected");
+    assert_eq!(
+        lab.probe().expect("drift must survive the rejection").class,
+        DriftClass::DestinationDrift
+    );
+
+    // A rejection is not undoable state: nothing landed, so there is nothing
+    // for Undo to find.
+    assert_eq!(lab.engine.undo_last().unwrap(), None);
+}
+
+/// Keep-source never needed the merge editor for a templated file — `chezmoi
+/// apply` renders templates — and this pins that it lands.
+#[test]
+fn story_e3_templated_keep_source_restores_the_render() {
+    let lab = DriftLab::new();
+    templatize_and_drift(&lab, TPL_LITERAL_DRIFT);
+
+    let outcome = lab.engine.keep_source(&lab.target).unwrap();
+    assert!(
+        matches!(
+            outcome,
+            ResolveOutcome::Done {
+                committed: false,
+                pushed: false,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_RENDERED);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        TPL_SOURCE
+    );
+    lab.wait_scan_done();
+    assert!(lab.settled_status().is_empty());
 }
 
 /// The source edit committed in story F, distinct from both the last-applied
@@ -1354,6 +1599,8 @@ fn story_h_templated_value_edit_is_rejected_and_touches_nothing() {
         arr[1]["detail"].as_str().unwrap().contains("protected"),
         "rejection detail must be journaled"
     );
+    // …and it is not undoable state: Undo looks past it and finds nothing.
+    assert_eq!(lab.engine.undo_last().unwrap(), None);
 
     // Daemon truth: no rescan was requested (nothing changed) — the drift is
     // still reported, and the filesystem still probes as drifted.

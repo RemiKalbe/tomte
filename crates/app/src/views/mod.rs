@@ -1059,9 +1059,6 @@ impl Shell {
                     });
                     None
                 }
-                Ok(BatchResult::Resolved(ResolveOutcome::NeedsMergeEditor)) => {
-                    Some("templated · use the merge editor".into())
-                }
                 Ok(BatchResult::Resolved(ResolveOutcome::ProtectedSpan { detail })) => {
                     Some(format!("touches a templated value: {detail}").into())
                 }
