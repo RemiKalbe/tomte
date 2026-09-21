@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:executing-plans. Executed inline (not subagent-per-task): every task's acceptance test is visual — `scripts/shoot.sh` before/after read by the executor.
 
-**Goal:** Execute the approved refinement spec (docs/superpowers/specs/2026-07-27-ui-refinement-design.md) — same style, more craft.
+**Goal:** Execute the approved refinement spec (.agents/artifacts/specs/2026-07-27-ui-refinement-design.md) — same style, more craft.
 
 **Architecture:** No new crates, no new views. Copy/label centralization in `czui_app::model` (map already exists there), layout surgery inside the four existing view files, new gallery fixtures for new sub-states.
 

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust stable (edition 2024), thiserror, serde/serde_json, sha2, wait-timeout, tempfile (dev). No async runtime — std threads only.
 
-**Plan series (spec: `docs/superpowers/specs/2026-07-19-chezmoi-ui-v0-design.md`):**
+**Plan series (spec: `.agents/artifacts/specs/2026-07-19-chezmoi-ui-v0-design.md`):**
 1. **This plan** — foundation & drift model (spec §3.4 core, §4, parts of §10/§12)
 2. Merge engine & template span mapping (§6)
 3. Journal, proto & daemon (§3.1, §3.3, §8)

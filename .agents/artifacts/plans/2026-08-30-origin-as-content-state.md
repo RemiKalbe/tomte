@@ -17,7 +17,7 @@ already making.
 
 **Tech Stack:** Rust 2024, gpui 0.2.2, imara-diff, chezmoi + git subprocesses.
 
-**Spec:** `docs/superpowers/specs/2026-08-29-sync-axes-design.md`
+**Spec:** `.agents/artifacts/specs/2026-08-29-sync-axes-design.md`
 
 ## Global Constraints
 

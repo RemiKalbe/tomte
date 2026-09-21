@@ -16,7 +16,7 @@ instead; a "Processing" section in the review sidebar shows what is queued.
 **Tech Stack:** Rust 2024, gpui 0.2.2, chezmoi + git subprocesses, the
 existing `FakeRunner` test double and `DriftLab` e2e harness.
 
-**Spec:** `docs/superpowers/specs/2026-09-02-async-action-queue-design.md`
+**Spec:** `.agents/artifacts/specs/2026-09-02-async-action-queue-design.md`
 
 ## Global Constraints
 

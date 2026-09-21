@@ -1,7 +1,7 @@
 # Origin as a content state: making "source" honest
 
 **Status:** decided. All of §6 is answered; implemented by
-`docs/superpowers/plans/2026-08-30-origin-as-content-state.md`.
+`.agents/artifacts/plans/2026-08-30-origin-as-content-state.md`.
 **Supersedes:** the first draft of this file (2026-08-29), which modelled
 origin as a separate "history axis" with its own surfaces. Rejected —
 correctly. This version follows the locked domain model instead.

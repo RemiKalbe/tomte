@@ -10,7 +10,7 @@
 
 **Prerequisites:** Plans 1–2 complete (54 tests green).
 
-**Plan series (spec: `docs/superpowers/specs/2026-07-19-chezmoi-ui-v0-design.md`):**
+**Plan series (spec: `.agents/artifacts/specs/2026-07-19-chezmoi-ui-v0-design.md`):**
 1. ✅ Foundation & drift model — 2. ✅ Merge engine & template mapping — **3. This plan** — 4. `chezmoid` daemon (watcher/fetch/socket) — 5. GPUI app shell — 6. Merge editor UI, sync pipeline, packaging.
 
 ## Global Constraints

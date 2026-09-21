@@ -1,7 +1,7 @@
 # Asynchronous, batched decisions
 
 **Status:** decided (conversation, 2026-09-02).
-**Implemented by:** `docs/superpowers/plans/2026-09-02-async-action-queue.md`
+**Implemented by:** `.agents/artifacts/plans/2026-09-02-async-action-queue.md`
 
 > "Each time I confirm a particular file, regardless of within the merge
 > editor or quick action button, the button swaps to 'working…' and I cannot
