@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tomte_proto::{
     ClientFrame, Event, PROTOCOL_VERSION, Request, Response, ServerFrame, read_frame, write_frame,
@@ -19,8 +19,16 @@ pub enum IpcError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Proto(String),
-    #[error("request timed out (connected, but no reply within 30s)")]
+    #[error(
+        "request timed out (connected, but no reply within 30s) — the daemon may still \
+         have run it; check the file after the next scan before pressing again"
+    )]
     Timeout,
+    /// The daemon answered "busy" (or "starting") for longer than the caller
+    /// was prepared to wait. Every one of those replies executed nothing, so
+    /// nothing happened — but nothing will until the daemon frees up.
+    #[error("the daemon stayed busy for {waited_secs:.1}s ({message}) — try again")]
+    Busy { waited_secs: f64, message: String },
     #[error("daemon rejected connection: {0}")]
     Rejected(String),
     #[error(
@@ -41,6 +49,17 @@ fn parse_daemon_version(message: &str) -> Option<u32> {
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
+
+/// How long a user-initiated request keeps retrying a daemon that answers
+/// "busy" (or "starting") before that becomes the failure the user sees.
+/// Long enough to outlast a fetch (30s ceiling) plus a scan, short enough
+/// that a daemon that is genuinely stuck is reported within the minute and a
+/// half the user would give it anyway.
+pub const DAEMON_PATIENCE: Duration = Duration::from_secs(90);
+
+/// Pause between retries. The daemon already waited its own bound before
+/// bouncing, so this only needs to avoid a hot loop.
+const DAEMON_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
 pub struct IpcClient {
     writer: Mutex<UnixStream>,
@@ -139,6 +158,54 @@ impl IpcClient {
         // the lock and quit. Give the old process a beat to actually die.
         std::thread::sleep(std::time::Duration::from_millis(500));
         Ok(())
+    }
+
+    /// [`Self::request`], retried across the daemon's busy bounces for up to
+    /// `patience`, each retry logged under `what`. The bounce (see
+    /// [`tomte_proto::is_daemon_bounce`]) is the daemon saying "I did nothing,
+    /// ask again": a scan, a fetch or an auto-join held its core past its own
+    /// wait. Retrying it is free, and a decision the user already recorded
+    /// must not fail because one scan ran long. When the budget runs out the
+    /// error is [`IpcError::Busy`], in those words.
+    ///
+    /// Only the bounce is retried. A client-side [`IpcError::Timeout`] is
+    /// NOT: the daemon may have executed that request after the client gave
+    /// up, and a second `SessionStart` or `SessionDecision` would then be a
+    /// duplicate.
+    pub fn request_patiently(
+        &self,
+        request: Request,
+        patience: Duration,
+        what: &str,
+    ) -> Result<Response, IpcError> {
+        let started = Instant::now();
+        let mut attempt = 1u32;
+        loop {
+            match self.request(request.clone())? {
+                Response::Error { message } if tomte_proto::is_daemon_bounce(&message) => {
+                    let waited = started.elapsed();
+                    if waited >= patience {
+                        tomte_core::log_error!(
+                            "ipc",
+                            "{what}: daemon stayed busy for {:.1}s over {attempt} attempt(s): {message}",
+                            waited.as_secs_f64()
+                        );
+                        return Err(IpcError::Busy {
+                            waited_secs: waited.as_secs_f64(),
+                            message,
+                        });
+                    }
+                    tomte_core::log_info!(
+                        "ipc",
+                        "{what}: daemon busy (attempt {attempt}, {:.1}s so far), retrying: {message}",
+                        waited.as_secs_f64()
+                    );
+                    attempt += 1;
+                    std::thread::sleep(DAEMON_RETRY_PAUSE);
+                }
+                other => return Ok(other),
+            }
+        }
     }
 
     pub fn request(&self, request: Request) -> Result<Response, IpcError> {

@@ -50,10 +50,24 @@ struct DriftLab {
     events: Receiver<Event>,
     journal_path: PathBuf,
     target: PathBuf,
+    /// The daemon's core, shared with the serving thread — a test that holds
+    /// this lock IS a scan holding the daemon, from every client's point of
+    /// view.
+    core: Arc<Mutex<DaemonCore>>,
 }
 
 impl DriftLab {
     fn new() -> Self {
+        Self::with_daemon(
+            tomte_daemon::server::DEFAULT_BUSY_WAIT,
+            tomte_app::resolve::DAEMON_PATIENCE,
+        )
+    }
+
+    /// A lab whose daemon bounces a core request after `busy_wait` and whose
+    /// engine keeps retrying such bounces for `patience` — both shrunk by
+    /// the busy stories so a held lock proves the behaviour in seconds.
+    fn with_daemon(busy_wait: Duration, patience: Duration) -> Self {
         // `Scratch::new` writes the repo-LOCAL identity and `commit.gpgsign
         // = false` the production `GitClient` needs: it runs plain `git`,
         // without testsupport's per-invocation `-c` overrides, so without
@@ -72,7 +86,9 @@ impl DriftLab {
         ));
         let sock = s.root.path().join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        std::thread::spawn(move || serve(listener, ServeCtx::ready(core, now_ts, Arc::new(|| {}))));
+        let mut ctx = ServeCtx::ready(core.clone(), now_ts, Arc::new(|| {}));
+        ctx.busy_wait = busy_wait;
+        std::thread::spawn(move || serve(listener, ctx));
 
         let ipc = Arc::new(IpcClient::connect(&sock).unwrap());
         let events = ipc.subscribe().unwrap();
@@ -82,6 +98,7 @@ impl DriftLab {
             git: GitClient::new(Arc::new(SystemRunner), s.source.clone()),
             ipc,
             journal_path: journal_path.clone(),
+            daemon_patience: patience,
         };
         let target = s.home.join(".testrc");
         Self {
@@ -90,6 +107,7 @@ impl DriftLab {
             events,
             journal_path,
             target,
+            core,
         }
     }
 
@@ -1342,6 +1360,154 @@ fn story_e3_templated_keep_source_restores_the_render() {
     );
     lab.wait_scan_done();
     assert!(lab.settled_status().is_empty());
+}
+
+/// A queued decision that meets a scan holding the daemon's core waits it
+/// out: the daemon bounces "daemon busy" after its wait, the engine retries
+/// the bounce, and the decision lands once the core is free. Before this the
+/// bounce was the row's failure — "daemon busy" on a file the user had just
+/// decided, whenever a scan ran a few seconds long.
+/// MUTATION: return the bounce instead of retrying (`request_patiently`
+/// → `self.ipc.request`) → fails with "daemon busy".
+#[test]
+fn story_w_a_decision_waits_out_a_scan_holding_the_core() {
+    let lab = DriftLab::with_daemon(
+        Duration::from_millis(200),
+        tomte_app::resolve::DAEMON_PATIENCE,
+    );
+    lab.drift_dest();
+
+    // A "scan" that holds the core for two seconds — ten bounces' worth.
+    // The holder reports once it OWNS the lock (the daemon's own scans
+    // contend for it too), so the decision below always starts against a
+    // held core rather than racing the holder for it.
+    let (hold, locked) = hold_the_core(&lab, Duration::from_secs(2));
+    locked.recv().unwrap();
+    let started = Instant::now();
+    let outcome = lab.engine.keep_disk(&lab.target).unwrap();
+    hold.join().unwrap();
+
+    assert!(
+        matches!(outcome, ResolveOutcome::Done { .. }),
+        "landed once the core was free, got {outcome:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "it really did wait for the lock: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        DRIFTED
+    );
+    let journal = lab.journal();
+    let (_, decisions) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(
+        decisions.as_array().unwrap().len(),
+        1,
+        "exactly one session, one decision"
+    );
+}
+
+/// …and only a daemon that stays busy past the engine's patience becomes the
+/// row's failure, in those words, with nothing journaled or touched.
+/// MUTATION: never give up (drop the `waited >= patience` return) → hangs
+/// past the 3s hold and lands instead of failing.
+#[test]
+fn story_w2_a_daemon_busy_past_the_patience_budget_is_the_rows_failure() {
+    let lab = DriftLab::with_daemon(Duration::from_millis(100), Duration::from_millis(700));
+    lab.drift_dest();
+
+    let (hold, locked) = hold_the_core(&lab, Duration::from_secs(3));
+    locked.recv().unwrap();
+    let started = Instant::now();
+    let err = lab
+        .engine
+        .keep_disk(&lab.target)
+        .expect_err("the daemon stayed busy past the budget")
+        .to_string();
+    let waited = started.elapsed();
+    hold.join().unwrap();
+
+    assert!(
+        err.contains("stayed busy") && err.contains("daemon busy"),
+        "{err}"
+    );
+    assert!(
+        waited >= Duration::from_millis(700) && waited < Duration::from_secs(3),
+        "gave up after the budget, before the hold ended: {waited:?}"
+    );
+    // Nothing happened: the bounce executes nothing, and the engine never
+    // got as far as opening a session.
+    assert_eq!(std::fs::read(&lab.target).unwrap(), DRIFTED);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        b"a=1\n"
+    );
+    let journal = lab.journal();
+    assert!(journal.last_finished_session().unwrap().is_none());
+    assert!(
+        journal
+            .timeline(50, None)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "session_start"),
+        "no session was opened"
+    );
+}
+
+/// A daemon that stays busy past the budget for one file is not asked again
+/// for the next: the batch reports the rest as not attempted, at once, rather
+/// than holding the queue for one budget per file.
+/// MUTATION: drop the `stuck` short-circuit in Phase 1 → the second slot
+/// reports "stayed busy" after its own budget instead of "not attempted".
+#[test]
+fn story_w3_a_stuck_daemon_costs_a_batch_one_budget_not_one_per_file() {
+    let lab = DriftLab::with_daemon(Duration::from_millis(100), Duration::from_millis(700));
+    more_managed_files(&lab, &["a"]);
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+
+    let (hold, locked) = hold_the_core(&lab, Duration::from_secs(4));
+    locked.recv().unwrap();
+    let outcome = lab.engine.resolve_batch(vec![
+        BatchItem {
+            target: lab.target.clone(),
+            decision: BatchDecision::KeepDisk,
+        },
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+    ]);
+    hold.join().unwrap();
+
+    let first = outcome.per_target[0].1.as_ref().unwrap_err().to_string();
+    let second = outcome.per_target[1].1.as_ref().unwrap_err().to_string();
+    assert!(first.contains("stayed busy"), "{first}");
+    assert!(
+        second.starts_with("not attempted") && second.contains("stayed busy"),
+        "{second}"
+    );
+    // Nothing happened to either file.
+    assert_eq!(std::fs::read(&lab.target).unwrap(), DRIFTED);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_a")).unwrap(),
+        MANAGED_BASE
+    );
+    assert!(lab.journal().last_finished_session().unwrap().is_none());
+}
+
+/// Hold the daemon's core for `hold` on another thread — a scan, from every
+/// client's point of view. The returned receiver fires once the lock is
+/// actually owned; callers wait on it, because the daemon's own scans
+/// contend for the same lock and a sleep is not a handshake.
+fn hold_the_core(lab: &DriftLab, hold: Duration) -> (std::thread::JoinHandle<()>, Receiver<()>) {
+    let core = lab.core.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _scan = core.lock().unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(hold);
+    });
+    (handle, rx)
 }
 
 /// The source edit committed in story F, distinct from both the last-applied

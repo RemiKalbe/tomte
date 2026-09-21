@@ -228,6 +228,59 @@ fn shutdown_replies_ok_then_fires_hook() {
     assert!(fired.load(Ordering::SeqCst));
 }
 
+/// The busy bounce is what the app retries, so it has to be prompt and
+/// nameable: a request that needs the core waits `busy_wait`, then answers
+/// "daemon busy" instead of hanging into the client's timeout.
+/// MUTATION: ignore `busy_wait` (hard-code the 20s) → the 5s read timeout
+/// below trips first and the test fails instead of hanging.
+#[test]
+fn a_shortened_busy_wait_bounces_a_core_request_promptly() {
+    let s = Scratch::new();
+    let chezmoi: ChezmoiClient = s.chezmoi();
+    let git = GitClient::new(Arc::new(SystemRunner), s.source.clone());
+    let journal = Journal::open_in_memory("busy-wait-test").unwrap();
+    let core = Arc::new(Mutex::new(
+        DaemonCore::new(chezmoi, git, journal, "origin/main".into()).unwrap(),
+    ));
+    let sock = s.root.path().join("bw.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let mut ctx = tomte_daemon::server::ServeCtx::ready(core.clone(), || 7, Arc::new(|| {}));
+    ctx.busy_wait = std::time::Duration::from_millis(200);
+    std::thread::spawn(move || serve(listener, ctx));
+    let _scan_guard = core.lock().unwrap();
+
+    let stream = UnixStream::connect(&sock).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    send(
+        &mut writer,
+        1,
+        Request::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    );
+    let _ = recv(&mut reader);
+
+    let started = std::time::Instant::now();
+    send(&mut writer, 2, Request::Rescan);
+    match recv(&mut reader) {
+        ServerFrame::Reply {
+            id: 2,
+            response: Response::Error { message },
+        } => assert!(message.contains("daemon busy"), "{message}"),
+        other => panic!("expected the busy bounce, got {other:?}"),
+    }
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(200)
+            && waited < std::time::Duration::from_secs(3),
+        "bounced after {waited:?}, expected ~200ms"
+    );
+}
+
 #[test]
 fn handshake_and_status_survive_a_long_scan_holding_the_core() {
     let s = Scratch::new();

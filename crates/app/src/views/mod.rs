@@ -2660,6 +2660,7 @@ mod render_smoke {
                 ),
                 ipc,
                 journal_path: journal_path.clone(),
+                daemon_patience: tomte_app::resolve::DAEMON_PATIENCE,
             });
             // One drifted managed file, so a `KeepDisk` on `target()` has
             // real work to do: the scratch source holds `dot_testrc` =

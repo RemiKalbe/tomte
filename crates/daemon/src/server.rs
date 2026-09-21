@@ -27,7 +27,18 @@ pub struct ServeCtx {
     pub starting_error: Arc<Mutex<String>>,
     pub now_fn: fn() -> u64,
     pub on_shutdown: Arc<dyn Fn() + Send + Sync>,
+    /// How long a non-Status request waits for the core before it is bounced
+    /// as "daemon busy". [`DEFAULT_BUSY_WAIT`] in the binary; tests shrink it
+    /// so a held lock proves the bounce (and the app's retry of it) in
+    /// milliseconds instead of twenty seconds.
+    pub busy_wait: std::time::Duration,
 }
+
+/// The bound a request waits for the core: well above a full scan (~9s over
+/// ~1k files, measured 2026-08-08) and under the client's 30s request
+/// timeout, so a bounce is always a clean "nothing happened" the client can
+/// retry, never an ambiguous timeout.
+pub const DEFAULT_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl ServeCtx {
     /// A context whose core arrives later via [`ServeCtx::set_core`].
@@ -44,6 +55,7 @@ impl ServeCtx {
             starting_error: Arc::new(Mutex::new("starting".to_string())),
             now_fn,
             on_shutdown,
+            busy_wait: DEFAULT_BUSY_WAIT,
         }
     }
 
@@ -211,9 +223,9 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
         // Before the first failure the placeholder reason is "starting" —
         // don't render the comical "tomted starting: starting".
         let why = if why == "starting" {
-            "tomted starting…".to_string()
+            format!("{}…", tomte_proto::STARTING_PREFIX)
         } else {
-            format!("tomted starting: {why}")
+            format!("{}: {why}", tomte_proto::STARTING_PREFIX)
         };
         return match request {
             Request::Status => Response::Status {
@@ -233,9 +245,12 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
     // banner). Every other request WAITS ITS TURN: scans hold the core for
     // seconds and run constantly, so bouncing "busy — retry shortly" at the
     // user made saves a timing game (2026-08-08). Each connection has its
-    // own thread, so waiting here stalls nobody else; the bound rides well
-    // above a full scan (~9s over ~1k files, measured 2026-08-08) and under
-    // the client's 30s request timeout.
+    // own thread, so waiting here stalls nobody else; the bound
+    // (`busy_wait`, see `DEFAULT_BUSY_WAIT`) rides above a full scan and
+    // under the client's request timeout. A scan that outlasts it still
+    // bounces — and the app's resolve engine retries that bounce for as
+    // long as its own patience allows, so the user sees "busy" only when
+    // the daemon stayed busy, not because one scan ran long (2026-09-21).
     let mut c = match core.try_lock() {
         Ok(c) => c,
         Err(std::sync::TryLockError::WouldBlock) => {
@@ -248,7 +263,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     last_fetch_ts: None,
                 };
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + ctx.busy_wait;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 match core.try_lock() {
@@ -256,7 +271,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                     Err(std::sync::TryLockError::WouldBlock) => {
                         if std::time::Instant::now() >= deadline {
                             return Response::Error {
-                                message: "daemon busy (scan in progress) — retry shortly".into(),
+                                message: tomte_proto::BUSY_REPLY.into(),
                             };
                         }
                     }

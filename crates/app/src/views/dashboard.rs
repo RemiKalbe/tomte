@@ -624,7 +624,22 @@ fn trigger_onepassword_unlock(
                         .timeout(std::time::Duration::from_secs(120)),
                 );
                 if let Some(engine) = engine {
-                    let _ = engine.ipc.request(tomte_proto::Request::Rescan);
+                    // Best-effort, but never silent: the unlock's whole point
+                    // is the rescan that follows it.
+                    match engine.ipc.request_patiently(
+                        tomte_proto::Request::Rescan,
+                        tomte_app::ipc::DAEMON_PATIENCE,
+                        "rescan after unlock",
+                    ) {
+                        Ok(tomte_proto::Response::Ok) => {}
+                        Ok(other) => tomte_core::log_warn!(
+                            "unlock",
+                            "rescan after unlock: unexpected reply {other:?}"
+                        ),
+                        Err(e) => {
+                            tomte_core::log_warn!("unlock", "rescan after unlock failed: {e}")
+                        }
+                    }
                 }
             })
             .await;
@@ -682,7 +697,19 @@ fn fetch_now_button(
                 cx.spawn(async move |cx| {
                     let outcome = cx
                         .background_executor()
-                        .spawn(async move { engine.ipc.request(tomte_proto::Request::Fetch) })
+                        .spawn(async move {
+                            // Retried across the daemon's busy bounces like
+                            // every decision is: a scan in progress is not a
+                            // failed fetch. A single bounce never reaches the
+                            // tile; only a daemon that stayed busy past the
+                            // budget does, in those words, the bounce quoted
+                            // inside.
+                            engine.ipc.request_patiently(
+                                tomte_proto::Request::Fetch,
+                                tomte_app::ipc::DAEMON_PATIENCE,
+                                "fetch now",
+                            )
+                        })
                         .await;
                     // Only failures resolve the spinner here — on an ack the
                     // FetchDone/FetchFailed push is the truth. (2026-08-08: a

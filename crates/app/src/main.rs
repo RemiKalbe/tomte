@@ -91,6 +91,7 @@ fn build_engine(ipc: Arc<IpcClient>, journal_path: PathBuf) -> Result<ResolveEng
         git,
         ipc,
         journal_path,
+        daemon_patience: tomte_app::resolve::DAEMON_PATIENCE,
     })
 }
 
@@ -227,9 +228,7 @@ fn verify_connectivity(paths: &Paths) -> ExitCode {
     for _ in 0..60 {
         match client.request(Request::Rescan) {
             Ok(Response::Ok) => break,
-            Ok(Response::Error { message })
-                if message.contains("busy") || message.contains("starting") =>
-            {
+            Ok(Response::Error { message }) if tomte_proto::is_daemon_bounce(&message) => {
                 std::thread::sleep(Duration::from_secs(1));
             }
             Ok(other) => {

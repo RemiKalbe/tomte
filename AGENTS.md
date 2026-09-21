@@ -233,6 +233,18 @@ Hard rules, each one learned the expensive way.
   (`tomte_core::log_error!`) and reach the user: row chip, banner, or
   notification. Degraded says why and what to do; scanning never claims
   in-sync.
+- The daemon bounces a request it cannot serve within its core-lock wait
+  (`ServeCtx::busy_wait`, 20 s) with `tomte_proto::BUSY_REPLY`, and answers
+  `STARTING_PREFIX` before it has a core: nothing executed either way.
+  `tomte_proto::is_daemon_bounce` is the one matcher; every user-initiated
+  request goes through `IpcClient::request_patiently`, which retries the
+  bounce for `DAEMON_PATIENCE` (90 s, per request) and then fails typed
+  (`IpcError::Busy`). Never surface a single bounce. A batch makes the budget
+  per batch: after the first exhausted one it stops asking, the closing
+  rescan included (later files are "not attempted — … — try again"; files
+  whose work already landed are "resolved, but the session was not closed",
+  never "try again"). A client-side timeout is NOT retried — the daemon may
+  have executed it.
 - Subprocess waits are WNOHANG polling with timeouts, never signal-based;
   fetch runs with `GIT_TERMINAL_PROMPT=0` and ssh `BatchMode` so a locked
   1Password agent fails fast instead of hanging the daemon.

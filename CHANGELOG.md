@@ -4,6 +4,20 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## Unreleased
+
+### Fixed
+
+- **A busy daemon no longer fails a decision you already made.** While a scan
+  (or a fetch) holds the daemon, a request that waits past the daemon's own
+  bound is bounced with "daemon busy" — and that bounce used to land on the
+  row as the decision's failure, so a scan that ran a few seconds long could
+  fail a file you had just confirmed. The bounce executes nothing, so it is
+  now retried, each retry logged, for up to a minute and a half; only a
+  daemon that stays busy that long is reported, in those words. The same
+  holds for the dashboard's Fetch now, and a daemon that stays busy through
+  a whole batch is reported once, not once per file after a full wait each.
+
 ## 0.1.19 — 2026-09-21
 
 ### Fixed

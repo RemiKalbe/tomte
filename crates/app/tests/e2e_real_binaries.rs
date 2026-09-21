@@ -299,9 +299,7 @@ fn fetch_request_updates_freshness_and_pushes_fetch_done() {
     for _ in 0..60 {
         match client.request(Request::Fetch) {
             Ok(Response::Ok) => break,
-            Ok(Response::Error { message })
-                if message.contains("busy") || message.contains("starting") =>
-            {
+            Ok(Response::Error { message }) if tomte_proto::is_daemon_bounce(&message) => {
                 std::thread::sleep(Duration::from_millis(500));
             }
             other => panic!("fetch request failed: {other:?}"),

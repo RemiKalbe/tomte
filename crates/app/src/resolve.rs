@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
 use tomte_core::git::{GitClient, GitError};
@@ -144,7 +144,13 @@ pub struct ResolveEngine {
     pub ipc: Arc<IpcClient>,
     /// Read-only opens for undo (spec §8: single writer = daemon).
     pub journal_path: PathBuf,
+    /// How long a decision keeps retrying a daemon that answers "busy" (or
+    /// "starting") before that becomes the row's failure. [`DAEMON_PATIENCE`]
+    /// in the app; tests shrink it.
+    pub daemon_patience: Duration,
 }
+
+pub use crate::ipc::DAEMON_PATIENCE;
 
 impl ResolveEngine {
     /// Keep the on-disk version: re-add it into the source state.
@@ -356,14 +362,40 @@ impl ResolveEngine {
         // Phase 1 — per file, cheap: session, snapshot, decision. AFTER the
         // catch-up on purpose: a merge rewrites source files, and a snapshot
         // taken before it would journal content undo must not restore.
+        // A daemon that stayed busy past the whole patience budget for one
+        // file is not asked again for the next: the budget is per request in
+        // `IpcClient`, so it is made per BATCH here — a ten-file batch must
+        // not hold the queue for ten budgets while every row sits at
+        // "running…". `stuck` is set by the first exhausted budget, in this
+        // loop or in Phase 2a's rejection journaling or in Phase 3's session
+        // close, and every later daemon call in the batch is skipped: the
+        // file is reported as not attempted (nothing happened to it), or —
+        // after its work landed — as resolved with its session left open.
         let mut prepared: Vec<Prepared> = Vec::new();
+        let mut stuck: Option<String> = None;
         for candidate in candidates {
+            if let Some(why) = &stuck {
+                per_target[candidate.slot].1 = Err(not_attempted(why));
+                continue;
+            }
             match self.open_batch_session(&candidate) {
                 Ok(session) => prepared.push(Prepared { candidate, session }),
-                Err(e) => per_target[candidate.slot].1 = Err(e),
+                Err(e) => {
+                    if let Some(why) = stuck_phrase(&e) {
+                        stuck = Some(why);
+                    }
+                    per_target[candidate.slot].1 = Err(e);
+                }
             }
         }
         if prepared.is_empty() {
+            return BatchOutcome { per_target };
+        }
+        if let Some(why) = &stuck {
+            // Nothing below has run for anyone: no announcement, no write.
+            for p in &prepared {
+                per_target[p.candidate.slot].1 = Err(not_attempted(why));
+            }
             return BatchOutcome { per_target };
         }
 
@@ -410,6 +442,10 @@ impl ResolveEngine {
                 continue;
             }
             let target = p.candidate.target.as_path();
+            if let Some(why) = &stuck {
+                per_target[p.candidate.slot].1 = Err(not_attempted(why));
+                continue;
+            }
             per_target[p.candidate.slot].1 = match self.write_back_disk_text(p) {
                 Ok(WriteBackAttempt::Verified(new_template)) => {
                     match std::fs::write(&p.candidate.source, new_template) {
@@ -420,9 +456,17 @@ impl ResolveEngine {
                         Err(e) => Err(e.into()),
                     }
                 }
-                Ok(WriteBackAttempt::Rejected(detail)) => self
-                    .journal_rejection(p.session, "keep_disk", target, &detail)
-                    .map(|()| ResolveOutcome::ProtectedSpan { detail }),
+                Ok(WriteBackAttempt::Rejected(detail)) => {
+                    match self.journal_rejection(p.session, "keep_disk", target, &detail) {
+                        Ok(()) => Ok(ResolveOutcome::ProtectedSpan { detail }),
+                        Err(e) => {
+                            if let Some(why) = stuck_phrase(&e) {
+                                stuck = Some(why);
+                            }
+                            Err(e)
+                        }
+                    }
+                }
                 Err(e) => Err(e),
             };
         }
@@ -514,22 +558,24 @@ impl ResolveEngine {
                 BatchDecision::KeepDisk => "keep_disk",
                 BatchDecision::KeepSourceLocal => "keep_source",
             };
-            per_target[p.candidate.slot].1 = match landed {
-                Ok((committed, pushed, note)) => self
-                    .session_end(
+            per_target[p.candidate.slot].1 = close_landed(
+                p.session,
+                landed,
+                || {
+                    self.session_end(
                         p.session,
                         &format!("{label} {}", display_name(&p.candidate.target)),
                     )
-                    .map(|()| ResolveOutcome::Done {
-                        session: p.session,
-                        committed,
-                        pushed,
-                        note,
-                    }),
-                Err(msg) => Err(ResolveError::Failed(msg)),
-            };
+                },
+                &mut stuck,
+            );
         }
-        if let Err(e) = self.rescan() {
+        if let Some(why) = &stuck {
+            // The last daemon call of the batch is skipped like the others:
+            // a stuck daemon is not asked once more for a second budget. Its
+            // own next scan covers what this one would have.
+            tomte_core::log_warn!("resolve", "rescan after batch skipped: {why}");
+        } else if let Err(e) = self.rescan() {
             // Every file already landed; a missed rescan only means the
             // daemon's view is stale, which the next scan fixes.
             tomte_core::log_warn!("resolve", "rescan after batch failed: {e}");
@@ -1385,12 +1431,25 @@ impl ResolveEngine {
     }
 
     fn session_start(&self) -> Result<i64, ResolveError> {
-        match self.ipc.request(Request::SessionStart { ts: now_ts() })? {
+        match self.request_patiently(Request::SessionStart { ts: now_ts() }, "session start")? {
             Response::SessionStarted { session } => Ok(session),
             other => Err(unexpected("session start", other)),
         }
     }
 
+    /// One daemon request, retried across busy bounces for up to
+    /// [`Self::daemon_patience`] ([`IpcClient::request_patiently`]). A busy
+    /// budget that runs out is [`IpcError::Busy`], which the batch reads to
+    /// stop asking a stuck daemon once per file.
+    fn request_patiently(
+        &self,
+        request: Request,
+        what: &'static str,
+    ) -> Result<Response, ResolveError> {
+        Ok(self
+            .ipc
+            .request_patiently(request, self.daemon_patience, what)?)
+    }
     fn session_decision(
         &self,
         session: i64,
@@ -1414,7 +1473,7 @@ impl ResolveEngine {
     }
 
     fn snapshot_blobs(&self, paths: Vec<PathBuf>) -> Result<Vec<String>, ResolveError> {
-        match self.ipc.request(Request::SnapshotBlobs { paths })? {
+        match self.request_patiently(Request::SnapshotBlobs { paths }, "snapshot blobs")? {
             Response::Blobs { hashes } => Ok(hashes),
             other => Err(unexpected("snapshot blobs", other)),
         }
@@ -1435,9 +1494,75 @@ impl ResolveEngine {
     }
 
     fn ipc_ok(&self, request: Request, what: &'static str) -> Result<(), ResolveError> {
-        match self.ipc.request(request)? {
+        match self.request_patiently(request, what)? {
             Response::Ok => Ok(()),
             other => Err(unexpected(what, other)),
+        }
+    }
+}
+
+/// The batch's answer for a file it never asked the daemon about, because an
+/// earlier file already exhausted the busy budget: nothing happened to it, so
+/// trying again is exactly right.
+fn not_attempted(why: &str) -> ResolveError {
+    ResolveError::Failed(format!("not attempted — {why} — try again"))
+}
+
+/// What a batch remembers about a stuck daemon: the busy error's own words
+/// WITHOUT its "try again". Each row adds the guidance that is true for it —
+/// a file nothing happened to may be tried again ([`not_attempted`]); a file
+/// whose work landed must not be ([`close_landed`]).
+fn stuck_phrase(e: &ResolveError) -> Option<String> {
+    match e {
+        ResolveError::Ipc(IpcError::Busy {
+            waited_secs,
+            message,
+        }) => Some(format!(
+            "the daemon stayed busy for {waited_secs:.1}s ({message})"
+        )),
+        _ => None,
+    }
+}
+
+/// Phase 3 for one file of the batch's tail. `landed` is its group's result
+/// (its `re-add`/write-back/`apply` ran, or failed as a group); `end` closes
+/// its journal session. The one thing this must never do is tell the user to
+/// try again a file whose work has already landed: whatever goes wrong with
+/// the close — the daemon known stuck already (`stuck`, then `end` is not even
+/// called), or `end` itself failing — the row says the file is resolved and
+/// only Undo is unavailable for it. A close that exhausted the busy budget
+/// sets `stuck` for the files after it.
+fn close_landed(
+    session: i64,
+    landed: Result<(bool, bool, Option<String>), String>,
+    end: impl FnOnce() -> Result<(), ResolveError>,
+    stuck: &mut Option<String>,
+) -> Result<ResolveOutcome, ResolveError> {
+    let (committed, pushed, note) = match landed {
+        Ok(landed) => landed,
+        Err(msg) => return Err(ResolveError::Failed(msg)),
+    };
+    let unclosed = |why: &str| {
+        ResolveError::Failed(format!(
+            "resolved, but its journal session was not closed (Undo unavailable for it): {why}"
+        ))
+    };
+    if let Some(why) = stuck.as_deref() {
+        return Err(unclosed(why));
+    }
+    match end() {
+        Ok(()) => Ok(ResolveOutcome::Done {
+            session,
+            committed,
+            pushed,
+            note,
+        }),
+        Err(e) => {
+            let why = stuck_phrase(&e);
+            if let Some(why) = &why {
+                *stuck = Some(why.clone());
+            }
+            Err(unclosed(&why.unwrap_or_else(|| e.to_string())))
         }
     }
 }
@@ -1782,6 +1907,88 @@ mod tests {
             &serde_json::json!([{ "action": "undo", "of": 3 }])
         ));
         assert!(session_landed(&serde_json::json!({"not": "array"})));
+    }
+
+    fn busy() -> ResolveError {
+        ResolveError::Ipc(IpcError::Busy {
+            waited_secs: 90.0,
+            message: tomte_proto::BUSY_REPLY.into(),
+        })
+    }
+
+    /// A landed file is never told "try again": the close failing, or being
+    /// skipped because the daemon is already known stuck, both read as
+    /// resolved-with-Undo-unavailable, and only a busy close sets `stuck`.
+    /// MUTATION: return `Err(e)` unchanged from the `end` failure → the
+    /// second case fails; drop the `stuck` early return → the third case
+    /// panics inside `end`; set `stuck` on every error → the fourth fails.
+    #[test]
+    fn close_landed_never_asks_the_user_to_redo_landed_work() {
+        let landed = || Ok((true, true, None));
+        let mut stuck = None;
+        let ok = close_landed(7, landed(), || Ok(()), &mut stuck).unwrap();
+        assert!(matches!(
+            ok,
+            ResolveOutcome::Done {
+                session: 7,
+                committed: true,
+                pushed: true,
+                ..
+            }
+        ));
+        assert!(stuck.is_none());
+
+        let mut stuck = None;
+        let err = close_landed(7, landed(), || Err(busy()), &mut stuck).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("resolved, but its journal session was not closed"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("stayed busy"), "{err}");
+        assert!(
+            stuck.is_some(),
+            "a busy close marks the daemon stuck for the files after it"
+        );
+        assert!(
+            !err.to_string().contains("try again"),
+            "landed work is never retried: {err}"
+        );
+        assert!(!stuck.as_deref().unwrap_or_default().contains("try again"));
+
+        let mut stuck = Some("the daemon stayed busy for 90.0s".to_string());
+        let err = close_landed(
+            7,
+            landed(),
+            || panic!("must not ask a stuck daemon"),
+            &mut stuck,
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with("resolved, but"), "{err}");
+
+        let mut stuck = None;
+        let err = close_landed(
+            7,
+            landed(),
+            || Err(ResolveError::Failed("session end: no such session".into())),
+            &mut stuck,
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with("resolved, but"), "{err}");
+        assert!(
+            stuck.is_none(),
+            "an ordinary close failure is not a stuck daemon"
+        );
+
+        let mut stuck = None;
+        let err = close_landed(
+            7,
+            Err("the batch re-add failed: x".into()),
+            || Ok(()),
+            &mut stuck,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the batch re-add failed: x");
     }
 
     #[test]

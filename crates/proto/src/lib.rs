@@ -9,6 +9,23 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 4;
 
+/// The daemon's reply when a request could not take the core within the
+/// daemon's own wait for it (a scan, a fetch, an auto-join holding it).
+/// Nothing executed: the request is safe to send again.
+pub const BUSY_REPLY: &str = "daemon busy (scan in progress) — retry shortly";
+
+/// Prefix of the daemon's reply while it has no core yet — `tomted
+/// starting…`, or `tomted starting: <why>` once a startup attempt has
+/// failed. Nothing executed: the request is safe to send again.
+pub const STARTING_PREFIX: &str = "tomted starting";
+
+/// Whether a `Response::Error` message is one of the two replies that
+/// executed nothing and invite a retry. Both sides of the socket read this
+/// so the client never has to guess at the daemon's wording.
+pub fn is_daemon_bounce(message: &str) -> bool {
+    message == BUSY_REPLY || message.starts_with(STARTING_PREFIX)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -191,6 +208,19 @@ pub fn check_hello(client_version: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MUTATION: loosen to `contains("busy")` or `contains("starting")` and the
+    /// two negative cases below no longer hold the line.
+    #[test]
+    fn is_daemon_bounce_matches_exactly_the_two_replies_that_executed_nothing() {
+        assert!(is_daemon_bounce(BUSY_REPLY));
+        assert!(is_daemon_bounce("tomted starting…"));
+        assert!(is_daemon_bounce("tomted starting: chezmoi not found"));
+        assert!(!is_daemon_bounce("daemon state poisoned"));
+        assert!(!is_daemon_bounce("session decision: no such session 7"));
+        assert!(!is_daemon_bounce("git busy: index.lock"));
+        assert!(!is_daemon_bounce("restarting the watcher"));
+    }
     use std::path::PathBuf;
 
     #[test]
