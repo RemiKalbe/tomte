@@ -970,8 +970,10 @@ Beside `three_decisions_queued_before_the_drain_are_one_push` in `crates/app/src
     /// pumps once, so three files are one re-add, one commit, one push.
     /// `enqueue` per file would pump on the first push and drain it alone
     /// (queue spec §2.2's "first click drains alone").
-    /// MUTATION: make `enqueue_many` call `enqueue` per item → `running()`
-    /// is 1 after the call and `engine_pushes()` is 2.
+    /// MUTATION: push AND pump per item inside `enqueue_many`'s loop (not
+    /// "call `enqueue` per item" — `enqueue` delegates here, so that would
+    /// recurse and abort) → `running()` is 1 after the call and
+    /// `engine_pushes()` is 2.
     #[gpui::test]
     fn a_bulk_press_is_one_batch_and_one_push(cx: &mut TestAppContext) {
         let lab = EngineLab::publish(cx);
