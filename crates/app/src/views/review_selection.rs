@@ -22,15 +22,13 @@ pub(super) struct Selection {
 }
 
 impl Selection {
-    /// Consumed by Task 6: the bulk-action bar reads the ticked set to build
+    /// The bulk-action bar reads the ticked set to build
     /// `Shell::enqueue_many`'s batch.
-    #[allow(dead_code)]
     pub(super) fn members(&self) -> &[PathBuf] {
         &self.members
     }
 
-    /// Consumed by Task 6: gates the bulk-action bar's visibility.
-    #[allow(dead_code)]
+    /// Gates the bulk-action bar's visibility.
     pub(super) fn is_empty(&self) -> bool {
         self.members.is_empty()
     }
@@ -43,8 +41,7 @@ impl Selection {
     /// does not list as safe is refused, silently — the row it came from
     /// has no checkbox, so this is a structural guard, not a user path.
     ///
-    /// Consumed by Task 6: the row's ⌘-click and checkbox gesture.
-    #[allow(dead_code)]
+    /// The row's ⌘-click and checkbox gesture.
     pub(super) fn toggle(&mut self, target: &Path, safe_order: &[PathBuf]) {
         if !safe_order.iter().any(|t| t == target) {
             return;
@@ -64,8 +61,7 @@ impl Selection {
     /// anchor the range starts at `fallback_anchor` (the detail row, when it
     /// is safe), else at the first visible row.
     ///
-    /// Consumed by Task 6: the row's ⇧-click gesture.
-    #[allow(dead_code)]
+    /// The row's ⇧-click gesture.
     pub(super) fn extend_range(
         &mut self,
         to: &Path,
@@ -109,9 +105,8 @@ impl Selection {
     /// already a member, drop them all; otherwise add them all
     /// (`CheckState::toggled` in set form).
     ///
-    /// Consumed by Task 6 (the SAFE header's select-all) and Task 7 (a
-    /// folder row's checkbox).
-    #[allow(dead_code)]
+    /// The SAFE header's select-all (Task 6); a folder row's checkbox
+    /// (Task 7).
     pub(super) fn toggle_all(&mut self, targets: &[PathBuf], safe_order: &[PathBuf]) {
         if targets.is_empty() {
             return;
@@ -129,8 +124,7 @@ impl Selection {
         }
     }
 
-    /// Consumed by Task 6: Escape / a mode switch clears the selection.
-    #[allow(dead_code)]
+    /// Escape / a mode switch clears the selection.
     pub(super) fn clear(&mut self) {
         self.members.clear();
         self.anchor = None;
@@ -139,9 +133,8 @@ impl Selection {
     /// The plan was rebuilt: keep only what it still lists as safe, in its
     /// order, and forget an anchor whose row is gone.
     ///
-    /// Consumed by Task 6: `ReviewView` prunes the live `Selection` every
-    /// time the model or the queue changes the plan underneath it.
-    #[allow(dead_code)]
+    /// `ReviewView` prunes the live `Selection` every time the model or the
+    /// queue changes the plan underneath it.
     pub(super) fn prune(&mut self, safe_order: &[PathBuf]) {
         let keep: BTreeSet<&PathBuf> = safe_order.iter().collect();
         self.members.retain(|m| keep.contains(m));

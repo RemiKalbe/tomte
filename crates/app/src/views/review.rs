@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString, Stateful,
-    WeakEntity, Window, div, prelude::*, px,
+    AnyElement, ClickEvent, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString,
+    Stateful, WeakEntity, Window, div, prelude::*, px,
 };
 use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
@@ -38,7 +38,7 @@ use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind, worddiff::word_
 use tomte_journal::{EventRow, Journal};
 use tomte_proto::DriftSummary;
 use tomte_ui::components as ui;
-use tomte_ui::components::CheckState;
+use tomte_ui::components::{CheckState, TREE_INDENT};
 
 use super::Shell;
 use super::dashboard::system_now;
@@ -322,6 +322,23 @@ pub(super) fn source_actions(origin_available: bool) -> Vec<ResolveAction> {
         ]
     } else {
         vec![ResolveAction::KeepSourceLocal]
+    }
+}
+
+/// The bulk pair: exactly the one-click decisions (spec §2.1). Keep source ·
+/// origin needs each file's origin content shown; Keep both needs a dry-run
+/// per file. Neither is a bulk.
+pub(super) fn bulk_actions() -> [ResolveAction; 2] {
+    [ResolveAction::KeepDisk, ResolveAction::KeepSourceLocal]
+}
+
+pub(super) fn bulk_decision(action: ResolveAction) -> Decision {
+    match action {
+        ResolveAction::KeepDisk => Decision::KeepDisk,
+        ResolveAction::KeepSourceLocal => Decision::KeepSourceLocal,
+        // Structural: `bulk_actions` never yields it. Falling back to the
+        // local source would silently do something the user did not press.
+        ResolveAction::KeepSourceOrigin => unreachable!("origin is never a bulk action"),
     }
 }
 
@@ -977,8 +994,7 @@ pub(super) enum SidebarRow {
     Group {
         label: &'static str,
         /// The SAFE TO RESOLVE header's select-all; `None` on the others.
-        /// Consumed by Task 6, which renders it.
-        #[allow(dead_code)]
+        /// Rendered by `ReviewView::group_header_el`.
         check: Option<CheckState>,
     },
     /// Tree mode only: a folder of the safe group. Consumed by Task 7's tree
@@ -998,15 +1014,11 @@ pub(super) enum SidebarRow {
         /// this apparent redundancy is the point, not something to tidy
         /// away.
         locked: bool,
-        /// Tree indent level; 0 in flat mode. Consumed by Task 7 (indenting
-        /// a tree row).
-        #[allow(dead_code)]
+        /// Tree indent level; 0 in flat mode. Read by `target_row`'s
+        /// indent; Task 7 is what makes it ever non-zero.
         depth: usize,
-        /// A safe row: carries a checkbox, answers ⌘/⇧-clicks. Consumed by
-        /// Task 6.
-        #[allow(dead_code)]
+        /// A safe row: carries a checkbox, answers ⌘/⇧-clicks.
         selectable: bool,
-        #[allow(dead_code)]
         checked: bool,
     },
 }
@@ -1017,8 +1029,7 @@ pub(super) struct SidebarPlan {
     /// `Selection` is kept in the order of and pruned against.
     pub safe_order: Vec<PathBuf>,
     /// The selectable `Target` rows actually on screen, in row order — what
-    /// a ⇧-range and `next_after` walk. Consumed by Task 6.
-    #[allow(dead_code)]
+    /// a ⇧-range and `next_after` walk.
     pub visible_safe: Vec<PathBuf>,
 }
 
@@ -1123,12 +1134,22 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
             }
             ReviewMode::Tree => {
                 // Excluded = every drifted row that is not safe (needs-you or
-                // processing): counted by the folder chips, never listed here.
-                let excluded: Vec<PathBuf> = drifted
+                // processing), plus every processing target the drift model
+                // has already dropped (a rescan can clear a row while its
+                // decision is still running, spec §2.5): both are counted by
+                // the folder chips, never listed here. Without the second
+                // half a folder that lost its only other file this way would
+                // undercount its own total.
+                let mut excluded: Vec<PathBuf> = drifted
                     .iter()
                     .filter(|d| !safe_targets.contains(&d.target))
                     .map(|d| d.target.clone())
                     .collect();
+                for (target, _) in &queue.processing {
+                    if !drifted.iter().any(|d| d.target == *target) {
+                        excluded.push(target.clone());
+                    }
+                }
                 for row in tree_rows(&safe_targets, &excluded, collapsed, home) {
                     match row {
                         TreeRow::Folder(node) => {
@@ -1197,6 +1218,15 @@ pub struct ReviewView {
     /// Draggable History height, and its in-flight drag.
     history_height: Option<f32>,
     history_drag: Option<ui::DragState<()>>,
+    /// Flat list or folder tree (spec §2.5). `pub(super)` for the
+    /// render-smoke tests and the gallery poses.
+    pub(super) mode: ReviewMode,
+    /// The SAFE TO RESOLVE rows ticked right now. `pub(super)` for the same
+    /// reason.
+    pub(super) selection: Selection,
+    /// Tree-mode folders the user closed, by their (compacted) path.
+    /// `pub(super)` for the same reason; empty and inert in Flat mode.
+    pub(super) collapsed: BTreeSet<PathBuf>,
 }
 
 impl ReviewView {
@@ -1221,6 +1251,9 @@ impl ReviewView {
             sidebar_drag: None,
             history_height: None,
             history_drag: None,
+            mode: ReviewMode::Flat,
+            selection: Selection::default(),
+            collapsed: BTreeSet::new(),
         }
     }
 
@@ -1371,48 +1404,128 @@ impl ReviewView {
     /// between.
     ///
     /// The walk order is `sidebar_rows`'s own — needs-you targets, then the
-    /// safe group's `safe_order` (flat today; the tree's compacted order
-    /// once Task 6/7 wire a real mode) — so this never drifts from what the
-    /// sidebar shows.
+    /// safe group's `visible_safe` in THIS view's own mode — so this never
+    /// drifts from what the sidebar shows, and a collapsed folder's files are
+    /// skipped by the sweep exactly as they are invisible in it (spec §2.5).
     ///
-    /// `resolved` was just enqueued by the caller and so already reads as
-    /// processing; the plan below is built as if it were not, so it stays at
-    /// its true display position for `next_after`'s lookup instead of
-    /// vanishing from the list the instant it is answered. Every OTHER
-    /// processing row is filtered out exactly as `sidebar_rows` renders it —
-    /// `next_after`'s own `processing` check (over the REAL queue) skips
-    /// those as candidates either way, so nothing changes for them.
+    /// The plan is built with an EMPTY queue rather than the real one —
+    /// proven equivalent to the once-hand-rolled "every processing row but
+    /// `resolved`" snapshot: `next_after`'s own `processing` check below
+    /// (over the REAL queue) is what actually screens out every processing
+    /// row as a candidate, `resolved` included, so what the plan's queue
+    /// looks like does not change which candidate is picked — only which
+    /// rows exist to walk, and `visible_safe` never needed a queue to build.
     fn advance_from(&mut self, resolved: &Path, cx: &mut Context<Self>) {
         let drifted = self.state.read(cx).drifted.clone();
         let queue = self.queue_snapshot(cx);
         let home = home();
         let (needs_you, _) = severity_groups(&drifted);
-        let queue_before_this_click = QueueSnapshot {
-            processing: queue
-                .processing
-                .iter()
-                .filter(|(t, _)| t != resolved)
-                .cloned()
-                .collect(),
-            failures: BTreeMap::new(),
-            busy: queue.busy,
-        };
         let plan = sidebar_rows(SidebarInputs {
             drifted: &drifted,
-            queue: &queue_before_this_click,
-            mode: ReviewMode::Flat,
-            collapsed: &BTreeSet::new(),
-            selection: &Selection::default(),
+            queue: &QueueSnapshot::default(),
+            mode: self.mode,
+            collapsed: &self.collapsed,
+            selection: &self.selection,
             home: &home,
         });
         let ordered: Vec<PathBuf> = needs_you
             .iter()
             .map(|d| d.target.clone())
-            .chain(plan.safe_order)
+            .chain(plan.visible_safe)
             .collect();
         if let Some(next) = next_after(resolved, &ordered, &|p| queue.is_processing(p)) {
             self.select(next, cx);
         }
+    }
+
+    /// The plan the sidebar is showing right now, from the same inputs
+    /// `render_inner` uses. Cheap (a few dozen rows); rebuilt per gesture so
+    /// every rule reads one snapshot of the world.
+    fn plan(&self, cx: &Context<Self>) -> SidebarPlan {
+        let queue = self.queue_snapshot(cx);
+        let drifted = &self.state.read(cx).drifted;
+        sidebar_rows(SidebarInputs {
+            drifted,
+            queue: &queue,
+            mode: self.mode,
+            collapsed: &self.collapsed,
+            selection: &self.selection,
+            home: &home(),
+        })
+    }
+
+    /// ⌘-click or a checkbox on a safe row.
+    fn toggle_member(&mut self, target: &Path, cx: &mut Context<Self>) {
+        let plan = self.plan(cx);
+        self.selection.toggle(target, &plan.safe_order);
+        cx.notify();
+    }
+
+    /// ⇧-click on a safe row.
+    fn extend_to(&mut self, target: &Path, cx: &mut Context<Self>) {
+        let plan = self.plan(cx);
+        let fallback = self
+            .selected
+            .clone()
+            .filter(|s| plan.safe_order.contains(s));
+        self.selection
+            .extend_range(target, &plan.visible_safe, fallback.as_deref());
+        cx.notify();
+    }
+
+    /// The SAFE TO RESOLVE header's checkbox.
+    fn toggle_all_safe(&mut self, cx: &mut Context<Self>) {
+        let plan = self.plan(cx);
+        let all = plan.safe_order.clone();
+        self.selection.toggle_all(&all, &plan.safe_order);
+        cx.notify();
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection.clear();
+        cx.notify();
+    }
+
+    /// A bulk press: one `QueuedAction` per member, ONE batch (spec §2.4).
+    /// The selection clears, the rows move to PROCESSING, and the detail
+    /// selection advances past the last member.
+    ///
+    /// Updating the Shell from inside THIS view's own update is safe for the
+    /// same reason `enqueue` is (see its own comment): `Shell::enqueue_many`
+    /// → `Shell::pump` either returns immediately (already pumping, or no
+    /// engine to run with — see `pump`'s own comment on why it parks rather
+    /// than drops the batch) or hands the batch to `cx.spawn`, which only
+    /// SPAWNS a background task and returns. Neither path reaches back into
+    /// this (or any) view synchronously, so nesting this update inside the
+    /// Shell's is never the same crash `enqueue`'s comment names.
+    fn run_bulk(&mut self, action: ResolveAction, cx: &mut Context<Self>) {
+        let members = self.selection.members().to_vec();
+        let Some(last) = members.last().cloned() else {
+            return;
+        };
+        let decision = bulk_decision(action);
+        let actions: Vec<QueuedAction> = members
+            .iter()
+            .map(|target| QueuedAction {
+                target: target.clone(),
+                decision: decision.clone(),
+                notify_on_done: false,
+            })
+            .collect();
+        let count = actions.len();
+        if let Err(e) = self
+            .shell
+            .update(cx, |shell, cx| shell.enqueue_many(actions, cx))
+        {
+            tomte_core::log_error!(
+                "resolve",
+                "the bulk decision for {count} files was not queued: {e}"
+            );
+        }
+        self.selection.clear();
+        self.last_outcome = None;
+        self.advance_from(&last, cx);
+        cx.notify();
     }
 
     /// Undo the last finished session (restore destination files from their
@@ -1709,46 +1822,68 @@ impl ReviewView {
         ui::banner(theme, banner.tint, banner.text.clone(), undo)
     }
 
+    /// A SAFE TO RESOLVE-style group header, with the SAFE header's
+    /// select-all appended at the right when `check.is_some()`.
+    fn group_header_el(
+        &self,
+        label: &'static str,
+        check: Option<CheckState>,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let wrapper = div().flex().items_center().justify_between().w_full();
+        match check {
+            None => wrapper.child(group_header(label, theme)),
+            Some(state) => wrapper
+                .child(group_header(label, theme))
+                .child(div().pr_3().child(ui::checkbox(
+                    theme,
+                    "safe-select-all",
+                    state,
+                    cx.listener(|view, _ev, _w, cx| view.toggle_all_safe(cx)),
+                ))),
+        }
+    }
+
     fn sidebar(
         &self,
-        drifted: &[DriftSummary],
+        plan: &SidebarPlan,
         queue: &QueueSnapshot,
         in_sync: u64,
         now: u64,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let home = home();
-        let plan = sidebar_rows(SidebarInputs {
-            drifted,
-            queue,
-            mode: ReviewMode::Flat,
-            collapsed: &BTreeSet::new(),
-            selection: &Selection::default(),
-            home: &home,
-        });
+        let selection_active = !self.selection.is_empty();
         let mut ix = 0usize;
         let mut rows: Vec<AnyElement> = Vec::new();
-        for row in plan.rows {
+        for row in &plan.rows {
             match row {
-                SidebarRow::Group { label, .. } => {
-                    rows.push(group_header(label, theme).into_any_element())
-                }
+                SidebarRow::Group { label, check } => rows.push(
+                    self.group_header_el(label, *check, theme, cx)
+                        .into_any_element(),
+                ),
                 // Tree rendering starts in Task 7; Flat mode never emits one.
                 SidebarRow::Folder { .. } => continue,
                 SidebarRow::Target {
                     entry,
                     queued,
                     locked,
-                    ..
+                    depth,
+                    selectable,
+                    checked,
                 } => {
                     rows.push(
                         self.target_row(
                             ix,
-                            &entry,
+                            entry,
                             now,
-                            queued,
-                            locked,
+                            *queued,
+                            *locked,
+                            *depth,
+                            *selectable,
+                            *checked,
+                            selection_active,
                             queue.failure(&entry.target),
                             theme,
                             cx,
@@ -1848,6 +1983,10 @@ impl ReviewView {
         now: u64,
         queued: Option<QueuedDecision>,
         locked: bool,
+        depth: usize,
+        selectable: bool,
+        checked: bool,
+        selection_active: bool,
         failure: Option<&SharedString>,
         theme: Theme,
         cx: &mut Context<Self>,
@@ -1880,18 +2019,45 @@ impl ReviewView {
         let target = entry.target.clone();
         div()
             .id(ElementId::named_usize("review-target", ix))
+            .group("review-row")
             .px_3()
             .py_1()
+            .pl(px(12. + TREE_INDENT * depth as f32))
             .flex()
             .flex_col()
             .gap_0p5()
             .when(!locked, |el| el.cursor_pointer())
             .when(selected, |el| el.bg(theme.surface))
+            // Ticked rows carry a faint accent wash of their own — visible
+            // even while `selected` also applies (this one wins, painted
+            // after the surface tint above).
+            .when(checked, |el| el.bg(Theme::wash(theme.accent, 0.10)))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(selectable, |el| {
+                        let t = target.clone();
+                        el.child(
+                            ui::checkbox(
+                                theme,
+                                ElementId::named_usize("review-check", ix),
+                                if checked {
+                                    CheckState::On
+                                } else {
+                                    CheckState::Off
+                                },
+                                cx.listener(move |view, _ev, _w, cx| view.toggle_member(&t, cx)),
+                            )
+                            // Hidden until a selection exists, then always
+                            // shown; while none exists, a hover over THIS
+                            // row still reveals it (`group_hover`) so the
+                            // very first tick has somewhere to start.
+                            .opacity(if selection_active { 1. } else { 0. })
+                            .group_hover("review-row", |el| el.opacity(1.)),
+                        )
+                    })
                     .child(div().w_2().h_2().rounded_full().flex_shrink_0().bg(color))
                     .child(
                         div()
@@ -1942,8 +2108,16 @@ impl ReviewView {
                 ))
             }))
             .when(!locked, |el| {
-                el.on_click(cx.listener(move |view, _ev, _window, cx| {
-                    view.select(target.clone(), cx);
+                el.on_click(cx.listener(move |view, ev: &ClickEvent, _window, cx| {
+                    let mods = ev.modifiers();
+                    if selectable && mods.platform {
+                        view.toggle_member(&target, cx);
+                    } else if selectable && mods.shift {
+                        view.extend_to(&target, cx);
+                    } else {
+                        view.selection.clear();
+                        view.select(target.clone(), cx);
+                    }
                 }))
             })
     }
@@ -1976,61 +2150,103 @@ impl ReviewView {
         // Authoritative: origin's LOADED content, not the scan's hint.
         let split = self.origin_diffs.is_some();
         let blocked = blocked_reason(queue, selected);
-        let mut header_actions: Vec<AnyElement> = Vec::new();
-        header_actions.push(
-            self.action_button(ResolveAction::KeepDisk, split, blocked.clone(), theme, cx)
-                .into_any_element(),
-        );
-        header_actions.extend(self.header_source_actions().into_iter().map(|action| {
-            self.action_button(action, split, blocked.clone(), theme, cx)
+        // A selection bar REPLACES the per-file actions — it acts on the
+        // ticked set, not on the row `selected` happens to still name (the
+        // two can disagree: a ⌘/⇧-click never moves `selected`).
+        let header_actions: Vec<AnyElement> = if !self.selection.is_empty() {
+            let n = self.selection.members().len();
+            let mut header_actions: Vec<AnyElement> = vec![
+                div()
+                    .text_sm()
+                    .text_color(theme.text_muted)
+                    .flex_shrink_0()
+                    .child(format!("{n} selected"))
+                    .into_any_element(),
+            ];
+            header_actions.extend(bulk_actions().into_iter().map(|action| {
+                ui::button(
+                    theme,
+                    ElementId::Name(format!("bulk-{}", action.button_id()).into()),
+                    action.button_label(false).into(),
+                    ui::ButtonVariant::Tonal(action.tint(theme)),
+                    ui::ButtonSize::Sm,
+                    cx.listener(move |view, _ev, _window, cx| view.run_bulk(action, cx)),
+                )
+                .flex_shrink_0()
                 .into_any_element()
-        }));
-        if self.auto_merge.is_some() {
+            }));
             header_actions.push(
-                match &blocked {
-                    None => ui::button(
-                        theme,
-                        "keep-both",
-                        "Keep both".into(),
-                        ui::ButtonVariant::Tonal(theme.ok),
-                        ui::ButtonSize::Sm,
-                        cx.listener(|view, _ev, _window, cx| view.run_keep_both(cx)),
-                    ),
-                    Some(why) => ui::disabled_button(
-                        theme,
-                        "keep-both",
-                        "Keep both".into(),
-                        ui::ButtonSize::Sm,
-                        Some(why.clone()),
-                    ),
-                }
+                ui::button(
+                    theme,
+                    "bulk-clear",
+                    "✕".into(),
+                    ui::ButtonVariant::Ghost,
+                    ui::ButtonSize::Sm,
+                    cx.listener(|view, _ev, _window, cx| view.clear_selection(cx)),
+                )
+                .tooltip(ui::text_tooltip("Clear selection"))
                 .flex_shrink_0()
                 .into_any_element(),
             );
-        }
-        header_actions.push(
-            self.merge_editor_button(blocked.clone(), is_conflict, theme, cx)
-                .flex_shrink_0()
-                .into_any_element(),
-        );
-        // External editor: real but rare — an icon, not a fourth competing
-        // button.
-        header_actions.push(
-            div()
-                .id("open-in-editor")
-                .flex_shrink_0()
-                .px_1p5()
-                .py_0p5()
-                .rounded_md()
-                .text_sm()
-                .text_color(theme.text_muted)
-                .cursor_pointer()
-                .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
-                .child("↗")
-                .tooltip(ui::text_tooltip("Open in external editor"))
-                .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
-                .into_any_element(),
-        );
+            header_actions
+        } else {
+            let mut header_actions: Vec<AnyElement> = Vec::new();
+            header_actions.push(
+                self.action_button(ResolveAction::KeepDisk, split, blocked.clone(), theme, cx)
+                    .into_any_element(),
+            );
+            header_actions.extend(self.header_source_actions().into_iter().map(|action| {
+                self.action_button(action, split, blocked.clone(), theme, cx)
+                    .into_any_element()
+            }));
+            if self.auto_merge.is_some() {
+                header_actions.push(
+                    match &blocked {
+                        None => ui::button(
+                            theme,
+                            "keep-both",
+                            "Keep both".into(),
+                            ui::ButtonVariant::Tonal(theme.ok),
+                            ui::ButtonSize::Sm,
+                            cx.listener(|view, _ev, _window, cx| view.run_keep_both(cx)),
+                        ),
+                        Some(why) => ui::disabled_button(
+                            theme,
+                            "keep-both",
+                            "Keep both".into(),
+                            ui::ButtonSize::Sm,
+                            Some(why.clone()),
+                        ),
+                    }
+                    .flex_shrink_0()
+                    .into_any_element(),
+                );
+            }
+            header_actions.push(
+                self.merge_editor_button(blocked.clone(), is_conflict, theme, cx)
+                    .flex_shrink_0()
+                    .into_any_element(),
+            );
+            // External editor: real but rare — an icon, not a fourth
+            // competing button.
+            header_actions.push(
+                div()
+                    .id("open-in-editor")
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_sm()
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(Theme::wash(theme.text, 0.08)))
+                    .child("↗")
+                    .tooltip(ui::text_tooltip("Open in external editor"))
+                    .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
+                    .into_any_element(),
+            );
+            header_actions
+        };
 
         let body = if self.diff_pair != DiffPair::DiskVsLocal && self.origin_diffs.is_some() {
             self.diff_preview(theme)
@@ -2233,6 +2449,39 @@ impl ReviewView {
         // listener: the Shell cannot be borrowed across those.
         let queue = self.queue_snapshot(cx);
 
+        let home = home();
+        let mode = self.mode;
+        let collapsed = &self.collapsed;
+        // A member that resolved, got queued or turned into a conflict leaves
+        // the selection here, silently (spec §2.2). Pruned against the safe
+        // order of THIS render's inputs, then the plan is built from the
+        // pruned selection so every `checked` flag is current.
+        //
+        // Built twice rather than through a shared closure: a closure taking
+        // `&Selection` and returning a `SidebarInputs` borrowing it is
+        // inferred higher-ranked over that argument's lifetime, which then
+        // cannot unify with `drifted`/`queue`/`collapsed`/`home`'s fixed
+        // (captured) lifetime — a closure-shape limitation, not a borrow
+        // conflict.
+        let safe_order = sidebar_rows(SidebarInputs {
+            drifted: &drifted,
+            queue: &queue,
+            mode,
+            collapsed,
+            selection: &self.selection,
+            home: &home,
+        })
+        .safe_order;
+        self.selection.prune(&safe_order);
+        let plan = sidebar_rows(SidebarInputs {
+            drifted: &drifted,
+            queue: &queue,
+            mode,
+            collapsed,
+            selection: &self.selection,
+            home: &home,
+        });
+
         let dragging = self.sidebar_drag.is_some();
         div()
             .flex_1()
@@ -2268,7 +2517,7 @@ impl ReviewView {
                     }
                 }),
             )
-            .child(self.sidebar(&drifted, &queue, in_sync, now, theme, cx))
+            .child(self.sidebar(&plan, &queue, in_sync, now, theme, cx))
             .child(ui::resize_handle(
                 "review-sidebar-divider",
                 ui::ResizeAxis::X,
@@ -2440,10 +2689,10 @@ mod tests {
     use super::{
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
         QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, Selection, SidebarInputs,
-        SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, display_name, flatten_document,
-        next_after, origin_diffs, origin_hint, per_line_ranges, preview_decors,
-        queued_outcome_banner, refused_banner, severity_groups, sidebar_rows, source_actions,
-        undo_affordance, undo_banner,
+        SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
+        display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
+        preview_decors, queued_outcome_banner, refused_banner, severity_groups, sidebar_rows,
+        source_actions, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -2489,6 +2738,26 @@ mod tests {
                 ResolveAction::KeepSourceOrigin
             ]
         );
+    }
+
+    /// The bulk pair is exactly the one-click pair and nothing else (spec
+    /// §2.1). MUTATION: add KeepSourceOrigin → fails.
+    #[test]
+    fn bulk_actions_are_exactly_keep_disk_and_keep_source_this_machine() {
+        assert_eq!(
+            bulk_actions(),
+            [ResolveAction::KeepDisk, ResolveAction::KeepSourceLocal]
+        );
+        // `Decision` has no `PartialEq` (it holds an `Arc<MergeInputs>` in
+        // two of its variants), so the pairing is asserted by shape.
+        assert!(matches!(
+            bulk_decision(ResolveAction::KeepDisk),
+            Decision::KeepDisk
+        ));
+        assert!(matches!(
+            bulk_decision(ResolveAction::KeepSourceLocal),
+            Decision::KeepSourceLocal
+        ));
     }
 
     /// The list row is the one place the scan flag decides anything, and it
@@ -2865,9 +3134,12 @@ mod tests {
     /// Tree mode: needs-you and processing stay flat above; the safe group is
     /// folders + files; a folder's check reflects the selection over its
     /// descendants; collapsed files leave `visible_safe` but not `safe_order`.
-    /// MUTATION: build the tree over ALL drifted rows → the conflict shows
-    /// up as a file row; use `visible_safe` for `safe_order` → the collapsed
-    /// file is missing from it.
+    /// MUTATION: build the tree over ALL drifted rows (pass `drifted`'s
+    /// targets instead of `safe_targets` to `tree_rows`) → this does not
+    /// quietly show the conflict as a file row; `safe.iter().find(...)`'s
+    /// `.expect("tree rows come from \`safe\`")` (~:1148) panics first, since
+    /// the conflict target is not in `safe`. MUTATION: use `visible_safe` for
+    /// `safe_order` → the collapsed file is missing from it.
     #[test]
     fn tree_plan_keeps_the_other_groups_flat_and_tracks_collapse_and_ticks() {
         let drifted = vec![
@@ -2941,6 +3213,35 @@ mod tests {
         assert_eq!(
             plan.visible_safe,
             vec![p("/Users/x/.config/nvim/init.lua"), p("/Users/x/top")]
+        );
+    }
+
+    /// A PROCESSING target the drift model has already dropped (a rescan
+    /// cleared its row while its decision was still running, spec §2.5)
+    /// still counts toward its folder's denominator — the chip reads "1 of
+    /// 2", not a bare "1". MUTATION: build `excluded` from `drifted` alone
+    /// (drop the `queue.processing` pass in `sidebar_rows`) → the folder
+    /// reads `(safe: 1, total: 1)` instead of `(1, 2)`.
+    #[test]
+    fn a_dropped_processing_target_still_counts_in_its_folders_denominator() {
+        let drifted = vec![s("/Users/x/.config/a", "destination_drift")];
+        let queue = posed_queue(&["/Users/x/.config/b"], &[], false);
+        let plan = sidebar_rows(SidebarInputs {
+            drifted: &drifted,
+            queue: &queue,
+            mode: ReviewMode::Tree,
+            collapsed: &BTreeSet::new(),
+            selection: &Selection::default(),
+            home: Path::new("/Users/x"),
+        });
+        let folder = plan.rows.iter().find_map(|r| match r {
+            SidebarRow::Folder { node, .. } => Some((node.safe, node.total)),
+            _ => None,
+        });
+        assert_eq!(
+            folder,
+            Some((1, 2)),
+            "the dropped processing target still counts toward the folder's total"
         );
     }
 

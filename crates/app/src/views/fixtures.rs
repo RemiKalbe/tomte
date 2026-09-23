@@ -4,7 +4,7 @@
 //! (or a human) can screenshot any state on demand instead of reproducing it
 //! by hand. The registry doubles as documentation of every reachable state.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,8 +18,10 @@ use tomte_proto::DriftSummary;
 use super::PendingRepoOp;
 use super::merge::{LoadedMerge, MergeView, Rollback};
 use super::review::{
-    BannerTint, DiffPair, OutcomeBanner, PreviewState, ProvRow, ReviewView, origin_diffs,
+    BannerTint, DiffPair, OutcomeBanner, PreviewState, ProvRow, QueueSnapshot, ReviewMode,
+    ReviewView, SidebarInputs, origin_diffs, sidebar_rows,
 };
+use super::review_selection::Selection;
 use super::settings::SettingsPaths;
 use super::{Route, Shell};
 use tomte_app::action_queue::{Decision, QueuedAction};
@@ -61,6 +63,10 @@ pub const STATES: &[(&str, &str)] = &[
     (
         "review-origin-compared",
         "the origin comparison picked: disk ↔ origin, origin's lines in the remote tint",
+    ),
+    (
+        "review-multiselect",
+        "three safe rows ticked: the selection bar replaces the file's actions, checkboxes visible",
     ),
     ("merge", "three-pane editor with unresolved conflicts"),
     (
@@ -222,6 +228,36 @@ fn rich_model() -> SyncModel {
             None,
         ),
     ];
+    m
+}
+
+/// `rich_model()` plus three more safe (one-click) rows: the multi-select
+/// pose needs enough safe rows for the tri-state header and a bulk press to
+/// say anything.
+fn multiselect_model() -> SyncModel {
+    let mut m = rich_model();
+    let mut drifted = m.drifted.clone();
+    drifted.extend([
+        DriftSummary {
+            target: home(".config/starship.toml"),
+            class: "destination_drift".into(),
+            since_ts: Some(now() - 40_000),
+            origin_differs: false,
+        },
+        DriftSummary {
+            target: home(".zshrc"),
+            class: "source_ahead".into(),
+            since_ts: Some(now() - 60_000),
+            origin_differs: false,
+        },
+        DriftSummary {
+            target: home(".config/nvim/init.lua"),
+            class: "destination_drift".into(),
+            since_ts: Some(now() - 80_000),
+            origin_differs: false,
+        },
+    ]);
+    m.hydrate_status(drifted, m.in_sync, None, false, None);
     m
 }
 
@@ -445,8 +481,13 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         | "review-failed"
         | "review-keep-both"
         | "review-origin"
-        | "review-origin-compared" => {
-            let mut model = rich_model();
+        | "review-origin-compared"
+        | "review-multiselect" => {
+            let mut model = if name == "review-multiselect" {
+                multiselect_model()
+            } else {
+                rich_model()
+            };
             let origin = name.starts_with("review-origin");
             if origin {
                 // The scan's hint, kept honest alongside the loaded content
@@ -539,6 +580,33 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                         origin: None,
                     };
                     view.auto_merge = Some((Arc::new(inputs), "merged\n".into()));
+                });
+            }
+            if name == "review-multiselect" {
+                // Ticked against the plan's own `safe_order`, exactly as a
+                // real ⌘-click does (`ReviewView::toggle_member`) — not the
+                // detail pane's `selected` file, which stays
+                // `.config/zed/settings.json` (from `posed_review`) so the
+                // pose also shows the selection bar replacing a file's
+                // per-row actions while a DIFFERENT file's diff still shows
+                // underneath it.
+                let home_dir = home("");
+                let plan = sidebar_rows(SidebarInputs {
+                    drifted: &s.state.read(cx).drifted,
+                    queue: &QueueSnapshot::default(),
+                    mode: ReviewMode::Flat,
+                    collapsed: &BTreeSet::new(),
+                    selection: &Selection::default(),
+                    home: &home_dir,
+                });
+                review.update(cx, |view, _| {
+                    for target in [
+                        home(".gitconfig"),
+                        home(".config/starship.toml"),
+                        home(".zshrc"),
+                    ] {
+                        view.selection.toggle(&target, &plan.safe_order);
+                    }
                 });
             }
             s.review = Some(review);
