@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod fixtures;
 pub mod merge;
 pub mod review;
+mod review_selection;
 pub mod settings;
 
 use std::panic::AssertUnwindSafe;
