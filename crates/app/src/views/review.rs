@@ -1824,24 +1824,40 @@ impl ReviewView {
 
     /// A SAFE TO RESOLVE-style group header, with the SAFE header's
     /// select-all appended at the right when `check.is_some()`.
+    ///
+    /// Hover-revealed exactly like a row's own checkbox (ruling 5): opacity
+    /// 0 at rest, `group_hover` over the header's own `.group(..)` to 1, and
+    /// forced to 1 while the selection is non-empty — so the affordance
+    /// exists at rest (it is reachable by hovering) without being painted
+    /// when nothing is selected.
     fn group_header_el(
         &self,
         label: &'static str,
         check: Option<CheckState>,
+        selection_active: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let wrapper = div().flex().items_center().justify_between().w_full();
+        let wrapper = div()
+            .group("review-safe-header")
+            .flex()
+            .items_center()
+            .justify_between()
+            .w_full();
         match check {
             None => wrapper.child(group_header(label, theme)),
-            Some(state) => wrapper
-                .child(group_header(label, theme))
-                .child(div().pr_3().child(ui::checkbox(
-                    theme,
-                    "safe-select-all",
-                    state,
-                    cx.listener(|view, _ev, _w, cx| view.toggle_all_safe(cx)),
-                ))),
+            Some(state) => wrapper.child(group_header(label, theme)).child(
+                div().pr_3().child(
+                    ui::checkbox(
+                        theme,
+                        "safe-select-all",
+                        state,
+                        cx.listener(|view, _ev, _w, cx| view.toggle_all_safe(cx)),
+                    )
+                    .opacity(if selection_active { 1. } else { 0. })
+                    .group_hover("review-safe-header", |el| el.opacity(1.)),
+                ),
+            ),
         }
     }
 
@@ -1860,7 +1876,7 @@ impl ReviewView {
         for row in &plan.rows {
             match row {
                 SidebarRow::Group { label, check } => rows.push(
-                    self.group_header_el(label, *check, theme, cx)
+                    self.group_header_el(label, *check, selection_active, theme, cx)
                         .into_any_element(),
                 ),
                 // Tree rendering starts in Task 7; Flat mode never emits one.
@@ -2017,6 +2033,31 @@ impl ReviewView {
                 .into(),
         };
         let target = entry.target.clone();
+        // Ruling 5: the checkbox's gutter is reserved on EVERY row, not only
+        // selectable ones — a non-selectable row (PROCESSING, NEEDS A
+        // DECISION) gets an inert spacer of the checkbox's exact size in the
+        // same slot, so every group's severity dot lands in one column.
+        let checkbox_slot: AnyElement = if selectable {
+            let t = target.clone();
+            ui::checkbox(
+                theme,
+                ElementId::named_usize("review-check", ix),
+                if checked {
+                    CheckState::On
+                } else {
+                    CheckState::Off
+                },
+                cx.listener(move |view, _ev, _w, cx| view.toggle_member(&t, cx)),
+            )
+            // Hidden until a selection exists, then always shown; while none
+            // exists, a hover over THIS row still reveals it (`group_hover`)
+            // so the very first tick has somewhere to start.
+            .opacity(if selection_active { 1. } else { 0. })
+            .group_hover("review-row", |el| el.opacity(1.))
+            .into_any_element()
+        } else {
+            div().w(px(14.)).h(px(14.)).flex_none().into_any_element()
+        };
         div()
             .id(ElementId::named_usize("review-target", ix))
             .group("review-row")
@@ -2037,27 +2078,7 @@ impl ReviewView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .when(selectable, |el| {
-                        let t = target.clone();
-                        el.child(
-                            ui::checkbox(
-                                theme,
-                                ElementId::named_usize("review-check", ix),
-                                if checked {
-                                    CheckState::On
-                                } else {
-                                    CheckState::Off
-                                },
-                                cx.listener(move |view, _ev, _w, cx| view.toggle_member(&t, cx)),
-                            )
-                            // Hidden until a selection exists, then always
-                            // shown; while none exists, a hover over THIS
-                            // row still reveals it (`group_hover`) so the
-                            // very first tick has somewhere to start.
-                            .opacity(if selection_active { 1. } else { 0. })
-                            .group_hover("review-row", |el| el.opacity(1.)),
-                        )
-                    })
+                    .child(checkbox_slot)
                     .child(div().w_2().h_2().rounded_full().flex_shrink_0().bg(color))
                     .child(
                         div()
@@ -2164,10 +2185,14 @@ impl ReviewView {
                     .into_any_element(),
             ];
             header_actions.extend(bulk_actions().into_iter().map(|action| {
+                // `split: true` — spec §2.1/§2.4 give "Keep source · this
+                // machine" verbatim for the bulk bar's source button; `Keep
+                // disk` has no split form, so the flag is a no-op for it
+                // (`button_label` only branches on `KeepSourceLocal`).
                 ui::button(
                     theme,
                     ElementId::Name(format!("bulk-{}", action.button_id()).into()),
-                    action.button_label(false).into(),
+                    action.button_label(true).into(),
                     ui::ButtonVariant::Tonal(action.tint(theme)),
                     ui::ButtonSize::Sm,
                     cx.listener(move |view, _ev, _window, cx| view.run_bulk(action, cx)),
@@ -2452,35 +2477,51 @@ impl ReviewView {
         let home = home();
         let mode = self.mode;
         let collapsed = &self.collapsed;
+        // A plain `fn`, not a closure: a closure taking `&Selection` and
+        // returning a `SidebarInputs` borrowing it is inferred higher-ranked
+        // over that argument's lifetime, which then cannot unify with
+        // `drifted`/`queue`/`collapsed`/`home`'s fixed (captured) lifetime —
+        // a closure-shape limitation. A plain `fn` has no such capture, so
+        // each call below infers its own lifetime independently.
+        fn inputs<'a>(
+            drifted: &'a [DriftSummary],
+            queue: &'a QueueSnapshot,
+            mode: ReviewMode,
+            collapsed: &'a BTreeSet<PathBuf>,
+            selection: &'a Selection,
+            home: &'a Path,
+        ) -> SidebarInputs<'a> {
+            SidebarInputs {
+                drifted,
+                queue,
+                mode,
+                collapsed,
+                selection,
+                home,
+            }
+        }
         // A member that resolved, got queued or turned into a conflict leaves
         // the selection here, silently (spec §2.2). Pruned against the safe
         // order of THIS render's inputs, then the plan is built from the
         // pruned selection so every `checked` flag is current.
-        //
-        // Built twice rather than through a shared closure: a closure taking
-        // `&Selection` and returning a `SidebarInputs` borrowing it is
-        // inferred higher-ranked over that argument's lifetime, which then
-        // cannot unify with `drifted`/`queue`/`collapsed`/`home`'s fixed
-        // (captured) lifetime — a closure-shape limitation, not a borrow
-        // conflict.
-        let safe_order = sidebar_rows(SidebarInputs {
-            drifted: &drifted,
-            queue: &queue,
+        let safe_order = sidebar_rows(inputs(
+            &drifted,
+            &queue,
             mode,
             collapsed,
-            selection: &self.selection,
-            home: &home,
-        })
+            &self.selection,
+            &home,
+        ))
         .safe_order;
         self.selection.prune(&safe_order);
-        let plan = sidebar_rows(SidebarInputs {
-            drifted: &drifted,
-            queue: &queue,
+        let plan = sidebar_rows(inputs(
+            &drifted,
+            &queue,
             mode,
             collapsed,
-            selection: &self.selection,
-            home: &home,
-        });
+            &self.selection,
+            &home,
+        ));
 
         let dragging = self.sidebar_drag.is_some();
         div()
