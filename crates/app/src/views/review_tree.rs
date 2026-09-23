@@ -5,9 +5,6 @@
 //! groups: they are never rows here, but a folder counts them so its chip
 //! can say "2 of 3" — what a tick reaches, of what is there.
 
-// consumed by review.rs from Task 5; remove then
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -17,11 +14,21 @@ pub(super) struct FolderNode {
     /// The absolute directory this row stands for — the DEEPEST directory of
     /// a compacted chain, which is what `collapsed` is keyed by.
     pub path: PathBuf,
+    // `depth`, `label`, `safe`, `total` and `collapsed` are read only by
+    // Task 7's tree rendering (the row's indent, name, chip and chevron);
+    // `review.rs` carries the node through to a `SidebarRow::Folder` without
+    // reading them yet, and `path` above is already read there
+    // (`safe_descendants`'s folder argument).
+    #[allow(dead_code)]
     pub depth: usize,
     /// `.config/nvim/` — the compacted chain, trailing slash.
+    #[allow(dead_code)]
     pub label: SharedString,
+    #[allow(dead_code)]
     pub safe: usize,
+    #[allow(dead_code)]
     pub total: usize,
+    #[allow(dead_code)]
     pub collapsed: bool,
 }
 

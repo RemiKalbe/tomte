@@ -19,7 +19,7 @@
 //! edits inside a templated value) hands the selected target to the Shell's
 //! full-window merge editor (plan 7 Task 3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -38,9 +38,12 @@ use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind, worddiff::word_
 use tomte_journal::{EventRow, Journal};
 use tomte_proto::DriftSummary;
 use tomte_ui::components as ui;
+use tomte_ui::components::CheckState;
 
 use super::Shell;
 use super::dashboard::system_now;
+use super::review_selection::Selection;
+use super::review_tree::{FolderNode, TreeRow, safe_descendants, tree_order, tree_rows};
 
 /// Fixed sidebar width per the approved mockup A (~260px).
 const SIDEBAR_WIDTH: f32 = 260.;
@@ -167,6 +170,16 @@ pub(super) fn journal_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("Library/Application Support/Tomte/journal.db")
+}
+
+/// Where the safe-group tree roots itself ($HOME, which the tree does not
+/// show — `review_tree::split`). Same env var the rest of the app resolves
+/// paths from; `/` when it is unset rather than a relative `.` (the tree's
+/// comparisons need an absolute root).
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Everything the detail pane needs for one target, computed entirely on the
@@ -939,6 +952,16 @@ pub(super) fn undo_affordance(banner: &OutcomeBanner, queue: &QueueSnapshot) -> 
     }
 }
 
+/// Flat: the historical two-group list. Tree: the safe group compacted into
+/// folders (spec §2.5); NEEDS A DECISION and PROCESSING stay flat either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReviewMode {
+    Flat,
+    /// Consumed by Task 6 (the mode toggle) and Task 7 (the tree it selects).
+    #[allow(dead_code)]
+    Tree,
+}
+
 /// One entry of the sidebar, in display order.
 ///
 /// The list is built as data before it is built as elements, because the
@@ -946,12 +969,22 @@ pub(super) fn undo_affordance(banner: &OutcomeBanner, queue: &QueueSnapshot) -> 
 /// is recorded for it, in its severity group otherwise — is invisible in a
 /// screenshot the moment it breaks (the duplicate looks like a second file)
 /// and unreachable from a render tree.
-// No `PartialEq`: `DriftSummary` has none, and the tests below assert on a
-// projection of these rows (label / file name / state) rather than on whole
-// summaries anyway.
-#[derive(Debug, Clone)]
+// No `PartialEq`, `Debug`, or `Clone`: `DriftSummary` has none, `FolderNode`
+// (Task 3's pure tree projection) carries none either, and the tests below
+// assert on a projection of these rows (label / file name / state) rather
+// than on whole rows anyway.
 pub(super) enum SidebarRow {
-    Group(&'static str),
+    Group {
+        label: &'static str,
+        /// The SAFE TO RESOLVE header's select-all; `None` on the others.
+        /// Consumed by Task 6, which renders it.
+        #[allow(dead_code)]
+        check: Option<CheckState>,
+    },
+    /// Tree mode only: a folder of the safe group. Consumed by Task 7's tree
+    /// rendering — Flat mode never emits one.
+    #[allow(dead_code)]
+    Folder { node: FolderNode, check: CheckState },
     Target {
         entry: DriftSummary,
         queued: Option<QueuedDecision>,
@@ -965,19 +998,58 @@ pub(super) enum SidebarRow {
         /// this apparent redundancy is the point, not something to tidy
         /// away.
         locked: bool,
+        /// Tree indent level; 0 in flat mode. Consumed by Task 7 (indenting
+        /// a tree row).
+        #[allow(dead_code)]
+        depth: usize,
+        /// A safe row: carries a checkbox, answers ⌘/⇧-clicks. Consumed by
+        /// Task 6.
+        #[allow(dead_code)]
+        selectable: bool,
+        #[allow(dead_code)]
+        checked: bool,
     },
 }
 
+pub(super) struct SidebarPlan {
+    pub rows: Vec<SidebarRow>,
+    /// Every safe target in display order, collapsed ones included — what
+    /// `Selection` is kept in the order of and pruned against.
+    pub safe_order: Vec<PathBuf>,
+    /// The selectable `Target` rows actually on screen, in row order — what
+    /// a ⇧-range and `next_after` walk. Consumed by Task 6.
+    #[allow(dead_code)]
+    pub visible_safe: Vec<PathBuf>,
+}
+
+pub(super) struct SidebarInputs<'a> {
+    pub drifted: &'a [DriftSummary],
+    pub queue: &'a QueueSnapshot,
+    pub mode: ReviewMode,
+    pub collapsed: &'a BTreeSet<PathBuf>,
+    pub selection: &'a Selection,
+    pub home: &'a Path,
+}
+
 /// Plan the sidebar: the PROCESSING group first (spec §2.1 — the row MOVES
-/// there), then the two severity groups minus whatever moved.
-///
-/// A queued target the model no longer lists (a rescan dropped it, say)
-/// still gets a row from a synthesised summary: it is answered-and-running,
-/// and hiding it would lose the only trace of that.
-pub(super) fn sidebar_rows(drifted: &[DriftSummary], queue: &QueueSnapshot) -> Vec<SidebarRow> {
+/// there), then NEEDS A DECISION flat, then SAFE TO RESOLVE flat or as a
+/// tree (spec §2.5 of the multi-select design). Only the safe group's rows
+/// are selectable, and the header's checkbox stands for all of them.
+pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
+    let SidebarInputs {
+        drifted,
+        queue,
+        mode,
+        collapsed,
+        selection,
+        home,
+    } = inputs;
     let mut rows = Vec::new();
     if !queue.processing.is_empty() {
-        rows.push(SidebarRow::Group("PROCESSING"));
+        rows.push(SidebarRow::Group {
+            label: "PROCESSING",
+            check: None,
+        });
         for (target, queued) in &queue.processing {
             let entry = drifted
                 .iter()
@@ -993,29 +1065,95 @@ pub(super) fn sidebar_rows(drifted: &[DriftSummary], queue: &QueueSnapshot) -> V
                 entry,
                 queued: Some(*queued),
                 locked: queued.locks_row(),
+                depth: 0,
+                selectable: false,
+                checked: false,
             });
         }
     }
     let (needs_you, one_click) = severity_groups(drifted);
-    for (label, group) in [
-        ("NEEDS A DECISION", &needs_you),
-        ("SAFE TO RESOLVE", &one_click),
-    ] {
-        let mut group = group
-            .iter()
-            .filter(|d| !queue.is_processing(&d.target))
-            .peekable();
-        if group.peek().is_none() {
-            continue;
-        }
-        rows.push(SidebarRow::Group(label));
-        rows.extend(group.map(|entry| SidebarRow::Target {
+    let needs_you: Vec<DriftSummary> = needs_you
+        .into_iter()
+        .filter(|d| !queue.is_processing(&d.target))
+        .collect();
+    let safe: Vec<DriftSummary> = one_click
+        .into_iter()
+        .filter(|d| !queue.is_processing(&d.target))
+        .collect();
+    if !needs_you.is_empty() {
+        rows.push(SidebarRow::Group {
+            label: "NEEDS A DECISION",
+            check: None,
+        });
+        rows.extend(needs_you.iter().map(|entry| SidebarRow::Target {
             entry: entry.clone(),
             queued: None,
             locked: false,
+            depth: 0,
+            selectable: false,
+            checked: false,
         }));
     }
-    rows
+    let mut safe_order: Vec<PathBuf> = Vec::new();
+    let mut visible_safe: Vec<PathBuf> = Vec::new();
+    if !safe.is_empty() {
+        let safe_targets: Vec<PathBuf> = safe.iter().map(|d| d.target.clone()).collect();
+        safe_order = match mode {
+            ReviewMode::Flat => safe_targets.clone(),
+            ReviewMode::Tree => tree_order(&safe_targets, home),
+        };
+        rows.push(SidebarRow::Group {
+            label: "SAFE TO RESOLVE",
+            check: Some(selection.check_state(&safe_order)),
+        });
+        let target_row = |entry: &DriftSummary, depth: usize| SidebarRow::Target {
+            entry: entry.clone(),
+            queued: None,
+            locked: false,
+            depth,
+            selectable: true,
+            checked: selection.contains(&entry.target),
+        };
+        match mode {
+            ReviewMode::Flat => {
+                for entry in &safe {
+                    visible_safe.push(entry.target.clone());
+                    rows.push(target_row(entry, 0));
+                }
+            }
+            ReviewMode::Tree => {
+                // Excluded = every drifted row that is not safe (needs-you or
+                // processing): counted by the folder chips, never listed here.
+                let excluded: Vec<PathBuf> = drifted
+                    .iter()
+                    .filter(|d| !safe_targets.contains(&d.target))
+                    .map(|d| d.target.clone())
+                    .collect();
+                for row in tree_rows(&safe_targets, &excluded, collapsed, home) {
+                    match row {
+                        TreeRow::Folder(node) => {
+                            let under = safe_descendants(&safe_targets, &node.path, home);
+                            let check = selection.check_state(&under);
+                            rows.push(SidebarRow::Folder { node, check });
+                        }
+                        TreeRow::File { target, depth } => {
+                            let entry = safe
+                                .iter()
+                                .find(|d| d.target == target)
+                                .expect("tree rows come from `safe`");
+                            visible_safe.push(target.clone());
+                            rows.push(target_row(entry, depth));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    SidebarPlan {
+        rows,
+        safe_order,
+        visible_safe,
+    }
 }
 
 pub struct ReviewView {
@@ -1231,16 +1369,47 @@ impl ReviewView {
     /// Spec §2.6: after a decision, select the next row that still needs
     /// one, so a sweep is one click per file with no re-targeting click
     /// between.
+    ///
+    /// The walk order is `sidebar_rows`'s own — needs-you targets, then the
+    /// safe group's `safe_order` (flat today; the tree's compacted order
+    /// once Task 6/7 wire a real mode) — so this never drifts from what the
+    /// sidebar shows.
+    ///
+    /// `resolved` was just enqueued by the caller and so already reads as
+    /// processing; the plan below is built as if it were not, so it stays at
+    /// its true display position for `next_after`'s lookup instead of
+    /// vanishing from the list the instant it is answered. Every OTHER
+    /// processing row is filtered out exactly as `sidebar_rows` renders it —
+    /// `next_after`'s own `processing` check (over the REAL queue) skips
+    /// those as candidates either way, so nothing changes for them.
     fn advance_from(&mut self, resolved: &Path, cx: &mut Context<Self>) {
-        let ordered: Vec<PathBuf> = {
-            let (needs_you, one_click) = severity_groups(&self.state.read(cx).drifted);
-            needs_you
-                .iter()
-                .chain(one_click.iter())
-                .map(|d| d.target.clone())
-                .collect()
-        };
+        let drifted = self.state.read(cx).drifted.clone();
         let queue = self.queue_snapshot(cx);
+        let home = home();
+        let (needs_you, _) = severity_groups(&drifted);
+        let queue_before_this_click = QueueSnapshot {
+            processing: queue
+                .processing
+                .iter()
+                .filter(|(t, _)| t != resolved)
+                .cloned()
+                .collect(),
+            failures: BTreeMap::new(),
+            busy: queue.busy,
+        };
+        let plan = sidebar_rows(SidebarInputs {
+            drifted: &drifted,
+            queue: &queue_before_this_click,
+            mode: ReviewMode::Flat,
+            collapsed: &BTreeSet::new(),
+            selection: &Selection::default(),
+            home: &home,
+        });
+        let ordered: Vec<PathBuf> = needs_you
+            .iter()
+            .map(|d| d.target.clone())
+            .chain(plan.safe_order)
+            .collect();
         if let Some(next) = next_after(resolved, &ordered, &|p| queue.is_processing(p)) {
             self.select(next, cx);
         }
@@ -1549,17 +1718,29 @@ impl ReviewView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let home = home();
+        let plan = sidebar_rows(SidebarInputs {
+            drifted,
+            queue,
+            mode: ReviewMode::Flat,
+            collapsed: &BTreeSet::new(),
+            selection: &Selection::default(),
+            home: &home,
+        });
         let mut ix = 0usize;
         let mut rows: Vec<AnyElement> = Vec::new();
-        for row in sidebar_rows(drifted, queue) {
+        for row in plan.rows {
             match row {
-                SidebarRow::Group(label) => {
+                SidebarRow::Group { label, .. } => {
                     rows.push(group_header(label, theme).into_any_element())
                 }
+                // Tree rendering starts in Task 7; Flat mode never emits one.
+                SidebarRow::Folder { .. } => continue,
                 SidebarRow::Target {
                     entry,
                     queued,
                     locked,
+                    ..
                 } => {
                     rows.push(
                         self.target_row(
@@ -2245,21 +2426,24 @@ fn preview_decors(lines: &[DiffLine], theme: Theme) -> Vec<ui::text_area::LineDe
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
     use tomte_app::action_queue::Decision;
     use tomte_app::resolve::{ResolveError, ResolveOutcome};
     use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind};
     use tomte_proto::DriftSummary;
+    use tomte_ui::components::CheckState;
 
     use super::super::BatchResult;
 
     use super::{
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
-        QueuedDecision, QueuedStatus, ResolveAction, SidebarRow, UndoAffordance, blocked_reason,
-        display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
-        preview_decors, queued_outcome_banner, refused_banner, severity_groups, sidebar_rows,
-        source_actions, undo_affordance, undo_banner,
+        QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, Selection, SidebarInputs,
+        SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, display_name, flatten_document,
+        next_after, origin_diffs, origin_hint, per_line_ranges, preview_decors,
+        queued_outcome_banner, refused_banner, severity_groups, sidebar_rows, source_actions,
+        undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -2270,6 +2454,21 @@ mod tests {
             since_ts: Some(1),
             origin_differs: false,
         }
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    fn plan_of(drifted: &[DriftSummary], queue: &QueueSnapshot) -> SidebarPlan {
+        sidebar_rows(SidebarInputs {
+            drifted,
+            queue,
+            mode: ReviewMode::Flat,
+            collapsed: &BTreeSet::new(),
+            selection: &Selection::default(),
+            home: Path::new("/Users/x"),
+        })
     }
 
     fn targets(group: &[DriftSummary]) -> Vec<&Path> {
@@ -2477,11 +2676,13 @@ mod tests {
     fn plan(rows: &[SidebarRow]) -> Vec<String> {
         rows.iter()
             .map(|row| match row {
-                SidebarRow::Group(label) => (*label).to_string(),
+                SidebarRow::Group { label, .. } => (*label).to_string(),
+                SidebarRow::Folder { .. } => unreachable!("these tests never build a tree"),
                 SidebarRow::Target {
                     entry,
                     queued,
                     locked,
+                    ..
                 } => format!(
                     "{} [{}]",
                     entry.target.display(),
@@ -2520,7 +2721,7 @@ mod tests {
 
         // Nothing queued: the two groups, no PROCESSING header.
         assert_eq!(
-            plan(&sidebar_rows(&drifted, &QueueSnapshot::default())),
+            plan(&plan_of(&drifted, &QueueSnapshot::default()).rows),
             [
                 "NEEDS A DECISION",
                 "/a [answerable]",
@@ -2531,7 +2732,7 @@ mod tests {
 
         // `/a` answered: it moves, and its group goes with it.
         assert_eq!(
-            plan(&sidebar_rows(&drifted, &posed_queue(&["/a"], &[], true))),
+            plan(&plan_of(&drifted, &posed_queue(&["/a"], &[], true)).rows),
             [
                 "PROCESSING",
                 "/a [Keep disk running, locked]",
@@ -2543,10 +2744,7 @@ mod tests {
         // Both answered: running first, then waiting, and no severity group
         // is left to head.
         assert_eq!(
-            plan(&sidebar_rows(
-                &drifted,
-                &posed_queue(&["/a"], &["/b"], true)
-            )),
+            plan(&plan_of(&drifted, &posed_queue(&["/a"], &["/b"], true)).rows),
             [
                 "PROCESSING",
                 "/a [Keep disk running, locked]",
@@ -2577,7 +2775,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            plan(&sidebar_rows(&drifted, &queue)),
+            plan(&plan_of(&drifted, &queue).rows),
             [
                 "PROCESSING",
                 "/a [Keep both running, locked]",
@@ -2608,10 +2806,141 @@ mod tests {
     /// that.
     #[test]
     fn a_processing_row_survives_the_model_dropping_it() {
-        let rows = sidebar_rows(&[], &posed_queue(&["/gone"], &[], true));
+        let plan_result = plan_of(&[], &posed_queue(&["/gone"], &[], true));
         assert_eq!(
-            plan(&rows),
+            plan(&plan_result.rows),
             ["PROCESSING", "/gone [Keep disk running, locked]"]
+        );
+    }
+
+    /// Flat mode: safe rows are selectable, needs-you and processing rows
+    /// are not; `safe_order` and `visible_safe` agree and list the safe rows
+    /// in group order; the SAFE header carries the tri-state.
+    /// MUTATION: mark every Target selectable → the needs-you assertion
+    /// fails; drop the header check → the last fails.
+    #[test]
+    fn flat_plan_marks_only_safe_rows_selectable_and_orders_them() {
+        let drifted = vec![
+            s("/Users/x/.config/a", "conflict"),
+            s("/Users/x/b", "destination_drift"),
+            s("/Users/x/c", "remote_ahead"),
+        ];
+        let plan = plan_of(&drifted, &QueueSnapshot::default());
+        let selectable: Vec<(PathBuf, bool)> = plan
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                SidebarRow::Target {
+                    entry, selectable, ..
+                } => Some((entry.target.clone(), *selectable)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            selectable,
+            vec![
+                (p("/Users/x/.config/a"), false),
+                (p("/Users/x/b"), true),
+                (p("/Users/x/c"), true)
+            ]
+        );
+        assert_eq!(plan.safe_order, vec![p("/Users/x/b"), p("/Users/x/c")]);
+        assert_eq!(plan.visible_safe, plan.safe_order);
+        assert!(plan.rows.iter().any(|r| matches!(
+            r,
+            SidebarRow::Group {
+                label: "SAFE TO RESOLVE",
+                check: Some(CheckState::Off)
+            }
+        )));
+        assert!(plan.rows.iter().any(|r| matches!(
+            r,
+            SidebarRow::Group {
+                label: "NEEDS A DECISION",
+                check: None
+            }
+        )));
+    }
+
+    /// Tree mode: needs-you and processing stay flat above; the safe group is
+    /// folders + files; a folder's check reflects the selection over its
+    /// descendants; collapsed files leave `visible_safe` but not `safe_order`.
+    /// MUTATION: build the tree over ALL drifted rows → the conflict shows
+    /// up as a file row; use `visible_safe` for `safe_order` → the collapsed
+    /// file is missing from it.
+    #[test]
+    fn tree_plan_keeps_the_other_groups_flat_and_tracks_collapse_and_ticks() {
+        let drifted = vec![
+            s("/Users/x/.config/needs", "conflict"),
+            s("/Users/x/.config/nvim/init.lua", "destination_drift"),
+            s("/Users/x/.config/nvim/lua/p.lua", "source_ahead"),
+            s("/Users/x/top", "remote_ahead"),
+        ];
+        let mut selection = Selection::default();
+        let order = vec![
+            p("/Users/x/.config/nvim/init.lua"),
+            p("/Users/x/.config/nvim/lua/p.lua"),
+            p("/Users/x/top"),
+        ];
+        selection.toggle(&p("/Users/x/.config/nvim/init.lua"), &order);
+        let collapsed = BTreeSet::from([p("/Users/x/.config/nvim/lua")]);
+        let plan = sidebar_rows(SidebarInputs {
+            drifted: &drifted,
+            queue: &QueueSnapshot::default(),
+            mode: ReviewMode::Tree,
+            collapsed: &collapsed,
+            selection: &selection,
+            home: Path::new("/Users/x"),
+        });
+        let labels: Vec<String> = plan
+            .rows
+            .iter()
+            .map(|r| match r {
+                SidebarRow::Group { label, .. } => format!("G:{label}"),
+                SidebarRow::Folder { node, check } => {
+                    format!("F:{}:{}:{:?}", node.label, node.collapsed, check)
+                }
+                SidebarRow::Target {
+                    entry,
+                    depth,
+                    selectable,
+                    checked,
+                    ..
+                } => {
+                    format!(
+                        "T:{}:{depth}:{selectable}:{checked}",
+                        entry.target.file_name().unwrap().to_string_lossy()
+                    )
+                }
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "G:NEEDS A DECISION",
+                "T:needs:0:false:false",
+                "G:SAFE TO RESOLVE",
+                // `.config/` holds the excluded `needs`, so it is NOT
+                // compacted into `nvim/` (a folder with a file stops the
+                // chain — by structure, not by name).
+                "F:.config/:false:Partial",
+                "F:nvim/:false:Partial",
+                "F:lua/:true:Off",
+                "T:init.lua:2:true:true",
+                "T:top:0:true:false",
+            ]
+        );
+        assert_eq!(
+            plan.safe_order,
+            vec![
+                p("/Users/x/.config/nvim/lua/p.lua"),
+                p("/Users/x/.config/nvim/init.lua"),
+                p("/Users/x/top")
+            ]
+        );
+        assert_eq!(
+            plan.visible_safe,
+            vec![p("/Users/x/.config/nvim/init.lua"), p("/Users/x/top")]
         );
     }
 
