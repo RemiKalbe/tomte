@@ -840,17 +840,28 @@ impl Shell {
     /// ends the moment the choice is remembered, and the row it came from
     /// goes to "processing" instead of the click being discarded.
     pub fn enqueue(&mut self, action: QueuedAction, cx: &mut Context<Self>) {
-        // Every press that owes git work says so in the log, the same as a
-        // repo op's request does: the run can be seconds (a batch) or
-        // minutes (a queue) away, and the log is the only place a press and
-        // its outcome can be tied back together.
-        tomte_core::log_info!(
-            "resolve",
-            "queued {} for {}",
-            action.decision.label(),
-            action.target.display()
-        );
-        self.queue.push(action);
+        self.enqueue_many(vec![action], cx);
+    }
+
+    /// Several decisions made in ONE gesture — a bulk press over a
+    /// selection. Every one is pushed before the queue is pumped, so they
+    /// drain as one batch: one `re-add`/`apply`, one commit, one push
+    /// (queue spec §2.2). `enqueue` per file would pump on the first push
+    /// and drain it alone. Each press still logs its own line: the run can
+    /// be minutes away and the log is where a press meets its outcome.
+    pub fn enqueue_many(&mut self, actions: Vec<QueuedAction>, cx: &mut Context<Self>) {
+        if actions.is_empty() {
+            return;
+        }
+        for action in actions {
+            tomte_core::log_info!(
+                "resolve",
+                "queued {} for {}",
+                action.decision.label(),
+                action.target.display()
+            );
+            self.queue.push(action);
+        }
         cx.notify();
         self.pump(cx);
     }
@@ -3279,6 +3290,58 @@ mod render_smoke {
                 "no finished session for {name}: {sessions:?}"
             );
         }
+    }
+
+    /// A bulk press is ONE batch: `enqueue_many` pushes every decision and
+    /// pumps once, so three files are one re-add, one commit, one push.
+    /// `enqueue` per file would pump on the first push and drain it alone
+    /// (queue spec §2.2's "first click drains alone").
+    /// MUTATION: make `enqueue_many` call `enqueue` per item → `running()`
+    /// is 1 after the call and `engine_pushes()` is 2.
+    #[gpui::test]
+    fn a_bulk_press_is_one_batch_and_one_push(cx: &mut TestAppContext) {
+        let lab = EngineLab::publish(cx);
+        let files = a_sweep_of_three_drifted_files(&lab);
+        let before = origin_commit_count(&lab);
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| latch_shell(Route::Review, cx));
+        vis.update(|_window, cx| {
+            shell.update(cx, |s, cx| {
+                let actions = files
+                    .iter()
+                    .map(|(target, _, _)| QueuedAction {
+                        target: target.clone(),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    })
+                    .collect();
+                s.enqueue_many(actions, cx);
+                assert_eq!(s.queue.running().len(), 3, "one batch took all three");
+            });
+        });
+        vis.run_until_parked();
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 0);
+            for (target, _, _) in &files {
+                assert!(
+                    s.queue.failure(target).is_none(),
+                    "{:?}",
+                    s.queue.failure(target)
+                );
+            }
+        });
+        assert_eq!(
+            origin_commit_count(&lab),
+            before + 1,
+            "ONE commit reaching origin"
+        );
+        assert_eq!(
+            lab.engine_pushes(),
+            1,
+            "ONE push invocation: {:?}",
+            lab.git_invocations()
+        );
     }
 
     /// The same sweep through the button the user actually presses — and the
