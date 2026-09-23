@@ -706,7 +706,6 @@ mod tests {
         let collapsed = BTreeSet::from([h(".config")]);
         let rows = tree_rows(&safe, &[], &collapsed, &home());
         assert_eq!(folders(&rows), vec![(".config/".into(), 0, 2, 2)]);
-        assert!(folders(&rows).is_empty() == false);
         assert!(matches!(&rows[0], TreeRow::Folder(f) if f.collapsed));
         assert_eq!(files(&rows), vec![(h("top"), 0)], "the collapsed folder's files are gone from the plan");
         assert_eq!(
@@ -1172,9 +1171,13 @@ Their assertions keep their meaning: `SidebarRow::Group("PROCESSING")` becomes `
                 "G:NEEDS A DECISION",
                 "T:needs:0:false:false",
                 "G:SAFE TO RESOLVE",
-                "F:.config/nvim/:false:Partial",
+                // `.config/` holds the excluded `needs`, so it is NOT
+                // compacted into `nvim/` (a folder with a file stops the
+                // chain — by structure, not by name).
+                "F:.config/:false:Partial",
+                "F:nvim/:false:Partial",
                 "F:lua/:true:Off",
-                "T:init.lua:1:true:true",
+                "T:init.lua:2:true:true",
                 "T:top:0:true:false",
             ]
         );
