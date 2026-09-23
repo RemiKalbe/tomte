@@ -664,20 +664,23 @@ mod tests {
         );
     }
 
-    /// MUTATION: sort case-sensitively → "Zed" sorts before "nvim".
+    /// MUTATION: sort case-sensitively (by the raw name) → ASCII puts "Zed"
+    /// before "nvim" and "B.txt" before "a.txt", and both assertions fail.
+    /// (The fixture's lowercase names must be the case-insensitive winners,
+    /// or an ASCII sort passes by coincidence.)
     #[test]
     fn directories_before_files_both_case_insensitive() {
-        let safe = vec![h("b.txt"), h("A.txt"), h("zed/s.json"), h("Nvim/i.lua")];
+        let safe = vec![h("B.txt"), h("a.txt"), h("Zed/s.json"), h("nvim/i.lua")];
         let rows = tree_rows(&safe, &[], &BTreeSet::new(), &home());
         assert_eq!(
             folders(&rows).iter().map(|f| f.0.clone()).collect::<Vec<_>>(),
-            vec!["Nvim/", "zed/"]
+            vec!["nvim/", "Zed/"]
         );
         let names: Vec<String> = files(&rows)
             .iter()
             .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["i.lua", "s.json", "A.txt", "b.txt"]);
+        assert_eq!(names, vec!["i.lua", "s.json", "a.txt", "B.txt"]);
     }
 
     /// MUTATION: count `excluded` into `safe` → the folder says 3 of 3.
