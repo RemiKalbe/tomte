@@ -19,6 +19,11 @@ pub const COMPONENTS: &[(&str, &str)] = &[
     ("merge-region", "decision strip states + provenance rows"),
     ("spinner", "indeterminate scan/load spinner"),
     ("buttons", "BUTTON LAB: 12 candidate designs in real scenes"),
+    (
+        "checkbox",
+        "off / partial / on, and forced-visible in a row",
+    ),
+    ("folder-row", "expanded, collapsed, partial-checked, n of m"),
 ];
 
 fn noop(_: &ClickEvent, _: &mut Window, _: &mut App) {}
@@ -326,6 +331,74 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
         )
         .into_any_element(),
         "buttons" => buttons::render(theme).into_any_element(),
+        "checkbox" => div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(variant(
+                theme,
+                "off",
+                checkbox(theme, "cb-off", CheckState::Off, noop).into_any_element(),
+            ))
+            .child(variant(
+                theme,
+                "partial",
+                checkbox(theme, "cb-partial", CheckState::Partial, noop).into_any_element(),
+            ))
+            .child(variant(
+                theme,
+                "on",
+                checkbox(theme, "cb-on", CheckState::On, noop).into_any_element(),
+            ))
+            .into_any_element(),
+        "folder-row" => div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w(gpui::px(260.))
+            .child(folder_row(
+                theme,
+                "fr-1",
+                FolderRow {
+                    depth: 0,
+                    label: ".config/".into(),
+                    collapsed: false,
+                    count: "4 of 6".into(),
+                    check: CheckState::Partial,
+                    show_check: true,
+                },
+                noop,
+                noop,
+            ))
+            .child(folder_row(
+                theme,
+                "fr-2",
+                FolderRow {
+                    depth: 1,
+                    label: "nvim/".into(),
+                    collapsed: true,
+                    count: "2".into(),
+                    check: CheckState::On,
+                    show_check: true,
+                },
+                noop,
+                noop,
+            ))
+            .child(folder_row(
+                theme,
+                "fr-3",
+                FolderRow {
+                    depth: 1,
+                    label: "zed/".into(),
+                    collapsed: false,
+                    count: "1".into(),
+                    check: CheckState::Off,
+                    show_check: false,
+                },
+                noop,
+                noop,
+            ))
+            .into_any_element(),
         _ => return None,
     };
     Some(el)

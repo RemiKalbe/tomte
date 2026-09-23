@@ -3,6 +3,7 @@
 
 pub mod banner;
 pub mod button;
+pub mod checkbox;
 pub mod chip;
 pub mod detail_header;
 pub mod dropdown;
@@ -25,6 +26,7 @@ pub mod tooltip;
 
 pub use banner::*;
 pub use button::*;
+pub use checkbox::*;
 pub use chip::*;
 pub use detail_header::*;
 pub use dropdown::*;
