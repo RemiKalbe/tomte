@@ -43,7 +43,9 @@ use tomte_ui::components::{CheckState, TREE_INDENT};
 use super::Shell;
 use super::dashboard::system_now;
 use super::review_selection::Selection;
-use super::review_tree::{FolderNode, TreeRow, safe_descendants, tree_order, tree_rows};
+use super::review_tree::{
+    FolderNode, TreeRow, count_chip, safe_descendants, tree_order, tree_rows,
+};
 
 /// Fixed sidebar width per the approved mockup A (~260px).
 const SIDEBAR_WIDTH: f32 = 260.;
@@ -1504,7 +1506,10 @@ impl ReviewView {
     }
 
     /// The List/Tree segmented control, top-right of the sidebar.
-    fn toggle_mode(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `pub(super)` so a `#[gpui::test]` can flip it directly, the same
+    /// reason `row_click` is.
+    pub(super) fn toggle_mode(&mut self, cx: &mut Context<Self>) {
         self.mode = match self.mode {
             ReviewMode::Flat => ReviewMode::Tree,
             ReviewMode::Tree => ReviewMode::Flat,
@@ -1516,7 +1521,9 @@ impl ReviewView {
 
     /// A folder row's plain click: open/close it. Its members stay selected
     /// while collapsed (spec §2.5) — only `toggle_folder` changes membership.
-    fn toggle_collapse(&mut self, folder: &Path, cx: &mut Context<Self>) {
+    ///
+    /// `pub(super)` for the same reason as `toggle_mode`.
+    pub(super) fn toggle_collapse(&mut self, folder: &Path, cx: &mut Context<Self>) {
         if !self.collapsed.remove(folder) {
             self.collapsed.insert(folder.to_path_buf());
         }
@@ -1525,11 +1532,33 @@ impl ReviewView {
 
     /// The folder's checkbox, or ⌘-click on the folder row: every safe file
     /// under it, collapsed or not.
-    fn toggle_folder(&mut self, folder: &Path, cx: &mut Context<Self>) {
+    ///
+    /// `pub(super)` for the same reason as `toggle_mode`.
+    pub(super) fn toggle_folder(&mut self, folder: &Path, cx: &mut Context<Self>) {
         let plan = self.plan(cx);
         let under = safe_descendants(&plan.safe_order, folder, &home());
         self.selection.toggle_all(&under, &plan.safe_order);
         cx.notify();
+    }
+
+    /// A folder row's click gesture (spec §2.3/§2.5): plain toggles collapse,
+    /// ⌘ ticks every safe file under it, collapsed or not. Mirrors
+    /// `row_click`'s gesture switch.
+    ///
+    /// `pub(super)` so the render-smoke tests can drive a gesture with a
+    /// synthetic `Modifiers` rather than a real mouse event, the same reason
+    /// `row_click` is.
+    pub(super) fn folder_click(
+        &mut self,
+        folder: &Path,
+        mods: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if mods.platform {
+            self.toggle_folder(folder, cx);
+        } else {
+            self.toggle_collapse(folder, cx);
+        }
     }
 
     /// A row's click gesture (spec §2.3): ⌘ toggles the row's membership
@@ -1930,13 +1959,8 @@ impl ReviewView {
                     group_header_el(label, *check, selection_active, theme, cx).into_any_element(),
                 ),
                 SidebarRow::Folder { node, check } => {
-                    let path = node.path.clone();
-                    let path2 = node.path.clone();
-                    let count: SharedString = if node.safe == node.total {
-                        node.safe.to_string().into()
-                    } else {
-                        format!("{} of {}", node.safe, node.total).into()
-                    };
+                    let row_path = node.path.clone();
+                    let check_path = node.path.clone();
                     rows.push(
                         ui::folder_row(
                             theme,
@@ -1945,18 +1969,16 @@ impl ReviewView {
                                 depth: node.depth,
                                 label: node.label.clone(),
                                 collapsed: node.collapsed,
-                                count,
+                                count: count_chip(node.safe, node.total),
                                 check: *check,
                                 show_check: selection_active,
                             },
                             cx.listener(move |view, ev: &ClickEvent, _w, cx| {
-                                if ev.modifiers().platform {
-                                    view.toggle_folder(&path, cx);
-                                } else {
-                                    view.toggle_collapse(&path, cx);
-                                }
+                                view.folder_click(&row_path, ev.modifiers(), cx);
                             }),
-                            cx.listener(move |view, _ev, _w, cx| view.toggle_folder(&path2, cx)),
+                            cx.listener(move |view, _ev, _w, cx| {
+                                view.toggle_folder(&check_path, cx)
+                            }),
                         )
                         .into_any_element(),
                     );
@@ -2931,8 +2953,8 @@ mod tests {
         QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, Selection, SidebarInputs,
         SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
         display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
-        preview_decors, queued_outcome_banner, refused_banner, safe_descendants, severity_groups,
-        sidebar_rows, source_actions, tree_order, undo_affordance, undo_banner,
+        preview_decors, queued_outcome_banner, refused_banner, severity_groups, sidebar_rows,
+        source_actions, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -3461,34 +3483,6 @@ mod tests {
             plan.visible_safe,
             vec![p("/Users/x/.config/nvim/init.lua"), p("/Users/x/top")]
         );
-    }
-
-    /// Ticking a folder reaches its collapsed descendants too (spec §2.3):
-    /// the composition `ReviewView::toggle_folder` runs (`safe_descendants`
-    /// feeding `Selection::toggle_all`, both fed by the plan's own
-    /// `safe_order`) reaches a file hidden inside a collapsed child folder.
-    /// MUTATION: tick only `visible_safe` under the folder → the collapsed
-    /// file is missing.
-    #[test]
-    fn a_folder_tick_reaches_collapsed_descendants() {
-        let safe = vec![
-            p("/Users/x/.config/nvim/init.lua"),
-            p("/Users/x/.config/nvim/lua/p.lua"),
-            p("/Users/x/top"),
-        ];
-        let home = Path::new("/Users/x");
-        let mut selection = Selection::default();
-        let order = tree_order(&safe, home);
-        let under = safe_descendants(&safe, Path::new("/Users/x/.config/nvim"), home);
-        selection.toggle_all(&under, &order);
-        assert_eq!(
-            selection.members(),
-            &[
-                p("/Users/x/.config/nvim/lua/p.lua"),
-                p("/Users/x/.config/nvim/init.lua")
-            ]
-        );
-        assert_eq!(selection.check_state(&under), CheckState::On);
     }
 
     /// A PROCESSING target the drift model has already dropped (a rescan

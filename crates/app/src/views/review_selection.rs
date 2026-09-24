@@ -124,7 +124,7 @@ impl Selection {
         }
     }
 
-    /// Escape / a mode switch clears the selection.
+    /// ✕, Esc, a bulk press, or a plain click clears the selection.
     pub(super) fn clear(&mut self) {
         self.members.clear();
         self.anchor = None;

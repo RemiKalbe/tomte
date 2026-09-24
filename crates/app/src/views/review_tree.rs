@@ -14,22 +14,26 @@ pub(super) struct FolderNode {
     /// The absolute directory this row stands for — the DEEPEST directory of
     /// a compacted chain, which is what `collapsed` is keyed by.
     pub path: PathBuf,
-    // `depth`, `label`, `safe`, `total` and `collapsed` are read only by
-    // Task 7's tree rendering (the row's indent, name, chip and chevron);
-    // `review.rs` carries the node through to a `SidebarRow::Folder` without
-    // reading them yet, and `path` above is already read there
-    // (`safe_descendants`'s folder argument).
-    #[allow(dead_code)]
+    /// The row's indent level.
     pub depth: usize,
     /// `.config/nvim/` — the compacted chain, trailing slash.
-    #[allow(dead_code)]
     pub label: SharedString,
-    #[allow(dead_code)]
     pub safe: usize,
-    #[allow(dead_code)]
     pub total: usize,
-    #[allow(dead_code)]
+    /// Whether the folder row draws its chevron collapsed.
     pub collapsed: bool,
+}
+
+/// The folder chip's text: a bare count when a tick would reach everything
+/// under the folder, `"n of m"` when it also holds files a tick will not
+/// touch (spec §2.5) — so the chip is honest about what a full-folder tick
+/// leaves behind.
+pub(super) fn count_chip(safe: usize, total: usize) -> SharedString {
+    if safe == total {
+        safe.to_string().into()
+    } else {
+        format!("{safe} of {total}").into()
+    }
 }
 
 pub(super) enum TreeRow {
@@ -249,6 +253,13 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// MUTATION: always format `n of m` → the first assertion fails.
+    #[test]
+    fn count_chip_is_bare_when_a_tick_reaches_everything_and_n_of_m_otherwise() {
+        assert_eq!(count_chip(3, 3).as_ref(), "3");
+        assert_eq!(count_chip(3, 5).as_ref(), "3 of 5");
     }
 
     /// MUTATION: compact only by NAME match, or never compact → the first

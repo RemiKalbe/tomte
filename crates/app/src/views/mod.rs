@@ -3863,6 +3863,152 @@ mod render_smoke {
         );
     }
 
+    /// The folder row's click gesture (spec §2.3/§2.5), dispatched through
+    /// `folder_click` — mirrors `row_click_dispatches_plain_platform_and_
+    /// shift_gestures`. Drives the `review-tree` pose (`.config/nvim/`
+    /// collapsed, only `starship.toml` ticked) through six steps in a row:
+    ///
+    /// 1. ⌘-click on `.config/nvim` (collapsed) ticks its one file —
+    ///    `init.lua` — even though it is hidden, and `check_state` over
+    ///    nvim's descendants reads On.
+    /// 2. A plain click on `.config/zed` collapses it; membership does not
+    ///    change.
+    /// 3. Expanding `.config/nvim` again (`toggle_collapse`) leaves
+    ///    membership untouched too — collapsing/expanding never edits
+    ///    `Selection`.
+    /// 4. `toggle_mode` flipped twice (Tree → Flat → Tree) keeps every
+    ///    member and lands back on Tree.
+    /// 5. ⌘-click on `.config` (Partial — 2 of its 3 safe descendants
+    ///    ticked) completes the set: every safe file under `.config`
+    ///    becomes a member.
+    /// 6. The same ⌘-click again — now On — clears the whole set.
+    ///
+    /// All six steps and their assertions run inside the SAME
+    /// `review.update` as the calls that produce them, for the reason
+    /// `a_bulk_press_clears_the_selection_and_advances_past_the_last_member`'s
+    /// own comment gives: a render in between would prune the selection
+    /// against the live plan's `safe_order`, silently hiding a mutation
+    /// that leaves a stray member outside it.
+    ///
+    /// MUTATION: `toggle_folder` ticks `plan.visible_safe` filtered to the
+    /// folder instead of `safe_descendants(&plan.safe_order, ..)` → step 1's
+    /// membership assertion fails (`init.lua`, hidden inside the collapsed
+    /// `nvim/`, is never reached).
+    /// MUTATION: `toggle_collapse` also drops the folder's descendants from
+    /// the selection → step 2's membership assertion fails.
+    /// MUTATION: `toggle_mode` calls `self.selection.clear()` after flipping
+    /// → step 4's membership assertion fails.
+    /// MUTATION: swap `folder_click`'s plain/`platform` arms (plain ticks,
+    /// ⌘ collapses) → step 1 never ticks anything and step 2 never
+    /// collapses `zed/`, so both the membership and the collapse
+    /// assertions fail.
+    #[gpui::test]
+    fn folder_click_dispatches_plain_and_platform_and_reaches_collapsed_files(
+        cx: &mut TestAppContext,
+    ) {
+        use review::ReviewMode;
+        use tomte_ui::components::CheckState;
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gallery"));
+        let nvim = home.join(".config/nvim");
+        let zed = home.join(".config/zed");
+        let config = home.join(".config");
+        let init_lua = home.join(".config/nvim/init.lua");
+        let settings_json = home.join(".config/zed/settings.json");
+        let starship = home.join(".config/starship.toml");
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-tree", smoke_paths(), cx).expect("review-tree fixture")
+        });
+        let review = review_of(&shell, vis);
+
+        let platform = gpui::Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| {
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![starship.clone()],
+                    "the pose starts with only starship.toml ticked"
+                );
+
+                // 1. ⌘-click a COLLAPSED folder still reaches its file.
+                view.folder_click(&nvim, platform, cx);
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![init_lua.clone(), starship.clone()],
+                    "⌘-click on nvim/ ticks init.lua even though it is hidden"
+                );
+                assert_eq!(
+                    view.selection.check_state(std::slice::from_ref(&init_lua)),
+                    CheckState::On,
+                    "every safe file under nvim/ is now ticked"
+                );
+
+                // 2. A plain click collapses zed/ without touching membership.
+                assert!(!view.collapsed.contains(&zed), "zed/ starts open");
+                view.folder_click(&zed, gpui::Modifiers::default(), cx);
+                assert!(
+                    view.collapsed.contains(&zed),
+                    "the plain click collapsed zed/"
+                );
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![init_lua.clone(), starship.clone()],
+                    "collapsing a folder never edits the selection"
+                );
+
+                // 3. Expanding nvim/ again is the same: membership untouched.
+                view.toggle_collapse(&nvim, cx);
+                assert!(!view.collapsed.contains(&nvim), "nvim/ is open again");
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![init_lua.clone(), starship.clone()],
+                    "expanding a folder never edits the selection either"
+                );
+
+                // 4. A mode round-trip keeps every member.
+                view.toggle_mode(cx);
+                view.toggle_mode(cx);
+                assert_eq!(view.mode, ReviewMode::Tree, "back to Tree after two flips");
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![init_lua.clone(), starship.clone()],
+                    "members keep their identity across a mode round-trip"
+                );
+
+                // 5. ⌘-click on the Partial `.config/` completes its safe set.
+                assert_eq!(
+                    view.selection.check_state(&[
+                        init_lua.clone(),
+                        settings_json.clone(),
+                        starship.clone()
+                    ]),
+                    CheckState::Partial,
+                    "2 of .config/'s 3 safe descendants are ticked before the click"
+                );
+                view.folder_click(&config, platform, cx);
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![init_lua.clone(), settings_json.clone(), starship.clone()],
+                    "the recursive tick completes .config/'s whole safe set"
+                );
+
+                // 6. The same ⌘-click again, now On, clears it.
+                view.folder_click(&config, platform, cx);
+                assert!(
+                    view.selection.is_empty(),
+                    "a second ⌘-click on the now-fully-ticked folder clears it"
+                );
+            });
+        });
+    }
+
     /// A failure has to outlive its action (spec §2.5) but NOT the drift.
     /// Only a retry cleared one before this, so a file that failed, went
     /// back in sync, and drifted again months later for an unrelated reason
