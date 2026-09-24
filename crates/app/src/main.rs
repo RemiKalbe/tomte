@@ -322,6 +322,7 @@ fn run_gallery(state_name: String, dark: Option<bool>, paths: SettingsPaths) -> 
         .with_assets(tomte_ui::Assets)
         .run(move |cx: &mut App| {
             views::merge::register_keys(cx);
+            views::review::register_keys(cx);
             let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
             let app = NSApplication::sharedApplication(mtm);
             if let Some(dark) = dark {
@@ -391,6 +392,7 @@ fn run_live(route: Route, paths: Paths) -> ExitCode {
         .with_assets(tomte_ui::Assets)
         .run(move |cx: &mut App| {
             views::merge::register_keys(cx);
+            views::review::register_keys(cx);
             let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
             set_regular_policy(mtm);
 
@@ -1001,6 +1003,7 @@ fn main() -> ExitCode {
     app.run(move |cx: &mut App| {
         let reopen_seed = &run_seed;
         views::merge::register_keys(cx);
+        views::review::register_keys(cx);
         let mtm = MainThreadMarker::new().expect("gpui runs on the main thread");
         set_regular_policy(mtm);
         let (status, menu_rx) = StatusItem::install(mtm);

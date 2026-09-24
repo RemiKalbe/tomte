@@ -4,6 +4,24 @@ The `## X.Y.Z` section for a version becomes the GitHub release body (and
 what the in-app updater shows) — `scripts/release.sh` refuses to tag a
 version without one.
 
+## Unreleased
+
+### Added
+
+- **Resolve several safe files at once.** In Review, ⌘-click or tick the
+  checkbox on any SAFE TO RESOLVE row (⇧-click for a range, the header's
+  checkbox for all of them), then press Keep disk or Keep source · this
+  machine once. The whole selection is one batch: one re-add or apply, one
+  commit, one push, still one journal session per file so Undo stays per
+  file. Esc clears, ⌘A selects all. Rows that need a decision cannot be
+  ticked; they keep their own buttons.
+- **A folder tree for the safe group.** The List / Tree switch at the top
+  of the sidebar shows SAFE TO RESOLVE as folders under `~`, single-child
+  chains folded (`.config/nvim/`). Ticking a folder ticks every safe file
+  under it, collapsed or not; its chip says `3 of 5` when two of its files
+  need a decision and stay out. The other two groups stay flat. The choice
+  and the collapse state last for the session.
+
 ## 0.1.20 — 2026-09-21
 
 ### Fixed

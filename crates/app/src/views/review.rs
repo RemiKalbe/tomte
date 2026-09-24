@@ -289,6 +289,18 @@ fn load_preview_blocking(target: &Path) -> PreviewState {
     ))
 }
 
+gpui::actions!(review, [ClearSelection, SelectAllSafe]);
+
+/// Key bindings for Review (active while its root has focus via the
+/// "Review" key context). Registered by every app entry point next to the
+/// merge editor's (`rg -n 'merge::register_keys' crates/app/src/main.rs`).
+pub fn register_keys(cx: &mut gpui::App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("escape", ClearSelection, Some("Review")),
+        gpui::KeyBinding::new("cmd-a", SelectAllSafe, Some("Review")),
+    ]);
+}
+
 /// The one-click resolutions (spec §5), shared with the dashboard's
 /// inline row actions.
 ///
@@ -1225,6 +1237,12 @@ pub struct ReviewView {
     /// Tree-mode folders the user closed, by their (compacted) path.
     /// `pub(super)` for the same reason; empty and inert in Flat mode.
     pub(super) collapsed: BTreeSet<PathBuf>,
+    /// Backs the "Review" key context (Esc / ⌘A) — see [`register_keys`].
+    /// Grabbed on mouse-down anywhere in the view, never stolen from the
+    /// merge editor (this view is not rendered while it is open).
+    /// `pub(super)` so the render-smoke tests can focus it directly, the
+    /// same reason `selection` is.
+    pub(super) focus_handle: gpui::FocusHandle,
 }
 
 impl ReviewView {
@@ -1252,6 +1270,7 @@ impl ReviewView {
             mode: ReviewMode::Flat,
             selection: Selection::default(),
             collapsed: BTreeSet::new(),
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -1460,7 +1479,10 @@ impl ReviewView {
     /// The plan the sidebar is showing right now, from the same inputs
     /// `render_inner` uses. Cheap (a few dozen rows); rebuilt per gesture so
     /// every rule reads one snapshot of the world.
-    fn plan(&self, cx: &Context<Self>) -> SidebarPlan {
+    ///
+    /// `pub(super)` so the render-smoke tests can read `safe_order` the same
+    /// way `select_all_safe` does, the same reason `row_click` is.
+    pub(super) fn plan(&self, cx: &Context<Self>) -> SidebarPlan {
         let queue = self.queue_snapshot(cx);
         let drifted = &self.state.read(cx).drifted;
         sidebar_rows(SidebarInputs {
@@ -1502,6 +1524,21 @@ impl ReviewView {
 
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selection.clear();
+        cx.notify();
+    }
+
+    /// ⌘A: SELECT every safe row, collapsed files included — never toggle.
+    /// `toggle_all` is a set-complete-or-clear primitive (the header
+    /// checkbox's job), so this only calls it when the set is not already
+    /// complete; a second ⌘A is then a no-op rather than clearing everything
+    /// it just selected. An empty safe group is a no-op either way —
+    /// `toggle_all` already refuses an empty `targets`.
+    pub(super) fn select_all_safe(&mut self, cx: &mut Context<Self>) {
+        let plan = self.plan(cx);
+        let all = plan.safe_order;
+        if self.selection.check_state(&all) != CheckState::On {
+            self.selection.toggle_all(&all, &all);
+        }
         cx.notify();
     }
 
@@ -2704,6 +2741,17 @@ impl ReviewView {
 
         let dragging = self.sidebar_drag.is_some();
         div()
+            .track_focus(&self.focus_handle)
+            .key_context("Review")
+            .on_action(cx.listener(|view, _: &ClearSelection, _w, cx| view.clear_selection(cx)))
+            .on_action(cx.listener(|view, _: &SelectAllSafe, _w, cx| view.select_all_safe(cx)))
+            // Take focus on any click in the view, so Esc/⌘A reach it without
+            // stealing focus from the merge editor (this view is not
+            // rendered while that one is open).
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|view, _ev, window, _cx| view.focus_handle.focus(window)),
+            )
             .flex_1()
             .min_h_0()
             .flex()

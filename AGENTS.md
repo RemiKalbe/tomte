@@ -47,7 +47,9 @@ crates/app      tomte-app      lib: ipc, model (pure), resolve (ResolveEngine),
                                action_queue, merge_inputs/merge_state (pure), update.
                                bin: main.rs (boot, reconnect loop, CLI flags),
                                views/ (mod.rs = Shell, dashboard, review, merge,
-                               settings, changelog, fixtures = gallery poses),
+                               settings, changelog, fixtures = gallery poses,
+                               review_selection/review_tree = pure Review
+                               multi-select + folder-tree projections),
                                platform_mac (status item, activation policy).
 ```
 
@@ -143,7 +145,9 @@ Then READ the PNG. `shoot.sh` deletes a stale PNG when a capture fails, so
 an "OK" line means this run wrote the file. `screencapture` fails inside a
 sandboxed shell; run it unsandboxed. Every new view sub-state gets a pose in
 `crates/app/src/views/fixtures.rs` (`STATES`); the render-smoke test builds
-all of them.
+all of them. `review-multiselect`, `review-tree`, and `review-tree-selected`
+pose the sidebar's multi-select and folder-tree states (checkboxes ticked,
+a folder collapsed, a whole folder selected).
 
 ## The gate
 
@@ -358,6 +362,8 @@ and run in the background, a Processing section replaces any "working…"
 button, consecutive one-click decisions share one re-add/commit/push, the
 selection auto-advances, failures stick to their row, the landed banner names
 the file Undo would revert, finish/roll-back/undo wait behind the latch.
+This branch adds multi-select of SAFE TO RESOLVE rows with bulk one-batch
+Keep disk / Keep source actions, Esc/⌘A, and a List/Tree folder sidebar.
 
 Open, deliberately (design calls, not bugs):
 
@@ -367,6 +373,9 @@ Open, deliberately (design calls, not bugs):
 - The dashboard has no processing surface: a quick action pressed with no
   daemon parks with nothing on screen until the notification fires.
 - Undo's button cannot name its file: `ui::button` has no tooltip slot.
+- The Review sidebar still rides `overflow_y_scroll` rather than
+  `uniform_list`; folder and file rows measure the same height, so the
+  conversion is unblocked but is its own piece of work.
 - Free-text region editing in the merge editor (`tomte_ui::text_area`
   exists; integration remains), keyboard hints, tabular figures (gpui has no
   font-features hook), journal pruning, SMAppService instead of launchctl.

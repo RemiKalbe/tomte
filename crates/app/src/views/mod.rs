@@ -3306,9 +3306,16 @@ mod render_smoke {
     /// A bulk press is ONE batch: `enqueue_many` pushes every decision and
     /// pumps once, so three files are one re-add, one commit, one push.
     /// `enqueue` per file would pump on the first push and drain it alone
-    /// (queue spec §2.2's "first click drains alone").
-    /// MUTATION: make `enqueue_many` call `enqueue` per item → `running()`
-    /// is 1 after the call and `engine_pushes()` is 2.
+    /// (queue spec §2.2's "first click drains alone") — and indeed `enqueue`
+    /// is defined as `enqueue_many(vec![action], cx)`, so a mutation cannot
+    /// swap one for the other without recursing; the mutation below instead
+    /// breaks `enqueue_many`'s OWN one-batch promise.
+    /// MUTATION: move the push inside the loop so `enqueue_many` pushes and
+    /// pumps PER ITEM (`self.queue.push(action); cx.notify(); self.pump(cx);`
+    /// inside the `for`, instead of pushing all three first) → the first
+    /// push drains alone, so `running()` is 1 (not 3) right after the call,
+    /// and the other two land in a second batch behind it: `engine_pushes()`
+    /// is 2, not the ONE push this test is named for.
     #[gpui::test]
     fn a_bulk_press_is_one_batch_and_one_push(cx: &mut TestAppContext) {
         let lab = EngineLab::publish(cx);
@@ -4007,6 +4014,79 @@ mod render_smoke {
                 );
             });
         });
+    }
+
+    /// Esc / ⌘A (spec §2.3, Task 8) dispatched through REAL keystrokes —
+    /// `simulate_keystrokes`, not `dispatch_action` directly — because that
+    /// is the only path that also proves the "Review" key context and the
+    /// binding itself, not just the method behind it. `register_keys` is
+    /// called explicitly first: `fixtures::build` (what poses the gallery
+    /// states, including the one below) never registers any app's key
+    /// bindings — only `main.rs`'s three entry points do, next to
+    /// `merge::register_keys`, which no test here calls either.
+    ///
+    /// ⌘A must SELECT `plan.safe_order` (collapsed files included), never
+    /// toggle it: pressed twice the selection is unchanged both times, not
+    /// emptied the second time.
+    ///
+    /// MUTATION: swap the two `on_action`s in `render_inner` → both
+    /// assertions below fail (Esc selects everything instead of clearing
+    /// the pose's starting selection; ⌘A then empties it instead of
+    /// completing it). MUTATION: `select_all_safe` calls `toggle_all`
+    /// unconditionally instead of only when the state is not already On →
+    /// the second ⌘A empties the selection it just filled.
+    #[gpui::test]
+    fn escape_and_cmd_a_drive_the_selection_through_real_key_bindings(cx: &mut TestAppContext) {
+        cx.update(review::register_keys);
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+
+        // The pose starts with 3 of its 5 safe rows ticked (see
+        // `fixtures::build`'s "review-multiselect" arm) — a non-empty,
+        // non-full selection, so Esc clearing it and ⌘A completing it are
+        // both observable.
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().len()),
+            3,
+            "the pose's own starting selection"
+        );
+
+        // Give the view's "Review" key context focus — nothing does this
+        // automatically on render (unlike the merge editor's root, which
+        // grabs focus whenever it is loaded); Review only takes it on a
+        // mouse-down, so the test stands in for that click.
+        vis.update(|window, cx| {
+            review.update(cx, |view, _cx| {
+                view.focus_handle.focus(window);
+            });
+        });
+
+        vis.simulate_keystrokes("escape");
+        assert!(
+            vis.update(|_window, cx| review.read(cx).selection.is_empty()),
+            "Esc reached the binding and cleared the selection"
+        );
+
+        let safe_len =
+            vis.update(|_window, cx| review.update(cx, |view, cx| view.plan(cx).safe_order.len()));
+        assert_eq!(safe_len, 5, "the pose's own safe-group size");
+
+        vis.simulate_keystrokes("cmd-a");
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().len()),
+            safe_len,
+            "⌘A selected every safe row, collapsed files included"
+        );
+
+        vis.simulate_keystrokes("cmd-a");
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().len()),
+            safe_len,
+            "a second ⌘A is a no-op: select, never toggle"
+        );
     }
 
     /// A failure has to outlive its action (spec §2.5) but NOT the drift.
