@@ -362,6 +362,9 @@ and run in the background, a Processing section replaces any "working…"
 button, consecutive one-click decisions share one re-add/commit/push, the
 selection auto-advances, failures stick to their row, the landed banner names
 the file Undo would revert, finish/roll-back/undo wait behind the latch.
+0.1.19 (2026-09-21) added templated keep-disk via the template write-back,
+with Undo skipping refused attempts. 0.1.20 (2026-09-21) waits out a busy
+daemon for 90 s per request; a batch stops after the first exhausted budget.
 
 This branch adds multi-select of SAFE TO RESOLVE rows with bulk one-batch
 Keep disk / Keep source actions, Esc/⌘A, and a List/Tree folder sidebar.
@@ -375,8 +378,15 @@ Open, deliberately (design calls, not bugs):
   daemon parks with nothing on screen until the notification fires.
 - Undo's button cannot name its file: `ui::button` has no tooltip slot.
 - The Review sidebar still rides `overflow_y_scroll` rather than
-  `uniform_list`; folder and file rows measure the same height, so the
-  conversion is unblocked but is its own piece of work.
+  `uniform_list`; folder and plain file rows measure the same height, but a
+  queued or failed row carries a sub-line and is taller, so a fixed-height
+  `uniform_list` conversion needs either a fixed row height that plans for
+  the sub-line or a two-height scheme — the tree did not make this worse,
+  it just did not unblock it either.
+- `review.rs` is ~4,100 lines; the sidebar planner (`SidebarRow`,
+  `SidebarPlan`, `SidebarInputs`, `sidebar_rows` and their tests, ~500 lines
+  together) is cohesive, pure, and depends only on `review_selection` and
+  `review_tree` — the next chunk to move into its own `review_plan.rs`.
 - Free-text region editing in the merge editor (`tomte_ui::text_area`
   exists; integration remains), keyboard hints, tabular figures (gpui has no
   font-features hook), journal pruning, SMAppService instead of launchctl.

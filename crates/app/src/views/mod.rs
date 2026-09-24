@@ -3763,7 +3763,7 @@ mod render_smoke {
     }
 
     /// The ⌘/⇧-click gesture switch (spec §2.3), dispatched through
-    /// `row_click` directly rather than a synthetic mouse event. Three
+    /// `row_click` directly rather than a synthetic mouse event. Four
     /// gestures in sequence, on the `review-multiselect` pose (`selected`
     /// starts on `settings.json`, `selection` starts with `.gitconfig`,
     /// `starship.toml`, `.zshrc`):
@@ -3775,12 +3775,20 @@ mod render_smoke {
     /// 3. A ⇧-click on `.zshrc` extends the range from that anchor
     ///    (`settings.json`) to `.zshrc`, covering `.gitconfig` and
     ///    `starship.toml` along the way; `selected` still does not move.
+    /// 4. A ⌘-click on `env.nu` (a NEEDS A DECISION row, `selectable =
+    ///    false`) changes nothing at all — not the members, not the anchor,
+    ///    not `selected` — instead of falling through to the plain-click arm
+    ///    and wiping out the selection steps 2–3 just built (final review,
+    ///    Minor 3).
     ///
     /// MUTATION: swap the ⌘ and ⇧ arms → step 2's membership assertion
     /// fails (a ⇧-style range lands instead of a single toggle). MUTATION:
     /// the plain-click arm no longer clears → step 1's
     /// `selection.is_empty()` assertion fails (the fixture's original three
-    /// members are still there).
+    /// members are still there). MUTATION: drop the `!selectable &&
+    /// (mods.platform || mods.shift)` early return in `row_click` → step 4's
+    /// membership assertion fails (the ⌘-click on env.nu clears the
+    /// selection instead of leaving it alone).
     #[gpui::test]
     fn row_click_dispatches_plain_platform_and_shift_gestures(cx: &mut TestAppContext) {
         let home = std::env::var_os("HOME")
@@ -3798,6 +3806,7 @@ mod render_smoke {
                 view.row_click(
                     &home.join(".config/nvim/init.lua"),
                     gpui::Modifiers::default(),
+                    true,
                     cx,
                 )
             });
@@ -3819,7 +3828,7 @@ mod render_smoke {
         };
         vis.update(|_window, cx| {
             review.update(cx, |view, cx| {
-                view.row_click(&home.join(".config/zed/settings.json"), platform, cx)
+                view.row_click(&home.join(".config/zed/settings.json"), platform, true, cx)
             });
         });
         assert_eq!(
@@ -3845,7 +3854,7 @@ mod render_smoke {
         };
         vis.update(|_window, cx| {
             review.update(cx, |view, cx| {
-                view.row_click(&home.join(".zshrc"), shift, cx)
+                view.row_click(&home.join(".zshrc"), shift, true, cx)
             });
         });
         assert_eq!(
@@ -3868,12 +3877,110 @@ mod render_smoke {
             Some(home.join(".config/nvim/init.lua")),
             "⇧-click never moves `selected`"
         );
+
+        // 4. ⌘-click on a NEEDS A DECISION row (not selectable).
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| {
+                view.row_click(&home.join(".config/nushell/env.nu"), platform, false, cx)
+            });
+        });
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().to_vec()),
+            vec![
+                home.join(".config/zed/settings.json"),
+                home.join(".gitconfig"),
+                home.join(".config/starship.toml"),
+                home.join(".zshrc"),
+            ],
+            "⌘-click on env.nu is ignored: the selection from steps 2–3 is untouched"
+        );
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.anchor.clone()),
+            Some(home.join(".config/zed/settings.json")),
+            "the anchor is untouched too"
+        );
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selected.clone()),
+            Some(home.join(".config/nvim/init.lua")),
+            "and `selected` still does not move"
+        );
+    }
+
+    /// Spec §2.2's whole guarantee — "nothing is ever selected that the plan
+    /// does not list as safe" — comes down to one call in `render_inner`:
+    /// `self.selection.prune(&plan.safe_order)`. `Selection::prune` itself is
+    /// well unit-tested, but nothing before this pinned the CALL: every other
+    /// test either asserts inside the same `review.update` as the mutating
+    /// call (deliberately, so a render in between cannot prune first) or
+    /// asserts a count pruning would not change anyway.
+    ///
+    /// Pose `review-multiselect` (members `.gitconfig`, `starship.toml`,
+    /// `.zshrc`), then reclassify `.gitconfig` as a conflict — the shape a
+    /// rescan produces when a file a decision touched turns out to need a
+    /// human after all: it stays drifted, just no longer safe. A render then
+    /// has to prune it out of the LIVE selection on its own, with no gesture
+    /// at all; the other two members keep their identity and order.
+    ///
+    /// MUTATION: remove `self.selection.prune(&plan.safe_order)` from
+    /// `render_inner` → `.gitconfig` stays a member after the render.
+    #[gpui::test]
+    fn a_render_prunes_a_member_that_stopped_being_safe(cx: &mut TestAppContext) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gallery"));
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+        let state = vis.update(|_window, cx| shell.read(cx).state.clone());
+
+        vis.update(|_window, cx| {
+            review.update(cx, |view, _cx| {
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![
+                        home.join(".gitconfig"),
+                        home.join(".config/starship.toml"),
+                        home.join(".zshrc"),
+                    ],
+                    "the pose starts with these three ticked"
+                );
+            });
+        });
+
+        // .gitconfig turns into a conflict — still drifted, no longer safe —
+        // the same shape a rescan produces after a decision landed elsewhere.
+        vis.update(|_window, cx| {
+            state.update(cx, |model, cx| {
+                let mut drifted = model.drifted.clone();
+                let entry = drifted
+                    .iter_mut()
+                    .find(|d| d.target == home.join(".gitconfig"))
+                    .expect(".gitconfig is in the pose's drifted set");
+                entry.class = "conflict".into();
+                let in_sync = model.in_sync;
+                model.hydrate_status(drifted, in_sync, None, false, None);
+                cx.notify();
+            });
+        });
+        vis.run_until_parked();
+
+        vis.update(|_window, cx| {
+            review.update(cx, |view, _cx| {
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![home.join(".config/starship.toml"), home.join(".zshrc")],
+                    "the render pruned .gitconfig out on its own — no gesture drove it"
+                );
+            });
+        });
     }
 
     /// The folder row's click gesture (spec §2.3/§2.5), dispatched through
     /// `folder_click` — mirrors `row_click_dispatches_plain_platform_and_
     /// shift_gestures`. Drives the `review-tree` pose (`.config/nvim/`
-    /// collapsed, only `starship.toml` ticked) through six steps in a row:
+    /// collapsed, only `starship.toml` ticked) through seven steps in a row:
     ///
     /// 1. ⌘-click on `.config/nvim` (collapsed) ticks its one file —
     ///    `init.lua` — even though it is hidden, and `check_state` over
@@ -3885,12 +3992,16 @@ mod render_smoke {
     ///    `Selection`.
     /// 4. `toggle_mode` flipped twice (Tree → Flat → Tree) keeps every
     ///    member and lands back on Tree.
-    /// 5. ⌘-click on `.config` (Partial — 2 of its 3 safe descendants
+    /// 5. `set_mode(Tree)` while already on Tree is a no-op: neither `mode`
+    ///    nor membership moves (Minor 11 — the segmented control's own
+    ///    "re-pressing the active segment does nothing" guard, pulled out of
+    ///    the listener and now directly testable).
+    /// 6. ⌘-click on `.config` (Partial — 2 of its 3 safe descendants
     ///    ticked) completes the set: every safe file under `.config`
     ///    becomes a member.
-    /// 6. The same ⌘-click again — now On — clears the whole set.
+    /// 7. The same ⌘-click again — now On — clears the whole set.
     ///
-    /// All six steps and their assertions run inside the SAME
+    /// All seven steps and their assertions run inside the SAME
     /// `review.update` as the calls that produce them, for the reason
     /// `a_bulk_press_clears_the_selection_and_advances_past_the_last_member`'s
     /// own comment gives: a render in between would prune the selection
@@ -3905,6 +4016,8 @@ mod render_smoke {
     /// the selection → step 2's membership assertion fails.
     /// MUTATION: `toggle_mode` calls `self.selection.clear()` after flipping
     /// → step 4's membership assertion fails.
+    /// MUTATION: `set_mode` always flips instead of guarding on the current
+    /// mode → step 5's mode assertion fails (Tree flips to Flat).
     /// MUTATION: swap `folder_click`'s plain/`platform` arms (plain ticks,
     /// ⌘ collapses) → step 1 never ticks anything and step 2 never
     /// collapses `zed/`, so both the membership and the collapse
@@ -3989,7 +4102,20 @@ mod render_smoke {
                     "members keep their identity across a mode round-trip"
                 );
 
-                // 5. ⌘-click on the Partial `.config/` completes its safe set.
+                // 5. `set_mode` on the already-active mode is a no-op.
+                view.set_mode(ReviewMode::Tree, cx);
+                assert_eq!(
+                    view.mode,
+                    ReviewMode::Tree,
+                    "re-pressing the active Tree segment stays on Tree"
+                );
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![init_lua.clone(), starship.clone()],
+                    "and does not touch membership either"
+                );
+
+                // 6. ⌘-click on the Partial `.config/` completes its safe set.
                 assert_eq!(
                     view.selection.check_state(&[
                         init_lua.clone(),
@@ -4006,7 +4132,7 @@ mod render_smoke {
                     "the recursive tick completes .config/'s whole safe set"
                 );
 
-                // 6. The same ⌘-click again, now On, clears it.
+                // 7. The same ⌘-click again, now On, clears it.
                 view.folder_click(&config, platform, cx);
                 assert!(
                     view.selection.is_empty(),

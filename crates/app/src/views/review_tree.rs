@@ -204,6 +204,17 @@ pub(super) fn tree_rows(
             &mut out,
         );
     }
+    // A safe target that is a direct child of `/` (e.g. `/swapfile`) has no
+    // enclosing directory to fold it into, so `under_root.dirs` never sees
+    // it: without this it silently disappears from the tree, and from
+    // `safe_order` (`tree_order` is built from these rows), making it
+    // unreachable by ⌘A or any tick (final review, Minor 5). Emitted the
+    // same way `emit_children` emits a directory's own files.
+    let mut root_files = under_root.safe_files.clone();
+    root_files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, target) in root_files {
+        out.push(TreeRow::File { target, depth: 0 });
+    }
     out
 }
 
@@ -357,8 +368,41 @@ mod tests {
         assert_eq!(folders(&rows), vec![("/etc/".into(), 0, 1, 1)]);
     }
 
-    /// MUTATION: `tree_order` honours a collapse set (it must not take one)
-    /// or lists files before folders → the order differs from the rows'.
+    /// A safe target that is a direct child of `/`, with no enclosing
+    /// directory: `under_root.dirs` never sees it, so `/swapfile` only
+    /// appears at all if `tree_rows` emits `under_root.safe_files` after
+    /// walking `under_root.dirs` (final review, Minor 5). Without that it
+    /// disappears from the tree AND from `safe_order` (`tree_order` is built
+    /// from these rows), so it is unreachable by ⌘A or any tick.
+    ///
+    /// MUTATION: drop the `under_root.safe_files` emit at the end of
+    /// `tree_rows` → `/swapfile` is missing from `files(&rows)`.
+    #[test]
+    fn a_target_at_the_filesystem_root_is_still_a_row() {
+        let safe = vec![
+            h(".zshrc"),
+            PathBuf::from("/etc/hosts"),
+            PathBuf::from("/swapfile"),
+        ];
+        let rows = tree_rows(&safe, &[], &BTreeSet::new(), &home());
+        assert_eq!(
+            folders(&rows),
+            vec![("/etc/".into(), 0, 1, 1)],
+            "/swapfile has no enclosing directory, so it is never a folder"
+        );
+        assert_eq!(
+            files(&rows),
+            vec![
+                (h(".zshrc"), 0),
+                (PathBuf::from("/etc/hosts"), 1),
+                (PathBuf::from("/swapfile"), 0),
+            ],
+            "/swapfile is a depth-0 file row, same as a home-relative one"
+        );
+    }
+
+    /// MUTATION: lists files before folders → the order differs from the
+    /// rows'.
     #[test]
     fn tree_order_is_the_rows_file_order_with_nothing_collapsed() {
         let safe = vec![h("z"), h(".config/nvim/init.lua"), h(".config/a")];

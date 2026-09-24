@@ -1163,7 +1163,16 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
                 for row in tree_rows(&safe_targets, &excluded, collapsed, home) {
                     match row {
                         TreeRow::Folder(node) => {
-                            let under = safe_descendants(&safe_targets, &node.path, home);
+                            // Equivalent to `safe_descendants(&safe_targets,
+                            // &node.path, home)` but reuses the `safe_order`
+                            // already computed above instead of rebuilding
+                            // the whole tree per folder row (final review,
+                            // Important 2).
+                            let under: Vec<PathBuf> = safe_order
+                                .iter()
+                                .filter(|t| t.starts_with(&node.path))
+                                .cloned()
+                                .collect();
                             let check = selection.check_state(&under);
                             rows.push(SidebarRow::Folder { node, check });
                         }
@@ -1566,6 +1575,16 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// The List/Tree segmented control's guard: re-pressing the already
+    /// active mode is a no-op, since `toggle_mode` only knows how to flip.
+    /// Both segment listeners share this instead of repeating the guard
+    /// inline (final review, Minor 11).
+    pub(super) fn set_mode(&mut self, mode: ReviewMode, cx: &mut Context<Self>) {
+        if self.mode != mode {
+            self.toggle_mode(cx);
+        }
+    }
+
     /// A folder row's plain click: open/close it. Its members stay selected
     /// while collapsed (spec §2.5) — only `toggle_folder` changes membership.
     ///
@@ -1611,9 +1630,12 @@ impl ReviewView {
     /// A row's click gesture (spec §2.3): ⌘ toggles the row's membership
     /// (sets the anchor, never moves `selected`), ⇧ extends the range from
     /// the anchor (also never moves `selected`), anything else clears the
-    /// selection and plain-selects the row. The caller neutralizes `mods`
-    /// for a non-selectable row before calling this (see `target_row`'s
-    /// `on_click`), so this never needs to know `selectable` itself.
+    /// selection and plain-selects the row. A NEEDS A DECISION / PROCESSING
+    /// row (`selectable = false`) has no membership to toggle or extend, so
+    /// a ⌘/⇧-click on one is ignored outright rather than falling through to
+    /// the plain-click arm — which would otherwise clear the selection and
+    /// move `selected`, silently destroying a large selection with no way
+    /// back (final review, Minor 3).
     ///
     /// `pub(super)` so the render-smoke tests can drive a gesture with a
     /// synthetic `Modifiers` rather than a real mouse event, the same
@@ -1622,8 +1644,22 @@ impl ReviewView {
         &mut self,
         target: &Path,
         mods: gpui::Modifiers,
+        selectable: bool,
         cx: &mut Context<Self>,
     ) {
+        if !selectable {
+            // ⌘/⇧ on a row with no membership to toggle or extend: ignore
+            // the gesture outright. Without this early return the row would
+            // fall through to the same plain-click clear+select below,
+            // wiping out an unrelated selection just because the click
+            // happened to carry a modifier.
+            if mods.platform || mods.shift {
+                return;
+            }
+            self.selection.clear();
+            self.select(target.to_path_buf(), cx);
+            return;
+        }
         if mods.platform {
             self.toggle_member(target, cx);
         } else if mods.shift {
@@ -2131,11 +2167,7 @@ impl ReviewView {
                         ui::ButtonVariant::Ghost
                     },
                     ui::ButtonSize::Micro,
-                    cx.listener(move |view, _ev, _window, cx| {
-                        if view.mode != mode {
-                            view.toggle_mode(cx);
-                        }
-                    }),
+                    cx.listener(move |view, _ev, _window, cx| view.set_mode(mode, cx)),
                 )
                 .tooltip(ui::text_tooltip(tooltip))
                 .flex_shrink_0()
@@ -2280,7 +2312,13 @@ impl ReviewView {
             )
             // Hidden until a selection exists, then always shown; while none
             // exists, a hover over THIS row still reveals it (`group_hover`)
-            // so the very first tick has somewhere to start.
+            // so the very first tick has somewhere to start. This is
+            // hit-testable even at opacity 0 (gpui 0.2.2's
+            // `Div::should_insert_hitbox` never consults `style.opacity`) —
+            // on purpose, so a click on the invisible slot still ticks the
+            // row: the reveal is `group_hover` over the row's own group, so
+            // the pointer cannot be on this slot without the checkbox
+            // already being painted (final review, Minor 4).
             .opacity(if selection_active { 1. } else { 0. })
             .group_hover("review-row", |el| el.opacity(1.))
             .into_any_element()
@@ -2359,17 +2397,7 @@ impl ReviewView {
             }))
             .when(!locked, |el| {
                 el.on_click(cx.listener(move |view, ev: &ClickEvent, _window, cx| {
-                    let mods = ev.modifiers();
-                    // A NEEDS A DECISION / PROCESSING row has no membership
-                    // to toggle or extend — neutralize ⌘/⇧ before handing
-                    // off, so `row_click` itself never needs to know
-                    // `selectable`.
-                    let mods = if selectable {
-                        mods
-                    } else {
-                        gpui::Modifiers::default()
-                    };
-                    view.row_click(&target, mods, cx);
+                    view.row_click(&target, ev.modifiers(), selectable, cx);
                 }))
             })
     }
