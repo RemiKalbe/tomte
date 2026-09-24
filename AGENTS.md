@@ -362,6 +362,7 @@ and run in the background, a Processing section replaces any "working…"
 button, consecutive one-click decisions share one re-add/commit/push, the
 selection auto-advances, failures stick to their row, the landed banner names
 the file Undo would revert, finish/roll-back/undo wait behind the latch.
+
 This branch adds multi-select of SAFE TO RESOLVE rows with bulk one-batch
 Keep disk / Keep source actions, Esc/⌘A, and a List/Tree folder sidebar.
 

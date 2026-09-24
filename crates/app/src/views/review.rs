@@ -1217,7 +1217,10 @@ pub struct ReviewView {
     /// The diff is a read-only [`ui::TextArea`] (2026-08-23 feedback: "diffs
     /// should be selectable"): same editor as the merge result, minus the
     /// decision strips — so a diff can be selected and copied like text.
-    preview_editor: Option<Entity<ui::TextArea>>,
+    /// `pub(super)` so a render-smoke test can read its `selected_text()`
+    /// after a real click + ⌘A — the only way to prove the editor, not the
+    /// sidebar, kept the click's focus.
+    pub(super) preview_editor: Option<Entity<ui::TextArea>>,
     /// Rebuild the editor's content + decorations on the next render (the
     /// preview changed, or the theme flipped).
     preview_dirty: bool,
@@ -1238,8 +1241,15 @@ pub struct ReviewView {
     /// `pub(super)` for the same reason; empty and inert in Flat mode.
     pub(super) collapsed: BTreeSet<PathBuf>,
     /// Backs the "Review" key context (Esc / ⌘A) — see [`register_keys`].
-    /// Grabbed on mouse-down anywhere in the view, never stolen from the
-    /// merge editor (this view is not rendered while it is open).
+    /// `render_inner`'s `track_focus` alone gives the root this on any click
+    /// no focusable descendant claims first (gpui's own protocol, not
+    /// something this view writes) — the diff pane's read-only editor is the
+    /// one descendant in Review that can claim it instead, and does. A
+    /// hand-written `on_mouse_down` here once re-focused the root
+    /// unconditionally, after every child's own focus listener in the
+    /// bubble, so a click inside the diff editor could never keep its own
+    /// focus: do not add one back. The merge editor is a non-issue either
+    /// way — the two never render at once (routes are exclusive).
     /// `pub(super)` so the render-smoke tests can focus it directly, the
     /// same reason `selection` is.
     pub(super) focus_handle: gpui::FocusHandle,
@@ -1533,7 +1543,7 @@ impl ReviewView {
     /// complete; a second ⌘A is then a no-op rather than clearing everything
     /// it just selected. An empty safe group is a no-op either way —
     /// `toggle_all` already refuses an empty `targets`.
-    pub(super) fn select_all_safe(&mut self, cx: &mut Context<Self>) {
+    fn select_all_safe(&mut self, cx: &mut Context<Self>) {
         let plan = self.plan(cx);
         let all = plan.safe_order;
         if self.selection.check_state(&all) != CheckState::On {
@@ -2071,6 +2081,11 @@ impl ReviewView {
             .child(
                 div()
                     .id("review-sidebar-rows")
+                    // Test-only (no-op in release builds): lets a
+                    // render-smoke test find this column's real bounds and
+                    // click into its empty space below the last row, rather
+                    // than guess a pixel offset.
+                    .debug_selector(|| "review-sidebar-rows".into())
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -2675,6 +2690,11 @@ impl ReviewView {
             .child(
                 div()
                     .id("review-diff-scroll")
+                    // Test-only (no-op in release builds): lets a
+                    // render-smoke test find this pane's real bounds and
+                    // click into its actual text, rather than guess a pixel
+                    // offset.
+                    .debug_selector(|| "review-diff-scroll".into())
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -2745,13 +2765,6 @@ impl ReviewView {
             .key_context("Review")
             .on_action(cx.listener(|view, _: &ClearSelection, _w, cx| view.clear_selection(cx)))
             .on_action(cx.listener(|view, _: &SelectAllSafe, _w, cx| view.select_all_safe(cx)))
-            // Take focus on any click in the view, so Esc/⌘A reach it without
-            // stealing focus from the merge editor (this view is not
-            // rendered while that one is open).
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|view, _ev, window, _cx| view.focus_handle.focus(window)),
-            )
             .flex_1()
             .min_h_0()
             .flex()

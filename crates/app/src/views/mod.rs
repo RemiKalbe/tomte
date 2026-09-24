@@ -4089,6 +4089,111 @@ mod render_smoke {
         );
     }
 
+    /// §2.3's OTHER half — "the root takes focus on any click inside the
+    /// view" — proven with REAL clicks (`simulate_click`), which the smoke
+    /// test above cannot do: it focuses `view.focus_handle` programmatically
+    /// and says so in its own comment, so it can tell "the binding fires
+    /// when focused" but not "a click gives the RIGHT element focus". That
+    /// gap is exactly how fix round 1's regression got through: a
+    /// hand-written `on_mouse_down` on the root re-focused the root on every
+    /// click, including one inside the diff editor's own pane, so ⌘A there
+    /// fired `SelectAllSafe` instead of the editor's own `SelectAll` and the
+    /// diff stopped being copyable. Two real clicks on `review-multiselect`
+    /// (a diff is showing; the pose's ~10 rows leave the scrollable rows
+    /// column well short of the sidebar's full height, so its floor is
+    /// genuinely empty):
+    ///
+    /// 1. Click inside the diff editor's own scroll pane (bounds read back
+    ///    through `debug_selector`/`debug_bounds`, so this lands on real
+    ///    rendered text rather than a guessed offset) → the editor's OWN
+    ///    `track_focus` claims focus before the root's ever runs (gpui's
+    ///    bubble order runs innermost first). ⌘A then reaches
+    ///    "TextAreaReadOnly"'s `SelectAll` — registered by
+    ///    `merge::register_keys`, called here for exactly that reason, the
+    ///    same way `main.rs` always calls it next to `review::register_keys`
+    ///    — not Review's `SelectAllSafe`: the sidebar selection stays at the
+    ///    pose's starting 3, and the editor's own selection is non-empty.
+    /// 2. Click in the same column's empty space, below the last row →
+    ///    nothing there claims focus, so the root's `track_focus` is the
+    ///    only listener that can. Esc then reaches `ClearSelection` and
+    ///    empties that same 3-member selection.
+    ///
+    /// MUTATION: reinstate the `on_mouse_down` block fix round 1 deleted
+    /// (`render_inner`, right after the two `on_action`s: `.on_mouse_down(
+    /// gpui::MouseButton::Left, cx.listener(|view, _ev, window, _cx|
+    /// view.focus_handle.focus(window)))`) → step 1's diff click focuses the
+    /// root instead of the editor, so ⌘A selects the pose's 5 safe rows
+    /// instead of the diff's text — the first two assertions below fail.
+    #[gpui::test]
+    fn a_click_in_the_diff_keeps_its_focus_and_a_sidebar_click_takes_the_root(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            // The diff editor's own cmd-a/cmd-c bindings — `main.rs` always
+            // registers this next to `review::register_keys`, and step 1
+            // needs it to tell "the editor's SelectAll fired" from "nothing
+            // fired".
+            merge::register_keys(cx);
+            review::register_keys(cx);
+        });
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().len()),
+            3,
+            "the pose's own starting selection"
+        );
+
+        // 1. Click inside the diff editor's own pane.
+        let diff_bounds = vis
+            .debug_bounds("review-diff-scroll")
+            .expect("the diff pane rendered (review-multiselect selects settings.json)");
+        vis.simulate_click(
+            diff_bounds.origin + gpui::point(px(20.), px(20.)),
+            gpui::Modifiers::default(),
+        );
+        vis.simulate_keystrokes("cmd-a");
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().len()),
+            3,
+            "⌘A reached the diff editor's own SelectAll, not Review's \
+             SelectAllSafe — the sidebar selection is untouched"
+        );
+        let editor_selected_len = vis.update(|_window, cx| {
+            review
+                .read(cx)
+                .preview_editor
+                .as_ref()
+                .and_then(|editor| editor.read(cx).selected_text().map(str::len))
+        });
+        assert!(
+            editor_selected_len.is_some_and(|len| len > 0),
+            "the click kept the diff editor focused, so ⌘A selected its own \
+             text: {editor_selected_len:?}"
+        );
+
+        // 2. Click in the rows column's empty space, below the last row.
+        let rows_bounds = vis
+            .debug_bounds("review-sidebar-rows")
+            .expect("the sidebar rows column rendered");
+        let empty_point = gpui::point(
+            rows_bounds.origin.x + px(20.),
+            rows_bounds.origin.y + rows_bounds.size.height - px(8.),
+        );
+        vis.simulate_click(empty_point, gpui::Modifiers::default());
+        vis.simulate_keystrokes("escape");
+        assert!(
+            vis.update(|_window, cx| review.read(cx).selection.is_empty()),
+            "a click on empty sidebar space still gave the root focus \
+             (nothing else claimed it), and Esc reached it"
+        );
+    }
+
     /// A failure has to outlive its action (spec §2.5) but NOT the drift.
     /// Only a retry cleared one before this, so a file that failed, went
     /// back in sync, and drifted again months later for an unrelated reason
