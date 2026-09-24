@@ -22,6 +22,7 @@ use super::review::{
     ReviewView, SidebarInputs, origin_diffs, sidebar_rows,
 };
 use super::review_selection::Selection;
+use super::review_tree::safe_descendants;
 use super::settings::SettingsPaths;
 use super::{Route, Shell};
 use tomte_app::action_queue::{Decision, QueuedAction};
@@ -67,6 +68,14 @@ pub const STATES: &[(&str, &str)] = &[
     (
         "review-multiselect",
         "three safe rows ticked: the selection bar replaces the file's actions, checkboxes visible",
+    ),
+    (
+        "review-tree",
+        "folder tree: .config/nvim/ collapsed, .config/ partially ticked, an \"n of m\" chip",
+    ),
+    (
+        "review-tree-selected",
+        "a whole folder ticked: its checkbox On, selection bar for its files",
     ),
     ("merge", "three-pane editor with unresolved conflicts"),
     (
@@ -482,8 +491,13 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         | "review-keep-both"
         | "review-origin"
         | "review-origin-compared"
-        | "review-multiselect" => {
-            let mut model = if name == "review-multiselect" {
+        | "review-multiselect"
+        | "review-tree"
+        | "review-tree-selected" => {
+            let mut model = if matches!(
+                name,
+                "review-multiselect" | "review-tree" | "review-tree-selected"
+            ) {
                 multiselect_model()
             } else {
                 rich_model()
@@ -606,6 +620,44 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                         home(".zshrc"),
                     ] {
                         view.selection.toggle(&target, &plan.safe_order);
+                    }
+                });
+            }
+            if name == "review-tree" || name == "review-tree-selected" {
+                let home_dir = home("");
+                // `review-tree`: `.config/nvim/` closed, so its chevron and
+                // "no children" are on screen; `review-tree-selected`: fully
+                // open, so a folder ticked On shows its files right under it.
+                let collapsed: BTreeSet<PathBuf> = if name == "review-tree" {
+                    BTreeSet::from([home(".config/nvim")])
+                } else {
+                    BTreeSet::new()
+                };
+                let plan = sidebar_rows(SidebarInputs {
+                    drifted: &s.state.read(cx).drifted,
+                    queue: &QueueSnapshot::default(),
+                    mode: ReviewMode::Tree,
+                    collapsed: &collapsed,
+                    selection: &Selection::default(),
+                    home: &home_dir,
+                });
+                review.update(cx, |view, _| {
+                    view.mode = ReviewMode::Tree;
+                    view.collapsed = collapsed.clone();
+                    if name == "review-tree" {
+                        // One tick under `.config/`, none under `nvim/` or
+                        // `zed/`: `.config/` reads Partial, "3 of 5".
+                        view.selection
+                            .toggle(&home(".config/starship.toml"), &plan.safe_order);
+                    } else {
+                        // Every safe file under `nvim/` (its checkbox On)
+                        // plus one more under `.config/` (`.config/` stays
+                        // Partial) — "2 selected".
+                        let under =
+                            safe_descendants(&plan.safe_order, &home(".config/nvim"), &home_dir);
+                        view.selection.toggle_all(&under, &plan.safe_order);
+                        view.selection
+                            .toggle(&home(".config/zed/settings.json"), &plan.safe_order);
                     }
                 });
             }

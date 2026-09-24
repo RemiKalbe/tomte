@@ -974,8 +974,6 @@ pub(super) fn undo_affordance(banner: &OutcomeBanner, queue: &QueueSnapshot) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReviewMode {
     Flat,
-    /// Consumed by Task 6 (the mode toggle) and Task 7 (the tree it selects).
-    #[allow(dead_code)]
     Tree,
 }
 
@@ -997,9 +995,7 @@ pub(super) enum SidebarRow {
         /// Rendered by `group_header_el`.
         check: Option<CheckState>,
     },
-    /// Tree mode only: a folder of the safe group. Consumed by Task 7's tree
-    /// rendering — Flat mode never emits one.
-    #[allow(dead_code)]
+    /// Tree mode only: a folder of the safe group. Flat mode never emits one.
     Folder { node: FolderNode, check: CheckState },
     Target {
         entry: DriftSummary,
@@ -1507,6 +1503,35 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// The List/Tree segmented control, top-right of the sidebar.
+    fn toggle_mode(&mut self, cx: &mut Context<Self>) {
+        self.mode = match self.mode {
+            ReviewMode::Flat => ReviewMode::Tree,
+            ReviewMode::Tree => ReviewMode::Flat,
+        };
+        // Members keep their identity across modes; only their order changes,
+        // and the next render's prune re-sorts them.
+        cx.notify();
+    }
+
+    /// A folder row's plain click: open/close it. Its members stay selected
+    /// while collapsed (spec §2.5) — only `toggle_folder` changes membership.
+    fn toggle_collapse(&mut self, folder: &Path, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(folder) {
+            self.collapsed.insert(folder.to_path_buf());
+        }
+        cx.notify();
+    }
+
+    /// The folder's checkbox, or ⌘-click on the folder row: every safe file
+    /// under it, collapsed or not.
+    fn toggle_folder(&mut self, folder: &Path, cx: &mut Context<Self>) {
+        let plan = self.plan(cx);
+        let under = safe_descendants(&plan.safe_order, folder, &home());
+        self.selection.toggle_all(&under, &plan.safe_order);
+        cx.notify();
+    }
+
     /// A row's click gesture (spec §2.3): ⌘ toggles the row's membership
     /// (sets the anchor, never moves `selected`), ⇧ extends the range from
     /// the anchor (also never moves `selected`), anything else clears the
@@ -1904,8 +1929,39 @@ impl ReviewView {
                 SidebarRow::Group { label, check } => rows.push(
                     group_header_el(label, *check, selection_active, theme, cx).into_any_element(),
                 ),
-                // Tree rendering starts in Task 7; Flat mode never emits one.
-                SidebarRow::Folder { .. } => continue,
+                SidebarRow::Folder { node, check } => {
+                    let path = node.path.clone();
+                    let path2 = node.path.clone();
+                    let count: SharedString = if node.safe == node.total {
+                        node.safe.to_string().into()
+                    } else {
+                        format!("{} of {}", node.safe, node.total).into()
+                    };
+                    rows.push(
+                        ui::folder_row(
+                            theme,
+                            ElementId::named_usize("review-folder", ix),
+                            ui::FolderRow {
+                                depth: node.depth,
+                                label: node.label.clone(),
+                                collapsed: node.collapsed,
+                                count,
+                                check: *check,
+                                show_check: selection_active,
+                            },
+                            cx.listener(move |view, ev: &ClickEvent, _w, cx| {
+                                if ev.modifiers().platform {
+                                    view.toggle_folder(&path, cx);
+                                } else {
+                                    view.toggle_collapse(&path, cx);
+                                }
+                            }),
+                            cx.listener(move |view, _ev, _w, cx| view.toggle_folder(&path2, cx)),
+                        )
+                        .into_any_element(),
+                    );
+                    ix += 1;
+                }
                 SidebarRow::Target {
                     entry,
                     queued,
@@ -1950,23 +2006,76 @@ impl ReviewView {
             .w(px(self.sidebar_width.unwrap_or(SIDEBAR_WIDTH)))
             .flex_shrink_0()
             .h_full()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .py_1()
-            .children(rows)
+            .child(self.mode_control(theme, cx))
             .child(
-                // Collapsed in-sync group: a count line, not a list (§7.2).
                 div()
-                    .px_3()
-                    .py_2()
-                    .mt_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(theme.text_muted)
-                    .child(format!("In sync ({in_sync})")),
+                    .id("review-sidebar-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .children(rows)
+                    .child(
+                        // Collapsed in-sync group: a count line, not a list (§7.2).
+                        div()
+                            .px_3()
+                            .py_2()
+                            .mt_2()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child(format!("In sync ({in_sync})")),
+                    ),
             )
+    }
+
+    /// The List/Tree segmented control, top-right of the sidebar (spec
+    /// §2.5): same shape as [`Self::comparison_selector`]. Re-pressing the
+    /// already-active mode is a no-op rather than flipping it, since
+    /// `toggle_mode` only knows how to flip.
+    fn mode_control(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let entries: [(ReviewMode, &'static str, &'static str, &'static str); 2] = [
+            (ReviewMode::Flat, "review-mode-list", "List", "Flat list"),
+            (ReviewMode::Tree, "review-mode-tree", "Tree", "Folder tree"),
+        ];
+        let segments: Vec<Stateful<Div>> = entries
+            .into_iter()
+            .map(|(mode, id, label, tooltip)| {
+                let selected = self.mode == mode;
+                ui::button(
+                    theme,
+                    id,
+                    label.into(),
+                    if selected {
+                        ui::ButtonVariant::Tonal(theme.accent)
+                    } else {
+                        ui::ButtonVariant::Ghost
+                    },
+                    ui::ButtonSize::Micro,
+                    cx.listener(move |view, _ev, _window, cx| {
+                        if view.mode != mode {
+                            view.toggle_mode(cx);
+                        }
+                    }),
+                )
+                .tooltip(ui::text_tooltip(tooltip))
+                .flex_shrink_0()
+            })
+            .collect();
+        div()
+            .flex_none()
+            .px_3()
+            .py_1()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_1()
+            .children(segments)
     }
 }
 
@@ -2822,8 +2931,8 @@ mod tests {
         QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, Selection, SidebarInputs,
         SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
         display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
-        preview_decors, queued_outcome_banner, refused_banner, severity_groups, sidebar_rows,
-        source_actions, undo_affordance, undo_banner,
+        preview_decors, queued_outcome_banner, refused_banner, safe_descendants, severity_groups,
+        sidebar_rows, source_actions, tree_order, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -3352,6 +3461,34 @@ mod tests {
             plan.visible_safe,
             vec![p("/Users/x/.config/nvim/init.lua"), p("/Users/x/top")]
         );
+    }
+
+    /// Ticking a folder reaches its collapsed descendants too (spec §2.3):
+    /// the composition `ReviewView::toggle_folder` runs (`safe_descendants`
+    /// feeding `Selection::toggle_all`, both fed by the plan's own
+    /// `safe_order`) reaches a file hidden inside a collapsed child folder.
+    /// MUTATION: tick only `visible_safe` under the folder → the collapsed
+    /// file is missing.
+    #[test]
+    fn a_folder_tick_reaches_collapsed_descendants() {
+        let safe = vec![
+            p("/Users/x/.config/nvim/init.lua"),
+            p("/Users/x/.config/nvim/lua/p.lua"),
+            p("/Users/x/top"),
+        ];
+        let home = Path::new("/Users/x");
+        let mut selection = Selection::default();
+        let order = tree_order(&safe, home);
+        let under = safe_descendants(&safe, Path::new("/Users/x/.config/nvim"), home);
+        selection.toggle_all(&under, &order);
+        assert_eq!(
+            selection.members(),
+            &[
+                p("/Users/x/.config/nvim/lua/p.lua"),
+                p("/Users/x/.config/nvim/init.lua")
+            ]
+        );
+        assert_eq!(selection.check_state(&under), CheckState::On);
     }
 
     /// A PROCESSING target the drift model has already dropped (a rescan
