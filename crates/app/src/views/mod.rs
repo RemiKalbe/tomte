@@ -3668,45 +3668,40 @@ mod render_smoke {
     /// The `review-multiselect` fixture pre-selects `.gitconfig`,
     /// `starship.toml` and `.zshrc` — the last three of the five SAFE rows
     /// in display order (`settings.json`, `.gitconfig`, `starship.toml`,
-    /// `.zshrc`, `init.lua`) — so the row after the last member is
-    /// `init.lua`.
+    /// `.zshrc`, `init.lua`). This test UNTICKS `starship.toml` first, so
+    /// the pressed set is `.gitconfig` and `.zshrc` with a GAP between
+    /// them — the shape that actually distinguishes "advance from the last
+    /// member" from "advance from the first member" (a contiguous
+    /// selection does not: `next_after` re-filters every candidate against
+    /// the real queue regardless of which already-processing member is
+    /// handed to it as `resolved`, so walking forward from either end of a
+    /// contiguous block skips the same processing rows and lands on the
+    /// same next candidate — this is why the fixture's original, untouched
+    /// three-in-a-row selection could not tell the two apart). With the
+    /// gap, `starship.toml` itself is never queued and stays answerable:
+    /// advancing from the LAST member (`.zshrc`) walks past it to
+    /// `init.lua`; advancing from the FIRST member (`.gitconfig`) stops at
+    /// `starship.toml`, the untouched row sitting right after it.
     ///
-    /// `EngineLab::publish` is what makes `running().len() == 3` mean
-    /// anything: with no engine, `pump` PARKS and never calls `take_batch`,
-    /// so nothing is ever "running" (see `pump`'s own comment). This never
+    /// `EngineLab::publish` is what makes `running().len()` mean anything:
+    /// with no engine, `pump` PARKS and never calls `take_batch`, so
+    /// nothing is ever "running" (see `pump`'s own comment). This never
     /// calls `run_until_parked`, so the spawned batch is never driven past
     /// that synchronous point and the fixture's symbolic paths are never
     /// actually handed to chezmoi/git.
     ///
     /// MUTATION: drop `self.selection.clear()` from `run_bulk` → the
-    /// `selection.is_empty()` assertion fails. MUTATION: drop the
-    /// `self.advance_from(&advance_target, cx)` call entirely → `selected`
-    /// stays on `settings.json` (the pose's original selection) instead of
-    /// advancing to `init.lua`.
+    /// `selection.is_empty()` assertion fails. MUTATION: advance from
+    /// `members.first()` instead of the last (visible) member → `selected`
+    /// becomes `starship.toml` instead of `init.lua`.
     ///
-    /// NOT tested here: `run_bulk`'s preference for the last member that is
-    /// actually VISIBLE over plain `members.last()` (MI-2's Task-7-hazard
-    /// fix). I tried the mutation the review named for it — `members.
-    /// first()` in place of the visible-preferred pick — and it does NOT
-    /// fail this test: `next_after` re-filters candidates against the REAL
-    /// queue regardless of which already-processing member is handed to it
-    /// as `resolved`, so walking forward from `.gitconfig` (first) skips
-    /// the still-processing `starship.toml`/`.zshrc` exactly as walking
-    /// from `.zshrc` (last) does, landing on `init.lua` either way. In Flat
-    /// mode `visible_safe` also always equals `safe_order` at the moment
-    /// `run_bulk` reads it (before its own `enqueue_many` call marks
-    /// anything processing), so the "prefer visible" branch is provably
-    /// unreachable-different from plain `members.last()` for ANY Flat-mode
-    /// selection — the distinction can only be observed once Task 7 lets a
-    /// member sit inside a collapsed folder. No test claims otherwise.
-    ///
-    /// All three assertions run INSIDE the same `review.update` as
-    /// `run_bulk` itself, not through a later, separate read: a render
+    /// All assertions after the press run INSIDE the same `review.update`
+    /// as `run_bulk` itself, not through a later, separate read: a render
     /// between the call and the read would prune the selection down to
-    /// empty on its own (every member here just became PROCESSING, so
-    /// none of them are in the next plan's `safe_order` either way),
-    /// silently satisfying `selection.is_empty()` even with the mutation
-    /// applied and making the assertion prove nothing.
+    /// empty on its own (both pressed members just became PROCESSING, so
+    /// neither is in the next plan's `safe_order` either way), silently
+    /// satisfying `selection.is_empty()` even with the mutation applied
+    /// and making the assertion prove nothing.
     #[gpui::test]
     fn a_bulk_press_clears_the_selection_and_advances_past_the_last_member(
         cx: &mut TestAppContext,
@@ -3714,6 +3709,13 @@ mod render_smoke {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/Users/gallery"));
+        let safe_order = vec![
+            home.join(".config/zed/settings.json"),
+            home.join(".gitconfig"),
+            home.join(".config/starship.toml"),
+            home.join(".zshrc"),
+            home.join(".config/nvim/init.lua"),
+        ];
         let _lab = EngineLab::publish(cx);
         let (shell, vis) = cx.add_window_view(|_window, cx| {
             fixtures::build("review-multiselect", smoke_paths(), cx)
@@ -3723,6 +3725,16 @@ mod render_smoke {
 
         vis.update(|_window, cx| {
             review.update(cx, |view, cx| {
+                // Untick starship.toml: members become .gitconfig, .zshrc —
+                // a gap, not the fixture's original contiguous block.
+                view.selection
+                    .toggle(&home.join(".config/starship.toml"), &safe_order);
+                assert_eq!(
+                    view.selection.members().to_vec(),
+                    vec![home.join(".gitconfig"), home.join(".zshrc"),],
+                    "starship.toml is unticked, leaving a gap between the two remaining members"
+                );
+
                 view.run_bulk(review::ResolveAction::KeepDisk, cx);
                 assert!(
                     view.selection.is_empty(),
@@ -3731,13 +3743,14 @@ mod render_smoke {
                 assert_eq!(
                     view.selected,
                     Some(home.join(".config/nvim/init.lua")),
-                    "advanced past the last (visible) member to the next row still needing a decision"
+                    "advanced past the last (visible) member, past the untouched \
+                     starship.toml in the gap, to the next row still needing a decision"
                 );
             });
             assert_eq!(
                 shell.read(cx).queue.running().len(),
-                3,
-                "one batch took all three members"
+                2,
+                "one batch took both pressed members — starship.toml was never selected"
             );
         });
     }
