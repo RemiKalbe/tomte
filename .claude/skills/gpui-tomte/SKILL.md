@@ -71,8 +71,34 @@ The shapes that matter in practice:
   on the background executor, and gate it off under `cfg!(test)` — then say in
   the report that the production spawn is untested.
 
+## Focus, hit-testing and keys
+
+- `.track_focus(&handle)` already focuses the element on mouse-down and
+  yields to a focusable child (a click in the diff pane's read-only editor
+  keeps the editor focused). A hand-written `.on_mouse_down(.., focus(window))`
+  on the same root runs last in the bubble and re-focuses the root
+  unconditionally — it stole ⌘A/⌘C from the diff editor (2026-09-24). Never
+  add one next to `track_focus`.
+- An element at `opacity(0.)` is still hit-testable: a hover-revealed
+  checkbox receives the click before it is visible. Say so in a comment when
+  that is the intent; gate on hover/selection state when it is not.
+- Key bindings: `gpui::actions!(ns, [A, B])`, `cx.bind_keys([KeyBinding::new("escape", A, Some("Ctx"))])`
+  registered at every app entry point (main / gallery / live, next to the
+  merge editor's), and `.key_context("Ctx")` + `.on_action(cx.listener(..))`
+  on the root that carries the focus handle. Routes are exclusive here, so
+  one view's `cmd-a` does not shadow another's.
+
 ## Tests
 
+- Keys and clicks: `VisualTestContext::simulate_keystrokes("cmd-a")` goes
+  through the bindings AND the key context of the focused node (remove the
+  `key_context` and the test fails — that is the proof it exercises the
+  binding); `dispatch_action(A)` skips the bindings and hits the focused
+  node's `on_action`. `simulate_click(point, modifiers)` is a real
+  mouse-down/up pair; take coordinates from `debug_bounds("name")` on an
+  element that carries `.debug_selector(|| "name".into())` (test-support only,
+  a no-op in the shipped binary). No repo test dispatched an action before
+  2026-09-24; these are the shapes to copy.
 - `#[gpui::test] fn x(cx: &mut TestAppContext)`; build with `cx.new(|cx| …)`,
   drive with `entity.update(cx, ..)`, assert with `entity.read_with(cx, |e, cx| ..)`.
 - `cx.run_until_parked()` drives foreground AND background tasks
