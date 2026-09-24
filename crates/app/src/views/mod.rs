@@ -1733,7 +1733,7 @@ mod render_smoke {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
     use tomte_app::model::{SyncModel, TimelineRow};
 
     use super::*;
@@ -2754,6 +2754,17 @@ mod render_smoke {
         }
     }
 
+    /// The `ReviewView` a posed Shell built, for tests that drive it
+    /// directly — a bulk press, a ⌘/⇧-click — rather than only observing
+    /// its render (the way `a_review_decision_queues_and_advances_the_
+    /// selection` already does inline). Pulled out so Task 8's key-binding
+    /// smoke test can share it. Panics if the pose has no Review entity:
+    /// pose a `review*` state first.
+    fn review_of(shell: &Entity<Shell>, vis: &mut VisualTestContext) -> Entity<ReviewView> {
+        vis.update(|_window, cx| shell.read(cx).review.clone())
+            .expect("pose has a Review entity")
+    }
+
     /// The queue's REAL path, end to end: `enqueue` → `pump` → `run_batch`
     /// against a live engine, and the decision actually lands on disk.
     ///
@@ -3645,6 +3656,197 @@ mod render_smoke {
             vis.update(|_window, cx| review.read(cx).selected.clone()),
             Some(home.join(".gitconfig")),
             "and the selection advanced to the next row that still needs a decision"
+        );
+    }
+
+    /// A bulk press clears the selection and advances `selected` past the
+    /// last member (spec §2.4) — the VIEW half of the queue's headline
+    /// behaviour. Task 4's `a_bulk_press_is_one_batch_and_one_push` drives
+    /// `Shell::enqueue_many` directly and never touches `ReviewView`, so
+    /// this is the only coverage of `run_bulk` itself.
+    ///
+    /// The `review-multiselect` fixture pre-selects `.gitconfig`,
+    /// `starship.toml` and `.zshrc` — the last three of the five SAFE rows
+    /// in display order (`settings.json`, `.gitconfig`, `starship.toml`,
+    /// `.zshrc`, `init.lua`) — so the row after the last member is
+    /// `init.lua`.
+    ///
+    /// `EngineLab::publish` is what makes `running().len() == 3` mean
+    /// anything: with no engine, `pump` PARKS and never calls `take_batch`,
+    /// so nothing is ever "running" (see `pump`'s own comment). This never
+    /// calls `run_until_parked`, so the spawned batch is never driven past
+    /// that synchronous point and the fixture's symbolic paths are never
+    /// actually handed to chezmoi/git.
+    ///
+    /// MUTATION: drop `self.selection.clear()` from `run_bulk` → the
+    /// `selection.is_empty()` assertion fails. MUTATION: drop the
+    /// `self.advance_from(&advance_target, cx)` call entirely → `selected`
+    /// stays on `settings.json` (the pose's original selection) instead of
+    /// advancing to `init.lua`.
+    ///
+    /// NOT tested here: `run_bulk`'s preference for the last member that is
+    /// actually VISIBLE over plain `members.last()` (MI-2's Task-7-hazard
+    /// fix). I tried the mutation the review named for it — `members.
+    /// first()` in place of the visible-preferred pick — and it does NOT
+    /// fail this test: `next_after` re-filters candidates against the REAL
+    /// queue regardless of which already-processing member is handed to it
+    /// as `resolved`, so walking forward from `.gitconfig` (first) skips
+    /// the still-processing `starship.toml`/`.zshrc` exactly as walking
+    /// from `.zshrc` (last) does, landing on `init.lua` either way. In Flat
+    /// mode `visible_safe` also always equals `safe_order` at the moment
+    /// `run_bulk` reads it (before its own `enqueue_many` call marks
+    /// anything processing), so the "prefer visible" branch is provably
+    /// unreachable-different from plain `members.last()` for ANY Flat-mode
+    /// selection — the distinction can only be observed once Task 7 lets a
+    /// member sit inside a collapsed folder. No test claims otherwise.
+    ///
+    /// All three assertions run INSIDE the same `review.update` as
+    /// `run_bulk` itself, not through a later, separate read: a render
+    /// between the call and the read would prune the selection down to
+    /// empty on its own (every member here just became PROCESSING, so
+    /// none of them are in the next plan's `safe_order` either way),
+    /// silently satisfying `selection.is_empty()` even with the mutation
+    /// applied and making the assertion prove nothing.
+    #[gpui::test]
+    fn a_bulk_press_clears_the_selection_and_advances_past_the_last_member(
+        cx: &mut TestAppContext,
+    ) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gallery"));
+        let _lab = EngineLab::publish(cx);
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| {
+                view.run_bulk(review::ResolveAction::KeepDisk, cx);
+                assert!(
+                    view.selection.is_empty(),
+                    "the selection cleared after the press"
+                );
+                assert_eq!(
+                    view.selected,
+                    Some(home.join(".config/nvim/init.lua")),
+                    "advanced past the last (visible) member to the next row still needing a decision"
+                );
+            });
+            assert_eq!(
+                shell.read(cx).queue.running().len(),
+                3,
+                "one batch took all three members"
+            );
+        });
+    }
+
+    /// The ⌘/⇧-click gesture switch (spec §2.3), dispatched through
+    /// `row_click` directly rather than a synthetic mouse event. Three
+    /// gestures in sequence, on the `review-multiselect` pose (`selected`
+    /// starts on `settings.json`, `selection` starts with `.gitconfig`,
+    /// `starship.toml`, `.zshrc`):
+    ///
+    /// 1. A plain click on `init.lua` selects it and clears the members.
+    /// 2. A ⌘-click on `settings.json` (now unselected) toggles it in, sets
+    ///    the anchor, and — the rule with no coverage before this — never
+    ///    moves `selected`.
+    /// 3. A ⇧-click on `.zshrc` extends the range from that anchor
+    ///    (`settings.json`) to `.zshrc`, covering `.gitconfig` and
+    ///    `starship.toml` along the way; `selected` still does not move.
+    ///
+    /// MUTATION: swap the ⌘ and ⇧ arms → step 2's membership assertion
+    /// fails (a ⇧-style range lands instead of a single toggle). MUTATION:
+    /// the plain-click arm no longer clears → step 1's
+    /// `selection.is_empty()` assertion fails (the fixture's original three
+    /// members are still there).
+    #[gpui::test]
+    fn row_click_dispatches_plain_platform_and_shift_gestures(cx: &mut TestAppContext) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gallery"));
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+
+        // 1. Plain click.
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| {
+                view.row_click(
+                    &home.join(".config/nvim/init.lua"),
+                    gpui::Modifiers::default(),
+                    cx,
+                )
+            });
+        });
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selected.clone()),
+            Some(home.join(".config/nvim/init.lua")),
+            "a plain click selects the row"
+        );
+        assert!(
+            vis.update(|_window, cx| review.read(cx).selection.is_empty()),
+            "a plain click clears the members"
+        );
+
+        // 2. ⌘-click.
+        let platform = gpui::Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| {
+                view.row_click(&home.join(".config/zed/settings.json"), platform, cx)
+            });
+        });
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().to_vec()),
+            vec![home.join(".config/zed/settings.json")],
+            "⌘-click toggles the row into the selection"
+        );
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.anchor.clone()),
+            Some(home.join(".config/zed/settings.json")),
+            "⌘-click sets the anchor"
+        );
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selected.clone()),
+            Some(home.join(".config/nvim/init.lua")),
+            "⌘-click never moves `selected`"
+        );
+
+        // 3. ⇧-click.
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| {
+                view.row_click(&home.join(".zshrc"), shift, cx)
+            });
+        });
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.members().to_vec()),
+            vec![
+                home.join(".config/zed/settings.json"),
+                home.join(".gitconfig"),
+                home.join(".config/starship.toml"),
+                home.join(".zshrc"),
+            ],
+            "⇧-click extends the range from the anchor (settings.json) to the target (.zshrc)"
+        );
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selection.anchor.clone()),
+            Some(home.join(".config/zed/settings.json")),
+            "the anchor stays put across a ⇧-click"
+        );
+        assert_eq!(
+            vis.update(|_window, cx| review.read(cx).selected.clone()),
+            Some(home.join(".config/nvim/init.lua")),
+            "⇧-click never moves `selected`"
         );
     }
 

@@ -994,7 +994,7 @@ pub(super) enum SidebarRow {
     Group {
         label: &'static str,
         /// The SAFE TO RESOLVE header's select-all; `None` on the others.
-        /// Rendered by `ReviewView::group_header_el`.
+        /// Rendered by `group_header_el`.
         check: Option<CheckState>,
     },
     /// Tree mode only: a folder of the safe group. Consumed by Task 7's tree
@@ -1408,21 +1408,42 @@ impl ReviewView {
     /// drifts from what the sidebar shows, and a collapsed folder's files are
     /// skipped by the sweep exactly as they are invisible in it (spec §2.5).
     ///
-    /// The plan is built with an EMPTY queue rather than the real one —
-    /// proven equivalent to the once-hand-rolled "every processing row but
-    /// `resolved`" snapshot: `next_after`'s own `processing` check below
-    /// (over the REAL queue) is what actually screens out every processing
-    /// row as a candidate, `resolved` included, so what the plan's queue
-    /// looks like does not change which candidate is picked — only which
-    /// rows exist to walk, and `visible_safe` never needed a queue to build.
+    /// `resolved` was just enqueued by the caller and so already reads as
+    /// processing in the REAL queue; the plan below is built as if it were
+    /// not — `resolved`'s own entry is the only one filtered out of the live
+    /// snapshot below — so it stays at its true display position (and, in
+    /// Tree mode, its folder does not re-compact around its absence) for
+    /// `next_after`'s lookup instead of vanishing the instant it is
+    /// answered. Every OTHER processing row is filtered out of the plan
+    /// normally: `next_after`'s own `processing` check below (over the REAL,
+    /// unfiltered queue) would have skipped those as candidates either way,
+    /// so nothing changes for them.
+    ///
+    /// This needs the REAL queue's shape, not an empty one: in Tree mode,
+    /// which files are processing changes `tree_rows`' folder compaction
+    /// (one extra processing file under `.config/` can split a compacted
+    /// `.config/nvim/` into two levels) and therefore the walk order itself,
+    /// so an empty queue is only a safe substitute in Flat, where the queue
+    /// cannot influence anything but which rows are filtered out — and
+    /// `next_after` filters those out again anyway.
     fn advance_from(&mut self, resolved: &Path, cx: &mut Context<Self>) {
         let drifted = self.state.read(cx).drifted.clone();
         let queue = self.queue_snapshot(cx);
         let home = home();
         let (needs_you, _) = severity_groups(&drifted);
+        let queue_before_this_click = QueueSnapshot {
+            processing: queue
+                .processing
+                .iter()
+                .filter(|(t, _)| t != resolved)
+                .cloned()
+                .collect(),
+            failures: BTreeMap::new(),
+            busy: queue.busy,
+        };
         let plan = sidebar_rows(SidebarInputs {
             drifted: &drifted,
-            queue: &QueueSnapshot::default(),
+            queue: &queue_before_this_click,
             mode: self.mode,
             collapsed: &self.collapsed,
             selection: &self.selection,
@@ -1486,9 +1507,35 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// A row's click gesture (spec §2.3): ⌘ toggles the row's membership
+    /// (sets the anchor, never moves `selected`), ⇧ extends the range from
+    /// the anchor (also never moves `selected`), anything else clears the
+    /// selection and plain-selects the row. The caller neutralizes `mods`
+    /// for a non-selectable row before calling this (see `target_row`'s
+    /// `on_click`), so this never needs to know `selectable` itself.
+    ///
+    /// `pub(super)` so the render-smoke tests can drive a gesture with a
+    /// synthetic `Modifiers` rather than a real mouse event, the same
+    /// reason `run_action` is.
+    pub(super) fn row_click(
+        &mut self,
+        target: &Path,
+        mods: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if mods.platform {
+            self.toggle_member(target, cx);
+        } else if mods.shift {
+            self.extend_to(target, cx);
+        } else {
+            self.selection.clear();
+            self.select(target.to_path_buf(), cx);
+        }
+    }
+
     /// A bulk press: one `QueuedAction` per member, ONE batch (spec §2.4).
     /// The selection clears, the rows move to PROCESSING, and the detail
-    /// selection advances past the last member.
+    /// selection advances past the last VISIBLE member (see below).
     ///
     /// Updating the Shell from inside THIS view's own update is safe for the
     /// same reason `enqueue` is (see its own comment): `Shell::enqueue_many`
@@ -1498,11 +1545,29 @@ impl ReviewView {
     /// SPAWNS a background task and returns. Neither path reaches back into
     /// this (or any) view synchronously, so nesting this update inside the
     /// Shell's is never the same crash `enqueue`'s comment names.
-    fn run_bulk(&mut self, action: ResolveAction, cx: &mut Context<Self>) {
+    ///
+    /// `pub(super)` so the render-smoke tests can press the bulk button
+    /// without a synthetic mouse event, the same reason `run_action` is.
+    pub(super) fn run_bulk(&mut self, action: ResolveAction, cx: &mut Context<Self>) {
         let members = self.selection.members().to_vec();
         let Some(last) = members.last().cloned() else {
             return;
         };
+        // Advance from the last member that is actually VISIBLE right now,
+        // not simply `members.last()`: `advance_from` walks
+        // `plan.visible_safe` (Task 7 hazard) — a member hidden inside a
+        // collapsed folder is absent from it, and handing `next_after` a
+        // target it cannot find returns `None`, silently stranding the
+        // selection. Unreachable in Flat mode today (every member is
+        // visible there), falls back to `members.last()` when every member
+        // is hidden.
+        let plan = self.plan(cx);
+        let advance_target = members
+            .iter()
+            .rev()
+            .find(|m| plan.visible_safe.contains(m))
+            .cloned()
+            .unwrap_or(last);
         let decision = bulk_decision(action);
         let actions: Vec<QueuedAction> = members
             .iter()
@@ -1524,7 +1589,7 @@ impl ReviewView {
         }
         self.selection.clear();
         self.last_outcome = None;
-        self.advance_from(&last, cx);
+        self.advance_from(&advance_target, cx);
         cx.notify();
     }
 
@@ -1822,45 +1887,6 @@ impl ReviewView {
         ui::banner(theme, banner.tint, banner.text.clone(), undo)
     }
 
-    /// A SAFE TO RESOLVE-style group header, with the SAFE header's
-    /// select-all appended at the right when `check.is_some()`.
-    ///
-    /// Hover-revealed exactly like a row's own checkbox (ruling 5): opacity
-    /// 0 at rest, `group_hover` over the header's own `.group(..)` to 1, and
-    /// forced to 1 while the selection is non-empty — so the affordance
-    /// exists at rest (it is reachable by hovering) without being painted
-    /// when nothing is selected.
-    fn group_header_el(
-        &self,
-        label: &'static str,
-        check: Option<CheckState>,
-        selection_active: bool,
-        theme: Theme,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let wrapper = div()
-            .group("review-safe-header")
-            .flex()
-            .items_center()
-            .justify_between()
-            .w_full();
-        match check {
-            None => wrapper.child(group_header(label, theme)),
-            Some(state) => wrapper.child(group_header(label, theme)).child(
-                div().pr_3().child(
-                    ui::checkbox(
-                        theme,
-                        "safe-select-all",
-                        state,
-                        cx.listener(|view, _ev, _w, cx| view.toggle_all_safe(cx)),
-                    )
-                    .opacity(if selection_active { 1. } else { 0. })
-                    .group_hover("review-safe-header", |el| el.opacity(1.)),
-                ),
-            ),
-        }
-    }
-
     fn sidebar(
         &self,
         plan: &SidebarPlan,
@@ -1876,8 +1902,7 @@ impl ReviewView {
         for row in &plan.rows {
             match row {
                 SidebarRow::Group { label, check } => rows.push(
-                    self.group_header_el(label, *check, selection_active, theme, cx)
-                        .into_any_element(),
+                    group_header_el(label, *check, selection_active, theme, cx).into_any_element(),
                 ),
                 // Tree rendering starts in Task 7; Flat mode never emits one.
                 SidebarRow::Folder { .. } => continue,
@@ -1944,6 +1969,27 @@ impl ReviewView {
             )
     }
 }
+
+/// `target_row`'s checkbox slot (`ui::checkbox`'s own `w(px(14.))`) — the
+/// first of the three numbers a row's content is indented by before the
+/// filename starts.
+const ROW_CHECKBOX_W: f32 = 14.;
+/// `target_row`'s own `gap_2()` between the checkbox/dot/name flex
+/// children — the same gap counted twice below (once after the checkbox,
+/// once after the dot).
+const ROW_GAP: f32 = 8.;
+/// The severity dot's own size (`.w_2()`).
+const ROW_DOT_W: f32 = 8.;
+/// How far a row's queued/failure sub-line (`.pl(px(..))`) must sit from
+/// the row's own left edge to land under the filename: the checkbox, a
+/// gap, the dot, a gap — the exact chain `target_row`'s flex layout puts
+/// before the name. Deliberately NOT `+ TREE_INDENT * depth`: a row's own
+/// `.pl(px(12. + TREE_INDENT * depth as f32))` already applies to every one
+/// of its children, sub-lines included, since they are siblings of the flex
+/// row inside that same padded container — adding depth again here would
+/// double it for sub-lines only, at any depth beyond Flat mode's constant 0
+/// (Task 7's indented rows must NOT re-add it).
+const ROW_SUBLINE_INDENT: f32 = ROW_CHECKBOX_W + ROW_GAP + ROW_DOT_W + ROW_GAP;
 
 /// The wording the origin hint carries. A HINT, deliberately: it says only
 /// what the scan measured — this path is in `git diff HEAD..origin/<branch>`
@@ -2111,7 +2157,7 @@ impl ReviewView {
             // that anything was cut.
             .children(queued.map(|queued| {
                 div()
-                    .pl(px(16.))
+                    .pl(px(ROW_SUBLINE_INDENT))
                     .w_full()
                     .text_xs()
                     .text_color(theme.text_muted)
@@ -2122,7 +2168,7 @@ impl ReviewView {
             // failure is ever said, and half of "op could not authenticate"
             // is not a message.
             .children(failure.map(|message| {
-                div().pl(px(16.)).child(ui::status_text(
+                div().pl(px(ROW_SUBLINE_INDENT)).child(ui::status_text(
                     theme,
                     message.clone(),
                     ui::StatusTone::Conflict,
@@ -2131,14 +2177,16 @@ impl ReviewView {
             .when(!locked, |el| {
                 el.on_click(cx.listener(move |view, ev: &ClickEvent, _window, cx| {
                     let mods = ev.modifiers();
-                    if selectable && mods.platform {
-                        view.toggle_member(&target, cx);
-                    } else if selectable && mods.shift {
-                        view.extend_to(&target, cx);
+                    // A NEEDS A DECISION / PROCESSING row has no membership
+                    // to toggle or extend — neutralize ⌘/⇧ before handing
+                    // off, so `row_click` itself never needs to know
+                    // `selectable`.
+                    let mods = if selectable {
+                        mods
                     } else {
-                        view.selection.clear();
-                        view.select(target.clone(), cx);
-                    }
+                        gpui::Modifiers::default()
+                    };
+                    view.row_click(&target, mods, cx);
                 }))
             })
     }
@@ -2173,10 +2221,17 @@ impl ReviewView {
         let blocked = blocked_reason(queue, selected);
         // A selection bar REPLACES the per-file actions — it acts on the
         // ticked set, not on the row `selected` happens to still name (the
-        // two can disagree: a ⌘/⇧-click never moves `selected`).
-        let header_actions: Vec<AnyElement> = if !self.selection.is_empty() {
+        // two can disagree: a ⌘/⇧-click never moves `selected`). It is its
+        // OWN full-width row below the header, not squeezed into the
+        // header's trailing slot alongside the title (MI-1): "Keep source ·
+        // this machine" (ruling 6) is wide enough that sharing the row with
+        // the title either wraps the bar or, once capped wide enough not
+        // to, pushes the title column under ~100px and truncates the
+        // filename — a strictly worse trade at ordinary window widths.
+        // Giving it the whole row avoids both.
+        let selection_bar: Option<AnyElement> = (!self.selection.is_empty()).then(|| {
             let n = self.selection.members().len();
-            let mut header_actions: Vec<AnyElement> = vec![
+            let mut items: Vec<AnyElement> = vec![
                 div()
                     .text_sm()
                     .text_color(theme.text_muted)
@@ -2184,7 +2239,7 @@ impl ReviewView {
                     .child(format!("{n} selected"))
                     .into_any_element(),
             ];
-            header_actions.extend(bulk_actions().into_iter().map(|action| {
+            items.extend(bulk_actions().into_iter().map(|action| {
                 // `split: true` — spec §2.1/§2.4 give "Keep source · this
                 // machine" verbatim for the bulk bar's source button; `Keep
                 // disk` has no split form, so the flag is a no-op for it
@@ -2200,7 +2255,7 @@ impl ReviewView {
                 .flex_shrink_0()
                 .into_any_element()
             }));
-            header_actions.push(
+            items.push(
                 ui::button(
                     theme,
                     "bulk-clear",
@@ -2213,8 +2268,23 @@ impl ReviewView {
                 .flex_shrink_0()
                 .into_any_element(),
             );
-            header_actions
-        } else {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .children(items)
+                .into_any_element()
+        });
+        // The selection bar takes the header's trailing slot's PLACE (there
+        // is nothing left there to protect a filename from), rather than
+        // joining it — an empty `vec![]` whenever the bar is showing, and
+        // the per-file buttons below are not even built in that case.
+        let title_trailing: Vec<AnyElement> = if self.selection.is_empty() {
             let mut header_actions: Vec<AnyElement> = Vec::new();
             header_actions.push(
                 self.action_button(ResolveAction::KeepDisk, split, blocked.clone(), theme, cx)
@@ -2270,7 +2340,27 @@ impl ReviewView {
                     .on_click(cx.listener(|view, _ev, _window, cx| view.open_in_editor(cx)))
                     .into_any_element(),
             );
-            header_actions
+            vec![
+                div()
+                    .flex()
+                    .flex_wrap()
+                    // Capped so the actions cannot eat the whole header:
+                    // the title column has flex-basis 0 and would
+                    // otherwise shrink to nothing, taking the path line
+                    // with it and letting a long filename overlap the
+                    // buttons.
+                    .max_w_2_3()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    // Flat, not nested: siblings pack onto a wrapped row
+                    // together, where a nested cluster would claim a row
+                    // of its own and push the rest down.
+                    .children(header_actions)
+                    .into_any_element(),
+            ]
+        } else {
+            Vec::new()
         };
 
         let body = if self.diff_pair != DiffPair::DiskVsLocal && self.origin_diffs.is_some() {
@@ -2304,27 +2394,12 @@ impl ReviewView {
                 // split there are four buttons here, and the detail pane is
                 // ~370px at the app's minimum window width. Squeezing them
                 // (the flex default) overlapped the filename; wrapping costs a
-                // header row only when the width genuinely isn't there.
-                vec![
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        // Capped so the actions cannot eat the whole header:
-                        // the title column has flex-basis 0 and would
-                        // otherwise shrink to nothing, taking the path line
-                        // with it and letting a long filename overlap the
-                        // buttons.
-                        .max_w_2_3()
-                        .items_center()
-                        .justify_end()
-                        .gap_2()
-                        // Flat, not nested: siblings pack onto a wrapped row
-                        // together, where a nested cluster would claim a row
-                        // of its own and push the rest down.
-                        .children(header_actions)
-                        .into_any_element(),
-                ],
+                // header row only when the width genuinely isn't there. Empty
+                // whenever the selection bar is showing — see
+                // `title_trailing`'s own comment.
+                title_trailing,
             ))
+            .children(selection_bar)
             .when_some(self.last_outcome.clone(), |el, banner| {
                 el.child(self.banner_el(&banner, queue, theme, cx))
             })
@@ -2475,53 +2550,26 @@ impl ReviewView {
         let queue = self.queue_snapshot(cx);
 
         let home = home();
-        let mode = self.mode;
-        let collapsed = &self.collapsed;
-        // A plain `fn`, not a closure: a closure taking `&Selection` and
-        // returning a `SidebarInputs` borrowing it is inferred higher-ranked
-        // over that argument's lifetime, which then cannot unify with
-        // `drifted`/`queue`/`collapsed`/`home`'s fixed (captured) lifetime —
-        // a closure-shape limitation. A plain `fn` has no such capture, so
-        // each call below infers its own lifetime independently.
-        fn inputs<'a>(
-            drifted: &'a [DriftSummary],
-            queue: &'a QueueSnapshot,
-            mode: ReviewMode,
-            collapsed: &'a BTreeSet<PathBuf>,
-            selection: &'a Selection,
-            home: &'a Path,
-        ) -> SidebarInputs<'a> {
-            SidebarInputs {
-                drifted,
-                queue,
-                mode,
-                collapsed,
-                selection,
-                home,
-            }
-        }
-        // A member that resolved, got queued or turned into a conflict leaves
-        // the selection here, silently (spec §2.2). Pruned against the safe
-        // order of THIS render's inputs, then the plan is built from the
-        // pruned selection so every `checked` flag is current.
-        let safe_order = sidebar_rows(inputs(
-            &drifted,
-            &queue,
-            mode,
-            collapsed,
-            &self.selection,
-            &home,
-        ))
-        .safe_order;
-        self.selection.prune(&safe_order);
-        let plan = sidebar_rows(inputs(
-            &drifted,
-            &queue,
-            mode,
-            collapsed,
-            &self.selection,
-            &home,
-        ));
+        let plan = sidebar_rows(SidebarInputs {
+            drifted: &drifted,
+            queue: &queue,
+            mode: self.mode,
+            collapsed: &self.collapsed,
+            selection: &self.selection,
+            home: &home,
+        });
+        // A member that resolved, got queued or turned into a conflict
+        // leaves the selection here, silently (spec §2.2). Pruned AFTER
+        // building the plan, not before, and not rebuilt a second time: a
+        // `checked`/`check` flag above only ever tests membership within
+        // `plan.safe_order`, and `prune` only ever REMOVES members that are
+        // NOT in `plan.safe_order` — so it cannot change any flag `plan`
+        // already carries. What it changes is `self.selection` itself,
+        // which the NEXT gesture reads (`extend_range`'s reordering, the
+        // selection bar's "N selected" count) — bookkeeping for later, not
+        // something this render needs a second `sidebar_rows` call to
+        // reflect.
+        self.selection.prune(&plan.safe_order);
 
         let dragging = self.sidebar_drag.is_some();
         div()
@@ -2583,6 +2631,48 @@ fn group_header(label: &'static str, theme: Theme) -> Div {
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.text_muted)
         .child(label)
+}
+
+/// A SAFE TO RESOLVE-style group header, with the SAFE header's select-all
+/// appended at the right when `check.is_some()`.
+///
+/// A free function, not a method: it never reads `ReviewView` state (
+/// `selection_active` is handed in rather than read via `&self` because the
+/// caller already has it computed for the row loop too).
+///
+/// Hover-revealed exactly like a row's own checkbox (ruling 5): opacity 0 at
+/// rest, `group_hover` over the header's own `.group(..)` to 1, and forced
+/// to 1 while the selection is non-empty — so the affordance exists at rest
+/// (it is reachable by hovering) without being painted when nothing is
+/// selected.
+fn group_header_el(
+    label: &'static str,
+    check: Option<CheckState>,
+    selection_active: bool,
+    theme: Theme,
+    cx: &mut Context<ReviewView>,
+) -> Div {
+    let wrapper = div()
+        .group("review-safe-header")
+        .flex()
+        .items_center()
+        .justify_between()
+        .w_full();
+    match check {
+        None => wrapper.child(group_header(label, theme)),
+        Some(state) => wrapper.child(group_header(label, theme)).child(
+            div().pr_3().child(
+                ui::checkbox(
+                    theme,
+                    "safe-select-all",
+                    state,
+                    cx.listener(|view, _ev, _w, cx| view.toggle_all_safe(cx)),
+                )
+                .opacity(if selection_active { 1. } else { 0. })
+                .group_hover("review-safe-header", |el| el.opacity(1.)),
+            ),
+        ),
+    }
 }
 
 pub(super) fn centered_note(theme: Theme, text: SharedString, color: Rgba) -> AnyElement {
@@ -2782,7 +2872,11 @@ mod tests {
     }
 
     /// The bulk pair is exactly the one-click pair and nothing else (spec
-    /// §2.1). MUTATION: add KeepSourceOrigin → fails.
+    /// §2.1). MUTATION: `bulk_actions` returns `[KeepDisk, KeepSourceOrigin]`
+    /// (same arity as the real pair, so it still compiles — appending a
+    /// THIRD element instead changes the return type, `[ResolveAction; 3]`,
+    /// which is a compile error the crate cannot build, not something this
+    /// `assert_eq!` catches) → the first assertion fails.
     #[test]
     fn bulk_actions_are_exactly_keep_disk_and_keep_source_this_machine() {
         assert_eq!(
@@ -2791,6 +2885,8 @@ mod tests {
         );
         // `Decision` has no `PartialEq` (it holds an `Arc<MergeInputs>` in
         // two of its variants), so the pairing is asserted by shape.
+        // MUTATION: `bulk_decision(KeepSourceLocal)` returns
+        // `Decision::KeepDisk` → these `matches!` assertions fail.
         assert!(matches!(
             bulk_decision(ResolveAction::KeepDisk),
             Decision::KeepDisk
@@ -3177,10 +3273,11 @@ mod tests {
     /// descendants; collapsed files leave `visible_safe` but not `safe_order`.
     /// MUTATION: build the tree over ALL drifted rows (pass `drifted`'s
     /// targets instead of `safe_targets` to `tree_rows`) → this does not
-    /// quietly show the conflict as a file row; `safe.iter().find(...)`'s
-    /// `.expect("tree rows come from \`safe\`")` (~:1148) panics first, since
-    /// the conflict target is not in `safe`. MUTATION: use `visible_safe` for
-    /// `safe_order` → the collapsed file is missing from it.
+    /// quietly show the conflict as a file row; `sidebar_rows`' tree arm's
+    /// `safe.iter().find(...)`'s `.expect("tree rows come from \`safe\`")`
+    /// panics first, since the conflict target is not in `safe`. MUTATION:
+    /// use `visible_safe` for `safe_order` → the collapsed file is missing
+    /// from it.
     #[test]
     fn tree_plan_keeps_the_other_groups_flat_and_tracks_collapse_and_ticks() {
         let drifted = vec![
