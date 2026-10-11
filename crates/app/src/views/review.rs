@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString,
     Stateful, WeakEntity, Window, div, prelude::*, px,
 };
 use tomte_app::action_queue::{Decision, QueuedAction};
@@ -901,7 +901,7 @@ impl QueuedDecision {
 /// Copied out of the Shell ONCE per render rather than read row by row:
 /// every row and button below needs `cx` mutably for its click listener, and
 /// a live borrow of the Shell entity cannot be held across that.
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq)]
 pub(super) struct QueueSnapshot {
     /// Everything queued or running, in `ActionQueue::processing` order —
     /// the running batch first, then the rest as the user chose them.
@@ -1208,6 +1208,17 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
     }
 }
 
+/// What `sidebar_rows` reads besides the model, compared by value before
+/// every rebuild (spec 2026-10-11 §2.3). The model is not in here: its
+/// changes arrive through the view's observer as `plan_dirty`.
+#[derive(PartialEq)]
+struct PlanKey {
+    queue: QueueSnapshot,
+    mode: ReviewMode,
+    collapsed: BTreeSet<PathBuf>,
+    selection: Selection,
+}
+
 pub struct ReviewView {
     state: Entity<SyncModel>,
     /// Back-reference for cross-view navigation ("Open merge editor" routes
@@ -1274,13 +1285,24 @@ pub struct ReviewView {
     /// `pub(super)` so the render-smoke tests can focus it directly, the
     /// same reason `selection` is.
     pub(super) focus_handle: gpui::FocusHandle,
+    /// The plan the sidebar is showing, with the inputs it was built from.
+    /// `plan` hands the `Rc` back while the key still matches and the
+    /// model has not changed; a 500-row plan was being rebuilt on every
+    /// hover before this (2026-10-11).
+    plan_cache: Option<(PlanKey, Rc<SidebarPlan>)>,
+    /// Set by the model observer; the next `plan` rebuilds.
+    plan_dirty: bool,
 }
 
 impl ReviewView {
     pub fn new(state: Entity<SyncModel>, shell: WeakEntity<Shell>, cx: &mut Context<Self>) -> Self {
         // Re-render whenever the shared model changes so new drift rows land
         // in the sidebar without user interaction.
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        cx.observe(&state, |view, _, cx| {
+            view.plan_dirty = true;
+            cx.notify();
+        })
+        .detach();
         Self {
             state,
             shell,
@@ -1302,6 +1324,8 @@ impl ReviewView {
             selection: Selection::default(),
             collapsed: BTreeSet::new(),
             focus_handle: cx.focus_handle(),
+            plan_cache: None,
+            plan_dirty: true,
         }
     }
 
@@ -1526,17 +1550,36 @@ impl ReviewView {
     ///
     /// `pub(super)` so the render-smoke tests can read `safe_order` the same
     /// way `select_all_safe` does, the same reason `row_click` is.
-    pub(super) fn plan(&self, cx: &Context<Self>) -> SidebarPlan {
+    pub(super) fn plan(&mut self, cx: &Context<Self>) -> Rc<SidebarPlan> {
         let queue = self.queue_snapshot(cx);
-        let drifted = &self.state.read(cx).drifted;
-        sidebar_rows(SidebarInputs {
-            drifted,
-            queue: &queue,
+        self.plan_with(queue, cx)
+    }
+
+    fn plan_with(&mut self, queue: QueueSnapshot, cx: &App) -> Rc<SidebarPlan> {
+        let key = PlanKey {
+            queue,
             mode: self.mode,
-            collapsed: &self.collapsed,
-            selection: &self.selection,
+            collapsed: self.collapsed.clone(),
+            selection: self.selection.clone(),
+        };
+        if !self.plan_dirty
+            && let Some((cached, plan)) = &self.plan_cache
+            && *cached == key
+        {
+            return plan.clone();
+        }
+        let drifted = &self.state.read(cx).drifted;
+        let plan = Rc::new(sidebar_rows(SidebarInputs {
+            drifted,
+            queue: &key.queue,
+            mode: key.mode,
+            collapsed: &key.collapsed,
+            selection: &key.selection,
             home: &home(),
-        })
+        }));
+        self.plan_cache = Some((key, plan.clone()));
+        self.plan_dirty = false;
+        plan
     }
 
     /// ⌘-click or a checkbox on a safe row.
@@ -1579,7 +1622,7 @@ impl ReviewView {
     /// `toggle_all` already refuses an empty `targets`.
     fn select_all_safe(&mut self, cx: &mut Context<Self>) {
         let plan = self.plan(cx);
-        let all = plan.safe_order;
+        let all = plan.safe_order.clone();
         if self.selection.check_state(&all) != CheckState::On {
             self.selection.toggle_all(&all, &all);
         }
@@ -2770,21 +2813,12 @@ impl ReviewView {
         self.sync_preview_editor(theme, window, cx);
         let now = system_now();
         let model = self.state.read(cx);
-        let drifted = model.drifted.clone();
         let in_sync = model.in_sync;
         // Read once, before anything below needs `cx` mutably for a
         // listener: the Shell cannot be borrowed across those.
         let queue = self.queue_snapshot(cx);
 
-        let home = home();
-        let plan = sidebar_rows(SidebarInputs {
-            drifted: &drifted,
-            queue: &queue,
-            mode: self.mode,
-            collapsed: &self.collapsed,
-            selection: &self.selection,
-            home: &home,
-        });
+        let plan = self.plan_with(queue.clone(), cx);
         // A member that resolved, got queued or turned into a conflict
         // leaves the selection here, silently (spec §2.2). Pruned AFTER
         // building the plan, not before, and not rebuilt a second time: a
@@ -2797,6 +2831,13 @@ impl ReviewView {
         // something this render needs a second `sidebar_rows` call to
         // reflect.
         self.selection.prune(&plan.safe_order);
+        // A prune only removes members outside `safe_order` — nothing the
+        // cached rows ever flagged `checked` — so the cache stays valid;
+        // record the pruned selection in its key so the next frame does
+        // not rebuild for a change that is already reflected.
+        if let Some((key, _)) = &mut self.plan_cache {
+            key.selection = self.selection.clone();
+        }
 
         let dragging = self.sidebar_drag.is_some();
         div()

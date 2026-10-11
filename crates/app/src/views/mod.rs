@@ -1747,6 +1747,7 @@ mod render_smoke {
 
     use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use gpui::{TestAppContext, VisualTestContext};
     use tomte_app::model::{SyncModel, TimelineRow};
@@ -2778,6 +2779,50 @@ mod render_smoke {
     fn review_of(shell: &Entity<Shell>, vis: &mut VisualTestContext) -> Entity<ReviewView> {
         vis.update(|_window, cx| shell.read(cx).review.clone())
             .expect("pose has a Review entity")
+    }
+
+    /// The sidebar plan is rebuilt when its inputs change, not when the
+    /// window redraws (spec 2026-10-11 §2.3): the same `Rc` comes back
+    /// until a gesture or the model changes it.
+    ///
+    /// MUTATION: return `Rc::new(sidebar_rows(..))` on every call (drop the
+    /// cache lookup) → the first `ptr_eq` fails. MUTATION: drop
+    /// `view.plan_dirty = true` from the model observer → the last
+    /// assertion sees the old plan after the model changed.
+    #[gpui::test]
+    fn the_sidebar_plan_is_rebuilt_only_when_its_inputs_change(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let first = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
+        vis.run_until_parked();
+        let second = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "nothing changed: the cached plan is handed back"
+        );
+
+        vis.update(|_w, cx| review.update(cx, |view, cx| view.toggle_mode(cx)));
+        let third = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
+        assert!(!Rc::ptr_eq(&second, &third), "a gesture is an input");
+
+        let state = vis.update(|_w, cx| shell.read(cx).state.clone());
+        vis.update(|_w, cx| {
+            state.update(cx, |model, cx| {
+                model.drifted.remove(0);
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        let fourth = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
+        assert!(
+            !Rc::ptr_eq(&third, &fourth),
+            "the model observer marks the plan dirty"
+        );
+        assert_eq!(fourth.rows.len(), third.rows.len() - 1);
     }
 
     /// The cross on a waiting row goes `ReviewView::cancel_queued` →
