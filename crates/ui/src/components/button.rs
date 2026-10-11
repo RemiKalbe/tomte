@@ -19,7 +19,7 @@
 //! — foreground-strength gray reads as an emphasis it doesn't deserve.
 
 use gpui::{
-    App, ClickEvent, Div, ElementId, Rgba, SharedString, Stateful, Window, div, prelude::*,
+    App, ClickEvent, Div, ElementId, Rgba, SharedString, Stateful, Svg, Window, div, prelude::*,
 };
 
 use crate::components::tooltip::text_tooltip;
@@ -116,4 +116,45 @@ pub fn disabled_button(
         .bg(Theme::wash(theme.text_muted, 0.08))
         .text_color(Theme::wash(theme.text_muted, 0.65))
         .when_some(tooltip, |el, text| el.tooltip(text_tooltip(text)))
+}
+
+/// A 20×20 icon TOGGLE: ghost at rest, the `Tonal(accent)` field and an
+/// accent-tinted icon when `active` — a toolbar's Bold, not a segmented
+/// control. `icon` arrives already sized (see `icon::folder_tree`); this
+/// only tints it and adds the hover wash, the tooltip and the click. The
+/// click stops propagation: a toggle that lives on a clickable row (a
+/// group header, a list row) must not also fire the row.
+pub fn icon_button(
+    theme: Theme,
+    id: impl Into<ElementId>,
+    icon: Svg,
+    active: bool,
+    tooltip: SharedString,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let accent = theme.accent;
+    div()
+        .id(id)
+        .w_5()
+        .h_5()
+        .flex_none()
+        .rounded_md()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(active, |el| el.bg(Theme::wash(accent, 0.14)))
+        .hover(move |el| {
+            if active {
+                el.bg(Theme::wash(accent, 0.22))
+            } else {
+                el.bg(Theme::wash(theme.text, 0.08))
+            }
+        })
+        .child(icon.text_color(if active { accent } else { theme.text_muted }))
+        .tooltip(text_tooltip(tooltip))
+        .on_click(move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
 }

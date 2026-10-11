@@ -19,6 +19,17 @@ pub fn chevron_down(theme: Theme) -> Svg {
         .text_color(theme.text_muted)
 }
 
+/// Folder tree (Lucide `folder-tree`), 12px, muted: the Review sidebar's
+/// flat-list / folder-tree toggle. The button tints it accent when active.
+pub fn folder_tree(theme: Theme) -> Svg {
+    svg()
+        .path("icons/folder_tree.svg")
+        .w(px(12.))
+        .h(px(12.))
+        .flex_none()
+        .text_color(theme.text_muted)
+}
+
 /// Indeterminate spinner: a rotating arc, muted. Use anywhere work is in
 /// flight without progress info (scans, loads). One per id.
 pub fn spinner(theme: Theme, id: impl Into<ElementId>) -> impl IntoElement {

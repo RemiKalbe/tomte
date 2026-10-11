@@ -24,6 +24,7 @@ pub const COMPONENTS: &[(&str, &str)] = &[
         "off / partial / on, and forced-visible in a row",
     ),
     ("folder-row", "expanded, collapsed, partial-checked, n of m"),
+    ("icon-button", "folder-tree toggle: off and on"),
 ];
 
 fn noop(_: &ClickEvent, _: &mut Window, _: &mut App) {}
@@ -397,6 +398,37 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 },
                 noop,
                 noop,
+            ))
+            .into_any_element(),
+        "icon-button" => div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(variant(
+                theme,
+                "off",
+                icon_button(
+                    theme,
+                    "prev-ib-off",
+                    folder_tree(theme),
+                    false,
+                    "Folder tree".into(),
+                    noop,
+                )
+                .into_any_element(),
+            ))
+            .child(variant(
+                theme,
+                "on",
+                icon_button(
+                    theme,
+                    "prev-ib-on",
+                    folder_tree(theme),
+                    true,
+                    "Folder tree".into(),
+                    noop,
+                )
+                .into_any_element(),
             ))
             .into_any_element(),
         _ => return None,
