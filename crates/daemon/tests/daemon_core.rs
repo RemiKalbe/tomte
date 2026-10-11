@@ -727,3 +727,31 @@ fn a_target_fixed_by_hand_during_a_scan_stays_resolved() {
     let outcome = core.apply_scan(ticket, report, 102).unwrap();
     assert_eq!(outcome.drifted, 0, "the stale report did not resurrect it");
 }
+
+/// A scan that FAILS must still reach `apply_scan`: that is what clears
+/// `scan_in_progress`, and without it Status says "scanning" forever and
+/// every Rescan is swallowed as `rescan_wanted` until the 30-minute
+/// takeover.
+///
+/// MUTATION: in `scan::run_scan`, return the scan's `Err` before calling
+/// `apply_scan` → the flag stays set and the second assertion fails.
+#[test]
+fn run_scan_releases_the_flag_when_the_scan_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = Scratch::new();
+    let core = std::sync::Arc::new(std::sync::Mutex::new(core_for(&s)));
+    // Make the scan fail deterministically: an unreadable source tree makes
+    // `chezmoi managed` (and every git call) fail. Permissions are restored
+    // before the scratch is dropped, whatever the outcome.
+    let original = std::fs::metadata(&s.source).unwrap().permissions();
+    std::fs::set_permissions(&s.source, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = tomte_daemon::scan::run_scan(&core, || 100);
+    std::fs::set_permissions(&s.source, original).unwrap();
+    assert!(
+        result.is_err(),
+        "the failure is reported, not swallowed: {result:?}"
+    );
+    let mut c = core.lock().unwrap();
+    assert!(!c.scan_in_progress(), "a failed scan releases the flag");
+    assert!(c.begin_scan(101).is_some(), "and the next scan may start");
+}
