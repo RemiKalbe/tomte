@@ -20,6 +20,11 @@ version without one.
   Nested repositories are ignored.
 - **Scans cost less.** One `chezmoi source-path` call for all candidates
   and two `git log` walks per scan replace three subprocesses per file.
+- **Review stays smooth with hundreds of files.** The sidebar renders only
+  the rows in view and rebuilds its plan only when something changed; with
+  500 drifted files the tree used to lag on every mouse move. After a
+  decision the next file scrolls into view instead of advancing
+  off-screen.
 
 ### Added
 
@@ -33,8 +38,8 @@ version without one.
   commit, one push, still one journal session per file so Undo stays per
   file. Esc clears, ⌘A selects all. Rows that need a decision cannot be
   ticked; they keep their own buttons.
-- **A folder tree for the safe group.** The List / Tree switch at the top
-  of the sidebar shows SAFE TO RESOLVE as folders under `~`, single-child
+- **A folder tree for the safe group.** The folder-tree toggle on the
+  SAFE TO RESOLVE header shows SAFE TO RESOLVE as folders under `~`, single-child
   chains folded (`.config/nvim/`). Ticking a folder ticks every safe file
   under it, collapsed or not; its chip says `3 of 5` when two of its files
   need a decision and stay out. The other two groups stay flat. The choice

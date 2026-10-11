@@ -5689,4 +5689,213 @@ mod render_smoke {
             banner.text
         );
     }
+
+    /// The sidebar is a virtualized `list` (spec 2026-10-11 §2.2): a
+    /// 500-row plan renders the rows in view plus the overdraw, not all of
+    /// them.
+    ///
+    /// MUTATION: render every row (a `div().flex_col().children(all rows)`
+    /// column instead of `list`, the 0.1.20 shape) → 500+ rows per frame.
+    #[gpui::test]
+    fn a_500_row_sidebar_renders_only_the_rows_in_view(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let (rows, rendered) = vis.update(|_w, cx| {
+            let v = review.read(cx);
+            (v.plan_rows_len_for_test(), v.rows_rendered.get())
+        });
+        assert!(rows > 450, "the pose has {rows} rows");
+        assert!(
+            rendered > 0 && rendered < 100,
+            "{rendered} of {rows} rows rendered in the last frame"
+        );
+    }
+
+    /// The scroll anchor must survive a plan rebuild that changes nothing
+    /// visible, and the list must drop its "nothing to review" item when
+    /// rows arrive (and take it back when they all go).
+    ///
+    /// MUTATION: `splice` instead of `reset` on the empty↔rows flip → the
+    /// item count is off by one after the flip. MUTATION: `reset` on every
+    /// rebuild → the scroll top returns to item 0 after the no-op update.
+    #[gpui::test]
+    fn the_list_resets_when_the_plan_flips_between_empty_and_rows(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let item_count = |vis: &mut VisualTestContext| {
+            vis.update(|_w, cx| {
+                let v = review.read(cx);
+                (v.list_state.item_count(), v.plan_rows_len_for_test())
+            })
+        };
+        let (items, rows) = item_count(vis);
+        assert_eq!(items, rows + 1, "rows plus the In sync footer");
+
+        // Scroll down, then a model update that changes no row.
+        vis.update(|_w, cx| {
+            review.read(cx).list_state.scroll_to(gpui::ListOffset {
+                item_ix: 200,
+                offset_in_item: px(0.),
+            })
+        });
+        let state = vis.update(|_w, cx| shell.read(cx).state.clone());
+        vis.update(|_w, cx| state.update(cx, |_model, cx| cx.notify()));
+        vis.run_until_parked();
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).list_state.logical_scroll_top().item_ix),
+            200,
+            "an unchanged plan keeps the scroll anchor"
+        );
+
+        // Everything resolves: the plan is empty.
+        let saved = vis.update(|_w, cx| state.read(cx).drifted.clone());
+        vis.update(|_w, cx| {
+            state.update(cx, |model, cx| {
+                model.drifted.clear();
+                cx.notify();
+            })
+        });
+        vis.update(|_w, cx| {
+            // Notified, as every real queue change is: the Review entity
+            // re-renders with its Shell and reads the emptied queue.
+            shell.update(cx, |s, cx| {
+                s.queue = Default::default();
+                s.queue_pumping = false;
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        assert_eq!(item_count(vis), (2, 0), "the note and the footer");
+
+        // And drift comes back.
+        vis.update(|_w, cx| {
+            state.update(cx, |model, cx| {
+                model.drifted = saved;
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        let (items, rows) = item_count(vis);
+        assert!(rows > 450);
+        assert_eq!(items, rows + 1);
+    }
+
+    /// Clicks reach rows THROUGH the list element (which owns a hitbox for
+    /// scrolling): a real click on a safe row selects it.
+    ///
+    /// MUTATION: pass `true` as `locked` to `target_row` from `sidebar_item`
+    /// → the row has no `on_click` and `selected` does not change.
+    #[gpui::test]
+    fn a_real_click_on_a_row_inside_the_list_selects_it(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let zshrc = fixtures::home(".zshrc");
+        let ix = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                plan.rows
+                    .iter()
+                    .position(|r| {
+                        matches!(r, review::SidebarRow::Target { entry, .. } if entry.target == zshrc)
+                    })
+                    .expect(".zshrc is a row of the pose")
+            })
+        });
+        let selector: &'static str = Box::leak(format!("review-row-{ix}").into_boxed_str());
+        let row = vis.debug_bounds(selector).expect("row rendered");
+        vis.simulate_click(row.center(), gpui::Modifiers::default());
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).selected.clone()),
+            Some(zshrc)
+        );
+    }
+
+    /// A row inside the list spans the sidebar's full width, as it did in
+    /// the plain column: the list lays each item out as a root and leaves
+    /// its width to the item, so without a stretching wrapper a row shrinks
+    /// to its content and its selected / ticked wash stops short (seen in
+    /// the first `review-multiselect` screenshot of the list, 2026-10-11).
+    ///
+    /// MUTATION: return the bare `sidebar_item` element from the list's
+    /// item closure (drop the `div().w_full().flex().flex_col()` wrapper)
+    /// → the row is narrower than the rows column.
+    #[gpui::test]
+    fn a_row_inside_the_list_spans_the_sidebar_width(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let zshrc = fixtures::home(".zshrc");
+        let ix = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                plan.rows
+                    .iter()
+                    .position(|r| {
+                        matches!(r, review::SidebarRow::Target { entry, .. } if entry.target == zshrc)
+                    })
+                    .expect(".zshrc is a row of the pose")
+            })
+        });
+        let selector: &'static str = Box::leak(format!("review-row-{ix}").into_boxed_str());
+        let row = vis.debug_bounds(selector).expect("row rendered");
+        let column = vis
+            .debug_bounds("review-sidebar-rows")
+            .expect("the sidebar rows column rendered");
+        assert_eq!(
+            row.size.width, column.size.width,
+            "the row spans the rows column (row {row:?}, column {column:?})"
+        );
+    }
+
+    /// Keep disk on a row far down a long list: the next row is revealed
+    /// (spec 2026-10-11 §2.2), not left off-screen.
+    ///
+    /// MUTATION: never set `reveal` in `advance_from` → the scroll top stays
+    /// at item 0.
+    #[gpui::test]
+    fn an_auto_advance_far_down_the_list_scrolls_to_the_new_selection(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let (resolved, next) = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                (
+                    plan.visible_safe[400].clone(),
+                    plan.visible_safe[401].clone(),
+                )
+            })
+        });
+        vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                view.selected = Some(resolved.clone());
+                view.advance_from(&resolved, cx);
+            })
+        });
+        vis.run_until_parked();
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).selected.clone()),
+            Some(next)
+        );
+        let top = vis.update(|_w, cx| review.read(cx).list_state.logical_scroll_top().item_ix);
+        assert!(
+            top > 300,
+            "the list scrolled to the new selection (scroll top at item {top})"
+        );
+    }
 }

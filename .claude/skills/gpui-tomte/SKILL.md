@@ -88,8 +88,39 @@ The shapes that matter in practice:
   on the root that carries the focus handle. Routes are exclusive here, so
   one view's `cmd-a` does not shadow another's.
 
+## Virtualized lists (`list` / `ListState`)
+
+- `gpui::list(ListState, FnMut(usize, &mut Window, &mut App) -> AnyElement)`
+  is `uniform_list` for mixed heights: items are measured lazily, visible
+  ones re-measured every frame, off-screen heights CACHED. Tell the state
+  about changes with `splice(old_range, new_count)`; `splice(0..old, new)`
+  snaps the scroll anchor to item 0 whenever the anchor is inside the
+  range, i.e. always — splice only the changed window (`splice_window` in
+  `review.rs`). `reset(n)` only when the item set is replaced wholesale.
+- The item closure runs in the list's prepaint, after the owning view's
+  `render` returned and its lease was released: `weak.upgrade().update(cx,
+  |view, cx| …)` inside it is a fresh update, and the way a row gets a
+  `Context` for `cx.listener` (`ReviewView::sidebar()`, 2026-10-11).
+- `bounds_for_item(ix)` is `Some` only for a rendered item;
+  `scroll_to_reveal_item(ix)` is exact only when every item up to `ix` is
+  measured. For a far row use `scroll_to(ListOffset { item_ix, .. })`.
+- A `Rc<Cell<usize>>` counter in the item closure, reset in `render`, is
+  the test seam for "only the rows in view render" (`rows_rendered`).
+- The item closure is also called from `List::request_layout` and
+  `prepaint` while the list holds its `ListState`'s `RefCell` borrowed
+  (`list.rs` 0.2.2): reading or splicing that `ListState` from inside a
+  row panics.
+- Each item is laid out with `layout_as_root` at a definite width but no
+  width of its own, so a bare row shrinks to its content (its background
+  stops short). Wrap it in `div().w_full().flex().flex_col()` to stretch
+  it the way a flex column did; `a_row_inside_the_list_spans_the_sidebar_width`
+  pins this.
+
 ## Tests
 
+- `debug_bounds` entries persist across frames (`Frame::clear` never
+  clears them), so assert a selector's presence on the frame that renders
+  it, never its absence after a re-render.
 - Keys and clicks: `VisualTestContext::simulate_keystrokes("cmd-a")` goes
   through the bindings AND the key context of the focused node (remove the
   `key_context` and the test fails — that is the proof it exercises the

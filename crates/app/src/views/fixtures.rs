@@ -77,6 +77,10 @@ pub const STATES: &[(&str, &str)] = &[
         "review-tree-selected",
         "a whole folder ticked: its checkbox On, selection bar for its files",
     ),
+    (
+        "review-many",
+        "500 safe files in Tree mode: queued, running, failed and ticked rows — the perf pose",
+    ),
     ("merge", "three-pane editor with unresolved conflicts"),
     (
         "merge-auto",
@@ -267,6 +271,41 @@ fn multiselect_model() -> SyncModel {
         },
     ]);
     m.hydrate_status(drifted, m.in_sync, None, false, None);
+    m
+}
+
+/// Five hundred drifted files under forty skill folders and twenty tool
+/// folders — the user's real shape on 2026-10-11 (499 drifted under
+/// `~/.agents/skills`), which the sidebar must render without lag.
+fn many_model() -> SyncModel {
+    let mut m = multiselect_model();
+    let mut drifted = m.drifted.clone();
+    for skill in 0..40u64 {
+        for file in 0..12u64 {
+            drifted.push(DriftSummary {
+                target: home(&format!(
+                    ".agents/skills/skill-{skill:02}/reference/doc-{file:02}.md"
+                )),
+                class: if file % 7 == 0 {
+                    "source_ahead"
+                } else {
+                    "destination_drift"
+                }
+                .into(),
+                since_ts: Some(now() - 1_000 * (skill * 12 + file)),
+                origin_differs: file % 11 == 0,
+            });
+        }
+    }
+    for tool in 0..20u64 {
+        drifted.push(DriftSummary {
+            target: home(&format!(".config/tool-{tool:02}/config.toml")),
+            class: "destination_drift".into(),
+            since_ts: Some(now() - 5_000 * tool),
+            origin_differs: false,
+        });
+    }
+    m.hydrate_status(drifted, 1_200, None, false, None);
     m
 }
 
@@ -493,14 +532,14 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         | "review-origin-compared"
         | "review-multiselect"
         | "review-tree"
-        | "review-tree-selected" => {
-            let mut model = if matches!(
-                name,
-                "review-multiselect" | "review-tree" | "review-tree-selected"
-            ) {
-                multiselect_model()
-            } else {
-                rich_model()
+        | "review-tree-selected"
+        | "review-many" => {
+            let mut model = match name {
+                "review-multiselect" | "review-tree" | "review-tree-selected" => {
+                    multiselect_model()
+                }
+                "review-many" => many_model(),
+                _ => rich_model(),
             };
             let origin = name.starts_with("review-origin");
             if origin {
@@ -658,6 +697,58 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                         view.selection.toggle_all(&under, &plan.safe_order);
                         view.selection
                             .toggle(&home(".config/zed/settings.json"), &plan.safe_order);
+                    }
+                });
+            }
+            if name == "review-many" {
+                // One failed, one running, three waiting: the sub-line rows
+                // the list must size one by one (spec 2026-10-11 §2.4).
+                let failed = home(".agents/skills/skill-02/reference/doc-03.md");
+                s.queue.push(QueuedAction {
+                    target: failed.clone(),
+                    decision: Decision::KeepDisk,
+                    notify_on_done: false,
+                });
+                let _ = s.queue.take_batch();
+                s.queue
+                    .finish_all(&[(failed, Some("op: could not authenticate".into()))]);
+                s.queue.push(QueuedAction {
+                    target: home(".agents/skills/skill-03/reference/doc-01.md"),
+                    decision: Decision::KeepDisk,
+                    notify_on_done: false,
+                });
+                let _running = s.queue.take_batch();
+                for file in ["doc-02", "doc-04", "doc-05"] {
+                    s.queue.push(QueuedAction {
+                        target: home(&format!(".agents/skills/skill-03/reference/{file}.md")),
+                        decision: Decision::KeepSourceLocal,
+                        notify_on_done: false,
+                    });
+                }
+                s.queue_pumping = true;
+                let home_dir = home("");
+                let collapsed: BTreeSet<PathBuf> = BTreeSet::from([
+                    home(".agents/skills/skill-05/reference"),
+                    home(".agents/skills/skill-06/reference"),
+                ]);
+                let plan = sidebar_rows(SidebarInputs {
+                    drifted: &s.state.read(cx).drifted,
+                    queue: &QueueSnapshot::default(),
+                    mode: ReviewMode::Tree,
+                    collapsed: &collapsed,
+                    selection: &Selection::default(),
+                    home: &home_dir,
+                });
+                review.update(cx, |view, _| {
+                    view.mode = ReviewMode::Tree;
+                    view.collapsed = collapsed.clone();
+                    for file in 0..6u64 {
+                        view.selection.toggle(
+                            &home(&format!(
+                                ".agents/skills/skill-10/reference/doc-{file:02}.md"
+                            )),
+                            &plan.safe_order,
+                        );
                     }
                 });
             }

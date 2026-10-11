@@ -150,17 +150,19 @@ sandboxed shell; run it unsandboxed. Every new view sub-state gets a pose in
 `crates/app/src/views/fixtures.rs` (`STATES`); the render-smoke test builds
 all of them. `review-multiselect`, `review-tree`, and `review-tree-selected`
 pose the sidebar's multi-select and folder-tree states (checkboxes ticked,
-a folder collapsed, a whole folder selected).
+a folder collapsed, a whole folder selected). `review-many` is the
+500-file perf pose.
 
 ## The gate
 
-Run before every commit, in the foreground, and read the output — clippy
-exits 0 on warnings, so the grep is the real check:
+Run before every commit, in the foreground, and read the output. Check
+clippy's exit status AND the grep: `-D warnings` reports lints as `error:`
+lines, which a `^warning`-only grep never sees.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings 2>&1 \
-  | grep -E '^warning' | grep -v -E 'block v0\.1\.6|proc-macro-error2'   # must print nothing
+cargo clippy --workspace --all-targets -- -D warnings > /tmp/clippy.log 2>&1; echo "clippy exit=$?"  # must be 0
+rg -n '^(error|warning)' /tmp/clippy.log | rg -v 'block v0\.1\.6|proc-macro-error2'          # must print nothing
 cargo test --workspace
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo test --workspace
 ```
@@ -266,8 +268,10 @@ Hard rules, each one learned the expensive way.
   `model.rs` `kind_label` / `class_label`), and new reusable styling goes in
   `crates/ui` first, never inline in a view. The review diff uses tinted dots
   (● source-only / ● disk-only), never +/− markers — the user rejected those.
-- Any scrollable list rides `uniform_list` with fixed-height rows; plain
-  `overflow_y_scroll` columns drop frames.
+- Any scrollable list rides `uniform_list` (fixed-height rows) or gpui's
+  `list` (mixed heights — the Review sidebar, whose plan is spliced into its
+  `ListState` by `splice_window` over `row_keys`, never `reset` on an
+  ordinary rebuild); plain `overflow_y_scroll` columns drop frames.
 
 **GPUI (0.2.2) — see `.claude/skills/gpui-tomte` for the verified detail**
 - Never update an entity from inside its own update closure. A view handing
@@ -375,6 +379,8 @@ daemon for 90 s per request; a batch stops after the first exhausted budget.
 
 This branch adds multi-select of SAFE TO RESOLVE rows with bulk one-batch
 Keep disk / Keep source actions, Esc/⌘A, and a List/Tree folder sidebar.
+The sidebar is virtualized (gpui `list`) with a cached plan; the
+folder-tree toggle sits on the SAFE TO RESOLVE header.
 Scans run off the daemon lock, nested repositories are ignored by the
 watcher, a queued decision can be ✕'d.
 
@@ -386,12 +392,6 @@ Open, deliberately (design calls, not bugs):
 - The dashboard has no processing surface: a quick action pressed with no
   daemon parks with nothing on screen until the notification fires.
 - Undo's button cannot name its file: `ui::button` has no tooltip slot.
-- The Review sidebar still rides `overflow_y_scroll` rather than
-  `uniform_list`; folder and plain file rows measure the same height, but a
-  queued or failed row carries a sub-line and is taller, so a fixed-height
-  `uniform_list` conversion needs either a fixed row height that plans for
-  the sub-line or a two-height scheme — the tree did not make this worse,
-  it just did not unblock it either.
 - `review.rs` is ~4,100 lines; the sidebar planner (`SidebarRow`,
   `SidebarPlan`, `SidebarInputs`, `sidebar_rows` and their tests, ~500 lines
   together) is cohesive, pure, and depends only on `review_selection` and

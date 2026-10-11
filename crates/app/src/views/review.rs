@@ -19,14 +19,16 @@
 //! edits inside a templated value) hands the selected target to the Shell's
 //! full-window merge editor (plan 7 Task 3).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FontWeight, Rgba, SharedString,
-    Stateful, WeakEntity, Window, div, prelude::*, px,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FontWeight, ListAlignment,
+    ListOffset, ListState, Rgba, SharedString, Stateful, WeakEntity, Window, div, list, prelude::*,
+    px,
 };
 use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
@@ -1068,8 +1070,6 @@ pub(super) enum RowKey {
     },
 }
 
-// used by the virtualized sidebar (next task)
-#[allow(dead_code)]
 pub(super) fn row_keys(plan: &SidebarPlan, queue: &QueueSnapshot) -> Vec<RowKey> {
     plan.rows
         .iter()
@@ -1090,8 +1090,6 @@ pub(super) fn row_keys(plan: &SidebarPlan, queue: &QueueSnapshot) -> Vec<RowKey>
 /// row: `(old_range, new_count)` for the middle that differs, `None` when
 /// the two lists are identical. `splice(0..old, new)` would snap the
 /// anchor to item 0 on every rebuild (gpui 0.2.2 `list.rs`, `splice_focusable`).
-// used by the virtualized sidebar (next task)
-#[allow(dead_code)]
 pub(super) fn splice_window(old: &[RowKey], new: &[RowKey]) -> Option<(Range<usize>, usize)> {
     if old == new {
         return None;
@@ -1353,6 +1351,19 @@ pub struct ReviewView {
     plan_cache: Option<(PlanKey, Rc<SidebarPlan>)>,
     /// Set by the model observer; the next `plan` rebuilds.
     plan_dirty: bool,
+    /// The virtualized sidebar's scroll state and height cache (spec
+    /// 2026-10-11 §2.2). Kept in step with the plan by `splice_window`
+    /// over `row_keys`, never `reset` on an ordinary rebuild (that snaps
+    /// the scroll anchor to the top). `pub(super)` for the tests.
+    pub(super) list_state: ListState,
+    /// The keys of the rows the list currently holds.
+    row_keys: Vec<RowKey>,
+    /// Rows the item closure rendered in the last frame — the proof that
+    /// 500 rows do not render 500 elements. A test seam and a perf counter.
+    pub(super) rows_rendered: Rc<Cell<usize>>,
+    /// A target the next frame should scroll into view: set by an
+    /// auto-advance, consumed by `render_inner`.
+    reveal: Option<PathBuf>,
 }
 
 impl ReviewView {
@@ -1387,6 +1398,10 @@ impl ReviewView {
             focus_handle: cx.focus_handle(),
             plan_cache: None,
             plan_dirty: true,
+            list_state: ListState::new(0, ListAlignment::Top, px(200.)),
+            row_keys: Vec::new(),
+            rows_rendered: Rc::new(Cell::new(0)),
+            reveal: None,
         }
     }
 
@@ -1572,7 +1587,9 @@ impl ReviewView {
     /// so an empty queue is only a safe substitute in Flat, where the queue
     /// cannot influence anything but which rows are filtered out — and
     /// `next_after` filters those out again anyway.
-    fn advance_from(&mut self, resolved: &Path, cx: &mut Context<Self>) {
+    ///
+    /// `pub(super)` so a test can drive an auto-advance without a live engine.
+    pub(super) fn advance_from(&mut self, resolved: &Path, cx: &mut Context<Self>) {
         let drifted = self.state.read(cx).drifted.clone();
         let queue = self.queue_snapshot(cx);
         let home = home();
@@ -1601,6 +1618,7 @@ impl ReviewView {
             .chain(plan.visible_safe)
             .collect();
         if let Some(next) = next_after(resolved, &ordered, &|p| queue.is_processing(p)) {
+            self.reveal = Some(next.clone());
             self.select(next, cx);
         }
     }
@@ -1621,6 +1639,13 @@ impl ReviewView {
     /// The one plan builder: rebuilds when `plan_dirty` is set or the key
     /// built from `queue` and the view's own state differs from the cached
     /// one, otherwise hands back the cached `Rc`.
+    /// How many rows the cached plan holds — a test seam for the
+    /// virtualized sidebar.
+    #[cfg(test)]
+    pub(super) fn plan_rows_len_for_test(&self) -> usize {
+        self.plan_cache.as_ref().map_or(0, |(_, p)| p.rows.len())
+    }
+
     fn plan_with(&mut self, queue: QueueSnapshot, cx: &App) -> Rc<SidebarPlan> {
         let key = PlanKey {
             queue,
@@ -2160,89 +2185,46 @@ impl ReviewView {
 
     fn sidebar(
         &self,
-        plan: &SidebarPlan,
+        plan: &Rc<SidebarPlan>,
         queue: &QueueSnapshot,
         in_sync: u64,
         now: u64,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let selection_active = !self.selection.is_empty();
-        let mut ix = 0usize;
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for row in &plan.rows {
-            match row {
-                SidebarRow::Group { label, check } => rows.push(
-                    group_header_el(label, *check, selection_active, self.mode, theme, cx)
-                        .into_any_element(),
-                ),
-                SidebarRow::Folder { node, check } => {
-                    let row_path = node.path.clone();
-                    let check_path = node.path.clone();
-                    rows.push(
-                        ui::folder_row(
-                            theme,
-                            ElementId::named_usize("review-folder", ix),
-                            ui::FolderRow {
-                                depth: node.depth,
-                                label: node.label.clone(),
-                                collapsed: node.collapsed,
-                                count: count_chip(node.safe, node.total),
-                                check: *check,
-                                show_check: selection_active,
-                            },
-                            cx.listener(move |view, ev: &ClickEvent, _w, cx| {
-                                view.folder_click(&row_path, ev.modifiers(), cx);
-                            }),
-                            cx.listener(move |view, _ev, _w, cx| {
-                                view.toggle_folder(&check_path, cx)
-                            }),
-                        )
-                        .into_any_element(),
-                    );
-                    ix += 1;
-                }
-                SidebarRow::Target {
-                    entry,
-                    queued,
-                    locked,
-                    cancellable,
-                    depth,
-                    selectable,
-                    checked,
-                } => {
-                    rows.push(
-                        self.target_row(
-                            ix,
-                            entry,
-                            now,
-                            *queued,
-                            *locked,
-                            *cancellable,
-                            *depth,
-                            *selectable,
-                            *checked,
-                            selection_active,
-                            queue.failure(&entry.target),
-                            theme,
-                            cx,
-                        )
-                        .into_any_element(),
-                    );
-                    ix += 1;
-                }
-            }
-        }
-        if rows.is_empty() {
-            rows.push(
-                div()
-                    .p_3()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .child("nothing to review")
-                    .into_any_element(),
-            );
-        }
+        let plan = plan.clone();
+        let queue = queue.clone();
+        let weak = cx.weak_entity();
+        let counter = self.rows_rendered.clone();
+        // The item closure runs during the list's layout and prepaint,
+        // after this view's render returned and its lease was released
+        // (gpui 0.2.2 `view.rs`: `Entity::request_layout` produces the
+        // element under `update`, then lays it out) — so updating the view
+        // here is a FRESH update, not a nested one, and gives each row the
+        // `Context` its listeners need. The list holds its own `ListState`
+        // borrowed while it calls this closure: never touch `list_state`
+        // from a row.
+        let rows = list(self.list_state.clone(), move |ix, _window, cx| {
+            let Some(view) = weak.upgrade() else {
+                return div().into_any_element();
+            };
+            counter.set(counter.get() + 1);
+            let item = view.update(cx, |view, cx| {
+                view.sidebar_item(ix, &plan, &queue, in_sync, now, theme, cx)
+            });
+            // The list lays each item out as a root at the list's width
+            // but leaves its own width to the item, so a bare row would
+            // shrink to its content and its selected / ticked wash would
+            // stop short. A full-width flex column stretches it the way
+            // the old column did.
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(item)
+                .into_any_element()
+        })
+        .size_full();
         div()
             .id("review-sidebar")
             .w(px(self.sidebar_width.unwrap_or(SIDEBAR_WIDTH)))
@@ -2255,29 +2237,100 @@ impl ReviewView {
                     .id("review-sidebar-rows")
                     // Test-only (no-op in release builds): lets a
                     // render-smoke test find this column's real bounds and
-                    // click into its empty space below the last row, rather
-                    // than guess a pixel offset.
+                    // click into its empty space below the last row.
                     .debug_selector(|| "review-sidebar-rows".into())
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
                     .py_1()
-                    .children(rows)
-                    .child(
-                        // Collapsed in-sync group: a count line, not a list (§7.2).
-                        div()
-                            .px_3()
-                            .py_2()
-                            .mt_2()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child(format!("In sync ({in_sync})")),
-                    ),
+                    .child(rows),
             )
+    }
+
+    /// One list item: a plan row, the "nothing to review" note (item 0 of
+    /// an empty plan), or the In sync footer (the last item). The rows are
+    /// `target_row` / `ui::folder_row` / `group_header_el` exactly as
+    /// before the sidebar was virtualized; only the container changed.
+    #[allow(clippy::too_many_arguments)]
+    fn sidebar_item(
+        &self,
+        ix: usize,
+        plan: &SidebarPlan,
+        queue: &QueueSnapshot,
+        in_sync: u64,
+        now: u64,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selection_active = !self.selection.is_empty();
+        match plan.rows.get(ix) {
+            Some(SidebarRow::Group { label, check }) => {
+                group_header_el(label, *check, selection_active, self.mode, theme, cx)
+                    .into_any_element()
+            }
+            Some(SidebarRow::Folder { node, check }) => {
+                let row_path = node.path.clone();
+                let check_path = node.path.clone();
+                ui::folder_row(
+                    theme,
+                    ElementId::named_usize("review-folder", ix),
+                    ui::FolderRow {
+                        depth: node.depth,
+                        label: node.label.clone(),
+                        collapsed: node.collapsed,
+                        count: count_chip(node.safe, node.total),
+                        check: *check,
+                        show_check: selection_active,
+                    },
+                    cx.listener(move |view, ev: &ClickEvent, _w, cx| {
+                        view.folder_click(&row_path, ev.modifiers(), cx);
+                    }),
+                    cx.listener(move |view, _ev, _w, cx| view.toggle_folder(&check_path, cx)),
+                )
+                .into_any_element()
+            }
+            Some(SidebarRow::Target {
+                entry,
+                queued,
+                locked,
+                cancellable,
+                depth,
+                selectable,
+                checked,
+            }) => self
+                .target_row(
+                    ix,
+                    entry,
+                    now,
+                    *queued,
+                    *locked,
+                    *cancellable,
+                    *depth,
+                    *selectable,
+                    *checked,
+                    selection_active,
+                    queue.failure(&entry.target),
+                    theme,
+                    cx,
+                )
+                .into_any_element(),
+            None if plan.rows.is_empty() && ix == 0 => div()
+                .p_3()
+                .text_sm()
+                .text_color(theme.text_muted)
+                .child("nothing to review")
+                .into_any_element(),
+            // Collapsed in-sync group: a count line, not a list (§7.2).
+            None => div()
+                .px_3()
+                .py_2()
+                .mt_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child(format!("In sync ({in_sync})"))
+                .into_any_element(),
+        }
     }
 }
 
@@ -2453,6 +2506,9 @@ impl ReviewView {
         };
         div()
             .id(ElementId::named_usize("review-target", ix))
+            // Test-only (no-op in release builds): a real click in the
+            // render-smoke tests finds this row by its plan index.
+            .debug_selector(move || format!("review-row-{ix}"))
             .group("review-row")
             .px_3()
             .py_1()
@@ -2904,6 +2960,41 @@ impl ReviewView {
         if let Some((key, _)) = &mut self.plan_cache {
             key.selection = self.selection.clone();
         }
+
+        // Keep the list's height cache in step with the rows (spec
+        // 2026-10-11 §2.2). `reset` only when the plan flips between empty
+        // and non-empty (the "nothing to review" item comes and goes);
+        // otherwise splice exactly the window that changed, so unchanged
+        // rows keep their heights and the scroll anchor stays on its row.
+        let keys = row_keys(&plan, &queue);
+        let item_count = plan.rows.len().max(1) + 1;
+        if self.list_state.item_count() == 0 || keys.is_empty() != self.row_keys.is_empty() {
+            self.list_state.reset(item_count);
+        } else if let Some((range, count)) = splice_window(&self.row_keys, &keys) {
+            self.list_state.splice(range, count);
+        }
+        self.row_keys = keys;
+        // An auto-advance landed on a row the user may not be able to see.
+        // `bounds_for_item` is `Some` only for a rendered (hence measured)
+        // row, and `scroll_to_reveal_item` is exact for those; a row that
+        // was never rendered has no measured height to aim at, so it is
+        // put near the top with `scroll_to` instead.
+        if let Some(target) = self.reveal.take()
+            && let Some(ix) = plan.rows.iter().position(
+                |r| matches!(r, SidebarRow::Target { entry, .. } if entry.target == target),
+            )
+        {
+            let viewport = self.list_state.viewport_bounds();
+            match self.list_state.bounds_for_item(ix) {
+                Some(b) if b.top() >= viewport.top() && b.bottom() <= viewport.bottom() => {}
+                Some(_) => self.list_state.scroll_to_reveal_item(ix),
+                None => self.list_state.scroll_to(ListOffset {
+                    item_ix: ix.saturating_sub(2),
+                    offset_in_item: px(0.),
+                }),
+            }
+        }
+        self.rows_rendered.set(0);
 
         let dragging = self.sidebar_drag.is_some();
         div()
