@@ -6,8 +6,27 @@ version without one.
 
 ## Unreleased
 
+### Fixed
+
+- **A scan no longer blocks what you do.** The daemon used to hold its one
+  lock for the whole scan — minutes with hundreds of drifted files — and
+  every Save, Undo or Keep disk pressed meanwhile waited, then failed with
+  "the daemon stayed busy". Scans now run with the lock released; what you
+  press is answered while they run, and the status line says "scanning…"
+  next to real numbers instead of blanking them.
+- **The daemon no longer rescans itself in a loop.** A vendored skill with
+  its own `.git` inside the chezmoi source tree made every `git status`
+  look like a source change; the log cycled every half second, forever.
+  Nested repositories are ignored.
+- **Scans cost a third of what they did.** One `chezmoi source-path` call
+  for all candidates and two `git log` walks per scan replace three
+  subprocesses per file.
+
 ### Added
 
+- **Remove a queued decision.** A ✕ on every PROCESSING row that has not
+  started yet takes it back; the file returns to its group. A running
+  decision cannot be recalled mid-commit, and shows no ✕.
 - **Resolve several safe files at once.** In Review, ⌘-click or tick the
   checkbox on any SAFE TO RESOLVE row (⇧-click for a range, the header's
   checkbox for all of them), then press Keep disk or Keep source · this

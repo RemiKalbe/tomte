@@ -62,7 +62,10 @@ action queue, batching, per-file undo).
 
 ### Data flow
 
-1. `tomted` scans (chezmoi `status` + git) → `DaemonCore` classifies each
+1. `tomted` scans (chezmoi `status` + git) — with the core lock RELEASED for
+   the subprocess phase (`scan::run_scan`: `begin_scan` /
+   `DriftScanner::scan` / `apply_scan`; a target the per-event path touched
+   meanwhile keeps its state) → `DaemonCore` classifies each
    target → journals → pushes `Event::{Drift, ScanDone, FetchDone, …}` to
    subscribers.
 2. `tomte` connects on boot (`IpcClient::connect_or_spawn` launches `tomted`
@@ -248,7 +251,11 @@ Hard rules, each one learned the expensive way.
   rescan included (later files are "not attempted — … — try again"; files
   whose work already landed are "resolved, but the session was not closed",
   never "try again"). A client-side timeout is NOT retried — the daemon may
-  have executed it.
+  have executed it. Since 2026-10-11 a scan never holds the core; the lock
+  holders are the per-event path, the fetch and a scan's apply phase.
+- Watcher paths go through `classify_path`: anything inside a NESTED `.git`
+  is ignored (vendored repos in the source tree made the daemon rescan
+  itself every 0.6 s).
 - Subprocess waits are WNOHANG polling with timeouts, never signal-based;
   fetch runs with `GIT_TERMINAL_PROMPT=0` and ssh `BatchMode` so a locked
   1Password agent fails fast instead of hanging the daemon.
@@ -368,6 +375,8 @@ daemon for 90 s per request; a batch stops after the first exhausted budget.
 
 This branch adds multi-select of SAFE TO RESOLVE rows with bulk one-batch
 Keep disk / Keep source actions, Esc/⌘A, and a List/Tree folder sidebar.
+Scans run off the daemon lock, nested repositories are ignored by the
+watcher, a queued decision can be ✕'d.
 
 Open, deliberately (design calls, not bugs):
 
@@ -387,6 +396,9 @@ Open, deliberately (design calls, not bugs):
   `SidebarPlan`, `SidebarInputs`, `sidebar_rows` and their tests, ~500 lines
   together) is cohesive, pure, and depends only on `review_selection` and
   `review_tree` — the next chunk to move into its own `review_plan.rs`.
+- The per-event path (`rescan_source_side`) and `handle_fetch`'s per-file
+  probes still run under the lock — bounded by changed-file counts; give
+  them the begin/apply split if one ever shows in a banner.
 - Free-text region editing in the merge editor (`tomte_ui::text_area`
   exists; integration remains), keyboard hints, tabular figures (gpui has no
   font-features hook), journal pruning, SMAppService instead of launchctl.

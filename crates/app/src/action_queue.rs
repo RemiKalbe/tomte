@@ -196,6 +196,18 @@ impl ActionQueue {
         self.pending.push_back(action);
     }
 
+    /// Take back a decision that has not started (spec 2026-10-11 §2.4).
+    /// `true` when a pending entry for `target` was removed; `false` — and
+    /// nothing else — when none was pending: a RUNNING decision is one
+    /// in-flight re-add/apply/commit/push on the user's repo, and the
+    /// engine is blocking in a background thread for it. Records no
+    /// failure: the user withdrew the decision, nothing failed.
+    pub fn cancel(&mut self, target: &Path) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|p| p.target != target);
+        self.pending.len() != before
+    }
+
     /// Take the next run of work: every consecutive batchable decision at
     /// the front of the queue, or exactly one non-batchable one. Marks every
     /// returned target as running.
@@ -637,6 +649,45 @@ mod tests {
             Path::new("/c"),
             "a partial report must not strand /b in `running` and wedge the queue"
         );
+    }
+
+    /// MUTATION: also drain `running` in `cancel` → `/a` stops processing.
+    /// MUTATION: insert a failure for the cancelled target → the `failure`
+    /// assertion fails: a withdrawn decision is not a failed one.
+    #[test]
+    fn a_pending_decision_can_be_cancelled_but_a_running_one_cannot() {
+        let mut q = ActionQueue::default();
+        q.push(action("/a", Decision::KeepDisk));
+        let _running = q.take_batch();
+        q.push(action("/b", Decision::KeepSourceLocal));
+        assert!(q.cancel(Path::new("/b")));
+        assert!(!is_processing(&q, "/b"));
+        assert!(
+            q.failure(Path::new("/b")).is_none(),
+            "withdrawn, not failed"
+        );
+        assert!(!q.cancel(Path::new("/a")), "running: cannot be recalled");
+        assert!(is_processing(&q, "/a"));
+        assert_eq!(q.depth(), 1);
+    }
+
+    /// A target that is running AND re-queued (a Save on a file whose batch
+    /// already started) holds two entries; the cross takes back only the
+    /// pending one and the running row keeps saying "running…".
+    ///
+    /// MUTATION: make `cancel` return `true` without removing anything when
+    /// the target is also running → the depth assertion fails.
+    #[test]
+    fn cancelling_a_re_queued_running_target_removes_only_the_pending_copy() {
+        let mut q = ActionQueue::default();
+        q.push(action("/a", Decision::KeepDisk));
+        let _running = q.take_batch();
+        q.push(action("/a", Decision::KeepSourceLocal));
+        assert_eq!(q.depth(), 2);
+        assert!(q.cancel(Path::new("/a")));
+        assert_eq!(q.depth(), 1);
+        assert_eq!(q.running().len(), 1);
+        assert_eq!(q.decision_label(Path::new("/a")), Some("Keep disk"));
     }
 
     /// A processing row has to say WHICH choice it is waiting on: thirty rows

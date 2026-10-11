@@ -11,7 +11,7 @@ mod review_tree;
 pub mod settings;
 
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     AppContext as _, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px,
@@ -864,6 +864,21 @@ impl Shell {
         }
         cx.notify();
         self.pump(cx);
+    }
+
+    /// Take back a queued decision (spec 2026-10-11 §2.4). No latch and no
+    /// repo: only the queue changes, so this may be reached from inside the
+    /// review view's own update — it never updates that view back.
+    pub fn cancel_queued(&mut self, target: &Path, cx: &mut Context<Self>) {
+        let label = self.queue.decision_label(target).unwrap_or("a decision");
+        if self.queue.cancel(target) {
+            tomte_core::log_info!(
+                "resolve",
+                "removed the queued {label} for {}",
+                target.display()
+            );
+            cx.notify();
+        }
     }
 
     /// Watch the shared model, and prune what a model change invalidates.
@@ -2763,6 +2778,54 @@ mod render_smoke {
     fn review_of(shell: &Entity<Shell>, vis: &mut VisualTestContext) -> Entity<ReviewView> {
         vis.update(|_window, cx| shell.read(cx).review.clone())
             .expect("pose has a Review entity")
+    }
+
+    /// The cross on a waiting row goes `ReviewView::cancel_queued` →
+    /// `Shell::cancel_queued` → `ActionQueue::cancel`, and the file comes
+    /// back under its group with no cross while the running row is
+    /// untouched.
+    ///
+    /// MUTATION: return from `Shell::cancel_queued` before
+    /// `self.queue.cancel` → the depth stays 2 and the waiting row stays
+    /// under PROCESSING. MUTATION: make `ReviewView::cancel_queued` a no-op
+    /// → the same assertions fail.
+    #[gpui::test]
+    fn the_x_on_a_waiting_row_removes_its_decision_from_the_queue(cx: &mut TestAppContext) {
+        use review::SidebarRow;
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-processing", smoke_paths(), cx)
+                .expect("review-processing fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let waiting = fixtures::home(".gitconfig");
+        let running = fixtures::home(".config/zed/settings.json");
+        let before = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
+        assert!(before.rows.iter().any(|r| matches!(r,
+            SidebarRow::Target { entry, cancellable: true, .. } if entry.target == waiting)));
+        vis.update(|_w, cx| review.update(cx, |view, cx| view.cancel_queued(&waiting, cx)));
+        vis.run_until_parked();
+        vis.update(|_w, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 1);
+            assert_eq!(s.queue.running().len(), 1);
+            assert_eq!(s.queue.running()[0].target, running);
+            assert!(s.queue.failure(&waiting).is_none());
+        });
+        let after = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
+        let group_of = |rows: &[SidebarRow], target: &Path| -> &'static str {
+            let mut current = "";
+            for r in rows {
+                match r {
+                    SidebarRow::Group { label, .. } => current = label,
+                    SidebarRow::Target { entry, .. } if entry.target == target => return current,
+                    _ => {}
+                }
+            }
+            "absent"
+        };
+        assert_eq!(group_of(&after.rows, &waiting), "SAFE TO RESOLVE");
+        assert_eq!(group_of(&after.rows, &running), "PROCESSING");
     }
 
     /// The queue's REAL path, end to end: `enqueue` → `pump` → `run_batch`

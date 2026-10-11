@@ -141,7 +141,7 @@ pub fn window_size(name: &str) -> gpui::Size<gpui::Pixels> {
     }
 }
 
-fn home(sub: &str) -> PathBuf {
+pub(super) fn home(sub: &str) -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/Users/gallery"));

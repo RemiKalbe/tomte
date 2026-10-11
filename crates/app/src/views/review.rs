@@ -889,6 +889,11 @@ impl QueuedDecision {
     fn locks_row(self) -> bool {
         self.status.locks_row()
     }
+
+    /// Still takes a ✕: the decision has not started (spec 2026-10-11 §2.4).
+    fn cancellable(self) -> bool {
+        matches!(self.status, QueuedStatus::Waiting)
+    }
 }
 
 /// The Shell's action queue as one render pass needs to see it.
@@ -1024,6 +1029,10 @@ pub(super) enum SidebarRow {
         /// this apparent redundancy is the point, not something to tidy
         /// away.
         locked: bool,
+        /// Under PROCESSING and not yet running: the row carries a ✕ that
+        /// removes the decision from the queue. A field like `locked`, for
+        /// the same reason — derived once here, read verbatim by the row.
+        cancellable: bool,
         /// Tree indent level; 0 in flat mode. Read by `target_row`'s
         /// indent; Task 7 is what makes it ever non-zero.
         depth: usize,
@@ -1086,6 +1095,7 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
                 entry,
                 queued: Some(*queued),
                 locked: queued.locks_row(),
+                cancellable: queued.cancellable(),
                 depth: 0,
                 selectable: false,
                 checked: false,
@@ -1110,6 +1120,7 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
             entry: entry.clone(),
             queued: None,
             locked: false,
+            cancellable: false,
             depth: 0,
             selectable: false,
             checked: false,
@@ -1131,6 +1142,7 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
             entry: entry.clone(),
             queued: None,
             locked: false,
+            cancellable: false,
             depth,
             selectable: true,
             checked: selection.contains(&entry.target),
@@ -1400,6 +1412,19 @@ impl ReviewView {
         self.last_outcome = None;
         self.enqueue(target.clone(), decision, cx);
         self.advance_from(&target, cx);
+    }
+
+    /// The ✕ on a waiting PROCESSING row. Safe from inside this view's
+    /// update for the same reason `enqueue` is: `Shell::cancel_queued`
+    /// only touches the queue and notifies.
+    pub(super) fn cancel_queued(&mut self, target: &Path, cx: &mut Context<Self>) {
+        let t = target.to_path_buf();
+        if let Err(e) = self
+            .shell
+            .update(cx, |shell, cx| shell.cancel_queued(&t, cx))
+        {
+            tomte_core::log_error!("resolve", "could not cancel {}: {e}", target.display());
+        }
     }
 
     /// Hand one decision to the Shell's queue.
@@ -2071,6 +2096,7 @@ impl ReviewView {
                     entry,
                     queued,
                     locked,
+                    cancellable,
                     depth,
                     selectable,
                     checked,
@@ -2082,6 +2108,7 @@ impl ReviewView {
                             now,
                             *queued,
                             *locked,
+                            *cancellable,
                             *depth,
                             *selectable,
                             *checked,
@@ -2260,6 +2287,7 @@ impl ReviewView {
         now: u64,
         queued: Option<QueuedDecision>,
         locked: bool,
+        cancellable: bool,
         depth: usize,
         selectable: bool,
         checked: bool,
@@ -2277,21 +2305,47 @@ impl ReviewView {
             theme.class_color(&entry.class)
         };
         let name = display_name(&entry.target);
-        // A processing row's trailing column goes BLANK: how long the file
-        // has been drifted stopped being the interesting fact about it the
-        // moment a decision was recorded, and what replaced it — the choice
-        // AND its state — is too long for a 200px sidebar's right edge. It
-        // goes on its own line under the name instead, where it fits whole:
-        // "Keep source · this machine · queued" truncated to "Keep source ·
-        // thi…" would answer nothing, and answering "which decision is this
-        // row waiting on" is the entire point of showing it.
-        let trailing: SharedString = match queued {
-            Some(_) => "".into(),
-            None => entry
-                .since_ts
-                .map(|ts| time_ago(now, ts))
-                .unwrap_or_default()
-                .into(),
+        // A processing row's trailing column goes BLANK while it RUNS and
+        // carries the ✕ while it WAITS: how long the file has been drifted
+        // stopped being the interesting fact about it the moment a decision
+        // was recorded, and what replaced it — the choice AND its state — is
+        // too long for a 200px sidebar's right edge. It goes on its own line
+        // under the name instead, where it fits whole: "Keep source · this
+        // machine · queued" truncated to "Keep source · thi…" would answer
+        // nothing, and answering "which decision is this row waiting on" is
+        // the entire point of showing it.
+        let trailing: AnyElement = if cancellable {
+            let t = entry.target.clone();
+            ui::button(
+                theme,
+                ElementId::named_usize("review-cancel", ix),
+                "✕".into(),
+                ui::ButtonVariant::Ghost,
+                ui::ButtonSize::Micro,
+                cx.listener(move |view, _ev, _w, cx| {
+                    // The row must not be selected by its own ✕.
+                    cx.stop_propagation();
+                    view.cancel_queued(&t, cx);
+                }),
+            )
+            .tooltip(ui::text_tooltip("Remove from queue"))
+            .flex_shrink_0()
+            .into_any_element()
+        } else {
+            let text: SharedString = match queued {
+                Some(_) => "".into(),
+                None => entry
+                    .since_ts
+                    .map(|ts| time_ago(now, ts))
+                    .unwrap_or_default()
+                    .into(),
+            };
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child(text)
+                .into_any_element()
         };
         let target = entry.target.clone();
         // Ruling 5: the checkbox's gutter is reserved on EVERY row, not only
@@ -2363,13 +2417,7 @@ impl ReviewView {
                     // The ONE surface where `DriftSummary::origin_differs`
                     // is authoritative — see `origin_hint`.
                     .children(origin_hint(ix, entry, theme))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child(trailing),
-                    ),
+                    .child(trailing),
             )
             // What this row is waiting on, in the words of the button that
             // was pressed. `line_clamp(1)` over a definite width, never
@@ -3328,6 +3376,38 @@ mod tests {
                 ),
             })
             .collect()
+    }
+
+    /// MUTATION: `cancellable: queued.cancellable()` → `queued.locks_row()`
+    /// reversed, or `true` for every PROCESSING row (the brief's
+    /// `queued.is_some()`) → the running row reads cancellable and this
+    /// fails.
+    #[test]
+    fn only_a_waiting_processing_row_is_cancellable() {
+        let drifted = vec![
+            s("/a", "destination_drift"),
+            s("/b", "destination_drift"),
+            s("/c", "destination_drift"),
+        ];
+        let queue = posed_queue(&["/a"], &["/b"], true);
+        let flags: Vec<(String, bool)> = plan_of(&drifted, &queue)
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                SidebarRow::Target {
+                    entry, cancellable, ..
+                } => Some((entry.target.display().to_string(), *cancellable)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("/a".to_string(), false),
+                ("/b".to_string(), true),
+                ("/c".to_string(), false),
+            ]
+        );
     }
 
     /// A file gets EXACTLY ONE row. Spec §2.1 has the row move to
