@@ -419,6 +419,42 @@ impl ChezmoiClient {
         ))
     }
 
+    /// `chezmoi source-path t1 t2 …` for MANY targets in one invocation: one
+    /// line per target, in argument order (verified against chezmoi on
+    /// 2026-10-11). Chunked so an argv stays a few thousand paths at most.
+    /// A chunk that exits non-zero (one unmanaged target fails the whole
+    /// call) or answers the wrong number of lines is retried one target at
+    /// a time — two lists of different lengths are never zipped.
+    pub fn source_paths(&self, targets: &[PathBuf]) -> Result<Vec<Option<PathBuf>>, ChezmoiError> {
+        const CHUNK: usize = 128;
+        let mut out = Vec::with_capacity(targets.len());
+        for chunk in targets.chunks(CHUNK) {
+            let mut args: Vec<String> = vec!["source-path".into()];
+            args.extend(chunk.iter().map(|p| p.to_string_lossy().into_owned()));
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            // Expected to fail when the chunk holds an unmanaged target:
+            // logged as such, not as an error, like `cat_probe`.
+            let req = self.request(&arg_refs).failure_is_expected();
+            let reply = self.runner.run(req)?;
+            let lines: Vec<PathBuf> = if reply.success() {
+                String::from_utf8_lossy(&reply.stdout)
+                    .lines()
+                    .map(|l| PathBuf::from(l.trim()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if reply.success() && lines.len() == chunk.len() {
+                out.extend(lines.into_iter().map(Some));
+            } else {
+                for target in chunk {
+                    out.push(self.source_path(target).ok());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn target_paths(&self, sources: &[PathBuf]) -> Result<Vec<PathBuf>, ChezmoiError> {
         if sources.is_empty() {
             return Ok(Vec::new());
@@ -828,5 +864,23 @@ mod tests {
                 "/Users/x/.config/a".into()
             ]
         );
+    }
+
+    /// A chunk that exits 0 but answers fewer lines than it has targets is
+    /// retried one target at a time, never zipped against the short reply.
+    ///
+    /// MUTATION: drop the `lines.len() == chunk.len()` check from
+    /// `source_paths` → the result has one entry for two targets.
+    #[test]
+    fn source_paths_retries_a_short_reply_per_target() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "/src/dot_a\n", ""); // batch: one line for two targets
+        fake.push_ok(0, "/src/dot_a\n", ""); // retry, first target
+        fake.push_ok(1, "", "chezmoi: not managed"); // retry, second target
+        let got = client(fake.clone())
+            .source_paths(&["/h/.a".into(), "/h/.b".into()])
+            .unwrap();
+        assert_eq!(got, vec![Some(PathBuf::from("/src/dot_a")), None]);
+        assert_eq!(fake.calls().len(), 3);
     }
 }

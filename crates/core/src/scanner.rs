@@ -55,6 +55,20 @@ pub struct UnprobedTarget {
     pub reason: String,
 }
 
+/// Where `probe_file` reads a target's ahead/behind from.
+enum GitSignalSource<'a> {
+    /// Two `rev-list --count` for THIS file: the per-event probe of one
+    /// target, where two subprocesses are cheap and a whole-history walk
+    /// per file event would not be.
+    PerFile,
+    /// Computed once per scan (spec 2026-10-11 §2.3): the paths touched by
+    /// `remote..HEAD` and by `HEAD..remote`.
+    Sets {
+        local: &'a BTreeSet<PathBuf>,
+        remote: &'a BTreeSet<PathBuf>,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
     #[error(transparent)]
@@ -169,30 +183,62 @@ impl DriftScanner {
             Err(other) => return Err(other.into()),
         }
 
-        let mut drifted = Vec::new();
-        for target in candidates {
+        // The probe loop's two git questions and its source-path lookup are
+        // answered once for the whole scan (spec 2026-10-11 §2.3): three
+        // subprocesses instead of three per candidate. A set that cannot be
+        // computed degrades to the per-file questions, logged — never to a
+        // guessed "not ahead".
+        let local_range = format!("{}..HEAD", self.remote_ref);
+        let remote_range = format!("HEAD..{}", self.remote_ref);
+        let sets = match (
+            self.git.files_touched_in(&local_range),
+            self.git.files_touched_in(&remote_range),
+        ) {
+            (Ok(local), Ok(remote)) => Some((local, remote)),
+            (l, r) => {
+                let why = l
+                    .err()
+                    .or(r.err())
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                crate::log_warn!(
+                    "scan",
+                    "git ahead/behind sets unavailable ({why}); asking per file"
+                );
+                None
+            }
+        };
+        let probe_targets: Vec<PathBuf> = candidates
+            .iter()
             // Already known unreadable from the pass above — don't spend a
             // subprocess re-confirming it, and don't record it twice.
-            if unprobed.iter().any(|u| u.target == target) {
-                continue;
-            }
-            let last_written = match dump.entry_state.get(&target) {
-                // A recorded entry that isn't a file: symlink/dir probing is
-                // out of scope, so skip without ceremony.
-                Some(entry) if entry.kind != "file" => continue,
-                Some(entry) => entry
-                    .contents_sha256
-                    .as_deref()
-                    .and_then(ContentHash::from_hex),
-                // Managed but never written by chezmoi (fresh from remote, or
-                // an ignored entry type) — probe with last_written = None.
-                // Nothing here says it IS a file: a managed directory that was
-                // never applied lands in this branch, and probing it ran
-                // `chezmoi cat` on a directory. That failure used to travel
-                // out through `?` and kill the entire scan.
-                None => None,
+            .filter(|t| !unprobed.iter().any(|u| u.target == **t))
+            // A recorded entry that isn't a file: symlink/dir probing is
+            // out of scope, so skip without ceremony.
+            .filter(|t| !matches!(dump.entry_state.get(*t), Some(entry) if entry.kind != "file"))
+            .cloned()
+            .collect();
+        let source_abs = self.chezmoi.source_paths(&probe_targets)?;
+        let mut drifted = Vec::new();
+        for (target, abs) in probe_targets.into_iter().zip(source_abs) {
+            // A target with no state entry was never written by chezmoi
+            // (fresh from remote, or an ignored entry type): probe with
+            // last_written = None. Nothing says it IS a file: a managed
+            // directory that was never applied lands here, and `chezmoi cat`
+            // on it fails with NotAFile, handled below — it used to travel
+            // out through `?` and kill the entire scan.
+            let last_written = dump
+                .entry_state
+                .get(&target)
+                .and_then(|entry| entry.contents_sha256.as_deref())
+                .and_then(ContentHash::from_hex);
+            let source_rel =
+                abs.and_then(|a| a.strip_prefix(&source_dir).ok().map(Path::to_path_buf));
+            let signals = match &sets {
+                Some((local, remote)) => GitSignalSource::Sets { local, remote },
+                None => GitSignalSource::PerFile,
             };
-            match self.probe_file(&source_dir, &target, last_written) {
+            match self.probe_file(&target, last_written, source_rel, &signals) {
                 Ok(Some(d)) => drifted.push(d),
                 Ok(None) => {}
                 // Chezmoi's own verdict that the target is not a regular
@@ -237,14 +283,20 @@ impl DriftScanner {
             .get(target)
             .and_then(|e| e.contents_sha256.as_deref())
             .and_then(ContentHash::from_hex);
-        self.probe_file(&source_dir, target, last)
+        let source_rel = self
+            .chezmoi
+            .source_path(target)
+            .ok()
+            .and_then(|abs| abs.strip_prefix(&source_dir).ok().map(Path::to_path_buf));
+        self.probe_file(target, last, source_rel, &GitSignalSource::PerFile)
     }
 
     fn probe_file(
         &self,
-        source_dir: &Path,
         target: &Path,
         last_written: Option<ContentHash>,
+        source_rel: Option<PathBuf>,
+        signals: &GitSignalSource<'_>,
     ) -> Result<Option<FileDrift>, ScanError> {
         let destination = hash_file(target)?;
         let rendered = match self.chezmoi.cat_probe(target) {
@@ -252,12 +304,8 @@ impl DriftScanner {
             Err(ChezmoiError::Eval(f)) => Err(f),
             Err(other) => return Err(other.into()),
         };
-        let source_rel = match self.chezmoi.source_path(target) {
-            Ok(abs) => abs.strip_prefix(source_dir).ok().map(Path::to_path_buf),
-            Err(_) => None,
-        };
-        let git = match &source_rel {
-            Some(rel) => GitSignals {
+        let git = match (&source_rel, signals) {
+            (Some(rel), GitSignalSource::PerFile) => GitSignals {
                 local_ahead: self
                     .git
                     .commits_touching(&format!("{}..HEAD", self.remote_ref), rel)?
@@ -267,7 +315,11 @@ impl DriftScanner {
                     .commits_touching(&format!("HEAD..{}", self.remote_ref), rel)?
                     > 0,
             },
-            None => GitSignals::default(),
+            (Some(rel), GitSignalSource::Sets { local, remote }) => GitSignals {
+                local_ahead: local.contains(rel),
+                remote_ahead: remote.contains(rel),
+            },
+            (None, _) => GitSignals::default(),
         };
         let probe = StateProbe {
             destination,

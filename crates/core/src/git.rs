@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -243,6 +244,20 @@ impl GitClient {
                 context: "commits_touching",
                 detail: e.to_string(),
             })
+    }
+
+    /// Every path some commit in `range` touched, from ONE history walk:
+    /// `rel ∈ files_touched_in(range)` is `commits_touching(range, rel) > 0`
+    /// without a subprocess per path (both list the files of each commit in
+    /// the range; both leave TREESAME merge commits out). `--format=` drops
+    /// the commit headers, so the output is file names and blank lines.
+    pub fn files_touched_in(&self, range: &str) -> Result<BTreeSet<PathBuf>, GitError> {
+        Ok(self
+            .run_utf8(&["log", "--name-only", "--format=", range])?
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect())
     }
 
     pub fn add_all(&self) -> Result<(), GitError> {

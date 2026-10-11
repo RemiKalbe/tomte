@@ -200,3 +200,64 @@ fn origin_differences_are_detected_per_target() {
         report.origin_differs
     );
 }
+
+/// `source-path` is batched (spec 2026-10-11 §2.3): one call, one line per
+/// target in argument order. A target chezmoi does not know makes the whole
+/// call fail, and the chunk is then answered one target at a time — never
+/// by zipping a short reply against the full chunk.
+///
+/// MUTATION: on a failed chunk, extend the result with `None` for EVERY
+/// target of the chunk instead of retrying per target → the third entry
+/// is `None`. (The line-count check is pinned by the scripted-runner test
+/// `source_paths_retries_a_short_reply_per_target` in `chezmoi.rs`: real
+/// chezmoi never answers a short reply with exit 0.)
+#[test]
+fn source_paths_answers_in_argument_order_and_never_misaligns() {
+    let s = Scratch::new();
+    let chezmoi = s.chezmoi();
+    let testrc = s.home.join(".testrc");
+    let unmanaged = s.home.join(".nope");
+    let got = chezmoi
+        .source_paths(&[testrc.clone(), unmanaged, testrc.clone()])
+        .unwrap();
+    assert_eq!(got.len(), 3);
+    assert_eq!(
+        got[0].as_deref(),
+        Some(s.source.join("dot_testrc").as_path())
+    );
+    assert_eq!(got[1], None);
+    assert_eq!(got[2], got[0]);
+}
+
+/// The scan reads ahead/behind from two `git log --name-only` sets computed
+/// once (spec 2026-10-11 §2.3). A committed, unpushed source edit is
+/// `local_ahead`; the per-event probe of one file still asks git per file.
+///
+/// MUTATION: hand `probe_file` an empty `local` set in `scan` (drop the
+/// `files_touched_in("origin/main..HEAD")` call) → `local_ahead` reads
+/// false here. (`remote_push_is_remote_ahead` above pins the `remote` set
+/// the same way: an empty one turns its RemoteAhead into something else.)
+#[test]
+fn a_committed_unpushed_source_edit_is_local_ahead_in_both_probes() {
+    let s = Scratch::new();
+    std::fs::write(s.source.join("dot_testrc"), "a=committed\n").unwrap();
+    git(&s.source, &["add", "."]);
+    git(&s.source, &["commit", "-m", "local edit"]);
+    let report = s.scanner().scan().unwrap();
+    assert_eq!(report.drifted.len(), 1);
+    assert!(
+        report.drifted[0].probe.git.local_ahead,
+        "{:?}",
+        report.drifted[0].probe.git
+    );
+    assert!(!report.drifted[0].probe.git.remote_ahead);
+    let one = s
+        .scanner()
+        .probe_one(&s.home.join(".testrc"))
+        .unwrap()
+        .expect("drifted");
+    assert_eq!(
+        one.probe.git, report.drifted[0].probe.git,
+        "both probes agree"
+    );
+}
