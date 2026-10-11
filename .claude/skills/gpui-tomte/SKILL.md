@@ -100,8 +100,13 @@ The shapes that matter in practice:
   below it fall in the same window (a Review decision on a row below the
   scroll top moves that row up into PROCESSING). So splice only the
   changed window (`splice_window`) AND re-anchor by row key around every
-  splice or reset (`re_anchor_index` in `review.rs`). `reset(n)` only when
-  the item set is replaced wholesale; it also drops every measured height.
+  splice or reset (`re_anchor_index` in `review.rs`). `splice` snaps only
+  a `Some` anchor: an unscrolled list (`logical_scroll_top() == {0, 0}`,
+  which is also what a `None` anchor reads as) is left at the top, which is
+  right when rows are inserted at index 0, so never re-anchor it (a
+  by-key re-anchor would follow the old first row down and push the new
+  rows above the viewport). `reset(n)` only when the item set is replaced
+  wholesale; it also drops every measured height.
 - The item closure runs in the list's prepaint, after the owning view's
   `render` returned and its lease was released: `weak.upgrade().update(cx,
   |view, cx| …)` inside it is a fresh update, and the way a row gets a
@@ -120,10 +125,11 @@ The shapes that matter in practice:
   `scroll_to(ListOffset { item_ix, .. })`.
 - A `Rc<Cell<usize>>` counter in the item closure, reset in `render`, is
   the test seam for "only the rows in view render" (`rows_rendered`).
-- The item closure is also called from `List::request_layout` and
-  `prepaint` while the list holds its `ListState`'s `RefCell` borrowed
-  (`list.rs` 0.2.2): reading or splicing that `ListState` from inside a
-  row panics.
+- The item closure is called from `List::prepaint` (and, only under
+  `ListSizingBehavior::Infer`, also from `request_layout`; the default
+  `Auto` just requests a plain layout there) while the list holds its
+  `ListState`'s `RefCell` borrowed (`list.rs` 0.2.2): reading or splicing
+  that `ListState` from inside a row panics.
 - Each item is laid out with `layout_as_root` at a definite width but no
   width of its own, so a bare row shrinks to its content (its background
   stops short). Wrap it in `div().w_full().flex().flex_col()` to stretch

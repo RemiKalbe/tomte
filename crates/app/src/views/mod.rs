@@ -5981,6 +5981,88 @@ mod render_smoke {
         );
     }
 
+    /// The first decision on an UNSCROLLED long list: the new PROCESSING
+    /// group must appear at the top, not above the viewport. gpui's own
+    /// splice leaves a top-of-list anchor alone (new rows at index 0 are
+    /// simply shown); the by-key re-anchor must not override that by
+    /// following the old first row down.
+    ///
+    /// MUTATION: drop the `top == {0, 0}` guard (re-anchor unconditionally)
+    /// → the scroll top lands on item 2 and PROCESSING is hidden.
+    #[gpui::test]
+    fn the_first_decision_on_an_unscrolled_list_keeps_processing_in_view(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        // No PROCESSING group yet: the pose's queue is emptied, so the
+        // first decision below CREATES the group at index 0.
+        vis.update(|_w, cx| {
+            shell.update(cx, |s, cx| {
+                s.queue = Default::default();
+                s.queue_pumping = false;
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        let (top, first_is_processing) = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                let is_processing = matches!(
+                    plan.rows.first(),
+                    Some(review::SidebarRow::Group {
+                        label: "PROCESSING",
+                        ..
+                    })
+                );
+                (view.list_state.logical_scroll_top().item_ix, is_processing)
+            })
+        });
+        assert_eq!(top, 0, "the list starts unscrolled");
+        assert!(
+            !first_is_processing,
+            "no PROCESSING group before the decision"
+        );
+        let first_safe = vis
+            .update(|_w, cx| review.update(cx, |view, cx| view.plan(cx).visible_safe[0].clone()));
+        vis.update(|_w, cx| {
+            shell.update(cx, |s, cx| {
+                s.enqueue(
+                    QueuedAction {
+                        target: first_safe.clone(),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    },
+                    cx,
+                )
+            });
+            review.update(cx, |view, cx| {
+                view.selected = Some(first_safe.clone());
+                view.advance_from(&first_safe, cx);
+            });
+        });
+        vis.run_until_parked();
+        vis.run_until_parked();
+        let (top, first_is_processing) = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                let is_processing = matches!(
+                    plan.rows.first(),
+                    Some(review::SidebarRow::Group {
+                        label: "PROCESSING",
+                        ..
+                    })
+                );
+                (view.list_state.logical_scroll_top().item_ix, is_processing)
+            })
+        });
+        assert!(
+            first_is_processing,
+            "the decision created a PROCESSING group at the top"
+        );
+        assert_eq!(top, 0, "and the list still shows the top");
+    }
+
     /// Keep disk on the last file of a folder at the bottom edge: the next
     /// file is the first of the NEXT folder, below that folder's row, which
     /// is the first row under the edge. The decided row leaves for

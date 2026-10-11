@@ -392,10 +392,11 @@ Open, deliberately (design calls, not bugs):
 - The dashboard has no processing surface: a quick action pressed with no
   daemon parks with nothing on screen until the notification fires.
 - Undo's button cannot name its file: `ui::button` has no tooltip slot.
-- `review.rs` is ~4,100 lines; the sidebar planner (`SidebarRow`,
-  `SidebarPlan`, `SidebarInputs`, `sidebar_rows` and their tests, ~500 lines
-  together) is cohesive, pure, and depends only on `review_selection` and
-  `review_tree` — the next chunk to move into its own `review_plan.rs`.
+- `review.rs` is ~4,700 lines; the sidebar planner (`SidebarRow`,
+  `SidebarPlan`, `SidebarInputs`, `sidebar_rows`, plus the list's row keys,
+  `splice_window` and `re_anchor_index`, and their tests) is cohesive, pure,
+  and depends only on `review_selection` and `review_tree` — the next chunk
+  to move into its own `review_plan.rs`.
 - The per-event path (`rescan_source_side`) and `handle_fetch`'s per-file
   probes still run under the lock — bounded by changed-file counts; give
   them the begin/apply split if one ever shows in a banner.

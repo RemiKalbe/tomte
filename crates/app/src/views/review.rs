@@ -3025,7 +3025,17 @@ impl ReviewView {
         // found by key. The offset into the row is kept only when the very
         // same row survived; a neighbour standing in for a vanished row is
         // shown from its top.
-        if changed && let Some(new_ix) = re_anchor_index(&self.row_keys, &keys, top.item_ix) {
+        //
+        // Never for an unscrolled list (`{0, 0}`, which is also what an
+        // unset anchor reads as): gpui's splice leaves it at the top, which
+        // is right when rows are inserted at index 0 (the first decision
+        // creates PROCESSING there). Following the old first row down would
+        // push the new group above the viewport.
+        let at_top = top.item_ix == 0 && top.offset_in_item == px(0.);
+        if changed
+            && !at_top
+            && let Some(new_ix) = re_anchor_index(&self.row_keys, &keys, top.item_ix)
+        {
             let same_row = self.row_keys.get(top.item_ix) == keys.get(new_ix);
             self.list_state.scroll_to(ListOffset {
                 item_ix: new_ix,
@@ -3147,8 +3157,9 @@ fn group_header(label: &'static str, theme: Theme) -> Div {
 /// `selection_active` is handed in rather than read via `&self` because the
 /// caller already has it computed for the row loop too).
 ///
-/// Hover-revealed exactly like a row's own checkbox (ruling 5): opacity 0 at
-/// rest, `group_hover` over the header's own `.group(..)` to 1, and forced
+/// The select-all checkbox is hover-revealed exactly like a row's own
+/// checkbox (ruling 5): opacity 0 at rest, `group_hover` over the header's
+/// own `.group(..)` to 1, and forced
 /// to 1 while the selection is non-empty — so the affordance exists at rest
 /// (it is reachable by hovering) without being painted when nothing is
 /// selected.
