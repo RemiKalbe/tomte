@@ -614,11 +614,15 @@ fn a_scan_requested_during_a_scan_runs_after_it() {
 
 /// MUTATION: clear `scan_in_progress` only on the `Ok` path → a failed scan
 /// leaves `begin_scan` returning `None` forever: no scan ever runs again.
+///
+/// MUTATION: take `rescan_wanted` before `report?` (the original shape) → the
+/// request asked during the failing scan is lost and this reads false.
 #[test]
 fn a_failed_scan_releases_the_in_progress_flag() {
     let s = Scratch::new();
     let mut core = core_for(&s);
     let (_scanner, ticket) = core.begin_scan(100).unwrap();
+    assert!(core.begin_scan(100).is_none(), "asked during the scan");
     let err = core.apply_scan(
         ticket,
         Err(ScanError::Io(std::io::Error::other("boom"))),
@@ -626,7 +630,12 @@ fn a_failed_scan_releases_the_in_progress_flag() {
     );
     assert!(err.is_err());
     assert!(!core.scan_in_progress());
-    assert!(core.begin_scan(102).is_some());
+    let (scanner, ticket) = core.begin_scan(102).unwrap();
+    let outcome = core.apply_scan(ticket, scanner.scan(), 103).unwrap();
+    assert!(
+        outcome.rescan_wanted,
+        "the request survived the failed scan"
+    );
 }
 
 /// A scan whose thread never came back (30 min and counting) is taken over
@@ -686,4 +695,35 @@ fn a_target_forgotten_during_a_scan_is_not_resurrected_by_its_report() {
         saw_left |= matches!(ev, Event::LeftManagement { .. });
     }
     assert!(saw_left);
+}
+
+/// A file fixed OUTSIDE Tomte while a scan runs (`chezmoi apply` in a
+/// terminal: no `expect_changes`, the watcher sees a foreign change that
+/// probes as in sync): the per-event path clears it through `clear_drift`,
+/// and the stale report must not put it back.
+///
+/// MUTATION: replace `self.clear_drift(target)` in `probe_and_journal`'s
+/// in-sync arm with `self.drift_state.remove(target)` → the report
+/// re-adds `.testrc` and `drifted` reads 1.
+#[test]
+fn a_target_fixed_by_hand_during_a_scan_stays_resolved() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let target = s.home.join(".testrc");
+    let source_text = std::fs::read(s.source.join("dot_testrc")).unwrap();
+    std::fs::write(&target, "a=drift\n").unwrap();
+    core.handle_paths_changed(std::slice::from_ref(&target), 99)
+        .unwrap();
+    let (scanner, ticket) = core.begin_scan(100).unwrap();
+    let report = scanner.scan();
+    assert_eq!(report.as_ref().unwrap().drifted.len(), 1);
+    std::fs::write(&target, &source_text).unwrap();
+    core.handle_paths_changed(std::slice::from_ref(&target), 101)
+        .unwrap();
+    assert!(
+        core.status_snapshot().0.is_empty(),
+        "the event path cleared it"
+    );
+    let outcome = core.apply_scan(ticket, report, 102).unwrap();
+    assert_eq!(outcome.drifted, 0, "the stale report did not resurrect it");
 }

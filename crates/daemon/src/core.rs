@@ -594,7 +594,9 @@ impl DaemonCore {
     /// Phase 3: land a report. Always releases `scan_in_progress` for the
     /// scan the ticket belongs to, `Err` included. A target the per-event
     /// path touched meanwhile keeps its state (see `set_drift`); a target
-    /// that left management meanwhile is dropped, not journaled.
+    /// that left management meanwhile is dropped, not journaled. A rescan
+    /// asked for meanwhile is handed back only on success: every `Err` path
+    /// leaves the flag set, so the next successful apply carries it.
     pub fn apply_scan(
         &mut self,
         ticket: ScanTicket,
@@ -614,7 +616,6 @@ impl DaemonCore {
         }
         let touched = std::mem::take(&mut self.touched_during_scan);
         self.scan_in_progress = false;
-        let rescan_wanted = std::mem::take(&mut self.rescan_wanted);
         let report = report?;
         self.reconcile_managed(now_ts)?;
         self.degraded = report.degraded.as_ref().map(|f| f.hint.clone());
@@ -684,6 +685,7 @@ impl DaemonCore {
             ts: now_ts,
             drifted,
         });
+        let rescan_wanted = std::mem::take(&mut self.rescan_wanted);
         Ok(ScanOutcome {
             drifted,
             rescan_wanted,
