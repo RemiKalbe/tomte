@@ -246,15 +246,30 @@ impl GitClient {
             })
     }
 
-    /// Every path some commit in `range` touched, from ONE history walk:
-    /// `rel ∈ files_touched_in(range)` is `commits_touching(range, rel) > 0`
-    /// without a subprocess per path (both list the files of each commit in
-    /// the range; both leave TREESAME merge commits out). `--format=` drops
-    /// the commit headers, so the output is file names and blank lines.
+    /// Whether `range` contains any merge commit.
+    pub fn has_merges(&self, range: &str) -> Result<bool, GitError> {
+        let text = self.run_utf8(&["rev-list", "--merges", "--count", range])?;
+        text.trim()
+            .parse::<u32>()
+            .map(|n| n > 0)
+            .map_err(|e| GitError::Parse {
+                context: "has_merges",
+                detail: e.to_string(),
+            })
+    }
+
+    /// Every path some commit in `range` touched, from ONE history walk.
+    /// For a MERGE-FREE range, `rel ∈ files_touched_in(range)` is
+    /// `commits_touching(range, rel) > 0` without a subprocess per path. With
+    /// a merge in the range the two can differ (no history simplification,
+    /// and merge commits list no files), so `DriftScanner::scan` checks
+    /// [`Self::has_merges`] first and asks per file otherwise. Output is
+    /// NUL-separated (`-z`) so `core.quotePath` cannot quote non-ASCII names;
+    /// `--format=` drops the commit headers.
     pub fn files_touched_in(&self, range: &str) -> Result<BTreeSet<PathBuf>, GitError> {
         Ok(self
-            .run_utf8(&["log", "--name-only", "--format=", range])?
-            .lines()
+            .run_utf8(&["log", "-z", "--name-only", "--format=", range])?
+            .split('\0')
             .filter(|l| !l.is_empty())
             .map(PathBuf::from)
             .collect())

@@ -261,3 +261,69 @@ fn a_committed_unpushed_source_edit_is_local_ahead_in_both_probes() {
         "both probes agree"
     );
 }
+
+/// `git log --name-only` quotes non-ASCII names (`core.quotePath`); the sets
+/// are read NUL-separated so they match the unquoted source path.
+///
+/// MUTATION: drop `-z` and split on newlines → the quoted path never matches
+/// and `local_ahead` reads false.
+#[test]
+fn a_non_ascii_source_name_is_local_ahead() {
+    let s = Scratch::new();
+    std::fs::write(s.source.join("dot_café"), "x=1\n").unwrap();
+    git(&s.source, &["add", "."]);
+    git(&s.source, &["commit", "-m", "add cafe"]);
+    let report = s.scanner().scan().unwrap();
+    let d = report
+        .drifted
+        .iter()
+        .find(|d| d.target.ends_with(".café"))
+        .unwrap_or_else(|| panic!("no .café entry: {:?}", report.drifted));
+    assert!(d.probe.git.local_ahead, "{:?} {:?}", d.class, d.probe.git);
+}
+
+/// A range holding a merge commit is answered per file: the sets would call
+/// a file "ahead" that a merge resolved to origin's version.
+///
+/// MUTATION: drop the `has_merges` check (always use the sets) →
+/// `local_ahead` reads true and the two probes disagree.
+#[test]
+fn a_range_with_a_merge_is_answered_per_file() {
+    let s = Scratch::new();
+    let other = s.root.path().join("other");
+    support::sh(
+        s.root.path(),
+        "git",
+        &["clone", s.bare.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    std::fs::write(other.join("dot_testrc"), "a=origin\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "origin edit"]);
+    git(&other, &["push"]);
+    std::fs::write(s.source.join("dot_testrc"), "a=local\n").unwrap();
+    git(&s.source, &["add", "."]);
+    git(&s.source, &["commit", "-m", "local edit"]);
+    git(&s.source, &["fetch", "origin"]);
+    // Conflicts; keep origin's version.
+    let _ = std::process::Command::new("git")
+        .current_dir(&s.source)
+        .args(["merge", "origin/main"])
+        .output()
+        .unwrap();
+    std::fs::write(s.source.join("dot_testrc"), "a=origin\n").unwrap();
+    git(&s.source, &["add", "."]);
+    git(&s.source, &["commit", "--no-edit", "-m", "merge"]);
+    let report = s.scanner().scan().unwrap();
+    let d = report
+        .drifted
+        .iter()
+        .find(|d| d.target.ends_with(".testrc"))
+        .unwrap_or_else(|| panic!("no .testrc entry: {:?}", report.drifted));
+    assert!(!d.probe.git.local_ahead, "{:?}", d.probe.git);
+    let one = s
+        .scanner()
+        .probe_one(&s.home.join(".testrc"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.probe.git, d.probe.git, "both probes agree");
+}

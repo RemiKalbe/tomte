@@ -191,10 +191,38 @@ impl DriftScanner {
         let local_range = format!("{}..HEAD", self.remote_ref);
         let remote_range = format!("HEAD..{}", self.remote_ref);
         let sets = match (
-            self.git.files_touched_in(&local_range),
-            self.git.files_touched_in(&remote_range),
+            self.git.has_merges(&local_range),
+            self.git.has_merges(&remote_range),
         ) {
-            (Ok(local), Ok(remote)) => Some((local, remote)),
+            (Ok(false), Ok(false)) => {
+                match (
+                    self.git.files_touched_in(&local_range),
+                    self.git.files_touched_in(&remote_range),
+                ) {
+                    (Ok(local), Ok(remote)) => Some((local, remote)),
+                    (l, r) => {
+                        let why = l
+                            .err()
+                            .or(r.err())
+                            .map(|e| e.to_string())
+                            .unwrap_or_default();
+                        crate::log_warn!(
+                            "scan",
+                            "git ahead/behind sets unavailable ({why}); asking per file"
+                        );
+                        None
+                    }
+                }
+            }
+            (Ok(l), Ok(r)) => {
+                let range = if l { &local_range } else { &remote_range };
+                let _ = r;
+                crate::log_info!(
+                    "scan",
+                    "{range} contains merge commits; asking git per file"
+                );
+                None
+            }
             (l, r) => {
                 let why = l
                     .err()
