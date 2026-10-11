@@ -215,12 +215,12 @@ impl DriftScanner {
                 }
             }
             (Ok(l), Ok(r)) => {
-                let range = if l { &local_range } else { &remote_range };
-                let _ = r;
-                crate::log_info!(
-                    "scan",
-                    "{range} contains merge commits; asking git per file"
-                );
+                let ranges = match (l, r) {
+                    (true, true) => format!("{local_range} and {remote_range}"),
+                    (true, false) => local_range.clone(),
+                    _ => remote_range.clone(),
+                };
+                crate::log_info!("scan", "merge commits in {ranges}; asking git per file");
                 None
             }
             (l, r) => {

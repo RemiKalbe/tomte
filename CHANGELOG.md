@@ -18,9 +18,8 @@ version without one.
   its own `.git` inside the chezmoi source tree made every `git status`
   look like a source change; the log cycled every half second, forever.
   Nested repositories are ignored.
-- **Scans cost a third of what they did.** One `chezmoi source-path` call
-  for all candidates and two `git log` walks per scan replace three
-  subprocesses per file.
+- **Scans cost less.** One `chezmoi source-path` call for all candidates
+  and two `git log` walks per scan replace three subprocesses per file.
 
 ### Added
 

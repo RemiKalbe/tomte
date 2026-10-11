@@ -291,17 +291,12 @@ fn main() -> ExitCode {
     ctx.set_core(core.clone());
     println!("tomted: core ready");
 
-    // Initial scan, OFF the lock (`scan::run_scan`): clients connect and get
-    // an honest `scanning: true` meanwhile instead of waiting on the core.
-    // A failure must not kill the daemon — the hourly rescan and manual
-    // Rescan requests can recover it (spec §10).
-    match tomte_daemon::scan::run_scan(&core, now_ts) {
-        Ok(Some(drifted)) => println!("tomted: initial scan done, {drifted} drifted"),
-        Ok(None) => println!("tomted: initial scan already running"),
-        Err(e) => eprintln!("tomted: initial scan failed: {e}"),
-    }
-
-    // watcher → debouncer
+    // watcher → debouncer, started BEFORE the initial scan. The scan runs
+    // off the core lock, so a client can resolve a file while it runs; the
+    // touched-meanwhile guard (`record_expected_apply` via
+    // `handle_paths_changed`) only works if the watcher already sees that
+    // write. Started after the scan, a daemon's first scan would re-journal
+    // a file resolved meanwhile as drifted (final review finding 3).
     let (debouncer, tx) = Debouncer::new(Duration::from_millis(500));
     let mut watcher =
         match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -356,6 +351,16 @@ fn main() -> ExitCode {
                 }
             }
         });
+    }
+
+    // Initial scan, OFF the lock (`scan::run_scan`): clients connect and get
+    // an honest `scanning: true` meanwhile instead of waiting on the core.
+    // A failure must not kill the daemon — the hourly rescan and manual
+    // Rescan requests can recover it (spec §10).
+    match tomte_daemon::scan::run_scan(&core, now_ts) {
+        Ok(Some(drifted)) => println!("tomted: initial scan done, {drifted} drifted"),
+        Ok(None) => {}
+        Err(e) => eprintln!("tomted: initial scan failed: {e}"),
     }
 
     // fetch timer — first fetch RIGHT AWAY (a fresh daemon used to show

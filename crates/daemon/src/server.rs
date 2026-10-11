@@ -248,11 +248,12 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
     // phase, each a bounded few seconds, so bouncing "busy — retry shortly"
     // at the user made saves a timing game (2026-08-08). Each connection has its
     // own thread, so waiting here stalls nobody else; the bound
-    // (`busy_wait`, see `DEFAULT_BUSY_WAIT`) rides above a full scan and
-    // under the client's request timeout. A scan that outlasts it still
+    // (`busy_wait`, see `DEFAULT_BUSY_WAIT`) rides above those holders and
+    // under the client's request timeout. Scans no longer hold the core, so
+    // what can outlast it is a slow apply phase or fetch; that still
     // bounces — and the app's resolve engine retries that bounce for as
     // long as its own patience allows, so the user sees "busy" only when
-    // the daemon stayed busy, not because one scan ran long (2026-09-21).
+    // the daemon stayed busy, not because one holder ran long (2026-09-21).
     let mut c = match core.try_lock() {
         Ok(c) => c,
         Err(std::sync::TryLockError::WouldBlock) => {

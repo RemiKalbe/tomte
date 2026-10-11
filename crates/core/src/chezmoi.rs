@@ -153,6 +153,52 @@ const ONEPASSWORD_ATTEMPTS: u32 = 3;
 /// worst case — 2 × this — stays under the second a person will sit through.
 const ONEPASSWORD_BACKOFF: Duration = Duration::from_millis(250);
 
+/// How many times a chezmoi call is attempted when another chezmoi holds its
+/// persistent-state (Bolt) lock. `chezmoi apply` holds it for its whole run,
+/// and a daemon scan runs WITHOUT the daemon's core lock (spec 2026-10-11),
+/// so a scan's `state dump` / `source-path` / `status` routinely meets the
+/// app's apply. chezmoi itself waits about a second before giving up, so 40
+/// attempts with [`STATE_LOCK_BACKOFF`] between them outlast a bulk apply of
+/// a minute — and stay bounded, so a chezmoi that never lets go still fails.
+const STATE_LOCK_ATTEMPTS: u32 = 40;
+
+/// The wait between [`STATE_LOCK_ATTEMPTS`].
+const STATE_LOCK_BACKOFF: Duration = Duration::from_millis(500);
+
+/// True when chezmoi failed because another chezmoi held its persistent-state
+/// lock (chezmoi v2.70.4: `timeout obtaining persistent state lock, is
+/// another instance of chezmoi running?`). Nothing ran: the lock is taken
+/// before any work, so the call is safe to repeat.
+pub(crate) fn is_state_lock_timeout(stderr: &str) -> bool {
+    stderr.contains("timeout obtaining persistent state lock")
+}
+
+/// The one retry policy for the state lock, shared by every loop that meets
+/// it. Called after attempt number `attempt` failed on the lock: returns
+/// `true` (after logging on attempts 1, 10, 20 and 30 and sleeping one
+/// backoff) when the caller should try again, `false` (after a warning) when
+/// the budget is spent and the caller must return the error.
+fn state_lock_should_retry(what: &str, attempt: u32) -> bool {
+    if attempt >= STATE_LOCK_ATTEMPTS {
+        crate::log_warn!(
+            "chezmoi",
+            "`chezmoi {what}`: another chezmoi still held the persistent-state lock after \
+             {attempt} attempts; giving up"
+        );
+        return false;
+    }
+    if attempt == 1 || attempt.is_multiple_of(10) {
+        crate::log_info!(
+            "chezmoi",
+            "`chezmoi {what}`: another chezmoi holds the persistent-state lock (attempt \
+             {attempt}/{STATE_LOCK_ATTEMPTS}); retrying every {}ms",
+            STATE_LOCK_BACKOFF.as_millis()
+        );
+    }
+    std::thread::sleep(STATE_LOCK_BACKOFF);
+    true
+}
+
 /// Classify stderr from a failed chezmoi invocation into a structured
 /// evaluation failure (spec §4 EvalFailed, §9 remediation hints).
 pub fn classify_eval_stderr(stderr: &str) -> Option<EvalFailure> {
@@ -302,8 +348,17 @@ impl ChezmoiClient {
         timeout: Duration,
     ) -> Result<Vec<u8>, ChezmoiError> {
         let mut attempt = 1;
+        let mut lock_attempt = 1;
         loop {
             match self.run_ok_once(args, stdin.clone(), timeout) {
+                // Another chezmoi (the app's `apply`) holds the state lock:
+                // nothing ran, so wait it out under the shared policy.
+                Err(ChezmoiError::Exit { ref stderr, .. })
+                    if is_state_lock_timeout(stderr)
+                        && state_lock_should_retry(&args.join(" "), lock_attempt) =>
+                {
+                    lock_attempt += 1;
+                }
                 Err(ChezmoiError::Eval(eval))
                     if eval.kind == EvalFailureKind::OnePasswordAuth
                         && attempt < ONEPASSWORD_ATTEMPTS =>
@@ -424,7 +479,10 @@ impl ChezmoiClient {
     /// 2026-10-11). Chunked so an argv stays a few thousand paths at most.
     /// A chunk that exits non-zero (one unmanaged target fails the whole
     /// call) or answers the wrong number of lines is retried one target at
-    /// a time — two lists of different lengths are never zipped.
+    /// a time — two lists of different lengths are never zipped. A chunk
+    /// that failed because another chezmoi held the persistent-state lock is
+    /// retried AS A CHUNK under the state-lock policy: splitting it would
+    /// only send every target into the same lock.
     pub fn source_paths(&self, targets: &[PathBuf]) -> Result<Vec<Option<PathBuf>>, ChezmoiError> {
         const CHUNK: usize = 128;
         let mut out = Vec::with_capacity(targets.len());
@@ -432,10 +490,30 @@ impl ChezmoiClient {
             let mut args: Vec<String> = vec!["source-path".into()];
             args.extend(chunk.iter().map(|p| p.to_string_lossy().into_owned()));
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            // Expected to fail when the chunk holds an unmanaged target:
-            // logged as such, not as an error, like `cat_probe`.
-            let req = self.request(&arg_refs).failure_is_expected();
-            let reply = self.runner.run(req)?;
+            let what = format!("source-path ({} targets)", chunk.len());
+            let mut lock_attempt = 1;
+            let reply = loop {
+                // Expected to fail when the chunk holds an unmanaged target:
+                // logged as such, not as an error, like `cat_probe`.
+                let req = self.request(&arg_refs).failure_is_expected();
+                let reply = self.runner.run(req)?;
+                if !reply.success() {
+                    let stderr = reply.stderr_utf8();
+                    if is_state_lock_timeout(&stderr) {
+                        if state_lock_should_retry(&what, lock_attempt) {
+                            lock_attempt += 1;
+                            continue;
+                        }
+                        // Budget spent: splitting the chunk would only send
+                        // every target into the same lock. Fail the call.
+                        return Err(ChezmoiError::Exit {
+                            code: reply.exit_code,
+                            stderr,
+                        });
+                    }
+                }
+                break reply;
+            };
             let lines: Vec<PathBuf> = if reply.success() {
                 String::from_utf8_lossy(&reply.stdout)
                     .lines()
@@ -447,8 +525,29 @@ impl ChezmoiClient {
             if reply.success() && lines.len() == chunk.len() {
                 out.extend(lines.into_iter().map(Some));
             } else {
+                crate::log_info!(
+                    "chezmoi",
+                    "source-path for a chunk of {} targets {}; asking one target at a time",
+                    chunk.len(),
+                    if reply.success() {
+                        format!("answered {} lines", lines.len())
+                    } else {
+                        format!("exited {}", reply.exit_code)
+                    }
+                );
                 for target in chunk {
-                    out.push(self.source_path(target).ok());
+                    match self.source_path(target) {
+                        Ok(p) => out.push(Some(p)),
+                        Err(e) => {
+                            crate::log_warn!(
+                                "chezmoi",
+                                "source-path for {} failed ({e}); git signals for it default to \
+                                 \"not ahead\" this scan",
+                                target.display()
+                            );
+                            out.push(None);
+                        }
+                    }
                 }
             }
         }
@@ -882,5 +981,49 @@ mod tests {
             .unwrap();
         assert_eq!(got, vec![Some(PathBuf::from("/src/dot_a")), None]);
         assert_eq!(fake.calls().len(), 3);
+    }
+
+    /// chezmoi v2.70.4's stderr when another chezmoi (the app's `apply`)
+    /// holds the persistent-state lock for longer than chezmoi waits.
+    const STATE_LOCK_STDERR: &str = "chezmoi: timeout obtaining persistent state lock, is another instance of chezmoi running?\n";
+
+    /// A scan's `state dump` that meets the app's `apply` waits it out
+    /// instead of killing the whole scan (final review finding 2a).
+    ///
+    /// MUTATION: drop the `is_state_lock_timeout` arm from
+    /// `run_ok_with_timeout` → the first reply is returned as `Err(Exit)`.
+    #[test]
+    fn a_state_lock_timeout_is_retried() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(1, "", STATE_LOCK_STDERR);
+        fake.push_ok(0, "/src\n", "");
+        let got = client(fake.clone()).source_dir().unwrap();
+        assert_eq!(got, PathBuf::from("/src"));
+        assert_eq!(fake.calls().len(), 2, "retried once, then succeeded");
+    }
+
+    /// A batched `source-path` chunk that meets the state lock is retried AS
+    /// A CHUNK; splitting it per target would send each target into the
+    /// same lock and degrade conflicts to "not ahead" (finding 2b).
+    ///
+    /// MUTATION: treat the lock timeout like any other chunk failure (drop
+    /// the lock branch in `source_paths`) → the chunk falls back per target:
+    /// three calls, and the per-target replies are not what was scripted.
+    #[test]
+    fn source_paths_retries_a_state_locked_chunk_whole() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(1, "", STATE_LOCK_STDERR);
+        fake.push_ok(0, "/src/dot_a\n/src/dot_b\n", "");
+        let got = client(fake.clone())
+            .source_paths(&["/h/.a".into(), "/h/.b".into()])
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Some(PathBuf::from("/src/dot_a")),
+                Some(PathBuf::from("/src/dot_b"))
+            ]
+        );
+        assert_eq!(fake.calls().len(), 2, "one retry of the whole chunk");
     }
 }

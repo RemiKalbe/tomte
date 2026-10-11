@@ -18,6 +18,7 @@ use gpui::{
     App, AppContext as _, Application, Bounds, Entity, WindowBounds, WindowOptions, px, size,
 };
 use objc2::MainThreadMarker;
+use tomte_app::daemon_watchdog::{DaemonWatchdog, Verdict};
 use tomte_app::ipc::{IpcClient, IpcError};
 use tomte_app::model::{SyncModel, TIMELINE_CAP};
 use tomte_app::resolve::ResolveEngine;
@@ -766,19 +767,12 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
             // after the scan), so poll Status every 30s regardless — the
             // first-launch bug was exactly this staleness.
             let mut last_status_refresh = Instant::now();
-            // Sick-daemon detector, rebuilt after the 2026-08-02 sleep/wake
-            // incident (kill-loop every 180s, orphaned daemons piling up):
-            // - the limit sits PAST the daemon's own 5-min startup deadline,
-            //   so a daemon that can self-recover always gets to;
-            // - machine sleep must not count as stuck time (Instant math
-            //   spans the nap): a big gap between ticks resets the clock;
-            // - one shot per connection epoch — after firing once we don't
-            //   fire again until the daemon has reported healthy
-            //   (scanning=false), so a slow recovery is never kill-looped.
+            // Sick-daemon detector (see `DaemonWatchdog` for the rules and
+            // the 2026-08-02 incident behind them). The limit sits PAST the
+            // daemon's own 5-min startup deadline; a ScanDone counts as
+            // progress, so chained scans while a queue clears never trip it.
             const STUCK_LIMIT: Duration = Duration::from_secs(360);
-            let mut stuck_since: Option<Instant> = None;
-            let mut watchdog_armed = true;
-            let mut last_tick = Instant::now();
+            let mut watchdog = DaemonWatchdog::new(STUCK_LIMIT, Duration::from_secs(120));
             loop {
                 // Flush an expired coalescing window: exactly one notification
                 // per window, no matter how many pushes landed inside it.
@@ -801,6 +795,7 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                             signal
                         });
                         if is_scan_done {
+                            watchdog.scan_done(Instant::now());
                             last_status_refresh = Instant::now();
                             if !refresh_status(&client, &state, cx).await {
                                 return;
@@ -840,37 +835,20 @@ fn spawn_boot_and_event_loop(cx: &mut App, state: Entity<SyncModel>, paths: Path
                                     (model.scanning, model.degraded.clone())
                                 })
                                 .unwrap_or((false, None));
-                            // Sleep grace: a wall gap far beyond the 30s
-                            // cadence means the machine napped — nothing the
-                            // daemon did, so its clock restarts.
-                            if last_tick.elapsed() > Duration::from_secs(120) {
-                                stuck_since = None;
-                            }
-                            last_tick = Instant::now();
-                            match (scanning, stuck_since) {
-                                (false, _) => {
-                                    stuck_since = None;
-                                    watchdog_armed = true;
-                                }
-                                (true, None) => stuck_since = Some(Instant::now()),
-                                (true, Some(since))
-                                    if watchdog_armed && since.elapsed() > STUCK_LIMIT =>
-                                {
-                                    eprintln!(
-                                        "tomte: daemon scanning/starting for {}s (status: {}) — restarting it once; will not fire again until it reports healthy",
-                                        since.elapsed().as_secs(),
-                                        degraded.as_deref().unwrap_or("no detail")
-                                    );
-                                    let c = client.clone();
-                                    cx.background_executor()
-                                        .spawn(async move {
-                                            let _ = c.request(Request::Shutdown);
-                                        })
-                                        .detach();
-                                    stuck_since = None;
-                                    watchdog_armed = false;
-                                }
-                                (true, Some(_)) => {}
+                            if let Verdict::Restart { stuck_for } =
+                                watchdog.tick(scanning, Instant::now())
+                            {
+                                eprintln!(
+                                    "tomte: daemon scanning/starting for {}s (status: {}) — restarting it once; will not fire again until it reports healthy",
+                                    stuck_for.as_secs(),
+                                    degraded.as_deref().unwrap_or("no detail")
+                                );
+                                let c = client.clone();
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        let _ = c.request(Request::Shutdown);
+                                    })
+                                    .detach();
                             }
                         }
                     }

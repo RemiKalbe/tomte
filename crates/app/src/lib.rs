@@ -3,6 +3,7 @@
 //! integration tests. Views and the AppKit platform layer stay bin-only.
 
 pub mod action_queue;
+pub mod daemon_watchdog;
 pub mod ipc;
 pub mod merge_inputs;
 pub mod merge_state;
