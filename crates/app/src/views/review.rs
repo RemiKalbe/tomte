@@ -51,7 +51,7 @@ use super::review_tree::{
 const SIDEBAR_WIDTH: f32 = 260.;
 /// The queue must stay wide enough to read a filename, and never swallow
 /// the diff it exists to introduce.
-const MIN_SIDEBAR_W: f32 = 180.;
+pub(super) const MIN_SIDEBAR_W: f32 = 180.;
 const MAX_SIDEBAR_W: f32 = 520.;
 /// History: tall enough for ~3 rows by default, and it must never grow so
 /// far that the diff it introduces disappears.
@@ -1247,7 +1247,7 @@ pub struct ReviewView {
     preview_dirty: bool,
     preview_appearance: Option<gpui::WindowAppearance>,
     /// Draggable sidebar width (2026-08-27); `None` until first render.
-    sidebar_width: Option<f32>,
+    pub(super) sidebar_width: Option<f32>,
     sidebar_drag: Option<ui::DragState<()>>,
     /// Draggable History height, and its in-flight drag.
     history_height: Option<f32>,
@@ -1586,7 +1586,7 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// The List/Tree segmented control, top-right of the sidebar.
+    /// The folder-tree toggle on the SAFE TO RESOLVE header.
     ///
     /// `pub(super)` so a `#[gpui::test]` can flip it directly, the same
     /// reason `row_click` is.
@@ -1600,10 +1600,10 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// The List/Tree segmented control's guard: re-pressing the already
-    /// active mode is a no-op, since `toggle_mode` only knows how to flip.
-    /// Both segment listeners share this instead of repeating the guard
-    /// inline (final review, Minor 11).
+    /// Set the mode idempotently: re-asserting the active mode is a no-op,
+    /// since `toggle_mode` only knows how to flip. Test-only now that the
+    /// header's single toggle flips; the T7 tree test still pins the guard.
+    #[cfg(test)]
     pub(super) fn set_mode(&mut self, mode: ReviewMode, cx: &mut Context<Self>) {
         if self.mode != mode {
             self.toggle_mode(cx);
@@ -2064,7 +2064,8 @@ impl ReviewView {
         for row in &plan.rows {
             match row {
                 SidebarRow::Group { label, check } => rows.push(
-                    group_header_el(label, *check, selection_active, theme, cx).into_any_element(),
+                    group_header_el(label, *check, selection_active, self.mode, theme, cx)
+                        .into_any_element(),
                 ),
                 SidebarRow::Folder { node, check } => {
                     let row_path = node.path.clone();
@@ -2140,7 +2141,6 @@ impl ReviewView {
             .h_full()
             .flex()
             .flex_col()
-            .child(self.mode_control(theme, cx))
             .child(
                 div()
                     .id("review-sidebar-rows")
@@ -2169,46 +2169,6 @@ impl ReviewView {
                             .child(format!("In sync ({in_sync})")),
                     ),
             )
-    }
-
-    /// The List/Tree segmented control, top-right of the sidebar (spec
-    /// §2.5): same shape as [`Self::comparison_selector`]. Re-pressing the
-    /// already-active mode is a no-op rather than flipping it, since
-    /// `toggle_mode` only knows how to flip.
-    fn mode_control(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
-        let entries: [(ReviewMode, &'static str, &'static str, &'static str); 2] = [
-            (ReviewMode::Flat, "review-mode-list", "List", "Flat list"),
-            (ReviewMode::Tree, "review-mode-tree", "Tree", "Folder tree"),
-        ];
-        let segments: Vec<Stateful<Div>> = entries
-            .into_iter()
-            .map(|(mode, id, label, tooltip)| {
-                let selected = self.mode == mode;
-                ui::button(
-                    theme,
-                    id,
-                    label.into(),
-                    if selected {
-                        ui::ButtonVariant::Tonal(theme.accent)
-                    } else {
-                        ui::ButtonVariant::Ghost
-                    },
-                    ui::ButtonSize::Micro,
-                    cx.listener(move |view, _ev, _window, cx| view.set_mode(mode, cx)),
-                )
-                .tooltip(ui::text_tooltip(tooltip))
-                .flex_shrink_0()
-            })
-            .collect();
-        div()
-            .flex_none()
-            .px_3()
-            .py_1()
-            .flex()
-            .items_center()
-            .justify_end()
-            .gap_1()
-            .children(segments)
     }
 }
 
@@ -2920,6 +2880,7 @@ fn group_header_el(
     label: &'static str,
     check: Option<CheckState>,
     selection_active: bool,
+    mode: ReviewMode,
     theme: Theme,
     cx: &mut Context<ReviewView>,
 ) -> Div {
@@ -2932,16 +2893,38 @@ fn group_header_el(
     match check {
         None => wrapper.child(group_header(label, theme)),
         Some(state) => wrapper.child(group_header(label, theme)).child(
-            div().pr_3().child(
-                ui::checkbox(
-                    theme,
-                    "safe-select-all",
-                    state,
-                    cx.listener(|view, _ev, _w, cx| view.toggle_all_safe(cx)),
+            div()
+                .pr_3()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                // The flat-list / folder-tree toggle (spec 2026-10-11 §2.1):
+                // on THIS header because Tree mode reshapes only this group.
+                // Always visible, unlike the hover-revealed checkbox beside
+                // it: it is the mode's only entry point.
+                .child(
+                    ui::icon_button(
+                        theme,
+                        "review-mode-toggle",
+                        ui::folder_tree(theme),
+                        mode == ReviewMode::Tree,
+                        "Folder tree".into(),
+                        cx.listener(|view, _ev, _w, cx| view.toggle_mode(cx)),
+                    )
+                    // Test-only (no-op in release builds): a real click in
+                    // the render-smoke test finds it by this name.
+                    .debug_selector(|| "review-mode-toggle".into()),
                 )
-                .opacity(if selection_active { 1. } else { 0. })
-                .group_hover("review-safe-header", |el| el.opacity(1.)),
-            ),
+                .child(
+                    ui::checkbox(
+                        theme,
+                        "safe-select-all",
+                        state,
+                        cx.listener(|view, _ev, _w, cx| view.toggle_all_safe(cx)),
+                    )
+                    .opacity(if selection_active { 1. } else { 0. })
+                    .group_hover("review-safe-header", |el| el.opacity(1.)),
+                ),
         ),
     }
 }

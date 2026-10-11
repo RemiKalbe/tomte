@@ -4437,6 +4437,73 @@ mod render_smoke {
         );
     }
 
+    /// The List/Tree control is a toggle on the SAFE TO RESOLVE header
+    /// (spec 2026-10-11 §2.1), reached by a real click.
+    ///
+    /// MUTATION: pass `|_, _, _| {}` as the toggle's listener in
+    /// `group_header_el` → the click lands and the mode stays Flat.
+    #[gpui::test]
+    fn the_header_toggle_flips_the_mode_with_a_real_click(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect", smoke_paths(), cx)
+                .expect("review-multiselect fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).mode),
+            review::ReviewMode::Flat
+        );
+        let toggle = vis
+            .debug_bounds("review-mode-toggle")
+            .expect("the SAFE TO RESOLVE header rendered its toggle");
+        vis.simulate_click(toggle.center(), gpui::Modifiers::default());
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).mode),
+            review::ReviewMode::Tree
+        );
+        vis.run_until_parked();
+        let toggle = vis
+            .debug_bounds("review-mode-toggle")
+            .expect("still there in Tree mode");
+        vis.simulate_click(toggle.center(), gpui::Modifiers::default());
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).mode),
+            review::ReviewMode::Flat
+        );
+    }
+
+    /// At the sidebar's minimum width the header still holds its label, the
+    /// toggle and the checkbox: the toggle is inside the sidebar, 20 px
+    /// wide, not pushed past the edge.
+    ///
+    /// MUTATION: make the toggle a two-segment "List | Tree" control (two
+    /// `ui::button`s, `ButtonSize::Micro`) → its right edge overruns the
+    /// 180 px column and the containment assertion fails.
+    #[gpui::test]
+    fn the_header_toggle_fits_at_the_minimum_sidebar_width(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-tree", smoke_paths(), cx).expect("review-tree fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                view.sidebar_width = Some(review::MIN_SIDEBAR_W);
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        let column = vis
+            .debug_bounds("review-sidebar-rows")
+            .expect("sidebar column");
+        let toggle = vis.debug_bounds("review-mode-toggle").expect("toggle");
+        assert!(
+            toggle.right() <= column.right() && toggle.left() >= column.left(),
+            "toggle {toggle:?} inside the column {column:?}"
+        );
+        assert_eq!(toggle.size.width, px(20.));
+    }
+
     /// A failure has to outlive its action (spec §2.5) but NOT the drift.
     /// Only a retry cleared one before this, so a file that failed, went
     /// back in sync, and drifted again months later for an unrelated reason
