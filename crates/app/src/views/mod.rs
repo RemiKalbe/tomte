@@ -4438,10 +4438,13 @@ mod render_smoke {
     }
 
     /// The List/Tree control is a toggle on the SAFE TO RESOLVE header
-    /// (spec 2026-10-11 §2.1), reached by a real click.
+    /// (spec 2026-10-11 §2.1), reached by a real click, and its lit state
+    /// follows the mode (the selector name carries `:on` / `:off`).
     ///
     /// MUTATION: pass `|_, _, _| {}` as the toggle's listener in
     /// `group_header_el` → the click lands and the mode stays Flat.
+    /// MUTATION: `active: mode != ReviewMode::Tree` → the `:on`/`:off`
+    /// lookups swap and the first assertion fails.
     #[gpui::test]
     fn the_header_toggle_flips_the_mode_with_a_real_click(cx: &mut TestAppContext) {
         let (shell, vis) = cx.add_window_view(|_window, cx| {
@@ -4454,18 +4457,26 @@ mod render_smoke {
             vis.update(|_w, cx| review.read(cx).mode),
             review::ReviewMode::Flat
         );
+        assert!(
+            vis.debug_bounds("review-mode-toggle:on").is_none(),
+            "Flat mode: the toggle is not lit"
+        );
         let toggle = vis
-            .debug_bounds("review-mode-toggle")
-            .expect("the SAFE TO RESOLVE header rendered its toggle");
+            .debug_bounds("review-mode-toggle:off")
+            .expect("the SAFE TO RESOLVE header rendered its unlit toggle");
         vis.simulate_click(toggle.center(), gpui::Modifiers::default());
         assert_eq!(
             vis.update(|_w, cx| review.read(cx).mode),
             review::ReviewMode::Tree
         );
         vis.run_until_parked();
+        // Only positive lookups after the first re-render: gpui 0.2.2 never
+        // clears `debug_bounds` between frames, so a stale `:off` entry
+        // outlives the mode flip. The first frame is fresh, which is why
+        // the initial `:on` absence check above is sound.
         let toggle = vis
-            .debug_bounds("review-mode-toggle")
-            .expect("still there in Tree mode");
+            .debug_bounds("review-mode-toggle:on")
+            .expect("lit in Tree mode");
         vis.simulate_click(toggle.center(), gpui::Modifiers::default());
         assert_eq!(
             vis.update(|_w, cx| review.read(cx).mode),
@@ -4496,7 +4507,9 @@ mod render_smoke {
         let column = vis
             .debug_bounds("review-sidebar-rows")
             .expect("sidebar column");
-        let toggle = vis.debug_bounds("review-mode-toggle").expect("toggle");
+        let toggle = vis
+            .debug_bounds("review-mode-toggle:on")
+            .expect("lit toggle (review-tree is Tree mode)");
         assert!(
             toggle.right() <= column.right() && toggle.left() >= column.left(),
             "toggle {toggle:?} inside the column {column:?}"

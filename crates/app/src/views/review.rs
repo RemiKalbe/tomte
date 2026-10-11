@@ -2864,8 +2864,11 @@ fn group_header(label: &'static str, theme: Theme) -> Div {
         .child(label)
 }
 
-/// A SAFE TO RESOLVE-style group header, with the SAFE header's select-all
-/// appended at the right when `check.is_some()`.
+/// A SAFE TO RESOLVE-style group header. When `check.is_some()` (the SAFE
+/// header) the right side carries the always-visible flat-list / folder-tree
+/// toggle (lit while `mode` is Tree) and the select-all checkbox after it.
+/// The toggle is not hover-revealed because it is the mode's only entry
+/// point.
 ///
 /// A free function, not a method: it never reads `ReviewView` state (
 /// `selection_active` is handed in rather than read via `&self` because the
@@ -2884,6 +2887,7 @@ fn group_header_el(
     theme: Theme,
     cx: &mut Context<ReviewView>,
 ) -> Div {
+    let active = mode == ReviewMode::Tree;
     let wrapper = div()
         .group("review-safe-header")
         .flex()
@@ -2907,13 +2911,17 @@ fn group_header_el(
                         theme,
                         "review-mode-toggle",
                         ui::folder_tree(theme),
-                        mode == ReviewMode::Tree,
+                        active,
                         "Folder tree".into(),
                         cx.listener(|view, _ev, _w, cx| view.toggle_mode(cx)),
                     )
                     // Test-only (no-op in release builds): a real click in
-                    // the render-smoke test finds it by this name.
-                    .debug_selector(|| "review-mode-toggle".into()),
+                    // the render-smoke test finds it by this name, and the
+                    // `:on`/`:off` suffix is the lit state, from the same
+                    // `active` the button was given.
+                    .debug_selector(move || {
+                        format!("review-mode-toggle:{}", if active { "on" } else { "off" })
+                    }),
                 )
                 .child(
                     ui::checkbox(
