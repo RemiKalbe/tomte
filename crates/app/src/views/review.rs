@@ -1052,6 +1052,62 @@ pub(super) struct SidebarPlan {
     pub visible_safe: Vec<PathBuf>,
 }
 
+/// What identifies a sidebar row to the list element's height cache
+/// (spec 2026-10-11 §2.2). A row whose key is unchanged across a plan
+/// rebuild keeps its measured height; anything else is re-measured. The
+/// queued status and the failure are in the key because they add a
+/// sub-line: same path, different height.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RowKey {
+    Group(&'static str),
+    Folder(PathBuf),
+    Target {
+        path: PathBuf,
+        queued: Option<QueuedStatus>,
+        failed: bool,
+    },
+}
+
+// used by the virtualized sidebar (next task)
+#[allow(dead_code)]
+pub(super) fn row_keys(plan: &SidebarPlan, queue: &QueueSnapshot) -> Vec<RowKey> {
+    plan.rows
+        .iter()
+        .map(|row| match row {
+            SidebarRow::Group { label, .. } => RowKey::Group(label),
+            SidebarRow::Folder { node, .. } => RowKey::Folder(node.path.clone()),
+            SidebarRow::Target { entry, queued, .. } => RowKey::Target {
+                path: entry.target.clone(),
+                queued: queued.map(|q| q.status),
+                failed: queue.failure(&entry.target).is_some(),
+            },
+        })
+        .collect()
+}
+
+/// The window `ListState::splice` must be told about so that unchanged
+/// rows keep their measured heights and the scroll anchor stays on its
+/// row: `(old_range, new_count)` for the middle that differs, `None` when
+/// the two lists are identical. `splice(0..old, new)` would snap the
+/// anchor to item 0 on every rebuild (gpui 0.2.2 `list.rs`, `splice_focusable`).
+// used by the virtualized sidebar (next task)
+#[allow(dead_code)]
+pub(super) fn splice_window(old: &[RowKey], new: &[RowKey]) -> Option<(Range<usize>, usize)> {
+    if old == new {
+        return None;
+    }
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let max_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(max_suffix);
+    Some((prefix..old.len() - suffix, new.len() - prefix - suffix))
+}
+
 pub(super) struct SidebarInputs<'a> {
     pub drifted: &'a [DriftSummary],
     pub queue: &'a QueueSnapshot,
@@ -3119,7 +3175,7 @@ fn preview_decors(lines: &[DiffLine], theme: Theme) -> Vec<ui::text_area::LineDe
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     use tomte_app::action_queue::Decision;
@@ -3132,11 +3188,11 @@ mod tests {
 
     use super::{
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
-        QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, Selection, SidebarInputs,
+        QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, RowKey, Selection, SidebarInputs,
         SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
         display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
-        preview_decors, queued_outcome_banner, refused_banner, severity_groups, sidebar_rows,
-        source_actions, undo_affordance, undo_banner,
+        preview_decors, queued_outcome_banner, refused_banner, row_keys, severity_groups,
+        sidebar_rows, source_actions, splice_window, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -3162,6 +3218,114 @@ mod tests {
             selection: &Selection::default(),
             home: Path::new("/Users/x"),
         })
+    }
+
+    fn keys(names: &[&str]) -> Vec<RowKey> {
+        names
+            .iter()
+            .map(|n| RowKey::Target {
+                path: PathBuf::from(n),
+                queued: None,
+                failed: false,
+            })
+            .collect()
+    }
+
+    /// `ListState::splice(0..old, new)` snaps the scroll anchor to item 0
+    /// whenever the anchor lies in the range — always, for a whole-list
+    /// splice. So only the window that changed is spliced (spec 2026-10-11
+    /// §2.2): common prefix and suffix are kept.
+    ///
+    /// MUTATION: ignore the suffix (`suffix = 0`) → "removed from the
+    /// middle" reports `(1..3, 1)` instead of `(1..2, 0)`.
+    #[test]
+    fn splice_window_keeps_the_common_prefix_and_suffix() {
+        assert_eq!(
+            splice_window(&keys(&["a", "b", "c"]), &keys(&["a", "b", "c"])),
+            None
+        );
+        assert_eq!(
+            splice_window(&keys(&["a", "b", "c"]), &keys(&["p", "q", "a", "b", "c"])),
+            Some((0..0, 2)),
+            "a PROCESSING group appearing at the top"
+        );
+        assert_eq!(
+            splice_window(&keys(&["a", "b", "c"]), &keys(&["a", "c"])),
+            Some((1..2, 0))
+        );
+        assert_eq!(
+            splice_window(&keys(&["a", "b"]), &keys(&["c", "d"])),
+            Some((0..2, 2))
+        );
+        assert_eq!(
+            splice_window(&keys(&["a", "a"]), &keys(&["a"])),
+            Some((1..2, 0)),
+            "no overlap"
+        );
+        assert_eq!(splice_window(&[], &keys(&["a"])), Some((0..0, 1)));
+    }
+
+    /// A row that grew a sub-line (queued, or failed) is taller: its key
+    /// changes so the list re-measures it in place.
+    ///
+    /// MUTATION: drop `queued` (or `failed`) from `RowKey::Target` → the
+    /// two keys compare equal and the window is `None`.
+    #[test]
+    fn a_row_whose_status_changed_is_spliced_in_place() {
+        let before = keys(&["a", "b", "c"]);
+        let mut after = before.clone();
+        after[1] = RowKey::Target {
+            path: PathBuf::from("b"),
+            queued: Some(QueuedStatus::Waiting),
+            failed: false,
+        };
+        assert_eq!(splice_window(&before, &after), Some((1..2, 1)));
+        let mut failed = before.clone();
+        failed[2] = RowKey::Target {
+            path: PathBuf::from("c"),
+            queued: None,
+            failed: true,
+        };
+        assert_eq!(splice_window(&before, &failed), Some((2..3, 1)));
+    }
+
+    /// `row_keys` reads the plan AND the failures: a failed row's key says
+    /// so even though `SidebarRow::Target` does not carry the message.
+    ///
+    /// MUTATIONS: `failed: false` always → the `/b` assertion fails;
+    /// `queued: None` always → the `/c` assertion fails.
+    #[test]
+    fn row_keys_follow_the_plan_and_the_failures() {
+        let drifted = vec![
+            s("/a", "conflict"),
+            s("/b", "destination_drift"),
+            s("/c", "destination_drift"),
+        ];
+        let queue = QueueSnapshot {
+            processing: vec![(
+                PathBuf::from("/c"),
+                QueuedDecision {
+                    status: QueuedStatus::Waiting,
+                    label: "Keep disk",
+                },
+            )],
+            failures: BTreeMap::from([(PathBuf::from("/b"), "op: could not authenticate".into())]),
+            busy: false,
+        };
+        let plan = plan_of(&drifted, &queue);
+        let ks = row_keys(&plan, &queue);
+        let target = |p: &str, queued, failed| RowKey::Target {
+            path: PathBuf::from(p),
+            queued,
+            failed,
+        };
+        assert!(matches!(ks[0], RowKey::Group(_)), "PROCESSING leads");
+        assert_eq!(ks[1], target("/c", Some(QueuedStatus::Waiting), false));
+        assert_eq!(ks[2], RowKey::Group("NEEDS A DECISION"));
+        assert_eq!(ks[3], target("/a", None, false));
+        assert_eq!(ks[4], RowKey::Group("SAFE TO RESOLVE"));
+        assert_eq!(ks[5], target("/b", None, true));
+        assert_eq!(ks.len(), 6);
     }
 
     fn targets(group: &[DriftSummary]) -> Vec<&Path> {
