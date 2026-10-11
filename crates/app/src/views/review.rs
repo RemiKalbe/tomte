@@ -1210,7 +1210,12 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
 
 /// What `sidebar_rows` reads besides the model, compared by value before
 /// every rebuild (spec 2026-10-11 §2.3). The model is not in here: its
-/// changes arrive through the view's observer as `plan_dirty`.
+/// changes arrive through the view's observer as `plan_dirty`. `home()` is
+/// left out too: it is constant for the process.
+///
+/// The observer is deferred: a `plan()` read inside the SAME outer update
+/// that changed the model sees the previous plan. No caller does that today;
+/// gestures are input-driven.
 #[derive(PartialEq)]
 struct PlanKey {
     queue: QueueSnapshot,
@@ -1544,17 +1549,22 @@ impl ReviewView {
         }
     }
 
-    /// The plan the sidebar is showing right now, from the same inputs
-    /// `render_inner` uses. Cheap (a few dozen rows); rebuilt per gesture so
+    /// The plan the sidebar is showing right now, cached (spec 2026-10-11
+    /// §2.3): rebuilt when the queue, the mode, the collapse set, the
+    /// selection or the model changed since the last build, otherwise the
+    /// same `Rc`. Every gesture and `render_inner` read through here, so
     /// every rule reads one snapshot of the world.
     ///
-    /// `pub(super)` so the render-smoke tests can read `safe_order` the same
-    /// way `select_all_safe` does, the same reason `row_click` is.
+    /// `pub(super)` so the render-smoke tests can read `safe_order` the
+    /// same way `select_all_safe` does.
     pub(super) fn plan(&mut self, cx: &Context<Self>) -> Rc<SidebarPlan> {
         let queue = self.queue_snapshot(cx);
         self.plan_with(queue, cx)
     }
 
+    /// The one plan builder: rebuilds when `plan_dirty` is set or the key
+    /// built from `queue` and the view's own state differs from the cached
+    /// one, otherwise hands back the cached `Rc`.
     fn plan_with(&mut self, queue: QueueSnapshot, cx: &App) -> Rc<SidebarPlan> {
         let key = PlanKey {
             queue,

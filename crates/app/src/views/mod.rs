@@ -2788,7 +2788,9 @@ mod render_smoke {
     /// MUTATION: return `Rc::new(sidebar_rows(..))` on every call (drop the
     /// cache lookup) → the first `ptr_eq` fails. MUTATION: drop
     /// `view.plan_dirty = true` from the model observer → the last
-    /// assertion sees the old plan after the model changed.
+    /// assertion sees the old plan after the model changed. MUTATION: set
+    /// `plan_dirty = true` at the top of `render_inner` (rebuild every frame)
+    /// → the forced redraw hands back a new Rc and the first `ptr_eq` fails.
     #[gpui::test]
     fn the_sidebar_plan_is_rebuilt_only_when_its_inputs_change(cx: &mut TestAppContext) {
         let (shell, vis) = cx.add_window_view(|_window, cx| {
@@ -2798,6 +2800,8 @@ mod render_smoke {
         let review = review_of(&shell, vis);
         vis.run_until_parked();
         let first = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
+        // Force a real frame: without a notify nothing draws between the reads.
+        vis.update(|_w, cx| review.update(cx, |_, cx| cx.notify()));
         vis.run_until_parked();
         let second = vis.update(|_w, cx| review.update(cx, |view, cx| view.plan(cx)));
         assert!(
