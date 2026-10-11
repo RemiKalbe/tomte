@@ -2828,6 +2828,60 @@ mod render_smoke {
         assert_eq!(group_of(&after.rows, &running), "PROCESSING");
     }
 
+    /// The ✕ really renders on the waiting row ONLY, and its click takes
+    /// the decision back without selecting the row.
+    ///
+    /// MUTATION: in `target_row`, `if queued.is_some()` instead of
+    /// `if cancellable` → the running row also gets a ✕ and the `is_none`
+    /// assertion fails. MUTATION: drop the `cx.stop_propagation()` from the
+    /// ✕ listener → the row's own click fires and `selected` moves to
+    /// `.gitconfig`.
+    #[gpui::test]
+    fn a_real_click_on_the_x_removes_the_queued_decision_without_selecting_the_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-processing", smoke_paths(), cx)
+                .expect("review-processing fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let waiting = fixtures::home(".gitconfig");
+        let running = fixtures::home(".config/zed/settings.json");
+        let selected_before = vis.update(|_w, cx| review.read(cx).selected.clone());
+        assert_eq!(
+            selected_before,
+            Some(running.clone()),
+            "the pose selects the running file"
+        );
+        // `debug_bounds` wants a `&'static str`; leaking two short strings in
+        // a test is the price of keying the selector by file.
+        let running_x: &'static str =
+            Box::leak(format!("review-cancel:{}", running.display()).into_boxed_str());
+        let waiting_x: &'static str =
+            Box::leak(format!("review-cancel:{}", waiting.display()).into_boxed_str());
+        assert!(
+            vis.debug_bounds(running_x).is_none(),
+            "a running row has no ✕"
+        );
+        let x = vis
+            .debug_bounds(waiting_x)
+            .expect("the waiting row renders its ✕");
+        vis.simulate_click(x.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        vis.update(|_w, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 1, "the waiting decision is gone");
+            assert_eq!(s.queue.running()[0].target, running);
+            assert!(s.queue.failure(&waiting).is_none());
+        });
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).selected.clone()),
+            selected_before,
+            "the ✕ did not select its row"
+        );
+    }
+
     /// The queue's REAL path, end to end: `enqueue` → `pump` → `run_batch`
     /// against a live engine, and the decision actually lands on disk.
     ///

@@ -2316,6 +2316,7 @@ impl ReviewView {
         // the entire point of showing it.
         let trailing: AnyElement = if cancellable {
             let t = entry.target.clone();
+            let selector_target = entry.target.clone();
             ui::button(
                 theme,
                 ElementId::named_usize("review-cancel", ix),
@@ -2328,6 +2329,8 @@ impl ReviewView {
                     view.cancel_queued(&t, cx);
                 }),
             )
+            // Test-only hook (a no-op in release): finds the ✕ by file.
+            .debug_selector(move || format!("review-cancel:{}", selector_target.display()))
             .tooltip(ui::text_tooltip("Remove from queue"))
             .flex_shrink_0()
             .into_any_element()
@@ -3378,10 +3381,9 @@ mod tests {
             .collect()
     }
 
-    /// MUTATION: `cancellable: queued.cancellable()` → `queued.locks_row()`
-    /// reversed, or `true` for every PROCESSING row (the brief's
-    /// `queued.is_some()`) → the running row reads cancellable and this
-    /// fails.
+    /// MUTATION: `cancellable: queued.is_some()` in `sidebar_rows` → the
+    /// running row reads cancellable and this fails. (Pins the plan field
+    /// only; the render wiring is pinned by the real-click test in mod.rs.)
     #[test]
     fn only_a_waiting_processing_row_is_cancellable() {
         let drifted = vec![
