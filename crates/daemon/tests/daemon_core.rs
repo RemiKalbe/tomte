@@ -256,6 +256,40 @@ fn paused_core_ignores_changes() {
     assert!(kinds(&core, &target).is_empty());
 }
 
+/// The 2026-10-11 loop: the source repo's `git status` wrote `index.lock`
+/// inside a vendored skill's own `.git`, the watcher reported it, and the
+/// daemon heard a source change — forever. The nested path must not start a
+/// source-side rescan; the real source path still does.
+///
+/// MUTATION: classify inline with the 0.1.20 rule (only
+/// `rel.components().next() == ".git"` is looked at) → the nested
+/// `index.lock` reads as a source change, `rescan_source_side` finds the
+/// dirty `dot_testrc`, and the first assertion sees a Drift push.
+#[test]
+fn a_nested_repos_index_lock_is_not_a_source_change() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let rx = core.subscribe();
+    // Dirty the source behind the core's back: a source-side rescan WOULD
+    // find this (source_edit_is_source_ahead in the scanner tests).
+    std::fs::write(s.source.join("dot_testrc"), "a=edited\n").unwrap();
+
+    let nested = s.source.join("dot_claude/skills/humanizer/.git/index.lock");
+    core.handle_paths_changed(std::slice::from_ref(&nested), 100)
+        .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "a nested .git path must not trigger a source-side rescan"
+    );
+
+    core.handle_paths_changed(&[s.source.join("dot_testrc")], 101)
+        .unwrap();
+    assert!(
+        matches!(rx.try_recv().unwrap(), Event::Drift { .. }),
+        "the real source path does"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The unattended auto-join and the commit signer (final review, Critical).
 // ---------------------------------------------------------------------------

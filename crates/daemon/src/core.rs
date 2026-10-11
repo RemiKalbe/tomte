@@ -59,6 +59,53 @@ pub fn class_str(class: DriftClass) -> &'static str {
     }
 }
 
+/// What one watcher path means to the daemon (spec 2026-10-11 §2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathChange {
+    /// A file of the chezmoi source tree changed.
+    SourceContent,
+    /// The source repo's own HEAD or refs moved (commit, fetch, checkout).
+    SourceGitRefs,
+    /// A managed destination file changed.
+    Target,
+    /// Nothing the daemon acts on: the top-level `.git`'s index, objects and
+    /// locks; anything inside a NESTED repository's `.git` (a vendored skill
+    /// with its own history — `git status` in the source repo refreshes its
+    /// index and writes `index.lock` there, and hearing that as a source
+    /// change was a self-sustaining rescan loop, 2026-10-11); an unmanaged
+    /// path outside the source tree.
+    Ignored,
+}
+
+/// Pure, so the rule is a value a test can read. `managed` is the current
+/// managed-target set.
+pub fn classify_path(source_dir: &Path, managed: &BTreeSet<PathBuf>, path: &Path) -> PathChange {
+    let Ok(rel) = path.strip_prefix(source_dir) else {
+        return if managed.contains(path) {
+            PathChange::Target
+        } else {
+            PathChange::Ignored
+        };
+    };
+    let mut comps = rel.components();
+    let first_is_git = comps.next().is_some_and(|c| c.as_os_str() == ".git");
+    // `comps` now starts at the second component: a `.git` anywhere below
+    // the first one is a nested repository.
+    if comps.any(|c| c.as_os_str() == ".git") {
+        return PathChange::Ignored;
+    }
+    if first_is_git {
+        let s = rel.to_string_lossy();
+        if s.ends_with("HEAD") || s.contains("refs") {
+            PathChange::SourceGitRefs
+        } else {
+            PathChange::Ignored
+        }
+    } else {
+        PathChange::SourceContent
+    }
+}
+
 pub struct DaemonCore {
     chezmoi: ChezmoiClient,
     git: GitClient,
@@ -367,23 +414,11 @@ impl DaemonCore {
         let mut targets: Vec<PathBuf> = Vec::new();
 
         for p in paths {
-            if p.starts_with(&self.source_dir) {
-                let rel = p.strip_prefix(&self.source_dir).unwrap_or(p);
-                let mut comps = rel.components();
-                if comps
-                    .next()
-                    .map(|c| c.as_os_str() == ".git")
-                    .unwrap_or(false)
-                {
-                    let s = rel.to_string_lossy();
-                    if s.ends_with("HEAD") || s.contains("refs") {
-                        git_refs_changed = true;
-                    }
-                } else {
-                    source_changed = true;
-                }
-            } else if self.managed.contains(p) {
-                targets.push(p.clone());
+            match classify_path(&self.source_dir, &self.managed, p) {
+                PathChange::SourceContent => source_changed = true,
+                PathChange::SourceGitRefs => git_refs_changed = true,
+                PathChange::Target => targets.push(p.clone()),
+                PathChange::Ignored => {}
             }
         }
 
@@ -843,5 +878,60 @@ impl DaemonCore {
 
     pub fn last_fetch_ts(&self) -> Option<u64> {
         self.last_fetch_ts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn managed(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// MUTATION: drop the "first component" distinction (treat ANY `.git`
+    /// component with the HEAD/refs rule) → the nested `HEAD` case reads
+    /// `SourceGitRefs`. MUTATION: drop the any-component check (only the
+    /// first component is ever looked at, the 0.1.20 shape) → the nested
+    /// `index.lock` case reads `SourceContent`, which is the self-sustaining
+    /// rescan loop of 2026-10-11.
+    #[test]
+    fn classify_path_ignores_nested_repositories_and_keeps_the_top_level_refs_rule() {
+        let src = Path::new("/src");
+        let m = managed(&["/home/.zshrc"]);
+        let at = |rel: &str| classify_path(src, &m, &src.join(rel));
+        assert_eq!(
+            at("dot_claude/skills/humanizer/.git/index.lock"),
+            PathChange::Ignored
+        );
+        assert_eq!(
+            at("dot_claude/skills/humanizer/.git/HEAD"),
+            PathChange::Ignored
+        );
+        assert_eq!(
+            at("dot_claude/skills/humanizer/.git/refs/heads/main"),
+            PathChange::Ignored
+        );
+        assert_eq!(at(".git/index.lock"), PathChange::Ignored);
+        assert_eq!(at(".git/objects/ab/cdef"), PathChange::Ignored);
+        assert_eq!(at(".git/HEAD"), PathChange::SourceGitRefs);
+        assert_eq!(at(".git/ORIG_HEAD"), PathChange::SourceGitRefs);
+        assert_eq!(
+            at(".git/refs/remotes/origin/main"),
+            PathChange::SourceGitRefs
+        );
+        assert_eq!(at("dot_zshrc"), PathChange::SourceContent);
+        assert_eq!(
+            at("dot_claude/skills/humanizer/SKILL.md"),
+            PathChange::SourceContent
+        );
+        assert_eq!(
+            classify_path(src, &m, Path::new("/home/.zshrc")),
+            PathChange::Target
+        );
+        assert_eq!(
+            classify_path(src, &m, Path::new("/tmp/x")),
+            PathChange::Ignored
+        );
     }
 }
