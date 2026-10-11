@@ -242,9 +242,11 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
     // Everything else needs the core. Status answers instantly with a busy
     // snapshot (a running scan is NOT a degradation — scanning:true is the
     // whole story; 2026-08-04: the busy text once leaked into the degraded
-    // banner). Every other request WAITS ITS TURN: scans hold the core for
-    // seconds and run constantly, so bouncing "busy — retry shortly" at the
-    // user made saves a timing game (2026-08-08). Each connection has its
+    // banner). Every other request WAITS ITS TURN: a scan's subprocess
+    // phase no longer holds the core at all (2026-10-11, `scan::run_scan`);
+    // what still does is the per-event path, the fetch and a scan's apply
+    // phase, each a bounded few seconds, so bouncing "busy — retry shortly"
+    // at the user made saves a timing game (2026-08-08). Each connection has its
     // own thread, so waiting here stalls nobody else; the bound
     // (`busy_wait`, see `DEFAULT_BUSY_WAIT`) rides above a full scan and
     // under the client's request timeout. A scan that outlasts it still
@@ -297,7 +299,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
                 drifted,
                 in_sync,
                 degraded,
-                scanning: false,
+                scanning: c.scan_in_progress(),
                 last_fetch_ts: c.last_fetch_ts(),
             }
         }
@@ -323,16 +325,17 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
         }
         Request::Shutdown => Response::Ok, // handled in handle_connection
         Request::Rescan => {
-            // Scans take ~15s on real dotfile trees — far beyond the client's
-            // request timeout. Acknowledge now, scan on a thread; completion
-            // arrives as the ScanDone push.
+            // Scans take minutes on real dotfile trees — far beyond the
+            // client's request timeout, and (since 2026-10-11) they run with
+            // the core lock RELEASED. Acknowledge now, scan on a thread;
+            // completion arrives as the ScanDone push. A scan already in
+            // progress is told to go again rather than doubled.
             drop(c);
             let core = ctx.core.get().cloned();
             let now_fn = ctx.now_fn;
             std::thread::spawn(move || {
                 if let Some(core) = core
-                    && let Ok(mut c) = core.lock()
-                    && let Err(e) = c.full_rescan(now_fn())
+                    && let Err(e) = crate::scan::run_scan(&core, now_fn)
                 {
                     eprintln!("tomted: requested rescan failed: {e}");
                 }

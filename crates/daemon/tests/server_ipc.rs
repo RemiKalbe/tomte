@@ -350,3 +350,150 @@ fn handshake_and_status_survive_a_long_scan_holding_the_core() {
         other => panic!("expected busy status, got {other:?}"),
     }
 }
+
+/// A scan in progress is a FLAG, not a held lock (spec 2026-10-11 §2.2):
+/// requests are answered meanwhile, and `Status` says `scanning: true`
+/// next to the real drift list rather than placeholder zeros.
+///
+/// MUTATION: report `scanning: false` from the locked Status arm (drop
+/// `c.scan_in_progress()`) → the scanning assertion fails.
+#[test]
+fn status_reports_scanning_with_real_data_while_a_scan_is_in_progress() {
+    let s = Scratch::new();
+    let chezmoi: ChezmoiClient = s.chezmoi();
+    let git = GitClient::new(Arc::new(SystemRunner), s.source.clone());
+    let journal = Journal::open_in_memory("scanning-test").unwrap();
+    let core = Arc::new(Mutex::new(
+        DaemonCore::new(chezmoi, git, journal, "origin/main".into()).unwrap(),
+    ));
+    std::fs::write(s.home.join(".testrc"), "a=drift\n").unwrap();
+    core.lock().unwrap().full_rescan(1).unwrap();
+    // A scan "in progress" without running it: deterministic.
+    // Held to the end of the test so the scan stays "in progress".
+    let _in_flight = core.lock().unwrap().begin_scan(2).unwrap();
+
+    let sock = s.root.path().join("sc.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let mut ctx = tomte_daemon::server::ServeCtx::ready(core.clone(), || 7, Arc::new(|| {}));
+    ctx.busy_wait = std::time::Duration::from_millis(200);
+    std::thread::spawn(move || serve(listener, ctx));
+
+    let stream = UnixStream::connect(&sock).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    send(
+        &mut writer,
+        1,
+        Request::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    );
+    let _ = recv(&mut reader);
+
+    send(&mut writer, 2, Request::SessionStart { ts: 3 });
+    assert!(
+        matches!(
+            recv(&mut reader),
+            ServerFrame::Reply {
+                id: 2,
+                response: Response::SessionStarted { .. }
+            }
+        ),
+        "answered, not bounced, while a scan is in progress"
+    );
+    send(&mut writer, 3, Request::Status);
+    match recv(&mut reader) {
+        ServerFrame::Reply {
+            id: 3,
+            response: Response::Status {
+                scanning, drifted, ..
+            },
+        } => {
+            assert!(scanning, "a scan is in progress");
+            assert_eq!(drifted.len(), 1, "and the real list is still served");
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
+}
+
+/// The Rescan arm runs the scan with the lock RELEASED: a request sent
+/// right after it is answered at once, long before the scan is done.
+///
+/// MUTATION: in `dispatch`'s Rescan arm, lock the core on the thread and
+/// call `full_rescan` (the 0.1.20 shape) → the scratch scan holds the lock
+/// for its ~1 s of subprocesses, `SessionStart` waits past the 200 ms
+/// `busy_wait` and bounces, and the match below fails.
+#[test]
+fn a_rescan_request_does_not_hold_the_core_for_the_scan() {
+    let s = Scratch::new();
+    let chezmoi: ChezmoiClient = s.chezmoi();
+    let git = GitClient::new(Arc::new(SystemRunner), s.source.clone());
+    let journal = Journal::open_in_memory("rescan-off-lock-test").unwrap();
+    let core = Arc::new(Mutex::new(
+        DaemonCore::new(chezmoi, git, journal, "origin/main".into()).unwrap(),
+    ));
+    let sock = s.root.path().join("rs.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let mut ctx = tomte_daemon::server::ServeCtx::ready(core.clone(), || 7, Arc::new(|| {}));
+    ctx.busy_wait = std::time::Duration::from_millis(200);
+    std::thread::spawn(move || serve(listener, ctx));
+
+    let stream = UnixStream::connect(&sock).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    send(
+        &mut writer,
+        1,
+        Request::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    );
+    let _ = recv(&mut reader);
+    send(&mut writer, 2, Request::Subscribe);
+    let _ = recv(&mut reader);
+
+    send(&mut writer, 3, Request::Rescan);
+    assert!(matches!(
+        recv(&mut reader),
+        ServerFrame::Reply {
+            id: 3,
+            response: Response::Ok
+        }
+    ));
+    send(&mut writer, 4, Request::SessionStart { ts: 5 });
+    // Pushes and replies share the stream: skip pushes until reply 4, but
+    // remember a ScanDone that lands first (a quick scratch scan can finish
+    // before the reply is read).
+    let mut scan_done = false;
+    loop {
+        match recv(&mut reader) {
+            ServerFrame::Reply {
+                id: 4,
+                response: Response::SessionStarted { .. },
+            } => break,
+            ServerFrame::Reply { id: 4, response } => {
+                panic!("expected SessionStarted, got {response:?}")
+            }
+            ServerFrame::Push {
+                event: tomte_proto::Event::ScanDone { .. },
+            } => scan_done = true,
+            ServerFrame::Push { .. } => continue,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // Let the scan finish before the scratch is torn down.
+    while !scan_done {
+        if let ServerFrame::Push {
+            event: tomte_proto::Event::ScanDone { .. },
+        } = recv(&mut reader)
+        {
+            scan_done = true;
+        }
+    }
+}

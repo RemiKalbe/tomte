@@ -291,10 +291,13 @@ fn main() -> ExitCode {
     ctx.set_core(core.clone());
     println!("tomted: core ready");
 
-    // Initial scan. A failure must not kill the daemon — the hourly rescan
-    // and manual Rescan requests can recover it (spec §10).
-    match core.lock().expect("core lock").full_rescan(now_ts()) {
-        Ok(drifted) => println!("tomted: initial scan done, {drifted} drifted"),
+    // Initial scan, OFF the lock (`scan::run_scan`): clients connect and get
+    // an honest `scanning: true` meanwhile instead of waiting on the core.
+    // A failure must not kill the daemon — the hourly rescan and manual
+    // Rescan requests can recover it (spec §10).
+    match tomte_daemon::scan::run_scan(&core, now_ts) {
+        Ok(Some(drifted)) => println!("tomted: initial scan done, {drifted} drifted"),
+        Ok(None) => println!("tomted: initial scan already running"),
         Err(e) => eprintln!("tomted: initial scan failed: {e}"),
     }
 
@@ -392,9 +395,7 @@ fn main() -> ExitCode {
                     continue;
                 }
                 ticks_since_scan = 0;
-                if let Ok(mut c) = core.lock()
-                    && let Err(e) = c.full_rescan(now_ts())
-                {
+                if let Err(e) = tomte_daemon::scan::run_scan(&core, now_ts) {
                     eprintln!("tomted: rescan failed: {e}");
                 }
             }
