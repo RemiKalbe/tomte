@@ -3,6 +3,7 @@
 use tomte_core::chezmoi::ChezmoiClient;
 use tomte_core::cmd::SystemRunner;
 use tomte_core::git::GitClient;
+use tomte_core::scanner::ScanError;
 use tomte_core::testsupport::{Scratch, git, sh};
 use tomte_daemon::core::DaemonCore;
 use tomte_journal::Journal;
@@ -523,4 +524,166 @@ fn a_join_that_fails_after_starting_is_backed_out_not_left_mid_merge() {
         "1",
         "and the divergence is back to where it was"
     );
+}
+
+/// A scan now runs OFF the lock (spec 2026-10-11 §2.2), so the app can
+/// resolve a file while the scan is still looking at it. The report then
+/// says "drifted" about a file the daemon already saw resolved; the
+/// daemon's own, fresher knowledge wins.
+///
+/// MUTATION: drop the touched-set note from `record_expected_apply` → the
+/// stale report re-adds `.testrc` to `drift_state`, and the status lists
+/// a file the user just resolved.
+#[test]
+fn a_target_the_app_resolved_during_a_scan_stays_resolved() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let target = s.home.join(".testrc");
+    let source_text = std::fs::read(s.source.join("dot_testrc")).unwrap();
+    std::fs::write(&target, "a=drift\n").unwrap();
+
+    let (scanner, ticket) = core.begin_scan(100).expect("no scan in progress");
+    let report = scanner.scan();
+    assert_eq!(
+        report.as_ref().unwrap().drifted.len(),
+        1,
+        "the scan saw the drift"
+    );
+
+    // While it ran: the app announced and applied the resolution.
+    core.expect_changes(std::slice::from_ref(&target), 60, 101);
+    std::fs::write(&target, &source_text).unwrap();
+    core.handle_paths_changed(std::slice::from_ref(&target), 102)
+        .unwrap();
+
+    let outcome = core.apply_scan(ticket, report, 103).unwrap();
+    assert_eq!(
+        outcome.drifted, 0,
+        "the stale verdict lost to the fresher apply"
+    );
+    assert!(core.status_snapshot().0.is_empty());
+    assert!(!core.scan_in_progress());
+}
+
+/// The mirror image: the file drifted AFTER the scan looked at it. The
+/// report says clean; the daemon already journaled the drift.
+///
+/// MUTATION: apply the stale removals to touched targets too (drop the
+/// `touched.contains` guard on the stale loop) → `.testrc` vanishes from
+/// the status although it is drifted right now.
+#[test]
+fn a_target_that_drifted_during_a_scan_stays_drifted() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let target = s.home.join(".testrc");
+
+    let (scanner, ticket) = core.begin_scan(100).unwrap();
+    let report = scanner.scan();
+    assert!(
+        report.as_ref().unwrap().drifted.is_empty(),
+        "clean when the scan looked"
+    );
+
+    std::fs::write(&target, "a=later\n").unwrap();
+    core.handle_paths_changed(std::slice::from_ref(&target), 101)
+        .unwrap();
+
+    let outcome = core.apply_scan(ticket, report, 102).unwrap();
+    assert_eq!(outcome.drifted, 1);
+    assert_eq!(core.status_snapshot().0[0].class, "destination_drift");
+}
+
+/// One scan at a time, and a request made during one is not lost: the
+/// caller is told to go again.
+///
+/// MUTATION: never set `rescan_wanted` in `begin_scan` → `None` still
+/// comes back, but `apply_scan` reports `rescan_wanted: false` and a
+/// Rescan pressed during a scan silently vanishes.
+#[test]
+fn a_scan_requested_during_a_scan_runs_after_it() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let (scanner, ticket) = core.begin_scan(100).unwrap();
+    assert!(core.scan_in_progress());
+    assert!(core.begin_scan(101).is_none(), "one scan at a time");
+    let outcome = core.apply_scan(ticket, scanner.scan(), 102).unwrap();
+    assert!(outcome.rescan_wanted);
+    assert!(!core.scan_in_progress());
+    assert!(core.begin_scan(103).is_some(), "and the next one may start");
+}
+
+/// MUTATION: clear `scan_in_progress` only on the `Ok` path → a failed scan
+/// leaves `begin_scan` returning `None` forever: no scan ever runs again.
+#[test]
+fn a_failed_scan_releases_the_in_progress_flag() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let (_scanner, ticket) = core.begin_scan(100).unwrap();
+    let err = core.apply_scan(
+        ticket,
+        Err(ScanError::Io(std::io::Error::other("boom"))),
+        101,
+    );
+    assert!(err.is_err());
+    assert!(!core.scan_in_progress());
+    assert!(core.begin_scan(102).is_some());
+}
+
+/// A scan whose thread never came back (30 min and counting) is taken over
+/// rather than blocking every later scan; if its report does turn up, it
+/// is the OLDER one and must not clobber the newer scan's flag or state.
+///
+/// MUTATION: drop the generation check in `apply_scan` → the old report
+/// applies and clears the NEW scan's `scan_in_progress`.
+#[test]
+fn a_stale_scan_is_taken_over_and_its_late_report_is_ignored() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let (old_scanner, old_ticket) = core.begin_scan(100).unwrap();
+    let (_new_scanner, _new_ticket) = core
+        .begin_scan(100 + 31 * 60)
+        .expect("a 31-minute-old scan is taken over");
+    let outcome = core
+        .apply_scan(old_ticket, old_scanner.scan(), 100 + 31 * 60 + 1)
+        .unwrap();
+    assert!(!outcome.rescan_wanted);
+    assert!(
+        core.scan_in_progress(),
+        "the newer scan is still the one in progress"
+    );
+}
+
+/// A file taken out of management while the scan ran (its source deleted,
+/// like `chezmoi forget`): the report still lists it, because it was
+/// managed when the scan looked. `apply_scan` reconciles first and must
+/// not journal a drift for a file that is no longer managed.
+///
+/// MUTATION: drop the `self.managed.contains(&fd.target)` filter in
+/// `apply_scan` → `.testrc` is listed as drifted after it left management.
+#[test]
+fn a_target_forgotten_during_a_scan_is_not_resurrected_by_its_report() {
+    let s = Scratch::new();
+    let mut core = core_for(&s);
+    let rx = core.subscribe();
+    let target = s.home.join(".testrc");
+    std::fs::write(&target, "a=drift\n").unwrap();
+    let (scanner, ticket) = core.begin_scan(100).unwrap();
+    let report = scanner.scan();
+    assert_eq!(report.as_ref().unwrap().drifted.len(), 1);
+
+    std::fs::remove_file(s.source.join("dot_testrc")).unwrap();
+
+    let outcome = core.apply_scan(ticket, report, 101).unwrap();
+    assert_eq!(outcome.drifted, 0);
+    assert!(core.status_snapshot().0.is_empty());
+    assert!(
+        kinds(&core, &target).contains(&"left_management".to_string()),
+        "{:?}",
+        kinds(&core, &target)
+    );
+    let mut saw_left = false;
+    while let Ok(ev) = rx.try_recv() {
+        saw_left |= matches!(ev, Event::LeftManagement { .. });
+    }
+    assert!(saw_left);
 }

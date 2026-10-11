@@ -14,6 +14,7 @@ use crate::chezmoi::{ChezmoiClient, ChezmoiError, EvalFailure};
 use crate::drift::{ContentHash, DriftClass, GitSignals, StateProbe, classify};
 use crate::git::{GitClient, GitError};
 
+#[derive(Clone)]
 pub struct DriftScanner {
     chezmoi: ChezmoiClient,
     git: GitClient,

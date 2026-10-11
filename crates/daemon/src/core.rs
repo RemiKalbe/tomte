@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
 use tomte_core::drift::{ContentHash, DriftClass};
 use tomte_core::git::{GitClient, GitError, MergeStart, MergeTreeOutcome};
-use tomte_core::scanner::{DriftScanner, FileDrift, ScanError};
+use tomte_core::scanner::{DriftScanner, FileDrift, ScanError, ScanReport};
 use tomte_journal::{EventKind, Journal, JournalError, NewEvent};
 use tomte_proto::{DriftSummary, Event};
 
@@ -26,6 +26,25 @@ const SIGNER_PROBE: std::time::Duration = std::time::Duration::from_secs(5);
 /// enough for the app to read the daemon as stuck (2026-08-02). User-driven
 /// merges keep [`GitClient::merge`]'s full 60s — there, waiting is correct.
 const AUTO_JOIN_MERGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A scan "in progress" for longer than this is presumed dead (its thread
+/// never came back) and taken over by the next `begin_scan`.
+const SCAN_STALE_SECS: u64 = 30 * 60;
+
+/// Proof that `begin_scan` ran, consumed by `apply_scan`. Carries the
+/// generation so a report from a scan that was taken over is recognised.
+pub struct ScanTicket {
+    generation: u64,
+    started_ts: u64,
+}
+
+/// What `apply_scan` hands back: the live drifted count, and whether a
+/// rescan was asked for while this one ran (the caller goes again).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub drifted: u32,
+    pub rescan_wanted: bool,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -132,6 +151,19 @@ pub struct DaemonCore {
     /// lock (the initial scan can hold it for minutes on secret-manager
     /// timeouts — head-of-line blocking the handshake was a real bug).
     subscribers: std::sync::Arc<Mutex<Vec<Sender<Event>>>>,
+    /// A scan is running OFF the lock (spec 2026-10-11 §2.2): `begin_scan`
+    /// set it, `apply_scan` clears it. `Status` reports it as `scanning`.
+    scan_in_progress: bool,
+    scan_started_ts: u64,
+    /// Bumped by every `begin_scan`; a `ScanTicket` carries the value it
+    /// was issued with, so a taken-over scan's late report is recognised.
+    scan_generation: u64,
+    /// A rescan asked for while one ran. `apply_scan` hands it back.
+    rescan_wanted: bool,
+    /// Targets the per-event path wrote `drift_state` for since
+    /// `begin_scan`. `apply_scan` leaves these alone: the report's view of
+    /// them is older than the daemon's own.
+    touched_during_scan: BTreeSet<PathBuf>,
 }
 
 impl DaemonCore {
@@ -179,6 +211,11 @@ impl DaemonCore {
             last_scan_drifted: None,
             last_fetch_ts,
             subscribers,
+            scan_in_progress: false,
+            scan_started_ts: 0,
+            scan_generation: 0,
+            rescan_wanted: false,
+            touched_during_scan: BTreeSet::new(),
         })
     }
 
@@ -226,6 +263,24 @@ impl DaemonCore {
         }
     }
 
+    /// The ONLY two writers of `drift_state` outside `apply_scan`. Both note
+    /// the target while a scan is in progress, which is what lets the scan
+    /// run with the lock released and still never overwrite something the
+    /// daemon learned after the scan looked.
+    fn set_drift(&mut self, target: PathBuf, class: String, since: u64) {
+        if self.scan_in_progress {
+            self.touched_during_scan.insert(target.clone());
+        }
+        self.drift_state.insert(target, (class, since));
+    }
+
+    fn clear_drift(&mut self, target: &Path) {
+        if self.scan_in_progress {
+            self.touched_during_scan.insert(target.to_path_buf());
+        }
+        self.drift_state.remove(target);
+    }
+
     fn is_expected(&mut self, path: &Path, now_ts: u64) -> bool {
         self.expected.retain(|(_, deadline)| *deadline >= now_ts);
         self.expected.iter().any(|(p, _)| p == path)
@@ -266,6 +321,8 @@ impl DaemonCore {
         }
     }
 
+    /// Writes `drift_state` through `set_drift`, which is what makes an
+    /// off-lock scan safe.
     fn journal_probe(&mut self, fd: &FileDrift, now_ts: u64) -> Result<(), DaemonError> {
         let target = fd.target.clone();
         let class = fd.class;
@@ -360,8 +417,7 @@ impl DaemonCore {
             .filter(|(c, _)| *c == cs)
             .map(|(_, s)| *s)
             .unwrap_or(now_ts);
-        self.drift_state
-            .insert(target.clone(), (cs.to_string(), since));
+        self.set_drift(target.clone(), cs.to_string(), since);
         self.emit(Event::Drift {
             target,
             class: cs.to_string(),
@@ -374,7 +430,7 @@ impl DaemonCore {
         match self.scanner.probe_one(target)? {
             Some(fd) => self.journal_probe(&fd, now_ts)?,
             None => {
-                self.drift_state.remove(target);
+                self.clear_drift(target);
             }
         }
         Ok(())
@@ -397,7 +453,7 @@ impl DaemonCore {
             to_hash: blob_hash.as_deref(),
             meta: Some(meta),
         })?;
-        self.drift_state.remove(target);
+        self.clear_drift(target);
         Ok(())
     }
 
@@ -464,7 +520,8 @@ impl DaemonCore {
     pub fn reconcile_managed(&mut self, now_ts: u64) -> Result<WatchDelta, DaemonError> {
         let fresh: BTreeSet<PathBuf> = self.chezmoi.managed()?.into_iter().collect();
         let mut delta = WatchDelta::default();
-        for departed in self.managed.difference(&fresh) {
+        let departed_paths: Vec<PathBuf> = self.managed.difference(&fresh).cloned().collect();
+        for departed in &departed_paths {
             self.journal.mark_unmanaged(departed, now_ts)?;
             self.journal.record_event(NewEvent {
                 target: Some(departed),
@@ -474,7 +531,7 @@ impl DaemonCore {
                 to_hash: None,
                 meta: None,
             })?;
-            self.drift_state.remove(departed);
+            self.clear_drift(departed);
             delta.removed.push(departed.clone());
         }
         for arrived in fresh.difference(&self.managed) {
@@ -495,10 +552,75 @@ impl DaemonCore {
         Ok(delta)
     }
 
-    pub fn full_rescan(&mut self, now_ts: u64) -> Result<u32, DaemonError> {
+    /// Phase 1 of a scan (spec 2026-10-11 §2.2), under the lock for
+    /// microseconds: a scanner the caller runs WITHOUT the lock, and the
+    /// ticket `apply_scan` wants back. `None` while another scan is in
+    /// progress — the request is remembered as `rescan_wanted`, never lost.
+    /// A scan in progress for more than `SCAN_STALE_SECS` is presumed dead
+    /// and taken over.
+    pub fn begin_scan(&mut self, now_ts: u64) -> Option<(DriftScanner, ScanTicket)> {
+        if self.scan_in_progress {
+            let age = now_ts.saturating_sub(self.scan_started_ts);
+            if age < SCAN_STALE_SECS {
+                self.rescan_wanted = true;
+                return None;
+            }
+            tomte_core::log_warn!(
+                "scan",
+                "a scan has been in progress for {age}s — taking over"
+            );
+        }
+        Some(self.start_scan(now_ts))
+    }
+
+    fn start_scan(&mut self, now_ts: u64) -> (DriftScanner, ScanTicket) {
+        self.scan_in_progress = true;
+        self.scan_started_ts = now_ts;
+        self.scan_generation += 1;
+        self.touched_during_scan.clear();
+        (
+            self.scanner.clone(),
+            ScanTicket {
+                generation: self.scan_generation,
+                started_ts: now_ts,
+            },
+        )
+    }
+
+    pub fn scan_in_progress(&self) -> bool {
+        self.scan_in_progress
+    }
+
+    /// Phase 3: land a report. Always releases `scan_in_progress` for the
+    /// scan the ticket belongs to, `Err` included. A target the per-event
+    /// path touched meanwhile keeps its state (see `set_drift`); a target
+    /// that left management meanwhile is dropped, not journaled.
+    pub fn apply_scan(
+        &mut self,
+        ticket: ScanTicket,
+        report: Result<ScanReport, ScanError>,
+        now_ts: u64,
+    ) -> Result<ScanOutcome, DaemonError> {
+        if ticket.generation != self.scan_generation {
+            tomte_core::log_warn!(
+                "scan",
+                "ignoring the report of a scan that was taken over (started t={})",
+                ticket.started_ts
+            );
+            return Ok(ScanOutcome {
+                drifted: self.drift_state.len() as u32,
+                rescan_wanted: false,
+            });
+        }
+        let touched = std::mem::take(&mut self.touched_during_scan);
+        self.scan_in_progress = false;
+        let rescan_wanted = std::mem::take(&mut self.rescan_wanted);
+        let report = report?;
         self.reconcile_managed(now_ts)?;
-        let report = self.scanner.scan()?;
         self.degraded = report.degraded.as_ref().map(|f| f.hint.clone());
+        // The report's number as is: off by the touched count until the next
+        // scan, which is the honest option — recounting here would mean
+        // guessing which touched files the scan had tallied as in sync.
         self.in_sync_count = report.in_sync_count as u64;
         self.origin_differs = report.origin_differs;
         // Targets the scan skipped. Never silent: one of these used to abort
@@ -520,16 +642,30 @@ impl DaemonCore {
         let stale: Vec<PathBuf> = self
             .drift_state
             .keys()
-            .filter(|t| !fresh_targets.contains(*t))
+            .filter(|t| !fresh_targets.contains(*t) && !touched.contains(*t))
             .cloned()
             .collect();
-        for t in stale {
-            self.drift_state.remove(&t);
+        for t in &stale {
+            self.clear_drift(t);
         }
-        let drifted = report.drifted.len() as u32;
+        let mut skipped = 0usize;
         for fd in &report.drifted {
+            if touched.contains(&fd.target) || !self.managed.contains(&fd.target) {
+                skipped += 1;
+                continue;
+            }
             self.journal_probe(fd, now_ts)?;
         }
+        let drifted = self.drift_state.len() as u32;
+        tomte_core::log_info!(
+            "scan",
+            "{} managed, {} drifted ({} report entries skipped: changed or unmanaged meanwhile), {} unprobed, {}s",
+            self.managed.len(),
+            drifted,
+            skipped,
+            report.unprobed.len(),
+            now_ts.saturating_sub(ticket.started_ts)
+        );
         // Journal the scan only when its outcome CHANGED — routine no-change
         // scans (hourly safety net, app-requested) were flooding the
         // timeline with thousands of identical "scan" rows.
@@ -548,7 +684,21 @@ impl DaemonCore {
             ts: now_ts,
             drifted,
         });
-        Ok(drifted)
+        Ok(ScanOutcome {
+            drifted,
+            rescan_wanted,
+        })
+    }
+
+    /// The one-call shape, lock held throughout: `tomted --once` and tests
+    /// that hold the core anyway. The daemon binary never calls this — it
+    /// goes through `crate::scan::run_scan`, which releases the lock for
+    /// phase 2. Takes over any scan in progress: the caller holds the core,
+    /// so nothing else can be applying.
+    pub fn full_rescan(&mut self, now_ts: u64) -> Result<u32, DaemonError> {
+        let (scanner, ticket) = self.start_scan(now_ts);
+        let report = scanner.scan();
+        Ok(self.apply_scan(ticket, report, now_ts)?.drifted)
     }
 
     /// May the UNATTENDED auto-join create a commit right now? `Err` carries
