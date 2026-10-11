@@ -39,7 +39,7 @@ version without one.
   file. Esc clears, ⌘A selects all. Rows that need a decision cannot be
   ticked; they keep their own buttons.
 - **A folder tree for the safe group.** The folder-tree toggle on the
-  SAFE TO RESOLVE header shows SAFE TO RESOLVE as folders under `~`, single-child
+  SAFE TO RESOLVE header shows that group as folders under `~`, single-child
   chains folded (`.config/nvim/`). Ticking a folder ticks every safe file
   under it, collapsed or not; its chip says `3 of 5` when two of its files
   need a decision and stay out. The other two groups stay flat. The choice

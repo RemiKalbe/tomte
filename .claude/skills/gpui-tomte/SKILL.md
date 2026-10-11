@@ -93,17 +93,31 @@ The shapes that matter in practice:
 - `gpui::list(ListState, FnMut(usize, &mut Window, &mut App) -> AnyElement)`
   is `uniform_list` for mixed heights: items are measured lazily, visible
   ones re-measured every frame, off-screen heights CACHED. Tell the state
-  about changes with `splice(old_range, new_count)`; `splice(0..old, new)`
-  snaps the scroll anchor to item 0 whenever the anchor is inside the
-  range, i.e. always — splice only the changed window (`splice_window` in
-  `review.rs`). `reset(n)` only when the item set is replaced wholesale.
+  about changes with `splice(old_range, new_count)`. `splice` snaps the
+  scroll anchor to the window's START whenever the anchor lies INSIDE the
+  window (`list.rs` `splice_focusable`): `splice(0..old, new)` always does,
+  and so does a minimal window whenever a change above the anchor and one
+  below it fall in the same window (a Review decision on a row below the
+  scroll top moves that row up into PROCESSING). So splice only the
+  changed window (`splice_window`) AND re-anchor by row key around every
+  splice or reset (`re_anchor_index` in `review.rs`). `reset(n)` only when
+  the item set is replaced wholesale; it also drops every measured height.
 - The item closure runs in the list's prepaint, after the owning view's
   `render` returned and its lease was released: `weak.upgrade().update(cx,
   |view, cx| …)` inside it is a fresh update, and the way a row gets a
   `Context` for `cx.listener` (`ReviewView::sidebar()`, 2026-10-11).
-- `bounds_for_item(ix)` is `Some` only for a rendered item;
-  `scroll_to_reveal_item(ix)` is exact only when every item up to `ix` is
-  measured. For a far row use `scroll_to(ListOffset { item_ix, .. })`.
+- `bounds_for_item(ix)` is `Some` for any MEASURED item at or after the
+  scroll top, and it sums the heights in between, where an unmeasured
+  (never rendered, or just spliced) item counts as 0. So it and
+  `scroll_to_reveal_item(ix)` are reliable only when the previous layout
+  rendered every item from the scroll top to `ix` — never on the frame
+  that spliced, and not for a row measured on an earlier visit with
+  unmeasured rows between. Review records the index range the item closure
+  rendered last frame (`rendered_range`), trusts the bounds only inside
+  it, defers a reveal off a splice frame (`cx.defer_in(window, |_, _, cx|
+  cx.notify())` — a bare `cx.notify()` from `render` does nothing while
+  drawing, `window.rs` `invalidate_view`), and otherwise uses
+  `scroll_to(ListOffset { item_ix, .. })`.
 - A `Rc<Cell<usize>>` counter in the item closure, reset in `render`, is
   the test seam for "only the rows in view render" (`rows_rendered`).
 - The item closure is also called from `List::request_layout` and

@@ -5720,7 +5720,10 @@ mod render_smoke {
     ///
     /// MUTATION: `splice` instead of `reset` on the empty↔rows flip → the
     /// item count is off by one after the flip. MUTATION: `reset` on every
-    /// rebuild → the scroll top returns to item 0 after the no-op update.
+    /// rebuild → the height cache is dropped: row 420, measured while the
+    /// list stood at 400 and off-screen since, has no bounds after the no-op
+    /// update. (The scroll top itself would survive that mutation: the
+    /// re-anchor puts it back on its row.)
     #[gpui::test]
     fn the_list_resets_when_the_plan_flips_between_empty_and_rows(cx: &mut TestAppContext) {
         let (shell, vis) = cx.add_window_view(|_window, cx| {
@@ -5737,7 +5740,18 @@ mod render_smoke {
         let (items, rows) = item_count(vis);
         assert_eq!(items, rows + 1, "rows plus the In sync footer");
 
-        // Scroll down, then a model update that changes no row.
+        // Visit item 400 so the rows below it are measured, then scroll up
+        // to 200 and send a model update that changes no row.
+        vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                view.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 400,
+                    offset_in_item: px(0.),
+                });
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
         vis.update(|_w, cx| {
             review.read(cx).list_state.scroll_to(gpui::ListOffset {
                 item_ix: 200,
@@ -5751,6 +5765,11 @@ mod render_smoke {
             vis.update(|_w, cx| review.read(cx).list_state.logical_scroll_top().item_ix),
             200,
             "an unchanged plan keeps the scroll anchor"
+        );
+        assert!(
+            vis.update(|_w, cx| review.read(cx).list_state.bounds_for_item(420))
+                .is_some(),
+            "an unchanged plan keeps the measured heights of rows off screen"
         );
 
         // Everything resolves: the plan is empty.
@@ -5860,11 +5879,22 @@ mod render_smoke {
         );
     }
 
-    /// Keep disk on a row far down a long list: the next row is revealed
-    /// (spec 2026-10-11 §2.2), not left off-screen.
+    /// Keep disk on a row far down a long list, through the real path (the
+    /// decision enqueued, then the auto-advance — what `run_action` does):
+    /// the next row is revealed (spec 2026-10-11 §2.2), not left off-screen.
+    /// The decision moves the row up into PROCESSING, splicing hundreds of
+    /// rows that stay unmeasured (height 0) even after the next frame's
+    /// layout, which measures only the rows on screen; the next row itself
+    /// was measured on an earlier visit. Its bounds therefore put it near
+    /// the top, so the reveal must not trust them for a row the last frame
+    /// did not render (`rendered_range`).
     ///
-    /// MUTATION: never set `reveal` in `advance_from` → the scroll top stays
-    /// at item 0.
+    /// MUTATION: treat every row as measured (`measured = true`) → the
+    /// stale bounds read "nearly visible", `scroll_to_reveal_item` aims
+    /// with zero heights, and the scroll top lands at 5, not near 447.
+    /// MUTATION: never set `reveal` in `advance_from` → scroll top 0.
+    /// (Applying the reveal on the splice frame is pinned by
+    /// `an_auto_advance_onto_the_row_below_the_viewport_scrolls_it_in`.)
     #[gpui::test]
     fn an_auto_advance_far_down_the_list_scrolls_to_the_new_selection(cx: &mut TestAppContext) {
         let (shell, vis) = cx.add_window_view(|_window, cx| {
@@ -5881,21 +5911,351 @@ mod render_smoke {
                 )
             })
         });
-        vis.update(|_w, cx| {
+        // The user has been down there before: the rows around `next` were
+        // rendered, so the list holds MEASURED heights for them, and the
+        // view is back at the top. On the splice frame `bounds_for_item`
+        // then finds `next` measured but every row between the top and it
+        // spliced to height 0 — `next` reads visible near the viewport top.
+        let resolved_ix = vis.update(|_w, cx| {
             review.update(cx, |view, cx| {
-                view.selected = Some(resolved.clone());
-                view.advance_from(&resolved, cx);
+                view.plan(cx)
+                    .rows
+                    .iter()
+                    .position(|r| {
+                        matches!(r, review::SidebarRow::Target { entry, .. } if entry.target == resolved)
+                    })
+                    .expect("the resolved row is in the plan")
             })
         });
+        for item_ix in [resolved_ix.saturating_sub(5), 0] {
+            vis.update(|_w, cx| {
+                review.update(cx, |view, cx| {
+                    view.list_state.scroll_to(gpui::ListOffset {
+                        item_ix,
+                        offset_in_item: px(0.),
+                    });
+                    cx.notify();
+                })
+            });
+            vis.run_until_parked();
+        }
+        vis.update(|_w, cx| {
+            review.update(cx, |view, _| view.selected = Some(resolved.clone()));
+            // No engine is published and the pose's queue is pumping, so
+            // the decision parks under PROCESSING.
+            shell.update(cx, |s, cx| {
+                s.enqueue(
+                    QueuedAction {
+                        target: resolved.clone(),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    },
+                    cx,
+                )
+            });
+            review.update(cx, |view, cx| view.advance_from(&resolved, cx));
+        });
+        // The splice frame, then the frame the deferred reveal asked for.
+        vis.run_until_parked();
         vis.run_until_parked();
         assert_eq!(
             vis.update(|_w, cx| review.read(cx).selected.clone()),
-            Some(next)
+            Some(next.clone())
         );
-        let top = vis.update(|_w, cx| review.read(cx).list_state.logical_scroll_top().item_ix);
+        let (top, next_ix) = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                let next_ix = plan
+                    .rows
+                    .iter()
+                    .position(|r| {
+                        matches!(r, review::SidebarRow::Target { entry, .. } if entry.target == next)
+                    })
+                    .expect("the next row is in the plan");
+                (view.list_state.logical_scroll_top().item_ix, next_ix)
+            })
+        });
         assert!(
-            top > 300,
-            "the list scrolled to the new selection (scroll top at item {top})"
+            top <= next_ix && next_ix - top < 40,
+            "the list scrolled to the new selection (scroll top {top}, next row {next_ix})"
         );
+    }
+
+    /// Keep disk on the last file of a folder at the bottom edge: the next
+    /// file is the first of the NEXT folder, below that folder's row, which
+    /// is the first row under the edge. The decided row leaves for
+    /// PROCESSING and everything below it moves up one row — still leaving
+    /// the next file under the edge. The decision splices every row from
+    /// the PROCESSING group down to the decided one; on that frame those
+    /// rows are unmeasured (height 0), so `bounds_for_item` puts the next
+    /// file near the top and it reads visible. The reveal must wait for the
+    /// next frame, whose layout measured the rows on screen, and scroll it
+    /// in. (When the next file is the very next row it simply moves up into
+    /// the decided row's place and no scroll is needed.)
+    ///
+    /// MUTATION: apply the reveal on the splice frame (drop `!changed &&`
+    /// from the reveal's `if`) → the next row stays below the bottom edge.
+    #[gpui::test]
+    fn an_auto_advance_onto_the_row_below_the_viewport_scrolls_it_in(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        // Find a scroll top whose first row below the bottom edge (`below`)
+        // is a folder row between two file rows: the advance from the last
+        // file of one folder lands on the first file of the next.
+        let mut found = None;
+        for start in 200..230 {
+            vis.update(|_w, cx| {
+                review.update(cx, |view, cx| {
+                    view.list_state.scroll_to(gpui::ListOffset {
+                        item_ix: start,
+                        offset_in_item: px(0.),
+                    });
+                    cx.notify();
+                })
+            });
+            vis.run_until_parked();
+            found = vis.update(|_w, cx| {
+                review.update(cx, |view, cx| {
+                    let plan = view.plan(cx);
+                    let viewport = view.list_state.viewport_bounds();
+                    let below = (start..plan.rows.len()).find(|&ix| {
+                        view.list_state
+                            .bounds_for_item(ix)
+                            .is_some_and(|b| b.bottom() > viewport.bottom())
+                    })?;
+                    let target = |ix: usize| match plan.rows.get(ix) {
+                        Some(review::SidebarRow::Target {
+                            entry,
+                            selectable: true,
+                            ..
+                        }) => Some(entry.target.clone()),
+                        _ => None,
+                    };
+                    let folder_row = matches!(
+                        plan.rows.get(below),
+                        Some(review::SidebarRow::Folder { .. })
+                    );
+                    if !folder_row {
+                        return None;
+                    }
+                    Some((target(below - 1)?, target(below + 1)?))
+                })
+            });
+            if found.is_some() {
+                break;
+            }
+        }
+        let (resolved, next) = found.expect("a scroll top with a folder row at the bottom edge");
+        vis.update(|_w, cx| {
+            review.update(cx, |view, _| view.selected = Some(resolved.clone()));
+            shell.update(cx, |s, cx| {
+                s.enqueue(
+                    QueuedAction {
+                        target: resolved.clone(),
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    },
+                    cx,
+                )
+            });
+            review.update(cx, |view, cx| view.advance_from(&resolved, cx));
+        });
+        vis.run_until_parked();
+        vis.run_until_parked();
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).selected.clone()),
+            Some(next.clone())
+        );
+        let (bounds, viewport) = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                let ix = plan
+                    .rows
+                    .iter()
+                    .position(|r| {
+                        matches!(r, review::SidebarRow::Target { entry, .. } if entry.target == next)
+                    })
+                    .expect("the next row is in the plan");
+                (
+                    view.list_state.bounds_for_item(ix),
+                    view.list_state.viewport_bounds(),
+                )
+            })
+        });
+        let bounds = bounds.expect("the next row was rendered");
+        assert!(
+            bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom(),
+            "the next row is fully on screen: {bounds:?} in {viewport:?}"
+        );
+    }
+
+    /// Scroll the pose to item 200, render, and hand back the row key the
+    /// anchor sits on.
+    fn anchor_at_200(review: &Entity<ReviewView>, vis: &mut VisualTestContext) -> review::RowKey {
+        vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                view.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 200,
+                    offset_in_item: px(0.),
+                });
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        vis.update(|_w, cx| {
+            let view = review.read(cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 200);
+            view.row_keys[200].clone()
+        })
+    }
+
+    /// Enqueue Keep disk on `target` (parks: no engine, the pose pumps).
+    fn decide(shell: &Entity<Shell>, target: PathBuf, vis: &mut VisualTestContext) {
+        vis.update(|_w, cx| {
+            shell.update(cx, |s, cx| {
+                s.enqueue(
+                    QueuedAction {
+                        target,
+                        decision: Decision::KeepDisk,
+                        notify_on_done: false,
+                    },
+                    cx,
+                )
+            })
+        });
+        vis.run_until_parked();
+    }
+
+    /// The scroll anchor's row, by key, in the list's current rows.
+    fn anchor_key_ix(
+        review: &Entity<ReviewView>,
+        key: &review::RowKey,
+        vis: &mut VisualTestContext,
+    ) -> (usize, usize) {
+        vis.update(|_w, cx| {
+            let view = review.read(cx);
+            (
+                view.list_state.logical_scroll_top().item_ix,
+                view.row_keys
+                    .iter()
+                    .position(|k| k == key)
+                    .expect("the anchor row is still listed"),
+            )
+        })
+    }
+
+    /// A decision on a row INSIDE the viewport, below the scroll top, moves
+    /// that row up into PROCESSING: the splice window runs from the
+    /// PROCESSING group down past the anchor, and gpui snaps an anchor
+    /// inside the window to the window's start. The view must put it back
+    /// on its row — the list must not jump to the top on every decision.
+    ///
+    /// MUTATION: drop the re-anchor in `render_inner` (`if false && ..`) →
+    /// the scroll top snaps to the splice start (~5). MUTATION:
+    /// `re_anchor_index` returns `Some(anchor_ix)` unchanged → off by one
+    /// (the decided row now sits above the anchor).
+    #[gpui::test]
+    fn a_decision_inside_the_viewport_keeps_the_scroll_anchor(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let key = anchor_at_200(&review, vis);
+        let decided = vis.update(|_w, cx| {
+            review.update(cx, |view, cx| {
+                let plan = view.plan(cx);
+                plan.rows[205..]
+                    .iter()
+                    .find_map(|r| match r {
+                        review::SidebarRow::Target {
+                            entry,
+                            selectable: true,
+                            ..
+                        } => Some(entry.target.clone()),
+                        _ => None,
+                    })
+                    .expect("a safe row just below the anchor")
+            })
+        });
+        decide(&shell, decided, vis);
+        let (top, key_ix) = anchor_key_ix(&review, &key, vis);
+        assert_eq!(top, key_ix, "the scroll top stays on the row it was on");
+    }
+
+    /// A decision on a row ABOVE the viewport: the splice window ends above
+    /// the anchor, so gpui shifts the anchor by the count change itself —
+    /// and the re-anchor must agree. The pose's queue is emptied first so
+    /// the decision also brings the PROCESSING header back: +2 rows above,
+    /// −1 where the row left, so the anchor row moves down by one.
+    ///
+    /// MUTATION: `re_anchor_index` returns `Some(anchor_ix)` unchanged → the
+    /// scroll top stays at 200 while its row moved to 201.
+    #[gpui::test]
+    fn a_decision_on_a_row_above_the_viewport_keeps_the_scroll_anchor(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.update(|_w, cx| {
+            shell.update(cx, |s, cx| {
+                // Still pumping: a decision parks rather than run.
+                s.queue = Default::default();
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        let key = anchor_at_200(&review, vis);
+        let decided = vis
+            .update(|_w, cx| review.update(cx, |view, cx| view.plan(cx).visible_safe[50].clone()));
+        let decided_ix =
+            vis.update(|_w, cx| {
+                review.read(cx).row_keys.iter().position(
+                    |k| matches!(k, review::RowKey::Target { path, .. } if *path == decided),
+                )
+            });
+        assert!(
+            decided_ix.is_some_and(|ix| ix < 200),
+            "{decided_ix:?} is above the anchor"
+        );
+        decide(&shell, decided, vis);
+        let (top, key_ix) = anchor_key_ix(&review, &key, vis);
+        assert_eq!(
+            key_ix, 201,
+            "the PROCESSING header and row above, one row gone"
+        );
+        assert_eq!(top, key_ix, "the scroll top stays on the row it was on");
+    }
+
+    /// An ordinary rebuild that changes the row count keeps the list's
+    /// item count in step with the plan (rows + the In sync footer).
+    ///
+    /// MUTATION: skip the splice (`let _ = (range, count);`) → the list
+    /// keeps the old count and the two diverge.
+    #[gpui::test]
+    fn an_ordinary_queue_change_keeps_the_item_count_in_step(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-many", smoke_paths(), cx).expect("review-many fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        let before = vis.update(|_w, cx| review.read(cx).plan_rows_len_for_test());
+        let state = vis.update(|_w, cx| shell.read(cx).state.clone());
+        vis.update(|_w, cx| {
+            state.update(cx, |model, cx| {
+                model.drifted.pop();
+                cx.notify();
+            })
+        });
+        vis.run_until_parked();
+        let (items, rows) = vis.update(|_w, cx| {
+            let v = review.read(cx);
+            (v.list_state.item_count(), v.plan_rows_len_for_test())
+        });
+        assert_ne!(rows, before, "the change altered the row count");
+        assert_eq!(items, rows + 1, "rows plus the In sync footer");
     }
 }

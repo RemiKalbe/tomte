@@ -1106,6 +1106,26 @@ pub(super) fn splice_window(old: &[RowKey], new: &[RowKey]) -> Option<(Range<usi
     Some((prefix..old.len() - suffix, new.len() - prefix - suffix))
 }
 
+/// Where the list's scroll anchor belongs after the rows changed from `old`
+/// to `new`: the new index of the row the anchor was on (`old[anchor_ix]`),
+/// or, when that row left the list (it was resolved, or moved to
+/// PROCESSING with a new key), the new index of the nearest LATER old row
+/// that survived, else of the nearest earlier one. `None` when the anchor
+/// was not on a row (an empty list, or the footer past the last row) or no
+/// old row survived.
+///
+/// Needed because gpui 0.2.2's `ListState::splice` snaps the anchor to the
+/// window's START whenever the anchor lies INSIDE the spliced window
+/// (`list.rs` `splice_focusable`), and a decision on a row below the anchor
+/// splices from the PROCESSING group down past it.
+pub(super) fn re_anchor_index(old: &[RowKey], new: &[RowKey], anchor_ix: usize) -> Option<usize> {
+    let index_in_new = |key: &RowKey| new.iter().position(|k| k == key);
+    let anchor = old.get(anchor_ix)?;
+    index_in_new(anchor)
+        .or_else(|| old[anchor_ix + 1..].iter().find_map(index_in_new))
+        .or_else(|| old[..anchor_ix].iter().rev().find_map(index_in_new))
+}
+
 pub(super) struct SidebarInputs<'a> {
     pub drifted: &'a [DriftSummary],
     pub queue: &'a QueueSnapshot,
@@ -1356,13 +1376,27 @@ pub struct ReviewView {
     /// over `row_keys`, never `reset` on an ordinary rebuild (that snaps
     /// the scroll anchor to the top). `pub(super)` for the tests.
     pub(super) list_state: ListState,
-    /// The keys of the rows the list currently holds.
-    row_keys: Vec<RowKey>,
+    /// The keys of the rows the list currently holds. `pub(super)` for the
+    /// tests, which follow a row's key across a rebuild.
+    pub(super) row_keys: Vec<RowKey>,
     /// Rows the item closure rendered in the last frame — the proof that
     /// 500 rows do not render 500 elements. A test seam and a perf counter.
     pub(super) rows_rendered: Rc<Cell<usize>>,
-    /// A target the next frame should scroll into view: set by an
-    /// auto-advance, consumed by `render_inner`.
+    /// The lowest and highest item index the item closure rendered in the
+    /// last frame. Rendered items are measured, and the list renders one
+    /// contiguous run (the viewport plus its overdraw), so a target inside
+    /// this range has true heights all the way from the scroll top; outside
+    /// it, rows the list never measured count as height 0 and
+    /// `bounds_for_item` / `scroll_to_reveal_item` aim at the wrong place.
+    rendered_range: Rc<Cell<Option<(usize, usize)>>>,
+    /// A target a frame should scroll into view: set by an auto-advance,
+    /// consumed by `render_inner` ONLY on a frame that did not splice or
+    /// reset the list. The decision that triggered the advance splices the
+    /// rows it moved, and spliced rows are unmeasured (height 0) until a
+    /// layout measures them, so on that frame `bounds_for_item` places the
+    /// target near the viewport top and it reads "visible" even when it is
+    /// hundreds of rows down. The splice frame keeps it and schedules the
+    /// next frame, whose previous layout measured the rows on screen.
     reveal: Option<PathBuf>,
 }
 
@@ -1401,6 +1435,7 @@ impl ReviewView {
             list_state: ListState::new(0, ListAlignment::Top, px(200.)),
             row_keys: Vec::new(),
             rows_rendered: Rc::new(Cell::new(0)),
+            rendered_range: Rc::new(Cell::new(None)),
             reveal: None,
         }
     }
@@ -1636,9 +1671,6 @@ impl ReviewView {
         self.plan_with(queue, cx)
     }
 
-    /// The one plan builder: rebuilds when `plan_dirty` is set or the key
-    /// built from `queue` and the view's own state differs from the cached
-    /// one, otherwise hands back the cached `Rc`.
     /// How many rows the cached plan holds — a test seam for the
     /// virtualized sidebar.
     #[cfg(test)]
@@ -1646,6 +1678,9 @@ impl ReviewView {
         self.plan_cache.as_ref().map_or(0, |(_, p)| p.rows.len())
     }
 
+    /// The one plan builder: rebuilds when `plan_dirty` is set or the key
+    /// built from `queue` and the view's own state differs from the cached
+    /// one, otherwise hands back the cached `Rc`.
     fn plan_with(&mut self, queue: QueueSnapshot, cx: &App) -> Rc<SidebarPlan> {
         let key = PlanKey {
             queue,
@@ -2196,6 +2231,7 @@ impl ReviewView {
         let queue = queue.clone();
         let weak = cx.weak_entity();
         let counter = self.rows_rendered.clone();
+        let range = self.rendered_range.clone();
         // The item closure runs during the list's layout and prepaint,
         // after this view's render returned and its lease was released
         // (gpui 0.2.2 `view.rs`: `Entity::request_layout` produces the
@@ -2209,6 +2245,10 @@ impl ReviewView {
                 return div().into_any_element();
             };
             counter.set(counter.get() + 1);
+            range.set(Some(match range.get() {
+                Some((lo, hi)) => (lo.min(ix), hi.max(ix)),
+                None => (ix, ix),
+            }));
             let item = view.update(cx, |view, cx| {
                 view.sidebar_item(ix, &plan, &queue, in_sync, now, theme, cx)
             });
@@ -2968,33 +3008,68 @@ impl ReviewView {
         // rows keep their heights and the scroll anchor stays on its row.
         let keys = row_keys(&plan, &queue);
         let item_count = plan.rows.len().max(1) + 1;
-        if self.list_state.item_count() == 0 || keys.is_empty() != self.row_keys.is_empty() {
-            self.list_state.reset(item_count);
-        } else if let Some((range, count)) = splice_window(&self.row_keys, &keys) {
-            self.list_state.splice(range, count);
+        let top = self.list_state.logical_scroll_top();
+        let changed =
+            if self.list_state.item_count() == 0 || keys.is_empty() != self.row_keys.is_empty() {
+                self.list_state.reset(item_count);
+                true
+            } else if let Some((range, count)) = splice_window(&self.row_keys, &keys) {
+                self.list_state.splice(range, count);
+                true
+            } else {
+                false
+            };
+        // `splice` snaps the anchor to the window's start whenever the
+        // anchor lay inside the window (a decision on a row below it moves
+        // that row up into PROCESSING): put it back on the row it was on,
+        // found by key. The offset into the row is kept only when the very
+        // same row survived; a neighbour standing in for a vanished row is
+        // shown from its top.
+        if changed && let Some(new_ix) = re_anchor_index(&self.row_keys, &keys, top.item_ix) {
+            let same_row = self.row_keys.get(top.item_ix) == keys.get(new_ix);
+            self.list_state.scroll_to(ListOffset {
+                item_ix: new_ix,
+                offset_in_item: if same_row { top.offset_in_item } else { px(0.) },
+            });
         }
         self.row_keys = keys;
         // An auto-advance landed on a row the user may not be able to see.
-        // `bounds_for_item` is `Some` only for a rendered (hence measured)
-        // row, and `scroll_to_reveal_item` is exact for those; a row that
-        // was never rendered has no measured height to aim at, so it is
-        // put near the top with `scroll_to` instead.
-        if let Some(target) = self.reveal.take()
+        // Not on a frame that spliced (see `reveal`): defer it to the next
+        // frame. `cx.notify()` alone does nothing mid-draw in gpui 0.2.2
+        // (`window.rs` `invalidate_view` only marks the view while
+        // drawing), so the notify is deferred until the draw is over.
+        if changed && self.reveal.is_some() {
+            cx.defer_in(window, |_view, _window, cx| cx.notify());
+        }
+        // The bounds are trusted only for a target the last frame rendered
+        // (see `rendered_range`): then `bounds_for_item` is exact, and a
+        // target already fully on screen needs nothing. Any other target
+        // has no true distance to aim at, so it is put near the top with
+        // `scroll_to`.
+        if !changed
+            && let Some(target) = self.reveal.take()
             && let Some(ix) = plan.rows.iter().position(
                 |r| matches!(r, SidebarRow::Target { entry, .. } if entry.target == target),
             )
         {
+            let measured = self
+                .rendered_range
+                .get()
+                .is_some_and(|(lo, hi)| lo <= ix && ix <= hi);
             let viewport = self.list_state.viewport_bounds();
             match self.list_state.bounds_for_item(ix) {
-                Some(b) if b.top() >= viewport.top() && b.bottom() <= viewport.bottom() => {}
-                Some(_) => self.list_state.scroll_to_reveal_item(ix),
-                None => self.list_state.scroll_to(ListOffset {
+                Some(b)
+                    if measured && b.top() >= viewport.top() && b.bottom() <= viewport.bottom() => {
+                }
+                Some(_) if measured => self.list_state.scroll_to_reveal_item(ix),
+                _ => self.list_state.scroll_to(ListOffset {
                     item_ix: ix.saturating_sub(2),
                     offset_in_item: px(0.),
                 }),
             }
         }
         self.rows_rendered.set(0);
+        self.rendered_range.set(None);
 
         let dragging = self.sidebar_drag.is_some();
         div()
@@ -3282,8 +3357,8 @@ mod tests {
         QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, RowKey, Selection, SidebarInputs,
         SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
         display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
-        preview_decors, queued_outcome_banner, refused_banner, row_keys, severity_groups,
-        sidebar_rows, source_actions, splice_window, undo_affordance, undo_banner,
+        preview_decors, queued_outcome_banner, re_anchor_index, refused_banner, row_keys,
+        severity_groups, sidebar_rows, source_actions, splice_window, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -3354,6 +3429,54 @@ mod tests {
             "no overlap"
         );
         assert_eq!(splice_window(&[], &keys(&["a"])), Some((0..0, 1)));
+    }
+
+    /// The anchor follows its row by key across a rebuild (gpui's `splice`
+    /// snaps it to the window's start when it lies inside the window).
+    ///
+    /// MUTATION: return `Some(anchor_ix)` unchanged → "a row moved to
+    /// PROCESSING above the anchor" reports 2 instead of 3. MUTATION: drop
+    /// the later-survivor search → "the anchor row itself left" falls back
+    /// to the earlier neighbour (1) instead of the later one (2).
+    #[test]
+    fn re_anchor_index_follows_the_anchor_row_by_key() {
+        let old = keys(&["p", "a", "b", "c", "d"]);
+        // `c` (below the anchor `b`) moved up into PROCESSING with a new key.
+        let mut new = keys(&["p", "a", "b", "d"]);
+        new.insert(
+            1,
+            RowKey::Target {
+                path: PathBuf::from("c"),
+                queued: Some(QueuedStatus::Waiting),
+                failed: false,
+            },
+        );
+        assert_eq!(
+            re_anchor_index(&old, &new, 2),
+            Some(3),
+            "a row moved to PROCESSING above the anchor: `b` is one lower"
+        );
+        assert_eq!(
+            re_anchor_index(&old, &keys(&["p", "a", "c", "d"]), 2),
+            Some(2),
+            "the anchor row itself left: the next surviving row (`c`)"
+        );
+        assert_eq!(
+            re_anchor_index(&old, &keys(&["p", "a"]), 3),
+            Some(1),
+            "no later row survived: the nearest earlier one (`a`)"
+        );
+        assert_eq!(
+            re_anchor_index(&old, &new, 5),
+            None,
+            "the anchor was the footer, past the last row"
+        );
+        assert_eq!(re_anchor_index(&[], &new, 0), None, "an empty list");
+        assert_eq!(
+            re_anchor_index(&old, &keys(&["x"]), 1),
+            None,
+            "no old row survived"
+        );
     }
 
     /// A row that grew a sub-line (queued, or failed) is taller: its key
