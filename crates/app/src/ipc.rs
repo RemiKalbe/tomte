@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,14 @@ pub enum IpcError {
     /// nothing happened — but nothing will until the daemon frees up.
     #[error("the daemon stayed busy for {waited_secs:.1}s ({message}) — try again")]
     Busy { waited_secs: f64, message: String },
+    /// The socket closed before the daemon replied: it is gone (shut
+    /// down, crashed, or replaced). The request may or may not have run,
+    /// exactly like a timeout; the app's boot loop reconnects on its own.
+    #[error(
+        "the daemon connection closed before it replied — it may still have run it; \
+         the app reconnects on its own"
+    )]
+    Closed,
     #[error("daemon rejected connection: {0}")]
     Rejected(String),
     #[error(
@@ -92,6 +100,10 @@ pub struct IpcClient {
     next_id: AtomicU64,
     pending: std::sync::Arc<Mutex<HashMap<u64, Sender<Response>>>>,
     events_tx: std::sync::Arc<Mutex<Option<Sender<Event>>>>,
+    /// Set by the reader thread at EOF: the daemon is gone. A request
+    /// made after that fails at once instead of waiting 30 s for a reply
+    /// that cannot come.
+    closed: std::sync::Arc<AtomicBool>,
     /// What the daemon said it runs in its hello reply.
     daemon_build: Option<BuildId>,
 }
@@ -133,12 +145,14 @@ impl IpcClient {
         let reader_stream = stream.try_clone()?;
         let pending: std::sync::Arc<Mutex<HashMap<u64, Sender<Response>>>> = Default::default();
         let events_tx: std::sync::Arc<Mutex<Option<Sender<Event>>>> = Default::default();
+        let closed = std::sync::Arc::new(AtomicBool::new(false));
 
         let client = Self {
             writer: Mutex::new(stream),
             next_id: AtomicU64::new(1),
             pending: pending.clone(),
             events_tx: events_tx.clone(),
+            closed: closed.clone(),
             daemon_build: None,
         };
 
@@ -163,6 +177,20 @@ impl IpcClient {
                         }
                     }
                 }
+            }
+            // EOF or a read error: the daemon is gone. Say so before
+            // failing anyone (see `request`), fail every in-flight request
+            // now rather than at its 30 s timeout, and close the event
+            // channel so the boot loop sees `Disconnected` and reconnects.
+            // Until 2026-10-12 the Sender lived on in the client, so the
+            // Receiver never disconnected: a daemon asked to shut down was
+            // never replaced, and every Status poll timed out, forever.
+            closed.store(true, Ordering::SeqCst);
+            if let Ok(mut p) = pending.lock() {
+                p.clear();
+            }
+            if let Ok(mut guard) = events_tx.lock() {
+                guard.take();
             }
         });
 
@@ -238,26 +266,47 @@ impl IpcClient {
     }
 
     pub fn request(&self, request: Request) -> Result<Response, IpcError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(IpcError::Closed);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel();
         if let Ok(mut p) = self.pending.lock() {
             p.insert(id, tx);
         }
+        let forget = || {
+            if let Ok(mut p) = self.pending.lock() {
+                p.remove(&id);
+            }
+        };
         {
             let mut w = self
                 .writer
                 .lock()
                 .map_err(|_| IpcError::Proto("writer poisoned".into()))?;
-            write_frame(&mut *w, &ClientFrame { id, request })?;
-            w.flush()?;
+            if let Err(e) =
+                write_frame(&mut *w, &ClientFrame { id, request }).and_then(|()| w.flush())
+            {
+                forget();
+                return Err(e.into());
+            }
+        }
+        // The reader thread sets `closed` BEFORE clearing `pending`: a
+        // close that landed between the check above and the insert is
+        // seen here, and one that lands later clears our entry, so the
+        // wait below ends in `Disconnected` — never in a 30 s timeout.
+        if self.closed.load(Ordering::SeqCst) {
+            forget();
+            return Err(IpcError::Closed);
         }
         // 30s: requests may legitimately WAIT inside the daemon for a full
         // scan to release the core (~9s over ~1k files) — see server.rs.
-        rx.recv_timeout(Duration::from_secs(30)).map_err(|_| {
-            if let Ok(mut p) = self.pending.lock() {
-                p.remove(&id);
+        rx.recv_timeout(Duration::from_secs(30)).map_err(|e| {
+            forget();
+            match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => IpcError::Timeout,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => IpcError::Closed,
             }
-            IpcError::Timeout
         })
     }
 
@@ -370,6 +419,94 @@ mod tests {
     /// MUTATION: compare only `exe` → the same-path-rebuilt case passes as
     /// fresh and the third assertion fails.
     /// MUTATION: `running.is_none()` treated as fresh → the fourth fails.
+    /// A daemon that goes away is noticed at once: the reader thread's
+    /// EOF closes the event channel (the boot loop reconnects on
+    /// `Disconnected`) and fails requests now, instead of leaving the app
+    /// polling a dead socket for good (2026-10-12: a daemon asked to shut
+    /// down was never replaced — the event Sender lived in the client, so
+    /// the Receiver never disconnected, and each Status poll timed out
+    /// after 30 s, forever).
+    ///
+    /// MUTATION: drop the `guard.take()` at the reader thread's end → the
+    /// channel reads `Timeout`, not `Disconnected`.
+    /// MUTATION: drop both `closed` checks and the `p.clear()` → the
+    /// request waits its full 30 s and the elapsed assertion fails.
+    #[test]
+    fn a_vanished_daemon_closes_the_event_channel_and_fails_requests_at_once() {
+        use super::{IpcClient, IpcError};
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::{Duration, Instant};
+        use tomte_proto::{
+            ClientFrame, PROTOCOL_VERSION, Request, Response, ServerFrame, read_frame, write_frame,
+        };
+
+        let socket =
+            std::env::temp_dir().join(format!("tomte-ipc-eof-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind");
+        // A daemon that answers hello and subscribe, then stops talking
+        // but keeps LISTENING (half-close): the client's reader sees EOF
+        // while its writes still succeed — the shape of a daemon mid-exit,
+        // and the one where only the `closed` flag saves a request from
+        // its full 30 s wait (a dead peer fails the write itself).
+        let (half_closed_tx, half_closed_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut out = stream;
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read");
+                let frame: ClientFrame = read_frame(line.trim_end()).expect("frame");
+                let response = match frame.request {
+                    Request::Hello { .. } => Response::HelloOk {
+                        version: PROTOCOL_VERSION,
+                        machine: "fake".into(),
+                        build: None,
+                    },
+                    _ => Response::Ok,
+                };
+                write_frame(
+                    &mut out,
+                    &ServerFrame::Reply {
+                        id: frame.id,
+                        response,
+                    },
+                )
+                .expect("reply");
+            }
+            out.shutdown(std::net::Shutdown::Write).expect("half-close");
+            half_closed_tx.send(()).expect("signal");
+            // Keep reading until the client hangs up, so its writes land.
+            let mut sink = String::new();
+            while reader.read_line(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+        });
+        let client = IpcClient::connect(&socket).expect("connect");
+        let events = client.subscribe().expect("subscribe");
+        half_closed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake daemon half-closed");
+
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            other => panic!("the event channel must close when the daemon goes: {other:?}"),
+        }
+        let started = Instant::now();
+        let err = client
+            .request(Request::Status)
+            .expect_err("no daemon to answer");
+        assert!(matches!(err, IpcError::Closed), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "failed in {:?}, not at the 30 s timeout",
+            started.elapsed()
+        );
+        drop(client);
+        let _ = std::fs::remove_file(&socket);
+    }
+
     #[test]
     fn stale_daemon_means_any_build_but_ours() {
         let ours = build("/app/tomted", 1_000);

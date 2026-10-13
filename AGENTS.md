@@ -263,6 +263,11 @@ Hard rules, each one learned the expensive way.
   never "try again"). A client-side timeout is NOT retried — the daemon may
   have executed it. Since 2026-10-11 a scan never holds the core; the lock
   holders are the per-event path, the fetch and a scan's apply phase.
+- The IPC reader thread's EOF is the ONLY "daemon gone" signal the app's
+  boot loop has: it sets `closed`, fails every in-flight request
+  (`IpcError::Closed`) and drops the event Sender so the loop sees
+  `Disconnected` and reconnects. Until 2026-10-12 the Sender outlived the
+  socket and a shut-down daemon was never replaced. Keep that cleanup.
 - Watcher paths go through `classify_path`: anything inside a NESTED `.git`
   is ignored (vendored repos in the source tree made the daemon rescan
   itself every 0.6 s).

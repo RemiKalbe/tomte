@@ -8,6 +8,11 @@ version without one.
 
 ### Fixed
 
+- **The app notices when its daemon goes away.** A daemon that exited — a
+  settings restart, the stuck-daemon watchdog, a crash — used to leave the
+  app polling the dead socket for good, every request timing out after
+  30 s. The app now reconnects, and spawns a daemon, the moment the
+  connection drops; a request caught in between fails at once and says so.
 - **A leftover daemon no longer hides a fix.** The app now checks which
   binary the running daemon came from and, when it is not the one this
   build ships, shuts it down and starts its own. A daemon from the
