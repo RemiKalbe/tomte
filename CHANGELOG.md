@@ -8,6 +8,12 @@ version without one.
 
 ### Fixed
 
+- **A leftover daemon no longer hides a fix.** The app now checks which
+  binary the running daemon came from and, when it is not the one this
+  build ships, shuts it down and starts its own. A daemon from the
+  previous version used to keep serving after an install — or beside a
+  development build — with the old behaviour, for as long as it spoke the
+  protocol; `tomte --diagnose` prints both identities.
 - **A scan no longer blocks what you do.** The daemon used to hold its one
   lock for the whole scan — minutes with hundreds of drifted files — and
   every Save, Undo or Keep disk pressed meanwhile waited, then failed with
@@ -33,11 +39,12 @@ version without one.
   decision cannot be recalled mid-commit, and shows no ✕.
 - **Resolve several safe files at once.** In Review, ⌘-click or tick the
   checkbox on any SAFE TO RESOLVE row (⇧-click for a range, the header's
-  checkbox for all of them), then press Keep disk or Keep source · this
-  machine once. The whole selection is one batch: one re-add or apply, one
-  commit, one push, still one journal session per file so Undo stays per
-  file. Esc clears, ⌘A selects all. Rows that need a decision cannot be
-  ticked; they keep their own buttons.
+  checkbox for all of them), then press Keep disk or Keep source in the
+  bar that appears under the list — there whether or not a file is open.
+  The whole selection is one batch: one re-add or apply, one commit, one
+  push, still one journal session per file so Undo stays per file. Esc
+  clears, ⌘A selects all. Rows that need a decision cannot be ticked; they
+  keep their own buttons.
 - **A folder tree for the safe group.** The folder-tree toggle on the
   SAFE TO RESOLVE header shows that group as folders under `~`, single-child
   chains folded (`.config/nvim/`). Ticking a folder ticks every safe file

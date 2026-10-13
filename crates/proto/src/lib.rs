@@ -26,6 +26,50 @@ pub fn is_daemon_bounce(message: &str) -> bool {
     message == BUSY_REPLY || message.starts_with(STARTING_PREFIX)
 }
 
+/// The binary a daemon process was started from: its resolved path and the
+/// file's modification time, read ONCE at startup. The app compares it with
+/// the `tomted` it would spawn and takes over a daemon from any other
+/// build — the installed bundle's daemon still serving beside a development
+/// app, or the previous bundle's after an in-place install (2026-10-12: a
+/// 0.1.20 daemon served a branch build for two days, and every "the daemon
+/// stayed busy" it produced looked like a bug the branch had already
+/// fixed). Read at startup, not on demand: after an in-place replace the
+/// file's mtime is the NEW build's while the running code is the old one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildId {
+    pub exe: PathBuf,
+    /// Modification time of `exe`, milliseconds since the Unix epoch.
+    pub modified_ms: u64,
+}
+
+impl BuildId {
+    /// The identity of the binary at `path`; `None` when it cannot be
+    /// resolved or read (the caller then has nothing to compare against).
+    pub fn of(path: &std::path::Path) -> Option<Self> {
+        let exe = std::fs::canonicalize(path).ok()?;
+        let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
+        let modified_ms = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        Some(Self {
+            exe,
+            modified_ms: u64::try_from(modified_ms).ok()?,
+        })
+    }
+
+    /// The identity of the running process's own binary.
+    pub fn of_current_exe() -> Option<Self> {
+        Self::of(&std::env::current_exe().ok()?)
+    }
+}
+
+impl std::fmt::Display for BuildId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (mtime {}ms)", self.exe.display(), self.modified_ms)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -96,6 +140,11 @@ pub enum Response {
     HelloOk {
         version: u32,
         machine: String,
+        /// Which binary this daemon runs — see [`BuildId`]. Absent from
+        /// daemons older than 2026-10-12, which the app treats as "another
+        /// build" and takes over.
+        #[serde(default)]
+        build: Option<BuildId>,
     },
     Ok,
     Error {

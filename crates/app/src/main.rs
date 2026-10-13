@@ -191,7 +191,13 @@ fn verify_connectivity(paths: &Paths) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("[2/5] connected + hello ok in {:?}", t0.elapsed());
+    println!(
+        "[2/5] connected + hello ok in {:?}; daemon build: {}",
+        t0.elapsed(),
+        client
+            .daemon_build()
+            .map_or_else(|| "none reported".to_string(), |b| b.to_string())
+    );
     match client.request(Request::Status) {
         Ok(Response::Status {
             drifted,
@@ -1130,6 +1136,12 @@ fn diagnose(paths: &Paths) -> ExitCode {
         paths.tomted.display(),
         paths.tomted.exists()
     );
+    let _ = writeln!(
+        out,
+        "tomted build (would spawn): {}",
+        tomte_proto::BuildId::of(&paths.tomted)
+            .map_or_else(|| "unreadable".to_string(), |b| b.to_string())
+    );
 
     let settings = std::fs::read_to_string(&paths.settings).unwrap_or_default();
     let has_account = settings.contains("onepassword_account");
@@ -1179,28 +1191,38 @@ fn diagnose(paths: &Paths) -> ExitCode {
     );
 
     match IpcClient::connect(&paths.socket) {
-        Ok(client) => match client.request(Request::Status) {
-            Ok(Response::Status {
-                drifted,
-                in_sync,
-                degraded,
-                scanning,
-                last_fetch_ts,
-            }) => {
-                let _ = writeln!(
-                    out,
-                    "daemon status: {} drifted, {in_sync} in sync, scanning: {scanning}, degraded: {:?}, last_fetch_ts: {last_fetch_ts:?}",
-                    drifted.len(),
-                    degraded
-                );
-                for d in drifted.iter().take(30) {
-                    let _ = writeln!(out, "  drifted: {} [{}]", d.target.display(), d.class);
+        Ok(client) => {
+            let _ = writeln!(
+                out,
+                "daemon build (running): {}",
+                client.daemon_build().map_or_else(
+                    || "none reported (older than 2026-10-12)".to_string(),
+                    |b| b.to_string()
+                )
+            );
+            match client.request(Request::Status) {
+                Ok(Response::Status {
+                    drifted,
+                    in_sync,
+                    degraded,
+                    scanning,
+                    last_fetch_ts,
+                }) => {
+                    let _ = writeln!(
+                        out,
+                        "daemon status: {} drifted, {in_sync} in sync, scanning: {scanning}, degraded: {:?}, last_fetch_ts: {last_fetch_ts:?}",
+                        drifted.len(),
+                        degraded
+                    );
+                    for d in drifted.iter().take(30) {
+                        let _ = writeln!(out, "  drifted: {} [{}]", d.target.display(), d.class);
+                    }
+                }
+                other => {
+                    let _ = writeln!(out, "daemon status: unexpected {other:?}");
                 }
             }
-            other => {
-                let _ = writeln!(out, "daemon status: unexpected {other:?}");
-            }
-        },
+        }
         Err(e) => {
             let _ = writeln!(out, "daemon connect: FAILED ({e})");
         }

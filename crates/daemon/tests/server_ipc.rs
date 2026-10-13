@@ -61,10 +61,20 @@ fn handshake_then_status_and_push() {
     match recv(&mut reader) {
         ServerFrame::Reply {
             id: 1,
-            response: Response::HelloOk { version, machine },
+            response:
+                Response::HelloOk {
+                    version,
+                    machine,
+                    build,
+                },
         } => {
             assert_eq!(version, PROTOCOL_VERSION);
             assert_eq!(machine, "ipc-test");
+            // The daemon names its own binary — this test process — so the
+            // app can tell a daemon from another build apart.
+            // MUTATION: `build: None` in the hello reply → fails here.
+            let me = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+            assert_eq!(build.expect("hello carries the daemon's build").exe, me);
         }
         other => panic!("bad hello reply: {other:?}"),
     }

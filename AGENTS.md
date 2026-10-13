@@ -69,8 +69,10 @@ action queue, batching, per-file undo).
    target → journals → pushes `Event::{Drift, ScanDone, FetchDone, …}` to
    subscribers.
 2. `tomte` connects on boot (`IpcClient::connect_or_spawn` launches `tomted`
-   if the socket is dead), hydrates `SyncModel` from `Request::Status`, and
-   reconnects forever.
+   if the socket is dead, and first shuts down a daemon from any OTHER
+   build — `HelloOk` carries the daemon's `BuildId`, exe path + mtime at
+   its start), hydrates `SyncModel` from `Request::Status`, and reconnects
+   forever.
 3. A user decision goes `view → Shell::enqueue → ActionQueue → Shell::pump →
    ResolveEngine` on the background executor. The engine snapshots (journal
    session), announces expected changes to the daemon, writes (chezmoi
@@ -148,10 +150,11 @@ Then READ the PNG. `shoot.sh` deletes a stale PNG when a capture fails, so
 an "OK" line means this run wrote the file. `screencapture` fails inside a
 sandboxed shell; run it unsandboxed. Every new view sub-state gets a pose in
 `crates/app/src/views/fixtures.rs` (`STATES`); the render-smoke test builds
-all of them. `review-multiselect`, `review-tree`, and `review-tree-selected`
-pose the sidebar's multi-select and folder-tree states (checkboxes ticked,
-a folder collapsed, a whole folder selected). `review-many` is the
-500-file perf pose.
+all of them. `review-multiselect`, `review-multiselect-closed`,
+`review-tree`, and `review-tree-selected` pose the sidebar's multi-select
+and folder-tree states (checkboxes ticked, ticked with no file open, a
+folder collapsed, a whole folder selected). `review-many` is the 500-file
+perf pose.
 
 ## The gate
 
@@ -223,7 +226,12 @@ Hard rules, each one learned the expensive way.
   `ps ax -o pid,lstart,command` that the start time is new. Old processes can
   inherit `SIGTERM=SIG_IGN` and survive `pkill`; escalate to `kill -KILL` or
   the socket `Shutdown` request. A "fix that changed nothing" is usually a
-  stale process or binary, not code.
+  stale process or binary, not code — read the COMMAND column too: the
+  bundle's `/Applications/Tomte.app/…/tomted` served a `target/debug/tomte`
+  for two days (2026-10-12) because it spoke the same protocol. Since then
+  the app takes over a daemon from another build at launch (`BuildId` in
+  `HelloOk`, compared with the `tomted` it would spawn); `tomte --diagnose`
+  prints both identities.
 - Unix socket paths are capped at 104 bytes; throwaway daemon probes need a
   short `/tmp` path, not a deep scratchpad one.
 
@@ -378,11 +386,13 @@ with Undo skipping refused attempts. 0.1.20 (2026-09-21) waits out a busy
 daemon for 90 s per request; a batch stops after the first exhausted budget.
 
 This branch adds multi-select of SAFE TO RESOLVE rows with bulk one-batch
-Keep disk / Keep source actions, Esc/⌘A, and a List/Tree folder sidebar.
-The sidebar is virtualized (gpui `list`) with a cached plan; the
-folder-tree toggle sits on the SAFE TO RESOLVE header.
+Keep disk / Keep source actions (the selection bar is pinned under the
+sidebar's rows, so it is there with no file open), Esc/⌘A, and a List/Tree
+folder sidebar. The sidebar is virtualized (gpui `list`) with a cached
+plan; the folder-tree toggle sits on the SAFE TO RESOLVE header.
 Scans run off the daemon lock, nested repositories are ignored by the
-watcher, a queued decision can be ✕'d.
+watcher, a queued decision can be ✕'d, and the app replaces a daemon from
+another build at launch.
 
 Open, deliberately (design calls, not bugs):
 

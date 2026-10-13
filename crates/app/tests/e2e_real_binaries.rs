@@ -339,3 +339,65 @@ fn fetch_request_updates_freshness_and_pushes_fetch_done() {
     let _ = client.request(Request::Shutdown);
     let _ = daemon.wait();
 }
+
+#[test]
+fn app_takes_over_a_daemon_from_another_build() {
+    use std::time::Duration;
+    use tomte_app::ipc::IpcClient;
+    use tomte_proto::Request;
+
+    let e2e = E2e::new();
+    // "Another build": the same daemon binary at another path — what the
+    // installed bundle's tomted is to a development app, or the previous
+    // bundle's daemon to a freshly installed one (2026-10-12: a 0.1.20
+    // daemon served a branch build for two days; it spoke the protocol, so
+    // nothing displaced it, and the branch's fixes looked unapplied).
+    let old_bin = e2e.scratch.root.path().join("old-tomted");
+    std::fs::copy(&e2e.tomted, &old_bin).expect("copy tomted");
+    let mut old = Command::new(&old_bin)
+        .env("TOMTE_SOCKET", e2e.socket())
+        .env(
+            "TOMTE_JOURNAL",
+            e2e.scratch.root.path().join("old-journal.db"),
+        )
+        .env(
+            "TOMTE_SETTINGS",
+            e2e.scratch.root.path().join("old-settings.toml"),
+        )
+        .env("HOME", &e2e.scratch.home)
+        .spawn()
+        .expect("start the old daemon");
+    let sock = e2e.socket();
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(sock.exists(), "the old daemon never bound its socket");
+
+    // The app, shipping the REAL tomted, boots against that socket.
+    let (ok, log) = e2e.verify(None);
+    assert!(ok, "verify-connectivity failed:\n{log}");
+    assert!(log.contains("shutting it down to spawn ours"), "{log}");
+    assert!(log.contains("CONNECTIVITY OK"), "{log}");
+
+    // The old process is gone — asked to shut down, not left serving…
+    let mut exited = None;
+    for _ in 0..50 {
+        if let Ok(Some(status)) = old.try_wait() {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        exited.is_some(),
+        "the old daemon is still running after the takeover"
+    );
+    // …and the daemon on the socket is the one this app ships.
+    let client = IpcClient::connect(&sock).expect("connect to the spawned daemon");
+    let want = std::fs::canonicalize(&e2e.tomted).unwrap();
+    assert_eq!(client.daemon_build().map(|b| b.exe.clone()), Some(want));
+    let _ = client.request(Request::Shutdown);
+}

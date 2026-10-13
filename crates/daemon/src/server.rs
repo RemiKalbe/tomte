@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
 use tomte_proto::{
-    ClientFrame, Event, EventSummary, PROTOCOL_VERSION, Request, Response, ServerFrame,
+    BuildId, ClientFrame, Event, EventSummary, PROTOCOL_VERSION, Request, Response, ServerFrame,
     check_hello, write_frame,
 };
 
@@ -23,6 +23,10 @@ pub struct ServeCtx {
     pub core: Arc<std::sync::OnceLock<Arc<Mutex<DaemonCore>>>>,
     pub subscribers: Arc<Mutex<Vec<std::sync::mpsc::Sender<Event>>>>,
     pub machine: String,
+    /// The binary this daemon was started from, told to every client in
+    /// the hello reply so the app can take over a daemon from another
+    /// build (see [`tomte_proto::BuildId`]).
+    pub build: Option<BuildId>,
     /// Last startup error, shown as degraded status while `core` is empty.
     pub starting_error: Arc<Mutex<String>>,
     pub now_fn: fn() -> u64,
@@ -55,6 +59,7 @@ impl ServeCtx {
             starting_error: Arc::new(Mutex::new("starting".to_string())),
             now_fn,
             on_shutdown,
+            build: BuildId::of_current_exe(),
             busy_wait: DEFAULT_BUSY_WAIT,
         }
     }
@@ -136,6 +141,7 @@ fn handle_connection(stream: UnixStream, ctx: ServeCtx) -> std::io::Result<()> {
                             Response::HelloOk {
                                 version: PROTOCOL_VERSION,
                                 machine,
+                                build: ctx.build.clone(),
                             },
                         )?;
                     }
@@ -190,6 +196,7 @@ fn dispatch(ctx: &ServeCtx, request: Request, out: &Arc<Mutex<UnixStream>>) -> R
             return Response::HelloOk {
                 version: PROTOCOL_VERSION,
                 machine: ctx.machine.clone(),
+                build: ctx.build.clone(),
             };
         }
         Request::Subscribe => {

@@ -9,8 +9,9 @@
 //!
 //! The swap itself runs from the STAGED binary (`tomte --apply-update`) so
 //! the bundle being replaced contains no running executable pages we care
-//! about; the old daemon is shut down through the normal IPC path (a
-//! protocol-mismatch takeover already handles downlevel daemons).
+//! about; the old daemon is shut down through the normal IPC path (the
+//! build-identity takeover in `IpcClient::connect_or_spawn` replaces a
+//! daemon from any other build, the protocol-mismatch one a downlevel one).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

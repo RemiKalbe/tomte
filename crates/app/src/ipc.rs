@@ -10,7 +10,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use tomte_proto::{
-    ClientFrame, Event, PROTOCOL_VERSION, Request, Response, ServerFrame, read_frame, write_frame,
+    BuildId, ClientFrame, Event, PROTOCOL_VERSION, Request, Response, ServerFrame, read_frame,
+    write_frame,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -61,20 +62,50 @@ pub const DAEMON_PATIENCE: Duration = Duration::from_secs(90);
 /// bouncing, so this only needs to avoid a hot loop.
 const DAEMON_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
+/// Is the daemon on the socket a different build from the `tomted` this
+/// app would spawn? `expected` is `None` when that binary cannot be read
+/// (nothing to compare against — and nothing to spawn either); `running`
+/// is `None` for a daemon too old to say, which IS another build.
+fn stale_daemon(expected: Option<&BuildId>, running: Option<&BuildId>) -> bool {
+    match expected {
+        None => false,
+        Some(want) => running != Some(want),
+    }
+}
+
+/// Poll until nothing accepts on `socket` any more, then give the old
+/// process a beat to actually exit: the listener dies before the process
+/// releases the sock.lock flock, and a fresh daemon spawned in that window
+/// would lose the lock and quit.
+fn wait_for_socket_death(socket: &Path) {
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if UnixStream::connect(socket).is_err() {
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+}
+
 pub struct IpcClient {
     writer: Mutex<UnixStream>,
     next_id: AtomicU64,
     pending: std::sync::Arc<Mutex<HashMap<u64, Sender<Response>>>>,
     events_tx: std::sync::Arc<Mutex<Option<Sender<Event>>>>,
+    /// What the daemon said it runs in its hello reply.
+    daemon_build: Option<BuildId>,
 }
 
 impl IpcClient {
     pub fn connect(socket: &Path) -> Result<Self, IpcError> {
-        let client = Self::connect_raw(socket)?;
+        let mut client = Self::connect_raw(socket)?;
         match client.request(Request::Hello {
             version: PROTOCOL_VERSION,
         })? {
-            Response::HelloOk { .. } => Ok(client),
+            Response::HelloOk { build, .. } => {
+                client.daemon_build = build;
+                Ok(client)
+            }
             Response::Error { message } => {
                 // Version skew: an OLD daemon owns the socket (it holds the
                 // flock, so a fresh spawn can't displace it — 2026-08-08:
@@ -108,6 +139,7 @@ impl IpcClient {
             next_id: AtomicU64::new(1),
             pending: pending.clone(),
             events_tx: events_tx.clone(),
+            daemon_build: None,
         };
 
         std::thread::spawn(move || {
@@ -147,17 +179,14 @@ impl IpcClient {
             other => return Err(IpcError::Proto(format!("old hello failed: {other:?}"))),
         }
         let _ = client.request(Request::Shutdown);
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if UnixStream::connect(socket).is_err() {
-                break;
-            }
-        }
-        // The listener dies before the process exits and releases the
-        // sock.lock flock; a fresh daemon spawned in that window would lose
-        // the lock and quit. Give the old process a beat to actually die.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        wait_for_socket_death(socket);
         Ok(())
+    }
+
+    /// The binary the daemon on the other end reported at hello; `None`
+    /// for a daemon too old to report one.
+    pub fn daemon_build(&self) -> Option<&BuildId> {
+        self.daemon_build.as_ref()
     }
 
     /// [`Self::request`], retried across the daemon's busy bounces for up to
@@ -243,9 +272,33 @@ impl IpcClient {
         }
     }
 
+    /// Connect to the daemon on `socket`, spawning `tomted_bin` when
+    /// nothing answers — or when what answers is a daemon from ANOTHER
+    /// build: the installed bundle's beside a development app, the previous
+    /// bundle's after an install. It speaks our protocol, so nothing would
+    /// ever displace it, and every fix in this build would look unapplied
+    /// (2026-10-12). That daemon is asked to shut down and ours spawned.
     pub fn connect_or_spawn(socket: &Path, tomted_bin: &Path) -> Result<Self, IpcError> {
+        let expected = BuildId::of(tomted_bin);
         match Self::connect(socket) {
-            Ok(c) => return Ok(c),
+            Ok(c) if !stale_daemon(expected.as_ref(), c.daemon_build()) => return Ok(c),
+            Ok(c) => {
+                tomte_core::log_info!(
+                    "ipc",
+                    "the daemon at {} runs {}; this build ships {} — shutting it down to spawn ours",
+                    socket.display(),
+                    c.daemon_build().map_or_else(
+                        || "a build with no identity (older than 2026-10-12)".to_string(),
+                        |b| b.to_string()
+                    ),
+                    expected
+                        .as_ref()
+                        .map_or_else(|| "?".to_string(), |b| b.to_string())
+                );
+                let _ = c.request(Request::Shutdown);
+                drop(c);
+                wait_for_socket_death(socket);
+            }
             Err(first) => {
                 eprintln!(
                     "tomte: no daemon at {} ({first}); spawning tomted",
@@ -299,7 +352,40 @@ impl IpcClient {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_daemon_version;
+    use super::{parse_daemon_version, stale_daemon};
+    use std::path::PathBuf;
+    use tomte_proto::BuildId;
+
+    fn build(exe: &str, modified_ms: u64) -> BuildId {
+        BuildId {
+            exe: PathBuf::from(exe),
+            modified_ms,
+        }
+    }
+
+    /// A daemon is stale when it is not exactly the binary we would spawn:
+    /// another path (the bundle's daemon beside a dev build), the same path
+    /// rebuilt (an in-place install), or one too old to say. With nothing
+    /// to compare against there is nothing to take over.
+    /// MUTATION: compare only `exe` → the same-path-rebuilt case passes as
+    /// fresh and the third assertion fails.
+    /// MUTATION: `running.is_none()` treated as fresh → the fourth fails.
+    #[test]
+    fn stale_daemon_means_any_build_but_ours() {
+        let ours = build("/app/tomted", 1_000);
+        assert!(!stale_daemon(Some(&ours), Some(&ours)));
+        assert!(stale_daemon(
+            Some(&ours),
+            Some(&build("/Applications/tomted", 1_000))
+        ));
+        assert!(stale_daemon(
+            Some(&ours),
+            Some(&build("/app/tomted", 2_000))
+        ));
+        assert!(stale_daemon(Some(&ours), None));
+        assert!(!stale_daemon(None, Some(&ours)));
+        assert!(!stale_daemon(None, None));
+    }
 
     #[test]
     fn parses_version_from_mismatch_message() {
