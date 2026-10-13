@@ -2284,6 +2284,90 @@ impl ReviewView {
                     .py_1()
                     .child(rows),
             )
+            .children(self.selection_bar(theme, cx))
+    }
+
+    /// The selection bar (spec §2.4): "N selected" and ✕ above the bulk
+    /// pair, pinned under the sidebar's rows. It lives with the selection
+    /// it acts on, not in the detail pane: that pane shows whichever row
+    /// `selected` names — often none of the ticked files, and nothing at
+    /// all when no file is open — and the bar used to vanish with it
+    /// (2026-10-12: "if I only multiselect and don't have a file open the
+    /// buttons don't show"). Pinned at the bottom rather than under the
+    /// SAFE TO RESOLVE header so that ticking never pushes the rows down.
+    /// Two rows on purpose: at the sidebar's default width the pair has no
+    /// room beside the count. The source button reads "Keep source", not
+    /// the header's split "· this machine": origin is never a bulk action
+    /// (§2.1), so there is nothing here to tell it apart from.
+    fn selection_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let n = self.selection.members().len();
+        let buttons: Vec<AnyElement> = bulk_actions()
+            .into_iter()
+            .map(|action| {
+                ui::button(
+                    theme,
+                    ElementId::Name(format!("bulk-{}", action.button_id()).into()),
+                    action.button_label(false).into(),
+                    ui::ButtonVariant::Tonal(action.tint(theme)),
+                    ui::ButtonSize::Sm,
+                    cx.listener(move |view, _ev, _window, cx| view.run_bulk(action, cx)),
+                )
+                .debug_selector(move || format!("review-bulk:{}", action.button_id()))
+                .flex_shrink_0()
+                .into_any_element()
+            })
+            .collect();
+        Some(
+            div()
+                .id("review-selection-bar")
+                // Test-only (no-op in release builds): the render-smoke
+                // test asserts the bar renders with NO file open.
+                .debug_selector(|| "review-selection-bar".into())
+                .flex_none()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.text_muted)
+                                .child(format!("{n} selected")),
+                        )
+                        .child(
+                            ui::button(
+                                theme,
+                                "bulk-clear",
+                                "✕".into(),
+                                ui::ButtonVariant::Ghost,
+                                ui::ButtonSize::Sm,
+                                cx.listener(|view, _ev, _window, cx| view.clear_selection(cx)),
+                            )
+                            .debug_selector(|| "review-bulk:clear".into())
+                            .tooltip(ui::text_tooltip("Clear selection")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .children(buttons),
+                )
+                .into_any_element(),
+        )
     }
 
     /// One list item: a plan row, the "nothing to review" note (item 0 of
@@ -2646,71 +2730,11 @@ impl ReviewView {
         // Authoritative: origin's LOADED content, not the scan's hint.
         let split = self.origin_diffs.is_some();
         let blocked = blocked_reason(queue, selected);
-        // A selection bar REPLACES the per-file actions — it acts on the
-        // ticked set, not on the row `selected` happens to still name (the
-        // two can disagree: a ⌘/⇧-click never moves `selected`). It is its
-        // OWN full-width row below the header, not squeezed into the
-        // header's trailing slot alongside the title (MI-1): "Keep source ·
-        // this machine" (ruling 6) is wide enough that sharing the row with
-        // the title either wraps the bar or, once capped wide enough not
-        // to, pushes the title column under ~100px and truncates the
-        // filename — a strictly worse trade at ordinary window widths.
-        // Giving it the whole row avoids both.
-        let selection_bar: Option<AnyElement> = (!self.selection.is_empty()).then(|| {
-            let n = self.selection.members().len();
-            let mut items: Vec<AnyElement> = vec![
-                div()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .flex_shrink_0()
-                    .child(format!("{n} selected"))
-                    .into_any_element(),
-            ];
-            items.extend(bulk_actions().into_iter().map(|action| {
-                // `split: true` — spec §2.1/§2.4 give "Keep source · this
-                // machine" verbatim for the bulk bar's source button; `Keep
-                // disk` has no split form, so the flag is a no-op for it
-                // (`button_label` only branches on `KeepSourceLocal`).
-                ui::button(
-                    theme,
-                    ElementId::Name(format!("bulk-{}", action.button_id()).into()),
-                    action.button_label(true).into(),
-                    ui::ButtonVariant::Tonal(action.tint(theme)),
-                    ui::ButtonSize::Sm,
-                    cx.listener(move |view, _ev, _window, cx| view.run_bulk(action, cx)),
-                )
-                .flex_shrink_0()
-                .into_any_element()
-            }));
-            items.push(
-                ui::button(
-                    theme,
-                    "bulk-clear",
-                    "✕".into(),
-                    ui::ButtonVariant::Ghost,
-                    ui::ButtonSize::Sm,
-                    cx.listener(|view, _ev, _window, cx| view.clear_selection(cx)),
-                )
-                .tooltip(ui::text_tooltip("Clear selection"))
-                .flex_shrink_0()
-                .into_any_element(),
-            );
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(theme.border)
-                .children(items)
-                .into_any_element()
-        });
-        // The selection bar takes the header's trailing slot's PLACE (there
-        // is nothing left there to protect a filename from), rather than
-        // joining it — an empty `vec![]` whenever the bar is showing, and
-        // the per-file buttons below are not even built in that case.
+        // While a selection exists the per-file actions are not built at
+        // all: the sidebar's selection bar (`selection_bar`) acts on the
+        // ticked set, and the row `selected` happens to still name is
+        // often not among them (a ⌘/⇧-click never moves `selected`), so a
+        // Keep disk here would be a second, ambiguous surface.
         let title_trailing: Vec<AnyElement> = if self.selection.is_empty() {
             let mut header_actions: Vec<AnyElement> = Vec::new();
             header_actions.push(
@@ -2822,11 +2846,10 @@ impl ReviewView {
                 // ~370px at the app's minimum window width. Squeezing them
                 // (the flex default) overlapped the filename; wrapping costs a
                 // header row only when the width genuinely isn't there. Empty
-                // whenever the selection bar is showing — see
-                // `title_trailing`'s own comment.
+                // while a selection exists: the sidebar's selection bar acts
+                // then — see `title_trailing`'s own comment.
                 title_trailing,
             ))
-            .children(selection_bar)
             .when_some(self.last_outcome.clone(), |el, banner| {
                 el.child(self.banner_el(&banner, queue, theme, cx))
             })

@@ -67,7 +67,11 @@ pub const STATES: &[(&str, &str)] = &[
     ),
     (
         "review-multiselect",
-        "three safe rows ticked: the selection bar replaces the file's actions, checkboxes visible",
+        "three safe rows ticked: the selection bar under the sidebar rows, the open file's own actions gone",
+    ),
+    (
+        "review-multiselect-closed",
+        "three safe rows ticked with NO file open: the bar is still there, the detail pane keeps its empty note",
     ),
     (
         "review-tree",
@@ -531,13 +535,15 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         | "review-origin"
         | "review-origin-compared"
         | "review-multiselect"
+        | "review-multiselect-closed"
         | "review-tree"
         | "review-tree-selected"
         | "review-many" => {
             let mut model = match name {
-                "review-multiselect" | "review-tree" | "review-tree-selected" => {
-                    multiselect_model()
-                }
+                "review-multiselect"
+                | "review-multiselect-closed"
+                | "review-tree"
+                | "review-tree-selected" => multiselect_model(),
                 "review-many" => many_model(),
                 _ => rich_model(),
             };
@@ -560,6 +566,9 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
             let mut s = shell(Route::Review, model);
             let (banner, selected) = match name {
                 "review-empty" => (None, false),
+                // The user's 2026-10-12 case: ticked rows, no file open — the
+                // bar must not depend on the detail pane.
+                "review-multiselect-closed" => (None, false),
                 "review-banner" => (
                     Some(OutcomeBanner {
                         // NOT the selected file: confirming `secrets.yaml`
@@ -635,14 +644,14 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                     view.auto_merge = Some((Arc::new(inputs), "merged\n".into()));
                 });
             }
-            if name == "review-multiselect" {
+            if name == "review-multiselect" || name == "review-multiselect-closed" {
                 // Ticked against the plan's own `safe_order`, exactly as a
                 // real ⌘-click does (`ReviewView::toggle_member`) — not the
-                // detail pane's `selected` file, which stays
-                // `.config/zed/settings.json` (from `posed_review`) so the
-                // pose also shows the selection bar replacing a file's
-                // per-row actions while a DIFFERENT file's diff still shows
-                // underneath it.
+                // detail pane's `selected` file, which (in
+                // `review-multiselect`) stays `.config/zed/settings.json`
+                // from `posed_review`, so that pose also shows a DIFFERENT
+                // file's diff with its own actions gone while the sidebar
+                // bar acts on the ticked set.
                 let home_dir = home("");
                 let plan = sidebar_rows(SidebarInputs {
                     drifted: &s.state.read(cx).drifted,

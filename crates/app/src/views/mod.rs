@@ -4486,6 +4486,70 @@ mod render_smoke {
         );
     }
 
+    /// The selection bar lives in the sidebar, with the selection it acts
+    /// on (spec 2026-09-23 §2.4 as amended 2026-10-12): it renders with NO
+    /// file open, pinned under the rows inside the sidebar column, and its
+    /// buttons are wired — a real click on its Keep disk queues the ticked
+    /// files, a real click on its ✕ clears them.
+    ///
+    /// MUTATION: build the bar inside `detail` again (below its
+    /// "select a file to review" early return) → no file open, no bar: the
+    /// first lookup fails.
+    /// MUTATION: `.children(self.selection_bar(theme, cx))` on the detail
+    /// pane instead of the sidebar → the bar lands right of the column and
+    /// the containment assertion fails.
+    /// MUTATION: `|_, _, _| {}` as the Keep disk listener → nothing queued.
+    #[gpui::test]
+    fn the_selection_bar_is_in_the_sidebar_even_with_no_file_open(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-multiselect-closed", smoke_paths(), cx)
+                .expect("review-multiselect-closed fixture")
+        });
+        let review = review_of(&shell, vis);
+        vis.run_until_parked();
+        assert!(
+            vis.update(|_w, cx| review.read(cx).selected.is_none()),
+            "pose premise: no file open"
+        );
+        assert_eq!(
+            vis.update(|_w, cx| review.read(cx).selection.members().len()),
+            3
+        );
+        let column = vis
+            .debug_bounds("review-sidebar-rows")
+            .expect("sidebar column");
+        let bar = vis
+            .debug_bounds("review-selection-bar")
+            .expect("the selection bar renders with no file open");
+        assert!(
+            bar.left() >= column.left() - px(1.) && bar.right() <= column.right() + px(1.),
+            "bar {bar:?} spans the sidebar column {column:?}"
+        );
+        assert!(
+            bar.top() >= column.bottom() - px(1.),
+            "bar {bar:?} is pinned under the rows {column:?}"
+        );
+        let clear = vis.debug_bounds("review-bulk:clear").expect("the bar's ✕");
+        assert!(
+            clear.right() <= column.right() + px(1.),
+            "✕ {clear:?} inside the column {column:?}"
+        );
+        let keep_disk = vis
+            .debug_bounds("review-bulk:keep-disk")
+            .expect("the bar's Keep disk");
+        vis.simulate_click(keep_disk.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(
+            vis.update(|_w, cx| shell.read(cx).queue.processing().len()),
+            3,
+            "one real click on the bar's Keep disk queued every ticked file"
+        );
+        assert!(
+            vis.update(|_w, cx| review.read(cx).selection.is_empty()),
+            "and the selection is spent"
+        );
+    }
+
     /// The List/Tree control is a toggle on the SAFE TO RESOLVE header
     /// (spec 2026-10-11 §2.1), reached by a real click, and its lit state
     /// follows the mode (the selector name carries `:on` / `:off`).

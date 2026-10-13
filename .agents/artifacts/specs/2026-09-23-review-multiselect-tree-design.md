@@ -88,12 +88,22 @@ the view. Nothing else is bound.
 
 ### 2.4 Bulk actions are one batch
 
-When `members` is non-empty, the header's action slot shows a **selection
-bar** instead of the selected row's actions:
+When `members` is non-empty, a **selection bar** is pinned under the
+sidebar's rows, and the detail header's action slot is empty:
 
 ```
-3 selected   [Keep disk]  [Keep source · this machine]   ✕
+3 selected                       ✕
+[Keep disk]  [Keep source]
 ```
+
+The bar lives with the selection it acts on, not in the detail pane
+(amended 2026-10-12): that pane shows whichever row `selected` names —
+often none of the ticked files, and nothing at all when no file is open —
+and a bar built there vanished with it. Pinned at the bottom rather than
+under the SAFE TO RESOLVE header so that ticking never pushes the rows
+down; two rows because at the sidebar's default width the pair has no room
+beside the count. The source button reads "Keep source" here: origin is
+never a bulk action (§2.1), so there is nothing to tell it apart from.
 
 A bulk press builds one `QueuedAction` per member (display order, the same
 `Decision` the single button would build, `notify_on_done: false`) and calls
