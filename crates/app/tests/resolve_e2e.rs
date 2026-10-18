@@ -1103,6 +1103,88 @@ fn story_b_keep_source_restores_rendered_content() {
     assert!(lab.settled_status().is_empty());
 }
 
+/// A source file this machine has never applied — in the source repo,
+/// absent on disk — is the plainest Keep source there is, and it used to be
+/// refused: `keep_source` snapshotted the disk copy for undo first, found
+/// nothing, and failed with "snapshot returned 0 blobs for 1 path"
+/// (2026-10-14: every file of a 427-file skill folder). The decision now
+/// journals `dest_blob: null`, and undo removes what `apply` created.
+///
+/// MUTATION: `snapshot_dest` treating NotFound as the old error → the
+/// `keep_source` call fails. MUTATION: undo skipping `UndoRestore::Absent` →
+/// the target survives the undo and the last assertion fails.
+#[test]
+fn story_v_keep_source_creates_a_file_missing_on_disk_and_undo_removes_it() {
+    let lab = DriftLab::new();
+    std::fs::write(lab.s.source.join("dot_newrc"), MANAGED_BASE).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(
+        &lab.s.source,
+        &["commit", "-m", "a file never applied here"],
+    );
+    git(&lab.s.source, &["push"]);
+    let target = lab.s.home.join(".newrc");
+    assert!(!target.exists(), "test premise: not on disk");
+
+    let outcome = lab.engine.keep_source(&target).unwrap();
+    let ResolveOutcome::Done { session, .. } = outcome else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert_eq!(std::fs::read(&target).unwrap(), MANAGED_BASE);
+
+    // Journal truth: the decision landed, with no disk content to go back to.
+    let journal = lab.journal();
+    let (id, decisions) = journal.last_finished_session().unwrap().unwrap();
+    assert_eq!(id, session);
+    let arr = decisions.as_array().unwrap();
+    assert_eq!(arr[0]["action"], "keep_source");
+    assert!(
+        arr[0]["dest_blob"].is_null(),
+        "absent on disk is journaled as null, not omitted: {:?}",
+        arr[0]
+    );
+    lab.wait_scan_done();
+
+    // Undo puts the disk back the way it was: without the file.
+    assert_eq!(lab.engine.undo_last().unwrap(), Some(session));
+    assert!(!target.exists(), "undo removes what apply created");
+}
+
+/// The batch path makes the same call: two never-applied files, one Keep
+/// source batch, both created. MUTATION: `open_batch_session` snapshotting
+/// `[target]` and demanding one blob → both items fail.
+#[test]
+fn story_w_a_keep_source_batch_creates_files_missing_on_disk() {
+    let lab = DriftLab::new();
+    for name in ["newa", "newb"] {
+        std::fs::write(lab.s.source.join(format!("dot_{name}")), MANAGED_BASE).unwrap();
+    }
+    git(&lab.s.source, &["add", "."]);
+    git(
+        &lab.s.source,
+        &["commit", "-m", "two files never applied here"],
+    );
+    git(&lab.s.source, &["push"]);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".newa", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".newb", BatchDecision::KeepSourceLocal),
+    ]);
+    for ix in 0..2 {
+        let (_, committed, pushed, note) = done(&outcome, ix);
+        assert!(!committed && !pushed, "apply never touches the source repo");
+        assert_eq!(note, None);
+    }
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".newa")).unwrap(),
+        MANAGED_BASE
+    );
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".newb")).unwrap(),
+        MANAGED_BASE
+    );
+}
+
 #[test]
 fn story_c_sync_all_pulls_remote_changes_into_dest() {
     const REMOTE: &[u8] = b"a=remote\n";

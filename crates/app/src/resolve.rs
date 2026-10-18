@@ -182,7 +182,7 @@ impl ResolveEngine {
                 hashes.len()
             )));
         };
-        let decision = build_decision("keep_disk", target, dest_blob, Some(source_blob));
+        let decision = build_decision("keep_disk", target, Some(dest_blob), Some(source_blob));
         self.session_decision(session, decision)?;
         self.expect_changes(vec![target.to_path_buf(), source.clone()])?;
         // The user has committed to an answer, so a diverged repo may now be
@@ -252,14 +252,8 @@ impl ResolveEngine {
             }
         }
         let session = self.session_start()?;
-        let hashes = self.snapshot_blobs(vec![target.to_path_buf()])?;
-        let [dest_blob] = hashes.as_slice() else {
-            return Err(ResolveError::Failed(format!(
-                "snapshot returned {} blobs for 1 path",
-                hashes.len()
-            )));
-        };
-        let decision = build_decision("keep_source", target, dest_blob, None);
+        let dest_blob = self.snapshot_dest(target)?;
+        let decision = build_decision("keep_source", target, dest_blob.as_deref(), None);
         self.session_decision(session, decision)?;
         self.expect_changes(vec![target.to_path_buf()])?;
         self.chezmoi.apply(Some(target))?;
@@ -597,32 +591,59 @@ impl ResolveEngine {
     /// the blobs undo will need. One session per file, never one per batch:
     /// that is what keeps Undo per file.
     ///
-    /// The blob count is checked as strictly as the single-file paths check
-    /// it: `SnapshotBlobs` silently omits a path it could not snapshot, and a
-    /// keep-disk decision journaled without its `source_blob` is an undo that
-    /// cannot restore the source.
+    /// The keep-disk blob count is checked as strictly as the single-file
+    /// path checks it: `SnapshotBlobs` silently omits a path it could not
+    /// snapshot, and a keep-disk decision journaled without its
+    /// `source_blob` is an undo that cannot restore the source. Keep source
+    /// goes through [`Self::snapshot_dest`], which knows a target absent on
+    /// disk from a snapshot that failed.
     fn open_batch_session(&self, c: &Candidate) -> Result<i64, ResolveError> {
         let session = self.session_start()?;
-        let (action, snapshot_paths) = match c.decision {
-            BatchDecision::KeepDisk => ("keep_disk", vec![c.target.clone(), c.source.clone()]),
-            BatchDecision::KeepSourceLocal => ("keep_source", vec![c.target.clone()]),
+        let (action, dest_blob, source_blob) = match c.decision {
+            BatchDecision::KeepDisk => {
+                let hashes = self.snapshot_blobs(vec![c.target.clone(), c.source.clone()])?;
+                let [dest, source] = hashes.as_slice() else {
+                    return Err(ResolveError::Failed(format!(
+                        "snapshot returned {} blobs for 2 paths",
+                        hashes.len()
+                    )));
+                };
+                ("keep_disk", Some(dest.clone()), Some(source.clone()))
+            }
+            BatchDecision::KeepSourceLocal => ("keep_source", self.snapshot_dest(&c.target)?, None),
         };
-        let want = snapshot_paths.len();
-        let hashes = self.snapshot_blobs(snapshot_paths)?;
-        if hashes.len() != want {
-            return Err(ResolveError::Failed(format!(
-                "snapshot returned {} blobs for {want} paths",
-                hashes.len()
-            )));
-        }
         let decision = build_decision(
             action,
             &c.target,
-            &hashes[0],
-            hashes.get(1).map(String::as_str),
+            dest_blob.as_deref(),
+            source_blob.as_deref(),
         );
         self.session_decision(session, decision)?;
         Ok(session)
+    }
+
+    /// The target's disk content, snapshotted for undo — or `None` when the
+    /// target does not exist on disk: a source file this machine has never
+    /// applied (2026-10-14: a 427-file skill folder, every Keep source
+    /// refused with "snapshot returned 0 blobs for 1 paths"). Undo of such a
+    /// decision removes what `apply` created. The absence is established
+    /// HERE, on the same filesystem, before asking the daemon: `SnapshotBlobs`
+    /// omits a path it cannot read without saying which, so a blob-count
+    /// mismatch for a target that DOES exist stays the error it always was.
+    fn snapshot_dest(&self, target: &Path) -> Result<Option<String>, ResolveError> {
+        match std::fs::metadata(target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {}
+        }
+        let hashes = self.snapshot_blobs(vec![target.to_path_buf()])?;
+        match hashes.as_slice() {
+            [one] => Ok(Some(one.clone())),
+            _ => Err(ResolveError::Failed(format!(
+                "snapshot returned {} blobs for 1 path",
+                hashes.len()
+            ))),
+        }
     }
 
     /// Keep ORIGIN's version of the source: origin's rendered content becomes
@@ -827,7 +848,7 @@ impl ResolveEngine {
                 hashes.len()
             )));
         };
-        let decision = build_decision(action, target, dest_blob, Some(source_blob));
+        let decision = build_decision(action, target, Some(dest_blob), Some(source_blob));
         self.session_decision(session, decision)?;
         self.expect_changes(vec![inputs.target.clone(), inputs.source_path.clone()])?;
 
@@ -934,24 +955,39 @@ impl ResolveEngine {
             return Ok(None);
         };
         let restores = parse_undo_restores(&decisions);
-        for (target, dest_blob) in &restores {
-            let bytes = journal.get_blob(dest_blob)?.ok_or_else(|| {
-                ResolveError::Failed(format!(
-                    "undo: blob {dest_blob} for {} is missing from the journal",
-                    target.display()
-                ))
-            })?;
+        let (mut restored, mut removed) = (0usize, 0usize);
+        for (target, restore) in &restores {
             self.expect_changes(vec![target.clone()])?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+            match restore {
+                UndoRestore::Content(dest_blob) => {
+                    let bytes = journal.get_blob(dest_blob)?.ok_or_else(|| {
+                        ResolveError::Failed(format!(
+                            "undo: blob {dest_blob} for {} is missing from the journal",
+                            target.display()
+                        ))
+                    })?;
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(target, &bytes)?;
+                    restored += 1;
+                }
+                // The file was not on disk before the decision: back to that.
+                UndoRestore::Absent => {
+                    match std::fs::remove_file(target) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    removed += 1;
+                }
             }
-            std::fs::write(target, &bytes)?;
         }
         let session = self.session_start()?;
         self.session_decision(session, serde_json::json!({ "action": "undo", "of": of }))?;
         self.session_end(
             session,
-            &format!("undo session {of} — restored {} files", restores.len()),
+            &format!("undo session {of} — restored {restored} files, removed {removed}"),
         )?;
         self.rescan()?;
         Ok(Some(of))
@@ -1630,11 +1666,14 @@ fn display_name(target: &Path) -> String {
 
 /// Decision JSON journaled with each resolution. Carries the blob hashes
 /// returned by SnapshotBlobs so undo can find them:
-/// `{action, target, dest_blob, source_blob?}`.
+/// `{action, target, dest_blob, source_blob?}`. `dest_blob` is `null` when
+/// the target was not on disk at decision time (see
+/// [`ResolveEngine::snapshot_dest`]): the key is still present, so
+/// `session_landed` counts the decision, and undo reads it as "remove".
 fn build_decision(
     action: &str,
     target: &Path,
-    dest_blob: &str,
+    dest_blob: Option<&str>,
     source_blob: Option<&str>,
 ) -> serde_json::Value {
     let mut decision = serde_json::json!({
@@ -1687,17 +1726,30 @@ fn decision_target(d: &serde_json::Value) -> Option<&str> {
     d.get("target").and_then(|t| t.as_str())
 }
 
-/// Extract `(target, dest_blob)` pairs from a session's decisions array.
-/// Decisions without both fields (e.g. `sync_all`, `undo`) restore nothing.
-fn parse_undo_restores(decisions: &serde_json::Value) -> Vec<(PathBuf, String)> {
+/// What undo does to one target: put its journaled content back, or remove
+/// it — a `keep_source` on a file that was not on disk journals
+/// `dest_blob: null`, and the only way back is to delete what `apply` made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UndoRestore {
+    Content(String),
+    Absent,
+}
+
+/// Extract `(target, restore)` pairs from a session's decisions array.
+/// Decisions without both fields (e.g. `sync_all`, `undo`) restore nothing;
+/// a `dest_blob` of `null` is [`UndoRestore::Absent`].
+fn parse_undo_restores(decisions: &serde_json::Value) -> Vec<(PathBuf, UndoRestore)> {
     decisions
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|decision| {
                     let target = decision.get("target")?.as_str()?;
-                    let dest_blob = decision.get("dest_blob")?.as_str()?;
-                    Some((PathBuf::from(target), dest_blob.to_string()))
+                    let restore = match decision.get("dest_blob")? {
+                        serde_json::Value::Null => UndoRestore::Absent,
+                        blob => UndoRestore::Content(blob.as_str()?.to_string()),
+                    };
+                    Some((PathBuf::from(target), restore))
                 })
                 .collect()
         })
@@ -1854,7 +1906,7 @@ mod tests {
         let with_source = build_decision(
             "keep_disk",
             Path::new("/Users/x/.zshrc"),
-            "abc123",
+            Some("abc123"),
             Some("def456"),
         );
         assert_eq!(with_source["action"], "keep_disk");
@@ -1862,20 +1914,42 @@ mod tests {
         assert_eq!(with_source["dest_blob"], "abc123");
         assert_eq!(with_source["source_blob"], "def456");
 
-        let without_source =
-            build_decision("keep_source", Path::new("/Users/x/.testrc"), "abc123", None);
+        let without_source = build_decision(
+            "keep_source",
+            Path::new("/Users/x/.testrc"),
+            Some("abc123"),
+            None,
+        );
         assert!(without_source.get("source_blob").is_none());
+        // Absent on disk at decision time: the key is there (it landed), the
+        // value is null (undo removes). MUTATION: omit the key for `None` →
+        // `session_landed` no longer counts it and the restore list below
+        // lacks the removal.
+        let absent = build_decision("keep_source", Path::new("/Users/x/.newrc"), None, None);
+        assert!(absent["dest_blob"].is_null());
+        assert!(session_landed(&serde_json::json!([
+            absent.clone(),
+            { "action": "keep_disk_rejected", "target": "/Users/x/.other" },
+        ])));
 
         let decisions = serde_json::json!([
             with_source,
             without_source,
+            absent,
             { "action": "sync_all" },
         ]);
         assert_eq!(
             parse_undo_restores(&decisions),
             vec![
-                (PathBuf::from("/Users/x/.zshrc"), "abc123".to_string()),
-                (PathBuf::from("/Users/x/.testrc"), "abc123".to_string()),
+                (
+                    PathBuf::from("/Users/x/.zshrc"),
+                    UndoRestore::Content("abc123".to_string())
+                ),
+                (
+                    PathBuf::from("/Users/x/.testrc"),
+                    UndoRestore::Content("abc123".to_string())
+                ),
+                (PathBuf::from("/Users/x/.newrc"), UndoRestore::Absent),
             ]
         );
     }

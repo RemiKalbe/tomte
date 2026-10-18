@@ -8,6 +8,11 @@ version without one.
 
 ### Fixed
 
+- **Keep source works on a file that is not on disk yet.** A source file
+  this machine had never applied — a whole skill folder, 427 files — was
+  refused with "snapshot returned 0 blobs for 1 paths": the decision
+  insisted on snapshotting the disk copy first. Such a file is now
+  journaled as absent, apply creates it, and Undo removes it again.
 - **The app notices when its daemon goes away.** A daemon that exited — a
   settings restart, the stuck-daemon watchdog, a crash — used to leave the
   app polling the dead socket for good, every request timing out after
