@@ -8,9 +8,10 @@
 
 use std::collections::HashMap;
 
-use gpui::{App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*};
+use gpui::{App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*, px};
 
 use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::components::icon::lock;
 use crate::components::mono::{line_gutter, line_text, mono_line};
 use crate::components::tooltip::text_tooltip;
 use crate::theme::Theme;
@@ -124,11 +125,39 @@ pub enum StripState {
         /// most files have no origin version, and most regions of the ones
         /// that do match it.
         origin: Option<SharedString>,
+        /// Whether the Both button is offered. Line regions always can; a
+        /// structured array entry has no meaningful "both".
+        both: bool,
     },
     /// A decision exists; collapsed affordance names it and offers revisit.
     /// `focused`: the region cursor sits here (Next ↓ walks decided regions
     /// too once every conflict is resolved).
     Decided { choice: ChoiceKind, focused: bool },
+    /// Follows source; no buttons. `reason` is the hover text (the template
+    /// line that owns the entry).
+    Locked { reason: SharedString, focused: bool },
+}
+
+/// Widest a strip's leading path label grows before it ellipsizes.
+const LABEL_MAX_W: f32 = 170.;
+
+/// The leading path label (e.g. `editor.fontSize`). `line_clamp(1)` inside a
+/// bounded width: `.truncate()` hard-clips mid-glyph in gpui 0.2.2.
+fn path_label(theme: Theme, label: SharedString) -> Div {
+    div()
+        .max_w(px(LABEL_MAX_W))
+        .min_w_0()
+        .line_clamp(1)
+        .text_ellipsis()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.text)
+        .child(label)
+}
+
+/// The words after the label: the caller's `detail` when given, else the
+/// engine-state wording the line editor has always shown.
+fn state_words(detail: Option<SharedString>, fallback: &'static str) -> SharedString {
+    detail.unwrap_or_else(|| fallback.into())
 }
 
 /// Decision strip rendered above a changed region, styled after Zed's
@@ -145,6 +174,8 @@ pub fn decision_strip(
     theme: Theme,
     region_ix: usize,
     state: StripState,
+    label: Option<SharedString>,
+    detail: Option<SharedString>,
     on_pick: impl Fn(Pick, &ClickEvent, &mut Window, &mut App) + Clone + 'static,
     on_edit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_revisit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -161,10 +192,28 @@ pub fn decision_strip(
             *focused,
         ),
         StripState::Decided { choice, focused } => (choice.tint(theme), *focused),
+        StripState::Locked { focused, .. } => (theme.text_muted, *focused),
     };
     // Zed's header: `border_focused` when the header owns the cursor,
     // plain `border` otherwise.
     let border = if focused { accent } else { theme.border };
+    // The leading cell takes the free width (it replaces the old spacer) and
+    // may shrink below its content, so a long path label ellipsizes instead
+    // of pushing the buttons out of the card.
+    let lead = |words: Option<(SharedString, Rgba)>| {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .when_some(label.clone(), |el, label| {
+                el.child(path_label(theme, label))
+            })
+            .when_some(words, |el, (words, color)| {
+                el.child(div().flex_none().text_color(color).child(words))
+            })
+    };
     let card = div()
         .w_full()
         // Explicit padding, NOT `h_full` + `items_center`: an ancestor that
@@ -189,6 +238,7 @@ pub fn decision_strip(
             current,
             focused,
             origin,
+            both,
         } => {
             let pick_button = |id: &'static str, pick: Pick, label: &'static str, tint: Rgba| {
                 let on_pick = on_pick.clone();
@@ -203,19 +253,19 @@ pub fn decision_strip(
                 )
                 .when(selected, |el| el.bg(Theme::wash(tint, 0.2)))
             };
-            card.child(
-                div()
-                    .text_color(if focused { accent } else { theme.text_muted })
-                    .child(if current.is_none() {
+            card.child(lead(Some((
+                state_words(
+                    detail,
+                    if current.is_none() {
                         "conflict"
                     } else {
                         // "merged" describes the whole-file operation; ONE
                         // region that needed no human decision was resolved.
                         "auto-resolved"
-                    }),
-            )
-            // Push the actions to the trailing edge (Zed's justify_between).
-            .child(div().flex_1())
+                    },
+                ),
+                if focused { accent } else { theme.text_muted },
+            ))))
             .child(pick_button("pick-ours", Pick::Ours, "disk", theme.drift))
             .child(pick_button(
                 "pick-theirs",
@@ -241,7 +291,9 @@ pub fn decision_strip(
                     theme.text_muted,
                 ))
             })
-            .child(pick_button("pick-both", Pick::Both, "both", theme.ok))
+            .when(both, |el| {
+                el.child(pick_button("pick-both", Pick::Both, "both", theme.ok))
+            })
             .child(divider(theme))
             .child(button(
                 theme,
@@ -253,12 +305,10 @@ pub fn decision_strip(
             ))
         }
         StripState::Decided { choice, .. } => card
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(format!("resolved · {}", choice.label()))),
-            )
-            .child(div().flex_1())
+            .child(lead(Some((
+                SharedString::from(format!("resolved · {}", choice.label())),
+                theme.text_muted,
+            ))))
             .child(button(
                 theme,
                 ElementId::named_usize("revisit-region", region_ix),
@@ -276,6 +326,20 @@ pub fn decision_strip(
                 ButtonSize::Micro,
                 on_edit,
             )),
+        StripState::Locked { reason, .. } => card
+            .child(lead(detail.map(|d| (d, theme.text_muted))))
+            // The hover text names the template line that owns the entry.
+            .child(
+                div()
+                    .id(ElementId::named_usize("locked-region", region_ix))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_color(theme.text_muted)
+                    .child(lock(theme))
+                    .child("templated · follows source")
+                    .tooltip(text_tooltip(reason)),
+            ),
     };
 
     // The 4px inset (Zed's BUFFER_HEADER_PADDING) is what makes the strip

@@ -2680,6 +2680,7 @@ fn strip_block(
                     focused,
                     origin,
                 } => ui::StripState::Deciding {
+                    both: true,
                     has_base: *has_base,
                     current: *current,
                     focused: *focused,
@@ -2729,7 +2730,7 @@ fn strip_block(
                 .h_full()
                 .w_full()
                 .child(ui::decision_strip(
-                    theme, region, state, on_pick, on_edit, on_revisit,
+                    theme, region, state, None, None, on_pick, on_edit, on_revisit,
                 ))
                 .into_any_element()
         }),
