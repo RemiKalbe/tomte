@@ -230,7 +230,12 @@ impl StructuredDocument {
         let ours = parse_side(ours, Side::Ours)?;
         let theirs = parse_side(theirs, Side::Theirs)?;
         let root = check_roots(&ours, &theirs)?;
-        let parsed_base = base.and_then(|text| jsonc::parse(text).ok());
+        // A base of another root shape than the sides cannot be compared key
+        // by key, so it degrades like an unparseable one. An empty base is a
+        // real, empty base.
+        let parsed_base = base
+            .and_then(|text| jsonc::parse(text).ok())
+            .filter(|doc| matches!(root_of(doc), Root::Empty) || root_of(doc) == root);
         let degraded_base = parsed_base.is_none();
         let base = match parsed_base {
             Some(doc) => doc,
@@ -617,8 +622,8 @@ mod tests {
         (path.to_string(), kind, what)
     }
 
-    // Mutation: have detect skip the BothEmpty check (return Ok for two empty
-    // texts), or report a mismatch before a parse error.
+    // Mutations: (1) check_roots skips the BothEmpty check; (2) detect parses
+    // theirs before ours, so `Parse` names the wrong side when both fail.
     #[test]
     fn detect_accepts_objects_and_arrays_and_names_the_failure() {
         assert_eq!(detect("{}", "{\"a\":1}"), Ok(Format::Jsonc));
@@ -626,6 +631,13 @@ mod tests {
         assert_eq!(detect("", "{}"), Ok(Format::Jsonc));
         assert_eq!(
             detect("{", "{}"),
+            Err(NotStructured::Parse {
+                side: Side::Ours,
+                line: 1
+            })
+        );
+        assert_eq!(
+            detect("{", "["),
             Err(NotStructured::Parse {
                 side: Side::Ours,
                 line: 1
@@ -644,7 +656,8 @@ mod tests {
         );
     }
 
-    // Mutation: drop the extension test, or the parsed-side test.
+    // Mutations: (1) looked_like_json ignores the extension; (2) it ignores
+    // the parsed sides.
     #[test]
     fn looked_like_json_is_extension_or_one_parsed_side() {
         assert!(!looked_like_json(Path::new(".zshrc"), "x", "y"));
@@ -682,7 +695,8 @@ mod tests {
         assert_eq!(d.auto_pick(1), Some(Pick::Source));
     }
 
-    // Mutation: label an absent side Value, or pick Added by the wrong side.
+    // Mutations: (1) `what` calls a key absent from base Value instead of
+    // Added; (2) Added and Removed swapped.
     #[test]
     fn adds_and_removes_are_entry_decisions_with_absent_sides() {
         let d = doc(Some("{\"a\":1}"), "{\"a\":1,\"n\":2}", "{}");
@@ -734,7 +748,7 @@ mod tests {
         assert_eq!(paths, ["e.f", "e.g", "e.h"]);
     }
 
-    // Mutation: recurse when the sides differ in type, or label it Value.
+    // Mutation: label a type change Value.
     #[test]
     fn type_change_is_one_decision_for_the_entry() {
         let same = "{\"a\":{\"x\":1}}";
@@ -753,7 +767,8 @@ mod tests {
         assert_eq!(paths, ["\"editor.fontSize\"", "\"a b\""]);
     }
 
-    // Mutation: set both_allowed true, or treat a missing side as unchanged.
+    // Mutations: (1) both_allowed set true; (2) a side missing from the key
+    // counts as unchanged (`ov.is_some() && ov != bv`).
     #[test]
     fn delete_versus_modify_is_a_conflict_without_both() {
         let d = doc(Some("{\"a\":1}"), "{}", "{\"a\":2}");
@@ -765,7 +780,7 @@ mod tests {
         assert!(!d.decisions[0].both_allowed);
     }
 
-    // Mutation: fill base from the other sides, or default has_base to true.
+    // Mutation: has_base always returns true.
     #[test]
     fn a_key_added_on_both_sides_with_different_values_conflicts_without_last_written() {
         let d = doc(Some("{}"), "{\"a\":1}", "{\"a\":2}");
@@ -790,7 +805,7 @@ mod tests {
         );
     }
 
-    // Mutation: return an error for an unparseable base instead of degrading.
+    // Mutation: an unparseable base returns an error instead of degrading.
     #[test]
     fn an_unparseable_base_degrades_to_two_way() {
         let d = doc(Some("{"), "{\"a\":2}", "{\"a\":1}");
@@ -825,8 +840,8 @@ mod tests {
         assert_eq!(d.auto_pick(0), Some(Pick::Source));
     }
 
-    // Mutation: insert disk-only keys at the end instead of after their
-    // disk predecessor.
+    // Mutation: forget the disk predecessor (`previous = None`), so every
+    // disk-only key goes to the end with no anchor.
     #[test]
     fn disk_only_keys_sit_after_their_disk_predecessor() {
         let d = doc(None, "{\"a\":1,\"n\":9,\"b\":2}", "{\"a\":1,\"b\":2}");
@@ -838,7 +853,7 @@ mod tests {
         assert_eq!(d.decisions[0].site.entry, None);
     }
 
-    // Mutation: drop the decision order walk (emit disk-only keys first).
+    // Mutation: walk the keys in reverse.
     #[test]
     fn decisions_follow_source_order_with_disk_only_keys_in_place() {
         let d = doc(
@@ -850,5 +865,30 @@ mod tests {
         assert_eq!(paths, ["a", "b", "n"]);
         // "n" follows "x" on disk, and "x" is last in source.
         assert_eq!(d.decisions[2].site.after, Some(2));
+    }
+
+    // Mutation: treat a base of another root shape as empty (the filter
+    // accepts any root): degraded_base stays false and a Conflict appears.
+    #[test]
+    fn a_base_of_another_root_shape_degrades_to_two_way() {
+        let d = doc(Some("[1]"), "{\"a\":2}", "{\"a\":1}");
+        assert!(d.degraded_base);
+        assert_eq!(
+            kinds(&d),
+            vec![row("a", RegionKind::OursOnly, Change::Value)]
+        );
+        assert_eq!(d.side_text(Side::Base), "{\"a\":1}");
+    }
+
+    // Mutation: treat an empty base like a degraded one (filter drops Empty).
+    #[test]
+    fn an_empty_base_is_a_real_empty_base() {
+        let d = doc(Some(""), "{\"a\":1}", "{\"a\":2}");
+        assert!(!d.degraded_base);
+        assert_eq!(
+            kinds(&d),
+            vec![row("a", RegionKind::Conflict, Change::Value)]
+        );
+        assert!(!d.has_base(0));
     }
 }
