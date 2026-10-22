@@ -623,9 +623,9 @@ impl Document {
         &self.nodes[id]
     }
 
-    /// The text covered by `range`; empty when the range is not a valid slice.
+    /// The text covered by `range`. Panics when the range is not a valid slice of the text.
     pub fn slice(&self, range: &Range<usize>) -> &str {
-        self.text.get(range.clone()).unwrap_or("")
+        &self.text[range.clone()]
     }
 
     /// The 1-based line containing byte `offset`, counted by `\n`.
@@ -720,6 +720,7 @@ mod tests {
         assert!(elements[1].comma.is_some());
     }
 
+    // Mutation: never record the comma (`comma = None` in `complete`) -> the comma assertions fail.
     #[test]
     fn trailing_commas_and_both_comment_styles_parse() {
         let text = "{ \"a\": 1, /* c */ \"b\": 2, }";
@@ -738,6 +739,7 @@ mod tests {
         assert!(entries[1].leading.is_empty());
     }
 
+    // Mutation: decode the `n` escape to a literal `n` -> `"a\nb"` mismatches and this fails.
     #[test]
     fn strings_are_unescaped_numbers_kept_raw() {
         let doc = parse("{\"caf\\u00e9\": \"a\\nb\", \"n\": 1.50e2}").unwrap();
@@ -784,6 +786,7 @@ mod tests {
         assert_eq!(doc.line_of(usize::MAX), 1);
     }
 
+    // Mutation: drop the `record_duplicates` call -> `duplicates` stays empty and this fails.
     #[test]
     fn duplicate_keys_are_kept_and_listed() {
         let doc = parse("{\"a\": 1, \"a\": 2}").unwrap();
@@ -803,6 +806,7 @@ mod tests {
         assert!(parse("{\"a\": 1, \"b\": 2}").unwrap().duplicates.is_empty());
     }
 
+    // Mutation: return an error instead of `Ok(None)` for a document with no value -> this fails.
     #[test]
     fn empty_and_comment_only_documents_have_no_root() {
         for text in ["", "  \n", "// nothing\n", "/* x */"] {
@@ -811,6 +815,7 @@ mod tests {
         }
     }
 
+    // Mutation: force `bom` to false -> the BOM test fails; make `crlf` ignore which byte precedes the first `\n` -> the lone-LF half fails.
     #[test]
     fn bom_and_crlf_are_recorded() {
         let doc = parse("\u{feff}{\r\n\"a\": 1\r\n}").unwrap();
@@ -836,6 +841,7 @@ mod tests {
         assert_eq!(handle.join().unwrap().unwrap(), 10_000);
     }
 
+    // Mutation: accept leading zeros in `parse_number` (digit run after a 0) -> `[01]` parses and this fails.
     #[test]
     fn single_quotes_and_unquoted_keys_are_errors() {
         assert!(parse("{a: 1}").is_err());
@@ -866,6 +872,7 @@ mod tests {
         );
     }
 
+    // Mutation: start `line_at` at 0 instead of 1 -> line_of(0) is 0 and this fails.
     #[test]
     fn line_of_is_one_based_and_counts_newlines() {
         let doc = parse("{\n\"a\": 1,\n\"b\": 2\n}").unwrap();
