@@ -5,6 +5,7 @@ pub mod git;
 pub mod logging;
 pub mod merge;
 pub mod scanner;
+pub mod structured;
 pub mod template;
 
 #[cfg(feature = "test-support")]
