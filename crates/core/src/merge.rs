@@ -1,19 +1,21 @@
 //! Structured 3-way merge (spec §6.1): no conflict markers, a region list.
 
+use std::hash::Hash;
 use std::ops::Range;
 
 use imara_diff::{Algorithm, Diff, Hunk, InternedInput, TokenSource};
 
 pub mod worddiff;
 
-/// Line tokens we control, so reassembly is byte-exact (lines keep `\n`).
-pub struct SliceTokens<'a>(pub &'a [&'a str]);
+/// Tokens we control, so reassembly is byte-exact (lines keep `\n`). Each
+/// token is a reference to a slice element; `T = &str` is the line case.
+pub struct SliceTokens<'a, T>(pub &'a [T]);
 
-impl<'a> TokenSource for SliceTokens<'a> {
-    type Token = &'a str;
-    type Tokenizer = std::iter::Copied<std::slice::Iter<'a, &'a str>>;
+impl<'a, T: Hash + Eq> TokenSource for SliceTokens<'a, T> {
+    type Token = &'a T;
+    type Tokenizer = std::slice::Iter<'a, T>;
     fn tokenize(&self) -> Self::Tokenizer {
-        self.0.iter().copied()
+        self.0.iter()
     }
     fn estimate_tokens(&self) -> u32 {
         self.0.len() as u32
@@ -57,7 +59,7 @@ pub struct MergeDocument {
 }
 
 /// One diff side: sorted hunks (base range × side range).
-fn side_hunks(base: &[&str], side: &[&str]) -> Vec<Hunk> {
+fn side_hunks<T: Hash + Eq>(base: &[T], side: &[T]) -> Vec<Hunk> {
     let input = InternedInput::new(SliceTokens(base), SliceTokens(side));
     let diff = Diff::compute(Algorithm::Histogram, &input);
     diff.hunks().collect()
@@ -154,7 +156,7 @@ fn map_pos(hunks: &[Hunk], upto: usize, base_pos: u32) -> usize {
     (base_pos as i64 + delta) as usize
 }
 
-fn eq_lines(a: &[String], b: &[String], opts: MergeOptions) -> bool {
+fn eq_lines(a: &[&str], b: &[&str], opts: MergeOptions) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -167,76 +169,83 @@ fn eq_lines(a: &[String], b: &[String], opts: MergeOptions) -> bool {
     })
 }
 
+/// Three-way region clustering over any token sequence (lines today, array
+/// elements for the structured merge). Regions partition each side in order.
+/// `same` decides `BothSame` versus `Conflict` between the two sides' changed
+/// slices; diffing against base uses `T`'s own `Hash + Eq`.
+pub fn three_way<T: Hash + Eq>(
+    base: &[T],
+    ours: &[T],
+    theirs: &[T],
+    same: impl Fn(&[T], &[T]) -> bool,
+) -> Vec<MergeRegion> {
+    let hunks_o = side_hunks(base, ours);
+    let hunks_t = side_hunks(base, theirs);
+
+    let mut regions = Vec::new();
+    let mut cursor: u32 = 0;
+    for c in clusters(&hunks_o, &hunks_t) {
+        if c.base.start > cursor {
+            let (bs, be) = (cursor as usize, c.base.start as usize);
+            regions.push(MergeRegion {
+                kind: RegionKind::Unchanged,
+                base: bs..be,
+                ours: map_pos(&hunks_o, c.ours.start, cursor)
+                    ..map_pos(&hunks_o, c.ours.start, c.base.start),
+                theirs: map_pos(&hunks_t, c.theirs.start, cursor)
+                    ..map_pos(&hunks_t, c.theirs.start, c.base.start),
+            });
+        }
+        let ours_range = map_pos(&hunks_o, c.ours.start, c.base.start)
+            ..map_pos(&hunks_o, c.ours.end, c.base.end);
+        let theirs_range = map_pos(&hunks_t, c.theirs.start, c.base.start)
+            ..map_pos(&hunks_t, c.theirs.end, c.base.end);
+        let ours_changed = !c.ours.is_empty();
+        let theirs_changed = !c.theirs.is_empty();
+        let kind = match (ours_changed, theirs_changed) {
+            (true, false) => RegionKind::OursOnly,
+            (false, true) => RegionKind::TheirsOnly,
+            (true, true) => {
+                if same(&ours[ours_range.clone()], &theirs[theirs_range.clone()]) {
+                    RegionKind::BothSame
+                } else {
+                    RegionKind::Conflict
+                }
+            }
+            (false, false) => RegionKind::Unchanged, // unreachable: clusters come from hunks
+        };
+        regions.push(MergeRegion {
+            kind,
+            base: c.base.start as usize..c.base.end as usize,
+            ours: ours_range,
+            theirs: theirs_range,
+        });
+        cursor = c.base.end;
+    }
+    if (cursor as usize) < base.len() || regions.is_empty() {
+        regions.push(MergeRegion {
+            kind: RegionKind::Unchanged,
+            base: cursor as usize..base.len(),
+            ours: map_pos(&hunks_o, hunks_o.len(), cursor)..ours.len(),
+            theirs: map_pos(&hunks_t, hunks_t.len(), cursor)..theirs.len(),
+        });
+    }
+    regions
+}
+
 impl MergeDocument {
     pub fn compute(base: &str, ours: &str, theirs: &str, opts: MergeOptions) -> Self {
         let b = split_lines(base);
         let o = split_lines(ours);
         let t = split_lines(theirs);
-        let hunks_o = side_hunks(&b, &o);
-        let hunks_t = side_hunks(&b, &t);
+        let regions = three_way(&b, &o, &t, |x, y| eq_lines(x, y, opts));
 
         let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let doc_base = own(&b);
-        let doc_ours = own(&o);
-        let doc_theirs = own(&t);
-
-        let mut regions = Vec::new();
-        let mut cursor: u32 = 0;
-        for c in clusters(&hunks_o, &hunks_t) {
-            if c.base.start > cursor {
-                let (bs, be) = (cursor as usize, c.base.start as usize);
-                regions.push(MergeRegion {
-                    kind: RegionKind::Unchanged,
-                    base: bs..be,
-                    ours: map_pos(&hunks_o, c.ours.start, cursor)
-                        ..map_pos(&hunks_o, c.ours.start, c.base.start),
-                    theirs: map_pos(&hunks_t, c.theirs.start, cursor)
-                        ..map_pos(&hunks_t, c.theirs.start, c.base.start),
-                });
-            }
-            let ours_range = map_pos(&hunks_o, c.ours.start, c.base.start)
-                ..map_pos(&hunks_o, c.ours.end, c.base.end);
-            let theirs_range = map_pos(&hunks_t, c.theirs.start, c.base.start)
-                ..map_pos(&hunks_t, c.theirs.end, c.base.end);
-            let ours_changed = !c.ours.is_empty();
-            let theirs_changed = !c.theirs.is_empty();
-            let kind = match (ours_changed, theirs_changed) {
-                (true, false) => RegionKind::OursOnly,
-                (false, true) => RegionKind::TheirsOnly,
-                (true, true) => {
-                    if eq_lines(
-                        &doc_ours[ours_range.clone()],
-                        &doc_theirs[theirs_range.clone()],
-                        opts,
-                    ) {
-                        RegionKind::BothSame
-                    } else {
-                        RegionKind::Conflict
-                    }
-                }
-                (false, false) => RegionKind::Unchanged, // unreachable: clusters come from hunks
-            };
-            regions.push(MergeRegion {
-                kind,
-                base: c.base.start as usize..c.base.end as usize,
-                ours: ours_range,
-                theirs: theirs_range,
-            });
-            cursor = c.base.end;
-        }
-        if (cursor as usize) < doc_base.len() || regions.is_empty() {
-            regions.push(MergeRegion {
-                kind: RegionKind::Unchanged,
-                base: cursor as usize..doc_base.len(),
-                ours: map_pos(&hunks_o, hunks_o.len(), cursor)..doc_ours.len(),
-                theirs: map_pos(&hunks_t, hunks_t.len(), cursor)..doc_theirs.len(),
-            });
-        }
         Self {
             regions,
-            base_lines: doc_base,
-            ours_lines: doc_ours,
-            theirs_lines: doc_theirs,
+            base_lines: own(&b),
+            ours_lines: own(&o),
+            theirs_lines: own(&t),
         }
     }
 
@@ -515,5 +524,29 @@ mod tests {
         assert_eq!(doc.assemble(&res).unwrap(), "from origin\n");
         // Provenance is the whole point: it must not be an `Edited`.
         assert!(matches!(res.get(0), Some(Choice::Origin(_))));
+    }
+
+    // Mutation: three_way ignores `theirs` -> the TheirsOnly region disappears.
+    #[test]
+    fn three_way_over_integers_matches_the_line_engine_shapes() {
+        let same = |a: &[i32], b: &[i32]| a == b;
+        let regions = three_way(&[1, 2, 3, 4, 5], &[1, 9, 3, 4, 5], &[1, 2, 3, 8, 5], same);
+        let kinds: Vec<RegionKind> = regions.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RegionKind::Unchanged,
+                RegionKind::OursOnly,
+                RegionKind::Unchanged,
+                RegionKind::TheirsOnly,
+                RegionKind::Unchanged
+            ]
+        );
+        assert_eq!(regions[1].ours, 1..2);
+        let kinds = |o: &[i32], t: &[i32]| -> Vec<RegionKind> {
+            three_way(&[1], o, t, same).iter().map(|r| r.kind).collect()
+        };
+        assert_eq!(kinds(&[2], &[3]), [RegionKind::Conflict]);
+        assert_eq!(kinds(&[2], &[2]), [RegionKind::BothSame]);
     }
 }
