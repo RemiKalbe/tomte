@@ -94,10 +94,12 @@ impl StructuredDocument {
                 (Some(k), Some(_)) => spans.push(replaced_span(&items[k], &d.what)),
                 (Some(k), None) => {
                     spans.push(items[k].start..items[k].end);
-                    // The last entry of a container without trailing
-                    // commas takes the previous entry's comma with it.
-                    let last = k + 1 == items.len();
-                    if last && items[k].comma.is_none() {
+                    // In a container without trailing commas, a removal can
+                    // leave the previous entry last, and its comma goes. That
+                    // holds for any removal once the entries after it are
+                    // removed too, so every removal reports it (ruling R12).
+                    let trailing = items.last().is_some_and(|item| item.comma.is_some());
+                    if !trailing {
                         let previous = (0..k).rev().find(|j| !collapsed.contains(j));
                         if let Some(comma) = previous.and_then(|j| items[j].comma.clone()) {
                             spans.push(comma);
@@ -258,7 +260,7 @@ impl StructuredDocument {
             return;
         }
         out.push("{");
-        let mut walk = Walk::new(false, "  ".to_string(), "\n");
+        let mut walk = Walk::new(false, "  ".to_string(), String::new(), "\n");
         for insert in &inserts {
             walk.insert(insert);
         }
@@ -336,9 +338,15 @@ impl StructuredDocument {
         let items = items_of(doc, container);
         let n = items.len();
         let dropped = |k: usize| matches!(plan.fates[k], Fate::Drop);
+        let close_indent = if starts_line(src, close) {
+            indent_of(src, close)
+        } else {
+            indent_of(src, range.start)
+        };
         let mut walk = Walk::new(
             is_inline(doc, container),
             indent_unit(doc, container),
+            close_indent.to_string(),
             newline(doc),
         );
         walk.out.copy(src, range.start..inner);
@@ -347,11 +355,6 @@ impl StructuredDocument {
             // it stay above the new entries.
             let kept = src[inner..close].trim_end().len();
             walk.out.copy(src, inner..inner + kept);
-            let close_indent = if starts_line(src, close) {
-                indent_of(src, close)
-            } else {
-                indent_of(src, range.start)
-            };
             format!("{}{close_indent}", walk.nl)
         } else {
             walk.pending = trim(&src[inner..items[0].start], false, dropped(0)).to_string();
@@ -679,6 +682,39 @@ fn glue(pending: &str, first: bool, inline: bool, indent: &str, nl: &str) -> Str
     }
 }
 
+/// The line rule, applied after [`glue`] and before a closing bracket:
+/// when the trivia just written (`suffix`, then `sep`) ends inside a `//`
+/// comment, `sep` is cut at its trailing whitespace and ends with a line
+/// break and `indent`, so the next text is not commented out.
+fn end_line_comment(suffix: &str, sep: String, indent: &str, nl: &str) -> String {
+    if ends_in_line_comment(&format!("{suffix}{sep}")) {
+        format!("{}{nl}{indent}", sep.trim_end())
+    } else {
+        sep
+    }
+}
+
+/// Whether `trivia` (whitespace, commas and comments only) ends inside a
+/// `//` comment that no line break closes.
+fn ends_in_line_comment(trivia: &str) -> bool {
+    let bytes = trivia.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i..] {
+            [b'/', b'/', ..] => match bytes[i..].iter().position(|&b| b == b'\n') {
+                Some(nl) => i += nl + 1,
+                None => return true,
+            },
+            [b'/', b'*', ..] => match bytes[i + 2..].windows(2).position(|w| w == b"*/") {
+                Some(end) => i += 2 + end + 2,
+                None => return false,
+            },
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// The part of the source text between two items that survives when the
 /// item on its left and/or right is dropped: a dropped item takes the rest
 /// of its last line (through the first line break) and the indent of its
@@ -708,11 +744,13 @@ struct Walk {
     deferred: Vec<usize>,
     inline: bool,
     indent: String,
+    /// The indent of the closing bracket's line.
+    close_indent: String,
     nl: &'static str,
 }
 
 impl Walk {
-    fn new(inline: bool, indent: String, nl: &'static str) -> Self {
+    fn new(inline: bool, indent: String, close_indent: String, nl: &'static str) -> Self {
         Self {
             out: Out::default(),
             prev: None,
@@ -721,6 +759,7 @@ impl Walk {
             deferred: Vec::new(),
             inline,
             indent,
+            close_indent,
             nl,
         }
     }
@@ -728,18 +767,17 @@ impl Walk {
     /// Writes what precedes the next item: the previous item's suffix with
     /// a comma, then the separator.
     fn begin(&mut self) {
-        let first = match self.prev.take() {
-            Some(suffix) => {
-                self.out.push(&suffix.render(true));
-                false
-            }
-            None => true,
+        let (suffix, first) = match self.prev.take() {
+            Some(suffix) => (suffix.render(true), false),
+            None => (String::new(), true),
         };
         let sep = if self.verbatim {
             std::mem::take(&mut self.pending)
         } else {
             glue(&self.pending, first, self.inline, &self.indent, self.nl)
         };
+        let sep = end_line_comment(&suffix, sep, &self.indent, self.nl);
+        self.out.push(&suffix);
         self.out.push(&sep);
         self.pending.clear();
         self.verbatim = false;
@@ -799,16 +837,18 @@ impl Walk {
     /// Closes the container: the last item's suffix (a comma only in
     /// trailing-comma style), any surviving separator text, then `tail`.
     fn finish(mut self, trailing: bool, tail: &str) -> Out {
-        if let Some(suffix) = self.prev.take() {
-            self.out.push(&suffix.render(trailing));
-        }
+        let suffix = self
+            .prev
+            .take()
+            .map_or_else(String::new, |suffix| suffix.render(trailing));
+        self.out.push(&suffix);
         let at = self.out.text.len();
         for id in self.deferred.drain(..) {
             self.out.marks.insert(id, at..at);
         }
-        let pending = std::mem::take(&mut self.pending);
-        self.out.push(&pending);
-        self.out.push(tail);
+        let rest = std::mem::take(&mut self.pending) + tail;
+        let rest = end_line_comment(&suffix, rest, &self.close_indent, self.nl);
+        self.out.push(&rest);
         self.out
     }
 }
@@ -1411,12 +1451,13 @@ mod tests {
         let d = doc(None, "{\n  \"a\": 1\n}\n", theirs);
         assert_eq!(d.touched_lines(0, Pick::Disk), vec![line(theirs, 3)]);
 
-        // A middle removal with its leading comment: those lines only.
+        // A middle removal with its leading comment: those lines, and (R12)
+        // the previous comma line, which goes if c is removed too.
         let theirs = "{\n  \"a\": 1,\n  // why\n  \"b\": 2,\n  \"c\": 3\n}\n";
         let d = doc(None, "{\n  \"a\": 1,\n  \"c\": 3\n}\n", theirs);
         assert_eq!(
             d.touched_lines(0, Pick::Disk),
-            vec![line(theirs, 3), line(theirs, 4)]
+            vec![line(theirs, 2), line(theirs, 3), line(theirs, 4)]
         );
 
         // A value change: the value's lines.
@@ -1455,5 +1496,82 @@ mod tests {
             d.assemble(&res),
             Err(AssembleError::Invalid { .. })
         ));
+    }
+
+    // Mutation: drop the line rule (`end_line_comment` returns `sep` as it
+    // is) — each probe's next text lands inside the `//` comment: the first
+    // result does not parse, the other two lose an entry.
+    #[test]
+    fn a_line_comment_before_inline_glue_breaks_the_line() {
+        let cases = [
+            (
+                "{\n  \"a\": 1,\n  \"n\": 2 // note\n}",
+                "{\"a\": 1}",
+                "{\"a\": 1, \"n\": 2 // note\n}",
+            ),
+            (
+                "{\"a\": 1, \"n\": 3, \"b\": 2}",
+                "{\"a\": 1, // c\n \"b\": 2}",
+                "{\"a\": 1, // c\n\"n\": 3,\n \"b\": 2}",
+            ),
+            (
+                "{\n  \"a\": 1,\n  \"n\": 2, // note\n  \"b\": 2\n}",
+                "{\"a\": 1, \"b\": 2\n}",
+                "{\"a\": 1, \"n\": 2, // note\n\"b\": 2\n}",
+            ),
+        ];
+        for (ours, theirs, expected) in cases {
+            let d = doc(None, ours, theirs);
+            let res = every(&d, Pick::Disk);
+            let seed = d.seed(&res);
+            assert!(jsonc::parse(&seed).is_ok(), "seed must parse: {seed:?}");
+            assert_eq!(d.assemble(&res).expect("assembles"), expected);
+            assert_eq!(value(expected), value(ours));
+        }
+    }
+
+    // Mutation: report the previous comma line only for the last entry (the
+    // rule before R12) — b reports only its own line.
+    #[test]
+    fn removing_the_last_two_entries_reports_the_comma_line_they_strip() {
+        let theirs = "{\n  \"a\": 1, // keep\n  \"b\": 2,\n  \"c\": 3\n}\n";
+        let d = doc(None, "{\n  \"a\": 1 // keep\n}\n", theirs);
+        assert_eq!(
+            d.assemble(&every(&d, Pick::Disk)).unwrap(),
+            "{\n  \"a\": 1 // keep\n}\n"
+        );
+        let paths: Vec<_> = d.decisions.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, ["b", "c"]);
+        // a's comma goes only when b goes, so b's row carries a's line.
+        assert_eq!(
+            d.touched_lines(0, Pick::Disk),
+            vec![line(theirs, 2), line(theirs, 3)]
+        );
+        // c alone strips b's comma; with b, b's row already holds line 2.
+        assert_eq!(
+            d.touched_lines(1, Pick::Disk),
+            vec![line(theirs, 3), line(theirs, 4)]
+        );
+    }
+
+    // Mutations: (1) `append_root` skips the closing `}\n` — the object
+    // result is cut short; (2) it skips the line break after a whole array.
+    #[test]
+    fn an_empty_source_gets_a_synthesized_root() {
+        let d = doc(None, "{\"a\": 1, \"b\": [1, 2]}", "");
+        assert_eq!(
+            d.assemble(&every(&d, Pick::Disk)).unwrap(),
+            "{\n  \"a\": 1,\n  \"b\": [1, 2]\n}\n"
+        );
+        assert_eq!(d.assemble(&every(&d, Pick::Source)).unwrap(), "");
+        let d = doc(None, "{\"a\": 1}", "// nothing yet");
+        assert_eq!(
+            d.assemble(&every(&d, Pick::Disk)).unwrap(),
+            "// nothing yet\n{\n  \"a\": 1\n}\n"
+        );
+        let d = doc(None, "[1, 2]", "");
+        assert_eq!(d.assemble(&every(&d, Pick::Disk)).unwrap(), "[1, 2]\n");
+        let ranges = d.result_ranges(&every(&d, Pick::Disk));
+        assert_eq!(ranges, vec![0..6]);
     }
 }
