@@ -89,6 +89,27 @@ fn touches(a: &Range<u32>, b: &Range<u32>) -> bool {
     a.start <= b.end && b.start <= a.end
 }
 
+/// Which pairs of hunks from the two sides fall into one cluster.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Join {
+    /// The line rule: overlapping or adjacent ([`touches`]).
+    Adjacent,
+    /// The element rule ([`shares`]): adjacent hunks stay apart.
+    Shared,
+}
+
+/// Hunks "share" base when they cover a common base element, insert at the
+/// same base position, or one inserts strictly inside the other's range.
+/// An insertion at a deletion's boundary does not share.
+fn shares(a: &Range<u32>, b: &Range<u32>) -> bool {
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => a.start == b.start,
+        (true, false) => b.start < a.start && a.start < b.end,
+        (false, true) => a.start < b.start && b.start < a.end,
+        (false, false) => a.start < b.end && b.start < a.end,
+    }
+}
+
 struct Cluster {
     base: Range<u32>,
     /// index ranges into the per-side hunk vectors
@@ -96,11 +117,20 @@ struct Cluster {
     theirs: Range<usize>,
 }
 
-fn clusters(hunks_o: &[Hunk], hunks_t: &[Hunk]) -> Vec<Cluster> {
+fn clusters(hunks_o: &[Hunk], hunks_t: &[Hunk], join: Join) -> Vec<Cluster> {
+    let joins = |a: &Range<u32>, b: &Range<u32>| match join {
+        Join::Adjacent => touches(a, b),
+        Join::Shared => shares(a, b),
+    };
     let (mut i, mut j) = (0usize, 0usize);
     let mut out = Vec::new();
     while i < hunks_o.len() || j < hunks_t.len() {
         let take_ours = match (hunks_o.get(i), hunks_t.get(j)) {
+            // Under the element rule an insertion at a deletion's start is
+            // its own cluster, so it must come first to keep base in order.
+            (Some(o), Some(t)) if join == Join::Shared => {
+                (o.before.start, !o.before.is_empty()) <= (t.before.start, !t.before.is_empty())
+            }
             (Some(o), Some(t)) => o.before.start <= t.before.start,
             (Some(_), None) => true,
             _ => false,
@@ -114,7 +144,7 @@ fn clusters(hunks_o: &[Hunk], hunks_t: &[Hunk]) -> Vec<Cluster> {
         loop {
             let mut grew = false;
             while let Some(h) = hunks_o.get(i) {
-                if touches(&h.before, &base) {
+                if joins(&h.before, &base) {
                     base.start = base.start.min(h.before.start);
                     base.end = base.end.max(h.before.end);
                     i += 1;
@@ -124,7 +154,7 @@ fn clusters(hunks_o: &[Hunk], hunks_t: &[Hunk]) -> Vec<Cluster> {
                 }
             }
             while let Some(h) = hunks_t.get(j) {
-                if touches(&h.before, &base) {
+                if joins(&h.before, &base) {
                     base.start = base.start.min(h.before.start);
                     base.end = base.end.max(h.before.end);
                     j += 1;
@@ -179,12 +209,38 @@ pub fn three_way<T: Hash + Eq>(
     theirs: &[T],
     same: impl Fn(&[T], &[T]) -> bool,
 ) -> Vec<MergeRegion> {
+    three_way_by(base, ours, theirs, same, Join::Adjacent)
+}
+
+/// [`three_way`] for array elements: changes on the two sides conflict only
+/// when they share base (a common base element, insertions at the same
+/// position, or an insertion strictly inside the other side's range). A
+/// change next to the other side's change stays one-sided, so one side
+/// deleting an element while the other inserts right after it gives a
+/// `TheirsOnly` and an `OursOnly` region rather than a conflict. Lines keep
+/// the conservative adjacency rule.
+pub fn three_way_elements<T: Hash + Eq>(
+    base: &[T],
+    ours: &[T],
+    theirs: &[T],
+    same: impl Fn(&[T], &[T]) -> bool,
+) -> Vec<MergeRegion> {
+    three_way_by(base, ours, theirs, same, Join::Shared)
+}
+
+fn three_way_by<T: Hash + Eq>(
+    base: &[T],
+    ours: &[T],
+    theirs: &[T],
+    same: impl Fn(&[T], &[T]) -> bool,
+    join: Join,
+) -> Vec<MergeRegion> {
     let hunks_o = side_hunks(base, ours);
     let hunks_t = side_hunks(base, theirs);
 
     let mut regions = Vec::new();
     let mut cursor: u32 = 0;
-    for c in clusters(&hunks_o, &hunks_t) {
+    for c in clusters(&hunks_o, &hunks_t, join) {
         if c.base.start > cursor {
             let (bs, be) = (cursor as usize, c.base.start as usize);
             regions.push(MergeRegion {
@@ -548,5 +604,43 @@ mod tests {
         };
         assert_eq!(kinds(&[2], &[3]), [RegionKind::Conflict]);
         assert_eq!(kinds(&[2], &[2]), [RegionKind::BothSame]);
+    }
+
+    // Mutations: (1) use the line rule (adjacency conflicts) — the delete
+    // next to the insert becomes one Conflict region; (2) order hunks by
+    // start alone (the line rule's tie-break) — disk's deletion of "b" is
+    // clustered before source's insertion in front of it, and the regions
+    // come out of base order.
+    #[test]
+    fn element_clustering_conflicts_only_on_shared_base() {
+        let same = |a: &[&str], b: &[&str]| a == b;
+        let kinds = |b: &[&str], o: &[&str], t: &[&str]| -> Vec<RegionKind> {
+            three_way_elements(b, o, t, same)
+                .iter()
+                .map(|r| r.kind)
+                .filter(|k| *k != RegionKind::Unchanged)
+                .collect()
+        };
+        // Source deletes "a"; disk inserts "x" right after it.
+        assert_eq!(
+            kinds(&["a", "b"], &["a", "x", "b"], &["b"]),
+            [RegionKind::TheirsOnly, RegionKind::OursOnly]
+        );
+        // Source inserts "y" in front of the "b" disk deletes: the
+        // insertion comes first.
+        assert_eq!(
+            kinds(&["a", "b"], &["a"], &["a", "y", "b"]),
+            [RegionKind::TheirsOnly, RegionKind::OursOnly]
+        );
+        // The line engine calls the same input one conflict.
+        let lines = three_way(&["a", "b"], &["a", "x", "b"], &["b"], same);
+        assert!(lines.iter().any(|r| r.kind == RegionKind::Conflict));
+        // Different insertions at one position conflict.
+        assert_eq!(
+            kinds(&["a"], &["a", "x"], &["a", "y"]),
+            [RegionKind::Conflict]
+        );
+        // Both deleting the same element agree.
+        assert_eq!(kinds(&["a", "b"], &["a"], &["a"]), [RegionKind::BothSame]);
     }
 }

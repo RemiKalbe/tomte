@@ -3,7 +3,9 @@
 //! [`StructuredDocument::compute`] walks the base, disk (`ours`) and source
 //! (`theirs`) trees together and lists one [`Decision`] for every place where
 //! the sides disagree. Equality is by value, never by text, so a reformatted
-//! but equal value produces no decision. Arrays are compared whole for now.
+//! but equal value produces no decision. Arrays that are arrays on both
+//! sides merge element-wise: each element is a token (its canonical value),
+//! [`three_way_elements`] clusters the token sequences, and each region becomes rows.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -11,8 +13,8 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use super::jsonc::{self, Document, NodeId, NodeKind, Value};
-use crate::merge::RegionKind;
+use super::jsonc::{self, Document, Element, NodeId, NodeKind, Value};
+use crate::merge::{MergeRegion, RegionKind, three_way_elements};
 use crate::template::anchor::SpanMap;
 
 /// A structured format the merge editor can offer.
@@ -138,9 +140,14 @@ pub struct Lock {
 }
 
 /// Where a decision lives in the source text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A key row uses `entry` and `after` and leaves `elements` empty. An
+/// element row (its `container` is a source array and its path is not
+/// empty) uses `elements` only; `entry` and `after` are `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Site {
-    /// The source object that holds the key. `None` when the source is empty.
+    /// The source object that holds the key, or the source array that holds
+    /// the elements. `None` when the source is empty.
     pub(crate) container: Option<NodeId>,
     /// The index of the key's entry in the source container, the last copy
     /// when the key repeats. `None` when the key is absent from source.
@@ -148,6 +155,12 @@ pub(crate) struct Site {
     /// For a key absent from source: the source entry index to insert after.
     /// `None` means the end of the container.
     pub(crate) after: Option<usize>,
+    /// Element rows: the source element indices the row covers. A single
+    /// element present in source is `k..k + 1`; an element absent from
+    /// source is the empty range at its insertion point (the source index
+    /// it goes before); a conflict run is the source run, empty at an
+    /// insertion point when source has none.
+    pub(crate) elements: Range<usize>,
 }
 
 /// One place where the three sides disagree.
@@ -435,6 +448,62 @@ fn shape(value: &Value) -> Shape {
     }
 }
 
+fn node_shape(doc: &Document, node: NodeId) -> Shape {
+    match doc.node(node).kind {
+        NodeKind::Object { .. } => Shape::Object,
+        NodeKind::Array { .. } => Shape::Array,
+        _ => Shape::Scalar,
+    }
+}
+
+/// `p[2]` for one union index, `p[2..4]` for more; `[0]` at the root.
+fn element_path(parent: &str, union: Range<usize>) -> String {
+    if union.len() == 1 {
+        format!("{parent}[{}]", union.start)
+    } else {
+        format!("{parent}[{}..{}]", union.start, union.end)
+    }
+}
+
+/// One side's array: its elements and their tokens. A missing node, or one
+/// that is not an array, has no elements.
+struct ArrayView<'a> {
+    doc: &'a Document,
+    elements: &'a [Element],
+    tokens: Vec<String>,
+}
+
+impl<'a> ArrayView<'a> {
+    fn new(doc: &'a Document, node: Option<NodeId>) -> Self {
+        let elements: &[Element] = match node.map(|id| &doc.node(id).kind) {
+            Some(NodeKind::Array { elements }) => elements,
+            _ => &[],
+        };
+        let tokens = elements
+            .iter()
+            .map(|e| jsonc::canonical(&doc.value(e.value)))
+            .collect();
+        Self {
+            doc,
+            elements,
+            tokens,
+        }
+    }
+
+    /// The text of a run of elements, from the first element's start to the
+    /// last one's end (its comma included); `None` for an empty run.
+    fn text(&self, run: Range<usize>) -> Option<SideText> {
+        if run.is_empty() {
+            return None;
+        }
+        let range = self.elements[run.start].range.start..self.elements[run.end - 1].range.end;
+        Some(SideText {
+            text: self.doc.slice(&range).to_string(),
+            range,
+        })
+    }
+}
+
 /// A path segment: the key as written, or quoted when it has a character
 /// that would read as nesting or whitespace.
 fn path_segment(key: &str) -> String {
@@ -499,27 +568,41 @@ impl<'a> Walker<'a> {
             if let (Some(of), Some(tf)) = (&of, &tf)
                 && !of.duplicated
                 && !tf.duplicated
-                && matches!(self.ours.node(of.node).kind, NodeKind::Object { .. })
-                && matches!(self.theirs.node(tf.node).kind, NodeKind::Object { .. })
             {
-                let base_object = bf
-                    .filter(|f| matches!(self.base.node(f.node).kind, NodeKind::Object { .. }))
-                    .map(|f| f.node);
-                self.walk_object(&key_path, base_object, Some(of.node), Some(tf.node));
-                continue;
+                let shape = node_shape(self.ours, of.node);
+                if shape != Shape::Scalar && shape == node_shape(self.theirs, tf.node) {
+                    let base_node = bf
+                        .filter(|f| node_shape(self.base, f.node) == shape)
+                        .map(|f| f.node);
+                    if shape == Shape::Object {
+                        self.walk_object(&key_path, base_node, Some(of.node), Some(tf.node));
+                    } else {
+                        self.walk_array(&key_path, base_node, of.node, tf.node);
+                    }
+                    continue;
+                }
             }
             let site = Site {
                 container: theirs,
                 entry: tf.as_ref().and_then(|f| f.entry),
                 after: if tf.is_none() { slot.anchor } else { None },
+                elements: 0..0,
             };
             self.decide(key_path, site, bf, of, tf);
         }
     }
 
-    /// Roots that are both arrays are compared whole until arrays get their
-    /// own element-wise walk.
+    /// Roots that are both arrays merge element-wise; an empty side makes
+    /// one decision for the whole root.
     fn walk_root_array(&mut self) {
+        if let (Some(ours), Some(theirs)) = (
+            root_if(self.ours, Root::Array),
+            root_if(self.theirs, Root::Array),
+        ) {
+            let base = root_if(self.base, Root::Array);
+            self.walk_array("", base, ours, theirs);
+            return;
+        }
         let root_found = |doc: &'a Document| {
             let node = doc
                 .root
@@ -536,6 +619,7 @@ impl<'a> Walker<'a> {
             container: self.theirs.root,
             entry: None,
             after: None,
+            elements: 0..0,
         };
         self.decide(
             String::new(),
@@ -544,6 +628,131 @@ impl<'a> Walker<'a> {
             root_found(self.ours),
             root_found(self.theirs),
         );
+    }
+
+    /// Merges the elements of two arrays (and the base's, when it has one at
+    /// this path) by their canonical values, one region at a time.
+    fn walk_array(&mut self, path: &str, base: Option<NodeId>, ours: NodeId, theirs: NodeId) {
+        let sides = [
+            ArrayView::new(self.base, base),
+            ArrayView::new(self.ours, Some(ours)),
+            ArrayView::new(self.theirs, Some(theirs)),
+        ];
+        let [b, o, t] = &sides;
+        let regions = three_way_elements(&b.tokens, &o.tokens, &t.tokens, |x, y| x == y);
+        let mut union = 0;
+        for region in &regions {
+            union += self.element_rows(path, theirs, &sides, region, union);
+        }
+    }
+
+    /// The rows of one region, and how many union indices it spans. Union
+    /// indices count every element in result order: base elements in place,
+    /// added elements right after their predecessor.
+    ///
+    /// A one-sided or `BothSame` region gives a `Removed` row per base
+    /// element the changed side dropped, then an `Added` row per element it
+    /// introduced. A conflict is one `Elements` row carrying each side's run,
+    /// spanning as many union indices as its longest run.
+    fn element_rows(
+        &mut self,
+        path: &str,
+        container: NodeId,
+        [b, o, t]: &[ArrayView<'a>; 3],
+        r: &MergeRegion,
+        union: usize,
+    ) -> usize {
+        let one = |side: &ArrayView<'a>, at: Option<usize>| at.and_then(|i| side.text(i..i + 1));
+        let site = |elements: Range<usize>| Site {
+            container: Some(container),
+            entry: None,
+            after: None,
+            elements,
+        };
+        match r.kind {
+            RegionKind::Unchanged => r.base.len(),
+            RegionKind::Conflict => {
+                let span = r.base.len().max(r.ours.len()).max(r.theirs.len()).max(1);
+                self.push_row(
+                    element_path(path, union..union + span),
+                    r.kind,
+                    Change::Elements,
+                    [
+                        b.text(r.base.clone()),
+                        o.text(r.ours.clone()),
+                        t.text(r.theirs.clone()),
+                    ],
+                    site(r.theirs.clone()),
+                );
+                span
+            }
+            RegionKind::OursOnly | RegionKind::TheirsOnly | RegionKind::BothSame => {
+                // The unchanged side still holds the base run, at the same
+                // offsets; a BothSame region's sides hold the same run.
+                let ours_kept = r.kind == RegionKind::TheirsOnly;
+                let theirs_kept = r.kind == RegionKind::OursOnly;
+                let mut u = union;
+                for k in 0..r.base.len() {
+                    let ours_at = ours_kept.then_some(r.ours.start + k);
+                    let theirs_at = theirs_kept.then_some(r.theirs.start + k);
+                    let elements = theirs_at.map_or(r.theirs.start..r.theirs.start, |j| j..j + 1);
+                    self.push_row(
+                        element_path(path, u..u + 1),
+                        r.kind,
+                        Change::Removed,
+                        [
+                            one(b, Some(r.base.start + k)),
+                            one(o, ours_at),
+                            one(t, theirs_at),
+                        ],
+                        site(elements),
+                    );
+                    u += 1;
+                }
+                let added = if ours_kept {
+                    r.theirs.len()
+                } else {
+                    r.ours.len()
+                };
+                for k in 0..added {
+                    let ours_at = (!ours_kept).then_some(r.ours.start + k);
+                    let theirs_at = (!theirs_kept).then_some(r.theirs.start + k);
+                    let elements = theirs_at.map_or(r.theirs.end..r.theirs.end, |j| j..j + 1);
+                    self.push_row(
+                        element_path(path, u..u + 1),
+                        r.kind,
+                        Change::Added,
+                        [None, one(o, ours_at), one(t, theirs_at)],
+                        site(elements),
+                    );
+                    u += 1;
+                }
+                u - union
+            }
+        }
+    }
+
+    fn push_row(
+        &mut self,
+        path: String,
+        kind: RegionKind,
+        what: Change,
+        [base, ours, theirs]: [Option<SideText>; 3],
+        site: Site,
+    ) {
+        self.decisions.push(Decision {
+            id: self.decisions.len(),
+            path,
+            kind,
+            both_allowed: what == Change::Elements,
+            what,
+            base,
+            ours,
+            theirs,
+            duplicated: None,
+            locked: None,
+            site,
+        });
     }
 
     /// Classifies one key against the base and records a decision unless the
@@ -874,6 +1083,136 @@ mod tests {
             vec![row("a", RegionKind::OursOnly, Change::Value)]
         );
         assert_eq!(d.side_text(Side::Base), "{\"a\":1}");
+    }
+
+    fn text(side: &Option<SideText>) -> Option<&str> {
+        side.as_ref().map(|s| s.text.as_str())
+    }
+
+    // Mutation: compare arrays whole → one Value decision instead of
+    // per-element rows.
+    #[test]
+    fn one_sided_array_changes_split_into_one_row_per_element() {
+        let d = doc(
+            Some("{\"p\":[\"a\",\"b\"]}"),
+            "{\"p\":[\"a\",\"x\",\"b\"]}",
+            "{\"p\":[\"b\"]}",
+        );
+        // A removed element keeps its place; an added one follows its
+        // predecessor.
+        assert_eq!(
+            kinds(&d),
+            vec![
+                row("p[0]", RegionKind::TheirsOnly, Change::Removed),
+                row("p[1]", RegionKind::OursOnly, Change::Added)
+            ]
+        );
+        assert!(d.decisions.iter().all(|x| !x.both_allowed));
+        // Neither element is in source: both sit before source's "b".
+        assert_eq!(d.decisions[0].site.elements, 0..0);
+        assert_eq!(d.decisions[1].site.elements, 0..0);
+        assert_eq!(text(&d.decisions[0].base), Some("\"a\","));
+        assert_eq!(text(&d.decisions[0].ours), Some("\"a\","));
+        assert_eq!(text(&d.decisions[0].theirs), None);
+        assert_eq!(text(&d.decisions[1].ours), Some("\"x\","));
+        assert_eq!(text(&d.decisions[1].base), None);
+    }
+
+    // Mutation: emit only the Added row for an edited element (skip the base
+    // elements of a one-sided region) — the Removed row is missing.
+    #[test]
+    fn an_edited_element_is_a_removed_row_and_an_added_row() {
+        let d = doc(
+            Some("{\"p\":[\"a\"]}"),
+            "{\"p\":[\"A\"]}",
+            "{\"p\":[\"a\"]}",
+        );
+        assert_eq!(
+            kinds(&d),
+            vec![
+                row("p[0]", RegionKind::OursOnly, Change::Removed),
+                row("p[1]", RegionKind::OursOnly, Change::Added)
+            ]
+        );
+        // The removed "a" is source's element 0; "A" goes after it.
+        assert_eq!(d.decisions[0].site.elements, 0..1);
+        assert_eq!(d.decisions[1].site.elements, 1..1);
+        assert_eq!(text(&d.decisions[0].theirs), Some("\"a\""));
+        assert_eq!(text(&d.decisions[0].ours), None);
+        assert!(d.has_base(0));
+        assert!(!d.has_base(1));
+        assert_eq!(d.auto_pick(0), Some(Pick::Disk));
+    }
+
+    // Mutation: both_allowed stays false on an Elements conflict.
+    #[test]
+    fn conflicting_element_runs_are_one_row_with_both() {
+        let d = doc(
+            Some("{\"p\":[\"a\"]}"),
+            "{\"p\":[\"x\"]}",
+            "{\"p\":[\"y\"]}",
+        );
+        assert_eq!(
+            kinds(&d),
+            vec![row("p[0]", RegionKind::Conflict, Change::Elements)]
+        );
+        let c = &d.decisions[0];
+        assert!(c.both_allowed);
+        assert_eq!(text(&c.base), Some("\"a\""));
+        assert_eq!(text(&c.ours), Some("\"x\""));
+        assert_eq!(text(&c.theirs), Some("\"y\""));
+        assert_eq!(c.site.elements, 0..1);
+        assert_eq!(d.auto_pick(0), None);
+        assert_eq!(d.required_decisions(), vec![0]);
+
+        // A run of more than one element spans its union indices, and its
+        // text runs from the first element to the last.
+        let d = doc(
+            Some("{\"p\":[0, \"a\", 9]}"),
+            "{\"p\":[0, \"x\", \"z\", 9]}",
+            "{\"p\":[0, \"y\", 9]}",
+        );
+        assert_eq!(
+            kinds(&d),
+            vec![row("p[1..3]", RegionKind::Conflict, Change::Elements)]
+        );
+        assert_eq!(text(&d.decisions[0].ours), Some("\"x\", \"z\","));
+    }
+
+    // Mutations: (1) tokens are the element's text, not its canonical
+    // value — disk's reformatted object is a change and the rows conflict;
+    // (2) a one-element region whose elements are all objects recurses
+    // (`walk_object` on the elements) — a "p[0].k" row appears.
+    #[test]
+    fn array_elements_compare_by_value_and_objects_do_not_recurse() {
+        let d = doc(
+            Some("{\"p\":[{\"k\":1}]}"),
+            "{\"p\":[{ \"k\" : 1 }]}",
+            "{\"p\":[{\"k\":2}]}",
+        );
+        assert_eq!(
+            kinds(&d),
+            vec![
+                row("p[0]", RegionKind::TheirsOnly, Change::Removed),
+                row("p[1]", RegionKind::TheirsOnly, Change::Added)
+            ]
+        );
+    }
+
+    // Mutation: join an element index like a key (`join_path(path, "0")`) —
+    // the root array's rows read "0" instead of "[0]".
+    #[test]
+    fn a_root_array_file_has_bracket_paths() {
+        let d = doc(None, "[\"x\", \"a\"]", "[\"a\"]");
+        assert_eq!(
+            kinds(&d),
+            vec![row("[0]", RegionKind::OursOnly, Change::Added)]
+        );
+        let d = doc(Some("[0, 1, 9]"), "[0, 2, 3, 9]", "[0, 4, 9]");
+        assert_eq!(
+            kinds(&d),
+            vec![row("[1..3]", RegionKind::Conflict, Change::Elements)]
+        );
     }
 
     // Mutation: treat an empty base like a degraded one (filter drops Empty).

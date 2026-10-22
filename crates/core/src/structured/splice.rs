@@ -1,11 +1,11 @@
 //! Assembly of the structured merge result (spec §5.4).
 //!
-//! The result starts from the source text. A container (object) whose
-//! decisions all resolve to source is copied byte for byte. Any other
-//! container is rebuilt from an ordered list of items — kept source entries,
-//! entries with a replaced value, entries inserted from another side — glued
-//! by the original text between two items that were neighbours in source, or
-//! by a synthesized separator otherwise. Containers are rebuilt innermost
+//! The result starts from the source text. A container (object or array)
+//! whose decisions all resolve to source is copied byte for byte. Any other
+//! container is rebuilt from an ordered list of items — kept source entries
+//! or elements, entries with a replaced value, items inserted from another
+//! side — glued by the original text between two items that were neighbours
+//! in source, or by a synthesized separator otherwise. Containers are rebuilt innermost
 //! first, and a rebuilt container's text replaces its range wherever its
 //! parent copies source text.
 
@@ -53,8 +53,10 @@ impl StructuredDocument {
 
     /// For each decision in order, its byte range in `seed(res)`; empty at the insertion point when absent from the result.
     ///
-    /// A `Value` decision covers the value; any other covers the entry from
-    /// its key through its value (no comma, no comments).
+    /// A `Value` decision covers the value; any other key row covers the
+    /// entry from its key through its value (no comma, no comments). An
+    /// element row covers its element's value, and a conflict run from its
+    /// first value through its last.
     pub fn result_ranges(&self, res: &Resolution) -> Vec<Range<usize>> {
         let out = self.render(&self.seed_picks(res));
         self.decisions
@@ -85,6 +87,20 @@ impl StructuredDocument {
             return lines_of(&doc.text, &spans);
         }
         let items = items_of(doc, container);
+        if self.is_element_row(d) {
+            let splice = self.element_splice(d, pick);
+            let run = d.site.elements.clone();
+            if splice.drop && !run.is_empty() {
+                spans.extend(run.clone().map(|k| items[k].start..items[k].end));
+                if splice.inserts.is_empty() {
+                    spans.extend(previous_comma(&items, run.start, &[]));
+                }
+            }
+            if !splice.inserts.is_empty() {
+                spans.push(insertion_span(doc, container, &items, run.start));
+            }
+            return lines_of(&doc.text, &spans);
+        }
         let collapsed = self.collapsed_copies(d, container);
         for &j in &collapsed {
             spans.push(items[j].start..items[j].end);
@@ -94,33 +110,11 @@ impl StructuredDocument {
                 (Some(k), Some(_)) => spans.push(replaced_span(&items[k], &d.what)),
                 (Some(k), None) => {
                     spans.push(items[k].start..items[k].end);
-                    // In a container without trailing commas, a removal can
-                    // leave the previous entry last, and its comma goes. That
-                    // holds for any removal once the entries after it are
-                    // removed too, so every removal reports it (ruling R12).
-                    let trailing = items.last().is_some_and(|item| item.comma.is_some());
-                    if !trailing {
-                        let previous = (0..k).rev().find(|j| !collapsed.contains(j));
-                        if let Some(comma) = previous.and_then(|j| items[j].comma.clone()) {
-                            spans.push(comma);
-                        }
-                    }
+                    spans.extend(previous_comma(&items, k, &collapsed));
                 }
                 (None, Some(_)) => {
-                    let at = match items.len() {
-                        // An empty container is reopened before its bracket.
-                        0 => {
-                            let close = doc.node(container).range.end - 1;
-                            close..close + 1
-                        }
-                        n => {
-                            // The predecessor's last line gets the comma and
-                            // the new lines follow it.
-                            let p = &items[d.site.after.unwrap_or(n - 1).min(n - 1)];
-                            p.value.end..p.end
-                        }
-                    };
-                    spans.push(at);
+                    let gap = self.gap(d, items.len());
+                    spans.push(insertion_span(doc, container, &items, gap));
                 }
                 (None, None) => {}
             }
@@ -140,14 +134,71 @@ impl StructuredDocument {
 
     /// The pick that applies: the user's, else the automatic one; a locked
     /// decision follows source. `None` is a conflict still owed — and so is
-    /// `Both`, which only array runs accept (none exist yet).
+    /// `Both` on a row that does not allow it (anything but an array
+    /// conflict run).
     fn effective_pick(&self, res: &Resolution, id: usize) -> Option<Pick> {
-        if self.decisions[id].locked.is_some() {
+        let d = &self.decisions[id];
+        if d.locked.is_some() {
             return Some(Pick::Source);
         }
         match res.get(id).or_else(|| self.auto_pick(id))? {
-            Pick::Both => None,
+            Pick::Both if !d.both_allowed => None,
             pick => Some(pick),
+        }
+    }
+
+    /// A row about array elements: its container is a source array. A root
+    /// array decided whole has the empty path instead.
+    fn is_element_row(&self, d: &Decision) -> bool {
+        !d.path.is_empty()
+            && d.site
+                .container
+                .is_some_and(|c| matches!(self.theirs.node(c).kind, NodeKind::Array { .. }))
+    }
+
+    /// The gap of a source container with `n` items where a row absent from
+    /// source goes in: gap `g` is before item `g`, gap `n` the end.
+    fn gap(&self, d: &Decision, n: usize) -> usize {
+        if self.is_element_row(d) {
+            d.site.elements.start.min(n)
+        } else {
+            d.site.after.map_or(n, |k| (k + 1).min(n))
+        }
+    }
+
+    /// What a pick does to an element row. A single element stays (when in
+    /// source) or goes in (when not) exactly when the chosen side has it. A
+    /// conflict run keeps the source run under Source and Both — Both
+    /// putting the disk run before it — and under Disk and Last written
+    /// swaps it for the chosen side's run.
+    fn element_splice<'a>(&'a self, d: &'a Decision, pick: Pick) -> ElementSplice<'a> {
+        let chosen = self.chosen(d, pick);
+        if d.what != Change::Elements {
+            return if d.site.elements.is_empty() {
+                ElementSplice {
+                    drop: false,
+                    inserts: chosen.into_iter().collect(),
+                }
+            } else {
+                ElementSplice {
+                    drop: chosen.is_none(),
+                    inserts: Vec::new(),
+                }
+            };
+        }
+        match pick {
+            Pick::Source => ElementSplice {
+                drop: false,
+                inserts: Vec::new(),
+            },
+            Pick::Both => ElementSplice {
+                drop: false,
+                inserts: self.chosen(d, Pick::Disk).into_iter().collect(),
+            },
+            Pick::Disk | Pick::LastWritten => ElementSplice {
+                drop: true,
+                inserts: chosen.into_iter().collect(),
+            },
         }
     }
 
@@ -160,6 +211,7 @@ impl StructuredDocument {
 
     /// The side a pick selects, with its text for this decision; `None` when
     /// that side does not have the entry, so the result must not either.
+    /// `Both` reads as Source here; [`Self::element_splice`] handles it.
     fn chosen<'a>(&'a self, d: &'a Decision, pick: Pick) -> Option<(&'a Document, &'a SideText)> {
         let (doc, text) = match pick {
             Pick::Disk => (&self.ours, &d.ours),
@@ -240,7 +292,9 @@ impl StructuredDocument {
             match self.chosen(d, picks[id]) {
                 Some((_, text)) if d.path.is_empty() => whole = Some((id, text)),
                 Some((doc, text)) => match find_entry(doc, text.range.start, Span::Entry) {
-                    Some(entry) => inserts.push(insertion(doc, entry, id, "  ", false)),
+                    Some(entry) => {
+                        inserts.push(insertion(doc, &Item::of_entry(doc, entry), id, "  ", false))
+                    }
                     None => lost_entry(d, text),
                 },
                 None => {}
@@ -273,30 +327,36 @@ impl StructuredDocument {
     fn plan(&self, container: NodeId, ids: &[usize], picks: &[Pick]) -> Plan {
         let src = &self.theirs;
         let items = items_of(src, container);
-        let gaps = items.len().max(1);
+        let n = items.len();
         let indent = indent_unit(src, container);
         let mut plan = Plan {
-            fates: vec![Fate::Keep; items.len()],
-            marks: vec![None; items.len()],
-            inserts: (0..gaps).map(|_| Vec::new()).collect(),
-            absent: vec![Vec::new(); gaps],
+            fates: vec![Fate::Keep; n],
+            marks: vec![None; n],
+            inserts: (0..=n).map(|_| Vec::new()).collect(),
+            absent: vec![Vec::new(); n + 1],
         };
         for &id in ids {
             let d = &self.decisions[id];
             let pick = picks[id];
+            if self.is_element_row(d) {
+                self.plan_elements(d, pick, &indent, &mut plan);
+                continue;
+            }
             let span = if d.what == Change::Value {
                 Span::Value
             } else {
                 Span::Entry
             };
             let Some(k) = d.site.entry else {
-                let gap = d.site.after.unwrap_or(gaps - 1).min(gaps - 1);
+                let gap = self.gap(d, n);
                 let insert = self.chosen(d, pick).and_then(|(doc, text)| {
                     let entry = find_entry(doc, text.range.start, Span::Entry);
                     if entry.is_none() {
                         lost_entry(d, text);
                     }
-                    entry.map(|entry| insertion(doc, entry, id, &indent, src.crlf))
+                    entry.map(|entry| {
+                        insertion(doc, &Item::of_entry(doc, entry), id, &indent, src.crlf)
+                    })
                 });
                 match insert {
                     Some(insert) => plan.inserts[gap].push(insert),
@@ -325,6 +385,37 @@ impl StructuredDocument {
         plan
     }
 
+    /// An element row's part of its array's plan: the source run kept (and
+    /// marked) or dropped, the chosen elements inserted at the row's gap,
+    /// and the row marked absent when the result holds none of it.
+    fn plan_elements(&self, d: &Decision, pick: Pick, indent: &str, plan: &mut Plan) {
+        let run = d.site.elements.clone();
+        let gap = run.start.min(plan.fates.len());
+        let splice = self.element_splice(d, pick);
+        for k in run.clone() {
+            if splice.drop {
+                plan.fates[k] = Fate::Drop;
+            } else {
+                plan.marks[k] = Some((d.id, Span::Entry));
+            }
+        }
+        let mut inserted = false;
+        for (doc, text) in splice.inserts {
+            let items = run_items(doc, text);
+            if items.is_empty() {
+                lost_entry(d, text);
+            }
+            for item in &items {
+                let insert = insertion(doc, item, d.id, indent, self.theirs.crlf);
+                plan.inserts[gap].push(insert);
+                inserted = true;
+            }
+        }
+        if !inserted && (splice.drop || run.is_empty()) {
+            plan.absent[gap].push(d.id);
+        }
+    }
+
     /// One container's text from its plan: the items in order, each pair
     /// glued by the original text between them when they were neighbours in
     /// source and by [`glue`] otherwise.
@@ -349,6 +440,7 @@ impl StructuredDocument {
             close_indent.to_string(),
             newline(doc),
         );
+        walk.close_line = starts_line(src, close);
         walk.out.copy(src, range.start..inner);
         let tail = if n == 0 {
             // An empty container is reopened on a new line; comments inside
@@ -361,21 +453,20 @@ impl StructuredDocument {
             walk.verbatim = !dropped(0);
             trim(&src[items[n - 1].end..close], dropped(n - 1), false).to_string()
         };
-        for gap in 0..n.max(1) {
-            if gap < n {
-                walk.original(src, &items[gap], &plan.fates[gap], plan.marks[gap], rebuilt);
-            }
-            for insert in &plan.inserts[gap] {
-                walk.insert(insert);
-            }
-            walk.deferred.extend(&plan.absent[gap]);
-            if gap + 1 < n {
+        // Gap `g` comes before item `g`; gap `n` is the end. The items
+        // inserted after a source item come before the source text that
+        // followed it, so that text still leads into the next item.
+        walk.gap(&plan.inserts[0], &plan.absent[0]);
+        for k in 0..n {
+            walk.original(src, &items[k], &plan.fates[k], plan.marks[k], rebuilt);
+            walk.gap(&plan.inserts[k + 1], &plan.absent[k + 1]);
+            if k + 1 < n {
                 let sep = trim(
-                    &src[items[gap].end..items[gap + 1].start],
-                    dropped(gap),
-                    dropped(gap + 1),
+                    &src[items[k].end..items[k + 1].start],
+                    dropped(k),
+                    dropped(k + 1),
                 );
-                if !dropped(gap) && !dropped(gap + 1) && plan.inserts[gap].is_empty() {
+                if !dropped(k) && !dropped(k + 1) && plan.inserts[k + 1].is_empty() {
                     walk.pending = sep.to_string();
                     walk.verbatim = true;
                 } else {
@@ -411,17 +502,80 @@ impl StructuredDocument {
             return doc.node(container).range.clone();
         }
         let items = items_of(doc, container);
-        match d.site.entry {
-            Some(k) => replaced_span(&items[k], &d.what),
-            None => {
-                let at = match items.len() {
-                    0 => doc.node(container).range.end - 1,
-                    n => items[d.site.after.unwrap_or(n - 1).min(n - 1)].end,
-                };
-                at..at
+        if self.is_element_row(d) {
+            let run = d.site.elements.clone();
+            if !run.is_empty() {
+                return items[run.start].head..items[run.end - 1].value.end;
             }
+        } else if let Some(k) = d.site.entry {
+            return replaced_span(&items[k], &d.what);
+        }
+        let at = match self.gap(d, items.len()) {
+            _ if items.is_empty() => doc.node(container).range.end - 1,
+            0 => items[0].start,
+            g => items[g - 1].end,
+        };
+        at..at
+    }
+}
+
+/// What a pick does to an element row: whether its source run is dropped,
+/// and the other sides' runs that go in at its gap.
+struct ElementSplice<'a> {
+    drop: bool,
+    inserts: Vec<(&'a Document, &'a SideText)>,
+}
+
+/// In a container without trailing commas, a removal can leave the previous
+/// item last, and its comma goes. That holds for any removal once the items
+/// after it are removed too, so every removal reports it (ruling R12).
+/// `skip` lists items that go whatever the pick.
+fn previous_comma(items: &[Item], k: usize, skip: &[usize]) -> Option<Range<usize>> {
+    if items.last().is_some_and(|item| item.comma.is_some()) {
+        return None;
+    }
+    let previous = (0..k).rev().find(|j| !skip.contains(j))?;
+    items[previous].comma.clone()
+}
+
+/// The source text an insertion at `gap` touches: the predecessor's last
+/// line, where its comma goes and the new lines follow; the first item's
+/// line for an insertion before it; the closing bracket of an empty
+/// container, which is reopened before it.
+fn insertion_span(doc: &Document, container: NodeId, items: &[Item], gap: usize) -> Range<usize> {
+    match gap {
+        _ if items.is_empty() => {
+            let close = doc.node(container).range.end - 1;
+            close..close + 1
+        }
+        0 => items[0].start..items[0].start,
+        g => {
+            let p = &items[g.min(items.len()) - 1];
+            p.value.end..p.end
         }
     }
+}
+
+/// The elements of one side's run, found by where its text starts.
+fn run_items(doc: &Document, text: &SideText) -> Vec<Item> {
+    doc.nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            NodeKind::Array { elements } => {
+                let first = elements
+                    .iter()
+                    .position(|e| e.range.start == text.range.start)?;
+                Some(
+                    elements[first..]
+                        .iter()
+                        .take_while(|e| e.range.end <= text.range.end)
+                        .map(|e| Item::of_element(doc, e))
+                        .collect(),
+                )
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// The source span a non-source pick rewrites on an entry source keeps:
@@ -556,10 +710,9 @@ fn replacement(
     }
 }
 
-/// The chosen side's entry — leading comments, key, value, same-line
-/// comment — re-indented to `indent` for insertion.
-fn insertion(doc: &Document, entry: &Entry, id: usize, indent: &str, crlf: bool) -> Insert {
-    let item = Item::of_entry(doc, entry);
+/// The chosen side's entry or element — leading comments, key, value,
+/// same-line comment — re-indented to `indent` for insertion.
+fn insertion(doc: &Document, item: &Item, id: usize, indent: &str, crlf: bool) -> Insert {
     let from = indent_of(&doc.text, item.head);
     let lead = with_newlines(
         &reindent(&doc.text[item.start..item.head], from, indent),
@@ -573,7 +726,7 @@ fn insertion(doc: &Document, entry: &Entry, id: usize, indent: &str, crlf: bool)
         id,
         key_at: lead.len(),
         body: lead + &rest,
-        suffix: Suffix::of(&doc.text, &item),
+        suffix: Suffix::of(&doc.text, item),
     }
 }
 
@@ -611,7 +764,7 @@ struct Plan {
     fates: Vec<Fate>,
     /// The decision that owns each source item, and what its range covers.
     marks: Vec<Option<(usize, Span)>>,
-    /// Gap `k` is after source item `k`; an empty container has one gap.
+    /// Gap `g` is before source item `g`; gap `n` (the last) is the end.
     inserts: Vec<Vec<Insert>>,
     /// Decisions absent from the result, by the gap they would occupy.
     absent: Vec<Vec<usize>>,
@@ -746,6 +899,9 @@ struct Walk {
     indent: String,
     /// The indent of the closing bracket's line.
     close_indent: String,
+    /// The closing bracket starts its line in source, so it must in the
+    /// result too.
+    close_line: bool,
     nl: &'static str,
 }
 
@@ -760,6 +916,7 @@ impl Walk {
             inline,
             indent,
             close_indent,
+            close_line: false,
             nl,
         }
     }
@@ -783,7 +940,7 @@ impl Walk {
         self.verbatim = false;
         let at = self.out.text.len();
         for id in self.deferred.drain(..) {
-            self.out.marks.insert(id, at..at);
+            self.out.mark(id, at..at);
         }
     }
 
@@ -817,20 +974,26 @@ impl Walk {
             };
             // Only text before the value can precede `start`, and it is
             // copied as it was.
-            self.out
-                .marks
-                .insert(id, at + (start - item.start)..self.out.text.len());
+            let end = self.out.text.len();
+            self.out.mark(id, at + (start - item.start)..end);
         }
         self.prev = Some(Suffix::of(src, item));
+    }
+
+    /// The items inserted into one gap, then the absent decisions there.
+    fn gap(&mut self, inserts: &[Insert], absent: &[usize]) {
+        for insert in inserts {
+            self.insert(insert);
+        }
+        self.deferred.extend(absent);
     }
 
     fn insert(&mut self, insert: &Insert) {
         self.begin();
         let at = self.out.text.len();
         self.out.push(&insert.body);
-        self.out
-            .marks
-            .insert(insert.id, at + insert.key_at..self.out.text.len());
+        let end = self.out.text.len();
+        self.out.mark(insert.id, at + insert.key_at..end);
         self.prev = Some(insert.suffix.clone());
     }
 
@@ -844,9 +1007,14 @@ impl Walk {
         self.out.push(&suffix);
         let at = self.out.text.len();
         for id in self.deferred.drain(..) {
-            self.out.marks.insert(id, at..at);
+            self.out.mark(id, at..at);
         }
-        let rest = std::mem::take(&mut self.pending) + tail;
+        let mut rest = std::mem::take(&mut self.pending) + tail;
+        // The line break before the bracket can leave with a dropped item
+        // (when every source item is replaced by inserted ones).
+        if self.close_line && !rest.contains('\n') {
+            rest = format!("{}{}{}", rest.trim_end(), self.nl, self.close_indent);
+        }
         let rest = end_line_comment(&suffix, rest, &self.close_indent, self.nl);
         self.out.push(&rest);
         self.out
@@ -876,6 +1044,16 @@ struct Verbatim {
 impl Out {
     fn push(&mut self, text: &str) {
         self.text.push_str(text);
+    }
+
+    /// Records where a decision landed. A conflict run written as several
+    /// items gets one range from its first to its last.
+    fn mark(&mut self, id: usize, range: Range<usize>) {
+        let range = match self.marks.get(&id) {
+            Some(r) => r.start.min(range.start)..r.end.max(range.end),
+            None => range,
+        };
+        self.marks.insert(id, range);
     }
 
     fn copy(&mut self, src: &str, range: Range<usize>) {
@@ -1214,12 +1392,12 @@ mod tests {
             disk(ours, theirs),
             "{\n  \"a\": {\n    \"x\": 1\n  },\n  \"b\": 2\n}\n"
         );
-        // A value change replaces the value only.
-        let theirs = "{\n  \"a\": [1],\n  \"b\": 2\n}\n";
-        let ours = "{\n    \"a\": [\n      1,\n      2\n    ],\n    \"b\": 2\n}\n";
+        // An inserted array element is re-indented to the source's elements.
+        let theirs = "{\n  \"a\": [\n    1\n  ],\n  \"b\": 2\n}\n";
+        let ours = "{\n    \"a\": [\n      1,\n      {\n        \"x\": 2\n      }\n    ],\n    \"b\": 2\n}\n";
         assert_eq!(
             disk(ours, theirs),
-            "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": 2\n}\n"
+            "{\n  \"a\": [\n    1,\n    {\n      \"x\": 2\n    }\n  ],\n  \"b\": 2\n}\n"
         );
     }
 
@@ -1460,9 +1638,9 @@ mod tests {
             vec![line(theirs, 2), line(theirs, 3), line(theirs, 4)]
         );
 
-        // A value change: the value's lines.
+        // A type change: the entry's lines, key through value.
         let theirs = "{\n  \"a\": [\n    1\n  ],\n  \"b\": 2\n}\n";
-        let d = doc(None, "{\"a\": [2], \"b\": 2}", theirs);
+        let d = doc(None, "{\"a\": 2, \"b\": 2}", theirs);
         assert_eq!(
             d.touched_lines(0, Pick::Disk),
             vec![line(theirs, 2), line(theirs, 3), line(theirs, 4)]
@@ -1552,6 +1730,82 @@ mod tests {
             d.touched_lines(1, Pick::Disk),
             vec![line(theirs, 3), line(theirs, 4)]
         );
+    }
+
+    // Mutation: an element insertion goes to the end of the array (the
+    // gap ignores `site.elements`) — "x" lands after "b".
+    #[test]
+    fn inserted_elements_land_where_the_diff_put_them_with_commas() {
+        let theirs = "[\n  \"a\",\n  \"b\"\n]\n";
+        let ours = "[\n  \"a\",\n  \"x\",\n  \"b\"\n]\n";
+        assert_eq!(disk(ours, theirs), ours);
+        // First, last, and into an inline array.
+        let ours = "[\n  \"x\",\n  \"a\",\n  \"b\"\n]\n";
+        assert_eq!(disk(ours, theirs), ours);
+        let ours = "[\n  \"a\",\n  \"b\",\n  \"x\"\n]\n";
+        assert_eq!(disk(ours, theirs), ours);
+        assert_eq!(
+            disk("{\"p\": [1, 5, 2]}", "{\"p\": [1, 2]}"),
+            "{\"p\": [1, 5, 2]}"
+        );
+        // The result range of the inserted element is its value.
+        let theirs = "[\n  \"a\",\n  \"b\"\n]\n";
+        let d = doc(None, "[\"a\", \"x\", \"b\"]", theirs);
+        let res = every(&d, Pick::Disk);
+        let seed = d.seed(&res);
+        assert_eq!(&seed[d.result_ranges(&res)[0].clone()], "\"x\"");
+        // Its touched line is the predecessor's, where the comma goes.
+        assert_eq!(d.touched_lines(0, Pick::Disk), vec![line(theirs, 2)]);
+    }
+
+    // Mutations: (1) Both is refused like any other non-array pick
+    // (`effective_pick` maps Both to None) — `assemble` returns Unresolved;
+    // (2) `Walk::finish` drops the close-line rule — the Disk result ends
+    // `"x"]`; (3) `Out::mark` overwrites instead of widening — the Both
+    // range covers only `"y"`.
+    #[test]
+    fn both_on_an_element_conflict_emits_disk_run_then_source_run() {
+        let d = doc(
+            Some("[\n  \"a\"\n]\n"),
+            "[\n  \"x\"\n]\n",
+            "[\n  \"y\"\n]\n",
+        );
+        assert_eq!(d.required_decisions(), vec![0]);
+        let mut res = Resolution::default();
+        res.set(0, Pick::Both);
+        assert_eq!(d.assemble(&res).unwrap(), "[\n  \"x\",\n  \"y\"\n]\n");
+        let seed = d.seed(&res);
+        assert_eq!(&seed[d.result_ranges(&res)[0].clone()], "\"x\",\n  \"y\"");
+        // Disk replaces every source element; the bracket keeps its line, as
+        // it does when an object's only entry is replaced by another.
+        res.set(0, Pick::Disk);
+        assert_eq!(d.assemble(&res).unwrap(), "[\n  \"x\"\n]\n");
+        assert_eq!(
+            disk("{\"n\": 1}", "{\n  \"a\": 1\n}\n"),
+            "{\n  \"n\": 1\n}\n"
+        );
+        res.set(0, Pick::LastWritten);
+        assert_eq!(d.assemble(&res).unwrap(), "[\n  \"a\"\n]\n");
+        res.set(0, Pick::Source);
+        assert_eq!(d.assemble(&res).unwrap(), "[\n  \"y\"\n]\n");
+    }
+
+    // Mutations: (1) `Suffix::render(false)` keeps an existing comma — the
+    // removal leaves `"a",` before the bracket; (2) element removals skip
+    // `previous_comma` — touched_lines reports only b's line.
+    #[test]
+    fn removing_the_last_element_fixes_the_previous_comma() {
+        let theirs = "[\n  \"a\",\n  \"b\"\n]\n";
+        let d = doc(None, "[\n  \"a\"\n]\n", theirs);
+        assert_eq!(
+            d.assemble(&every(&d, Pick::Disk)).unwrap(),
+            "[\n  \"a\"\n]\n"
+        );
+        assert_eq!(
+            d.touched_lines(0, Pick::Disk),
+            vec![line(theirs, 2), line(theirs, 3)]
+        );
+        assert_eq!(disk("[\"b\"]", "[\"a\", \"b\"]"), "[\"b\"]");
     }
 
     // Mutations: (1) `append_root` skips the closing `}\n` — the object
