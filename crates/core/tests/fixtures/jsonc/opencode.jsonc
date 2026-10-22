@@ -1,0 +1,49 @@
+{
+  // opencode configuration
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "tokyonight",
+  "model": "anthropic/claude-sonnet-5-5",
+  "autoupdate": true, // check on launch
+  "share": "manual",
+  /* Providers */
+  "provider": {
+    "anthropic": {
+      "options": {
+        "timeout": 600000,
+      },
+      "models": {
+        "claude-sonnet-5-5": {
+          "limit": {
+            "context": 200000,
+            "output": 32000,
+          },
+        },
+      },
+    },
+  },
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+    },
+    "filesystem": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+      "enabled": false,
+    },
+  },
+  // Extra instruction files, read in order.
+  "instructions": [
+    "AGENTS.md",
+    ".agents/rules/*.md",
+  ],
+  "permission": {
+    "edit": "ask",
+    "bash": {
+      "git status": "allow",
+      "git diff*": "allow",
+      "*": "ask",
+    },
+  },
+}

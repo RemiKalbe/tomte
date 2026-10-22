@@ -1,0 +1,52 @@
+{
+  // Zed settings. Run `zed: open default settings` for the full list.
+  "$schema": "zed://schemas/settings",
+  "theme": {
+    "mode": "system",
+    "light": "One Light",
+    "dark": "One Dark", // matches the terminal
+  },
+  "buffer_font_family": "JetBrains Mono",
+  "buffer_font_size": 14,
+  "ui_font_size": 15.5,
+  /* Languages */
+  "languages": {
+    "Rust": {
+      "tab_size": 4,
+      "formatter": "language_server",
+      "format_on_save": "on",
+    },
+    "Nu": {
+      "tab_size": 2,
+    },
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "check": {
+          "command": "clippy",
+        },
+        "cargo": {
+          "features": "all",
+        },
+      },
+    },
+  },
+  // Keep these out of the file finder.
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/target",
+    "**/node_modules", // large
+  ],
+  "terminal": {
+    "shell": {
+      "program": "/opt/homebrew/bin/nu",
+    },
+    "font_size": 13,
+  },
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false,
+  },
+  "vim_mode": false,
+}

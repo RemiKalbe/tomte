@@ -1,0 +1,44 @@
+{
+  // Editor
+  "editor.fontSize": 14,
+  "editor.fontFamily": "'JetBrains Mono', Menlo, monospace",
+  "editor.fontLigatures": true,
+  "editor.formatOnSave": true,
+  "editor.rulers": [80, 100],
+  "editor.minimap.enabled": false,
+  /* Workbench */
+  "workbench.colorTheme": "Default Dark Modern",
+  "workbench.startupEditor": "none",
+  "window.zoomLevel": 0.5,
+  "files.autoSave": "onFocusChange",
+  "files.exclude": {
+    "**/.DS_Store": true,
+    "**/.git": true, // hidden in the explorer
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/target": true,
+  },
+  // Per-language overrides
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.tabSize": 4,
+  },
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features",
+  },
+  "json.schemas": [
+    {
+      "fileMatch": ["/.prettierrc"],
+      "url": "https://json.schemastore.org/prettierrc.json",
+    },
+    {
+      "fileMatch": ["/tsconfig*.json"],
+      "url": "https://json.schemastore.org/tsconfig.json",
+    },
+  ],
+  "terminal.integrated.defaultProfile.osx": "nu",
+  "terminal.integrated.fontSize": 13,
+  "telemetry.telemetryLevel": "off",
+  "git.autofetch": false,
+}

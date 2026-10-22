@@ -6,7 +6,7 @@
 //! value and leave every other byte alone. Nesting never grows the Rust stack:
 //! open containers live in an explicit stack.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::Range;
 
@@ -612,7 +612,152 @@ impl Parser<'_> {
     }
 }
 
+/// A JSON number compared by value, not by spelling.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Num {
+    /// A literal with at most 15 significant digits, which an `f64` holds
+    /// exactly enough that `1e2`, `100` and `100.0` are equal.
+    Float(f64),
+    /// The raw literal, for one with more than 15 significant digits (or a
+    /// value `f64` cannot hold). Compared by text so two large ids that differ
+    /// in a low digit never compare equal.
+    Text(String),
+}
+
+impl Num {
+    fn from_literal(raw: &str) -> Num {
+        let mantissa = raw.split(['e', 'E']).next().unwrap_or(raw);
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let int = int.trim_start_matches(['-', '0']);
+        let frac = frac.trim_end_matches('0');
+        let digits = int.len() + frac.len();
+        match raw.parse::<f64>() {
+            Ok(f) if digits <= 15 && f.is_finite() => Num::Float(if f == 0.0 { 0.0 } else { f }),
+            _ => Num::Text(raw.to_string()),
+        }
+    }
+}
+
+/// A node's meaning with all formatting removed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Number(Num),
+    String(String),
+    Array(Vec<Value>),
+    /// Key order is not significant. When a key repeats, the last one wins.
+    Object(BTreeMap<String, Value>),
+}
+
+/// Deterministic text for `value`: equal values give equal strings whatever
+/// the original spacing, key order or number spelling. Used as the token that
+/// array elements are matched by.
+pub fn canonical(value: &Value) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+fn write_canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(Num::Float(f)) => out.push_str(&format!("{f}")),
+        Value::Number(Num::Text(raw)) => out.push_str(raw),
+        Value::String(s) => write_json_string(s, out),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(key, out);
+                out.push(':');
+                write_canonical(item, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_json_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 impl Document {
+    /// The value of node `id` with formatting, comments and key order removed.
+    /// Walks with an explicit stack so deep nesting cannot overflow.
+    pub fn value(&self, id: NodeId) -> Value {
+        enum Task<'a> {
+            Visit(NodeId),
+            Array(usize),
+            Object(Vec<&'a str>),
+        }
+        let mut tasks = vec![Task::Visit(id)];
+        let mut done: Vec<Value> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Visit(id) => match &self.node(id).kind {
+                    NodeKind::Null => done.push(Value::Null),
+                    NodeKind::Bool(b) => done.push(Value::Bool(*b)),
+                    NodeKind::Number(raw) => done.push(Value::Number(Num::from_literal(raw))),
+                    NodeKind::String(s) => done.push(Value::String(s.clone())),
+                    NodeKind::Array { elements } => {
+                        tasks.push(Task::Array(elements.len()));
+                        for e in elements.iter().rev() {
+                            tasks.push(Task::Visit(e.value));
+                        }
+                    }
+                    NodeKind::Object { entries } => {
+                        tasks.push(Task::Object(
+                            entries.iter().map(|e| e.key.as_str()).collect(),
+                        ));
+                        for e in entries.iter().rev() {
+                            tasks.push(Task::Visit(e.value));
+                        }
+                    }
+                },
+                Task::Array(n) => {
+                    let items = done.split_off(done.len() - n);
+                    done.push(Value::Array(items));
+                }
+                Task::Object(keys) => {
+                    let values = done.split_off(done.len() - keys.len());
+                    let map = keys
+                        .into_iter()
+                        .zip(values)
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect();
+                    done.push(Value::Object(map));
+                }
+            }
+        }
+        done.pop().expect("a visited node yields one value")
+    }
+
     /// True when the file has no value at all.
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
@@ -880,5 +1025,44 @@ mod tests {
         assert_eq!(doc.line_of(1), 1);
         assert_eq!(doc.line_of(2), 2);
         assert_eq!(doc.line_of(doc.text.len()), 4);
+    }
+
+    fn val(text: &str) -> Value {
+        let doc = parse(text).unwrap();
+        doc.value(doc.root.unwrap())
+    }
+
+    // Mutation: compare numbers by raw text (Num::Text for every literal) ->
+    // 1.0 vs 1.00 and 1e2 vs 100 differ and this fails.
+    #[test]
+    fn values_compare_by_content_not_text() {
+        assert_eq!(
+            val("{\"b\":1,\"a\":[1.0, \"x\"]}"),
+            val("{ \"a\" : [ 1 , \"x\" ] , \"b\" : 1.00 }")
+        );
+        assert_eq!(val("\"caf\\u00e9\""), val("\"café\""));
+        assert_ne!(val("12345678901234567890"), val("12345678901234567891"));
+        assert_eq!(val("1e2"), val("100"));
+    }
+
+    // Mutation: build the object by keeping the first duplicate -> a is 1 and this fails.
+    #[test]
+    fn object_value_takes_the_last_duplicate() {
+        let expected = Value::Object(BTreeMap::from([(
+            "a".to_string(),
+            Value::Number(Num::Float(2.0)),
+        )]));
+        assert_eq!(val("{\"a\":1,\"a\":2}"), expected);
+    }
+
+    // Mutation: write object keys in reverse order (map.iter().rev()) -> the
+    // expected canonical text no longer matches and this fails.
+    #[test]
+    fn canonical_is_stable_across_formatting() {
+        let a = canonical(&val("{\"b\":1,\"a\":[1.0, \"x\"]}"));
+        let b = canonical(&val("{ \"a\" : [ 1 , \"x\" ] , \"b\" : 1.00 }"));
+        assert_eq!(a, b);
+        assert_eq!(a, "{\"a\":[1,\"x\"],\"b\":1}");
+        assert_eq!(canonical(&val("\"a\\\"b\\n\"")), "\"a\\\"b\\n\"");
     }
 }
