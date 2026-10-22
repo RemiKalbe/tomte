@@ -46,7 +46,9 @@ shells = ["zsh", "nu"]
     (dir, ChezmoiClient::new(Arc::new(SystemRunner), opts))
 }
 
-/// Asserts which decisions lock, picks Disk on the rest, writes back, re-renders.
+/// Picks Disk on every decision the lock pass left free, requires the
+/// write-back and the re-render to succeed, and only then checks the locked
+/// paths and the free count.
 fn round_trip(template: &str, ours: &str, locked: &[&str], free: usize) {
     let (_g, chezmoi) = scratch_chezmoi();
     let rendered =
@@ -54,27 +56,30 @@ fn round_trip(template: &str, ours: &str, locked: &[&str], free: usize) {
     let map = anchor(template, &lex(template).unwrap(), &rendered);
     let doc = StructuredDocument::compute(None, ours, &rendered, Some(&map)).unwrap();
     let mut res = Resolution::default();
-    let mut unlocked = 0;
-    for d in &doc.decisions {
-        if locked.contains(&d.path.as_str()) {
-            assert!(d.locked.is_some(), "{} is locked", d.path);
-        } else {
-            assert!(d.locked.is_none(), "{} is free", d.path);
-            unlocked += 1;
-            res.set(d.id, Pick::Disk);
-        }
+    for d in doc.decisions.iter().filter(|d| d.locked.is_none()) {
+        res.set(d.id, Pick::Disk);
     }
-    assert_eq!(unlocked, free);
     let result = doc.assemble(&res).unwrap();
-    let new_template = write_back(template, &map, &rendered, &result).unwrap();
+    let new_template = write_back(template, &map, &rendered, &result)
+        .unwrap_or_else(|e| panic!("an unlocked Disk pick was refused: {e}"));
     verify_write_back(&chezmoi, &new_template, &result).unwrap();
+    let mut locked_paths: Vec<&str> = doc
+        .decisions
+        .iter()
+        .filter(|d| d.locked.is_some())
+        .map(|d| d.path.as_str())
+        .collect();
+    locked_paths.sort_unstable();
+    assert_eq!(locked_paths, locked);
+    assert_eq!(doc.decisions.len() - locked_paths.len(), free);
 }
 
-// Mutation: make touched_lines return only the value's range (drop the
-// previous entry's comma line for a removal). The second case then leaves
-// "tabs" unlocked, and write_back fails with ProtectedSpanTouched because the
-// comma it must drop sits on the templated "name" line. The first case is the
-// brief's: value edits plus one locked templated entry.
+// Mutation: make touched_lines drop the previous entry's comma line for a
+// removal. "tabs" in the second case then stays unlocked, its Disk pick drops
+// the comma on the templated "name" line, and write_back refuses with
+// ProtectedSpanTouched inside this test's write_back call, before any lock
+// list is compared. The first case is the brief's: value edits plus one
+// locked templated entry.
 #[test]
 fn every_unlocked_disk_pick_writes_back_and_re_renders() {
     round_trip(

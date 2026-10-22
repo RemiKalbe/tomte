@@ -1299,16 +1299,20 @@ mod tests {
         StructuredDocument::compute(None, ours, theirs, Some(&map)).expect("structured")
     }
 
-    // Mutation: lock only the value's own line, not every touched line -> the
-    // removal case (c) stays unlocked.
+    // Mutations: (1) lock only the value's own line, not every touched line
+    // -> the removal case (c) stays unlocked; (2) drop `&& d.locked.is_none()`
+    // from `required_decisions` -> case (a), a conflict row with a base,
+    // stays required.
     #[test]
     fn entries_whose_splice_touches_a_template_line_are_locked() {
         // (a) a templated value
         let ours = "{\n  \"email\": \"other@x.y\",\n  \"editor\": \"hx\"\n}\n";
-        let d = locked_doc(EMAIL_TMPL, ours, EMAIL_THEIRS);
-        assert_eq!(d.decisions.len(), 1);
-        let lock = d.decisions[0].locked.expect("email is locked");
+        let base = EMAIL_THEIRS.replace("me@", "old@");
         let map = map_for(EMAIL_TMPL, EMAIL_THEIRS);
+        let d = StructuredDocument::compute(Some(&base), ours, EMAIL_THEIRS, Some(&map)).unwrap();
+        assert_eq!(d.decisions.len(), 1);
+        assert_eq!(d.decisions[0].kind, RegionKind::Conflict);
+        let lock = d.decisions[0].locked.expect("email is locked");
         assert!(matches!(
             map.spans[lock.span].origin,
             SpanOrigin::Action { .. }
