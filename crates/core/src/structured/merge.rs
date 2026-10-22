@@ -138,8 +138,6 @@ pub struct Lock {
 }
 
 /// Where a decision lives in the source text.
-// The splicer (Task 5) is the only reader of these fields.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Site {
     /// The source object that holds the key. `None` when the source is empty.
@@ -170,8 +168,6 @@ pub struct Decision {
     pub both_allowed: bool,
     /// Follows source because a template pins the span.
     pub locked: Option<Lock>,
-    // The splicer (Task 5) is the only reader.
-    #[allow(dead_code)]
     pub(crate) site: Site,
 }
 
@@ -210,9 +206,9 @@ pub struct StructuredDocument {
     pub decisions: Vec<Decision>,
     /// The base was missing or did not parse, so source stood in for it.
     pub degraded_base: bool,
-    base: Document,
-    ours: Document,
-    theirs: Document,
+    pub(super) base: Document,
+    pub(super) ours: Document,
+    pub(super) theirs: Document,
 }
 
 impl StructuredDocument {
