@@ -1828,4 +1828,25 @@ mod tests {
         let ranges = d.result_ranges(&every(&d, Pick::Disk));
         assert_eq!(ranges, vec![0..6]);
     }
+
+    // Mutation: treat locked as Source -- a locked decision resolves to the
+    // Source pick, which collapses the duplicated key's copies on templated
+    // lines.
+    #[test]
+    fn a_locked_decision_is_a_verbatim_no_op_even_for_a_duplicated_key() {
+        use crate::template::anchor::anchor;
+        use crate::template::lexer::lex;
+        let tmpl = "{\n  \"a\": 1,\n  \"a\": \"{{ .v }}\"\n}\n";
+        let theirs = "{\n  \"a\": 1,\n  \"a\": \"x\"\n}\n";
+        let map = anchor(tmpl, &lex(tmpl).unwrap(), theirs);
+        let d = StructuredDocument::compute(None, "{\n  \"a\": \"y\"\n}\n", theirs, Some(&map))
+            .unwrap();
+        assert_eq!(d.decisions[0].duplicated, Some(Side::Theirs));
+        assert!(d.decisions[0].locked.is_some());
+        let res = every(&d, Pick::Source);
+        assert_eq!(d.assemble(&res).unwrap(), theirs);
+        assert_eq!(d.seed(&res), theirs);
+        let ranges = d.result_ranges(&res);
+        assert_eq!(&theirs[ranges[0].clone()], "\"x\"");
+    }
 }

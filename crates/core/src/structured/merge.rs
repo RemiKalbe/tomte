@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use super::jsonc::{self, Document, Element, NodeId, NodeKind, Value};
 use crate::merge::{MergeRegion, RegionKind, three_way_elements};
-use crate::template::anchor::SpanMap;
+use crate::template::anchor::{SpanMap, SpanOrigin};
 
 /// A structured format the merge editor can offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,12 +229,14 @@ impl StructuredDocument {
     /// written text. A missing or unparseable base degrades to two-way: base
     /// becomes source, so every difference is `OursOnly`.
     ///
-    /// `span_map` is accepted for the locking rule and not used yet.
+    /// With a `span_map` (the template that renders `theirs`), a decision
+    /// whose splice would touch a templated line is locked; see
+    /// [`Self::lock_against`].
     pub fn compute(
         base: Option<&str>,
         ours: &str,
         theirs: &str,
-        _span_map: Option<&SpanMap>,
+        span_map: Option<&SpanMap>,
     ) -> Result<Self, NotStructured> {
         let ours = parse_side(ours, Side::Ours)?;
         let theirs = parse_side(theirs, Side::Theirs)?;
@@ -264,13 +266,69 @@ impl StructuredDocument {
             _ => walker.walk_object("", root_if(&base, Root::Object), ours.root, theirs.root),
         }
         let decisions = walker.decisions;
-        Ok(Self {
+        let mut document = Self {
             decisions,
             degraded_base,
             base,
             ours,
             theirs,
-        })
+        };
+        if let Some(map) = span_map {
+            document.lock_against(map);
+        }
+        Ok(document)
+    }
+
+    /// Locks every decision whose splice would edit a protected line of
+    /// source. A line is protected when it overlaps a rendered span whose
+    /// origin is anything but an unrepeated template literal, because
+    /// `write_back` refuses an edit there.
+    ///
+    /// The picks checked are Disk always, LastWritten when the base has the
+    /// entry, Both when the row allows it, and Source only for a key that
+    /// source repeats (collapsing the copies edits their lines). The lock
+    /// records the lowest-indexed protected span the touched lines overlap.
+    fn lock_against(&mut self, map: &SpanMap) {
+        let protected: Vec<usize> = (0..map.spans.len())
+            .filter(|&i| {
+                !matches!(
+                    map.spans[i].origin,
+                    SpanOrigin::Literal {
+                        repeated: false,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let locks: Vec<Option<Lock>> = (0..self.decisions.len())
+            .map(|id| {
+                let d = &self.decisions[id];
+                let mut picks = vec![Pick::Disk];
+                if self.has_base(id) {
+                    picks.push(Pick::LastWritten);
+                }
+                if d.both_allowed {
+                    picks.push(Pick::Both);
+                }
+                if d.duplicated == Some(Side::Theirs) {
+                    picks.push(Pick::Source);
+                }
+                picks
+                    .into_iter()
+                    .flat_map(|pick| self.touched_lines(id, pick))
+                    .flat_map(|line| {
+                        protected.iter().copied().filter(move |&i| {
+                            let span = &map.spans[i].range;
+                            line.start < span.end && span.start < line.end
+                        })
+                    })
+                    .min()
+                    .map(|span| Lock { span })
+            })
+            .collect();
+        for (d, lock) in self.decisions.iter_mut().zip(locks) {
+            d.locked = lock;
+        }
     }
 
     /// The pick that needs no user input: disk for a disk-only change,
@@ -1225,5 +1283,65 @@ mod tests {
             vec![row("a", RegionKind::Conflict, Change::Value)]
         );
         assert!(!d.has_base(0));
+    }
+
+    fn map_for(tmpl: &str, rendered: &str) -> SpanMap {
+        use crate::template::anchor::anchor;
+        use crate::template::lexer::lex;
+        anchor(tmpl, &lex(tmpl).unwrap(), rendered)
+    }
+
+    const EMAIL_TMPL: &str = "{\n  \"email\": \"{{ .email }}\",\n  \"editor\": \"hx\"\n}\n";
+    const EMAIL_THEIRS: &str = "{\n  \"email\": \"me@x.y\",\n  \"editor\": \"hx\"\n}\n";
+
+    fn locked_doc(tmpl: &str, ours: &str, theirs: &str) -> StructuredDocument {
+        let map = map_for(tmpl, theirs);
+        StructuredDocument::compute(None, ours, theirs, Some(&map)).expect("structured")
+    }
+
+    // Mutation: lock only the value's own line, not every touched line -> the
+    // removal case (c) stays unlocked.
+    #[test]
+    fn entries_whose_splice_touches_a_template_line_are_locked() {
+        // (a) a templated value
+        let ours = "{\n  \"email\": \"other@x.y\",\n  \"editor\": \"hx\"\n}\n";
+        let d = locked_doc(EMAIL_TMPL, ours, EMAIL_THEIRS);
+        assert_eq!(d.decisions.len(), 1);
+        let lock = d.decisions[0].locked.expect("email is locked");
+        let map = map_for(EMAIL_TMPL, EMAIL_THEIRS);
+        assert!(matches!(
+            map.spans[lock.span].origin,
+            SpanOrigin::Action { .. }
+        ));
+        assert_eq!(d.auto_pick(0), Some(Pick::Source));
+        assert!(d.required_decisions().is_empty());
+        // (b) a literal value on another line
+        let ours = "{\n  \"email\": \"me@x.y\",\n  \"editor\": \"zed\"\n}\n";
+        let d = locked_doc(EMAIL_TMPL, ours, EMAIL_THEIRS);
+        assert_eq!(d.decisions.len(), 1);
+        assert!(d.decisions[0].locked.is_none());
+        // (c) removing the last entry fixes the comma on the templated line
+        let ours = "{\n  \"email\": \"me@x.y\"\n}\n";
+        let d = locked_doc(EMAIL_TMPL, ours, EMAIL_THEIRS);
+        assert_eq!(d.decisions.len(), 1);
+        assert_eq!(d.decisions[0].path, "editor");
+        assert!(d.decisions[0].locked.is_some());
+        // (d) a templated key
+        let tmpl = "{\n  \"{{ .k }}\": 1\n}\n";
+        let theirs = "{\n  \"kk\": 1\n}\n";
+        let d = locked_doc(tmpl, "{\n  \"kk\": 2\n}\n", theirs);
+        assert_eq!(d.decisions.len(), 1);
+        assert!(d.decisions[0].locked.is_some());
+    }
+
+    // Mutation: lock_against runs regardless of the map (treats None as
+    // "everything protected") -> the plain doc is locked.
+    #[test]
+    fn without_a_span_map_nothing_is_locked() {
+        let ours = "{\n  \"email\": \"other@x.y\",\n  \"editor\": \"hx\"\n}\n";
+        let base = EMAIL_THEIRS.replace("me@", "old@");
+        let d = doc(Some(&base), ours, EMAIL_THEIRS);
+        assert!(d.decisions.iter().all(|d| d.locked.is_none()));
+        assert_eq!(d.required_decisions(), vec![0]);
     }
 }
