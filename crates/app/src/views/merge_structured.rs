@@ -202,7 +202,7 @@ pub(super) fn progress_text(state: &StructuredState) -> String {
     if total == 0 {
         let changed = state.doc.decisions.len();
         let noun = if changed == 1 { "entry" } else { "entries" };
-        return format!("auto-resolved · {changed} changed {noun} — review below");
+        return format!("auto-resolved · {changed} changed {noun} · review below");
     }
     let s = if total == 1 { "" } else { "s" };
     format!("{total} conflict{s}, {decided} resolved")
@@ -557,6 +557,11 @@ mod tests {
         s.pick(0, Pick::Disk);
         assert_eq!(progress_text(&s), "2 conflicts, 1 resolved");
         assert!(has_picks(&s));
+        let auto = state(None, "{\"a\": 2}", "{\"a\": 3}");
+        assert_eq!(
+            progress_text(&auto),
+            "auto-resolved · 1 changed entry · review below"
+        );
         let same = state(Some("{\"a\": 1}"), "{ \"a\":1 }", "{\"a\": 1}");
         assert_eq!(
             progress_text(&same),

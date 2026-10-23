@@ -1140,17 +1140,29 @@ impl MergeView {
         inputs: std::sync::Arc<MergeInputs>,
         cx: &mut Context<Self>,
     ) {
-        self.target = Some(inputs.target.clone());
+        self.start_session(inputs.target.clone());
         self.repo_reconcile = true;
         self.loading = false;
+        self.loaded = Some(LoadedMerge::new(inputs));
+        self.seed_editor(cx);
+        cx.notify();
+    }
+
+    /// Forget everything the previous file left behind. The Shell reuses one
+    /// MergeView across files, so an undo entry, a revisit or an armed
+    /// confirmation from file A must not survive into file B: a stale
+    /// structured redo indexes B's decisions with A's ids and panics, and an
+    /// in-range one restores a pick that bypasses `pick_allowed`.
+    fn start_session(&mut self, target: PathBuf) {
+        self.target = Some(target);
         self.error = None;
         self.banner = None;
         self.cancel_armed = None;
         self.mode_switch_armed = None;
         self.editing = false;
-        self.loaded = Some(LoadedMerge::new(inputs));
-        self.seed_editor(cx);
-        cx.notify();
+        self.undo.clear();
+        self.redo.clear();
+        self.revisiting.clear();
     }
 
     /// (Re)load the merge inputs for `target` on the background executor.
@@ -1161,15 +1173,10 @@ impl MergeView {
     /// first whether an in-progress merge with origin left this file
     /// conflicted, because that changes where its two sides must be read from.
     pub fn load(&mut self, target: PathBuf, cx: &mut Context<Self>) {
+        self.start_session(target.clone());
         self.repo_reconcile = false;
-        self.target = Some(target.clone());
         self.loading = true;
-        self.error = None;
         self.loaded = None;
-        self.banner = None;
-        self.cancel_armed = None;
-        self.mode_switch_armed = None;
-        self.editing = false;
         self.result_editor = None;
         cx.notify();
 

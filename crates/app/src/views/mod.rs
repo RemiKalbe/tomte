@@ -6734,6 +6734,61 @@ mod render_smoke {
         assert!(result_text(&merge, vis).contains("\"Gruvbox\""));
     }
 
+    /// The Shell reuses one MergeView across files, so opening file B must
+    /// forget file A's undo history: A's decision 3 does not exist in B.
+    ///
+    /// MUTATION: drop the clearing in load (`start_session` keeps `undo`,
+    /// `redo` and `revisiting`) → ⌘Z unsets B's id 3, and ⇧⌘Z's
+    /// `StructuredState::pick(3)` panics out of bounds on B's two decisions.
+    #[gpui::test]
+    fn opening_another_file_clears_the_undo_stacks(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(3, Pick::Disk, cx)));
+        let picked = vis.update(|_w, cx| {
+            merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap()
+                .resolution
+                .get(3)
+        });
+        assert_eq!(picked, Some(Pick::Disk), "file A has a decision 3 to pick");
+        // Open file B (two decisions) in the same view. `present_repo_conflict`
+        // is the entry point that needs no subprocess; `load` shares its
+        // reset (`start_session`) but would run the real chezmoi.
+        vis.update(|_w, cx| {
+            merge.update(cx, |v, cx| {
+                v.present_repo_conflict(Arc::new(fixtures::json_templated_inputs()), cx)
+            })
+        });
+        vis.run_until_parked();
+        vis.simulate_keystrokes("cmd-z");
+        vis.run_until_parked();
+        vis.simulate_keystrokes("cmd-shift-z");
+        vis.run_until_parked();
+        let picks = vis.update(|_w, cx| {
+            let state = merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap();
+            assert_eq!(state.doc.decisions.len(), 2);
+            (0..4)
+                .map(|id| state.resolution.get(id))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(picks, vec![None; 4], "file B's resolution is untouched");
+    }
+
     /// A templated key's strip reads as locked and offers no buttons.
     ///
     /// MUTATION: `strip_specs` ignores `locked` (builds `Deciding`) → the
