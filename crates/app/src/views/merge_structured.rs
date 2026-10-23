@@ -12,11 +12,11 @@ use gpui::{App, ClickEvent, Context, Div, SharedString, WeakEntity, Window, div,
 use tomte_app::structured_state::StructuredState;
 use tomte_app::theme::Theme;
 use tomte_core::merge::RegionKind;
-use tomte_core::structured::{Change, Decision, Pick, Side};
+use tomte_core::structured::{Change, Decision, Pick, Side, SideText, StructuredDocument};
 use tomte_core::template::anchor::SpanMap;
 use tomte_ui::components as ui;
 
-use super::merge::{MergeMode, MergeView, STRIP_ROWS, span_reason};
+use super::merge::{MergeMode, MergeView, PaneSide, STRIP_ROWS, row_bg, span_reason};
 
 /// What one structured strip renders as. Plain data so the plan is testable;
 /// [`strip_block`] turns it into a `ui::StripState`.
@@ -208,21 +208,92 @@ pub(super) fn progress_text(state: &StructuredState) -> String {
     format!("{total} conflict{s}, {decided} resolved")
 }
 
-/// Input-pane decorations in Structure mode: no region washes (the line
-/// regions mean nothing here), only the source pane's `{}` gutter on lines
-/// a template generated. `protected[i]` is line `i`'s hover text.
+/// Input-pane decorations in Structure mode: [`structured_pane_decors`]'s
+/// per-decision washes plus the source pane's `{}` gutter on lines a
+/// template generated. `protected[i]` is line `i`'s hover text (all `None`
+/// on the other panes).
 pub(super) fn pane_decors(
+    doc: &StructuredDocument,
+    side: Side,
     protected: impl Iterator<Item = Option<SharedString>>,
     theme: Theme,
 ) -> Vec<ui::text_area::LineDecor> {
-    protected
-        .map(|tip| ui::text_area::LineDecor {
+    let mut decors = structured_pane_decors(doc, side, theme);
+    for (decor, tip) in decors.iter_mut().zip(protected) {
+        decor.gutter = tip.is_some().then(|| ("{}".into(), theme.drift));
+        decor.tooltip = tip;
+    }
+    decors
+}
+
+/// The pane side a structured side shows in.
+fn pane_side(side: Side) -> PaneSide {
+    match side {
+        Side::Base => PaneSide::Base,
+        Side::Ours => PaneSide::Ours,
+        Side::Theirs => PaneSide::Theirs,
+    }
+}
+
+/// Decision `d`'s piece of `side`. A degraded base is source standing in,
+/// not a last-written state, so it carries no decision of its own.
+fn side_piece<'a>(doc: &StructuredDocument, d: &'a Decision, side: Side) -> Option<&'a SideText> {
+    match side {
+        Side::Base if doc.degraded_base => None,
+        Side::Base => d.base.as_ref(),
+        Side::Ours => d.ours.as_ref(),
+        Side::Theirs => d.theirs.as_ref(),
+    }
+}
+
+/// The 0-based line of byte `offset` in `text`.
+fn line_of(text: &str, offset: usize) -> usize {
+    text.as_bytes()[..offset.min(text.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+}
+
+/// One decor per line of `side`'s full text: every line a decision's byte
+/// range on that side covers (first line through last) gets the line
+/// editor's wash for the decision's kind ([`row_bg`]); an empty range (an
+/// insertion point) tints nothing. Where two decisions share a line the
+/// first one's wash stays.
+pub(super) fn structured_pane_decors(
+    doc: &StructuredDocument,
+    side: Side,
+    theme: Theme,
+) -> Vec<ui::text_area::LineDecor> {
+    let text = doc.side_text(side);
+    let mut decors: Vec<ui::text_area::LineDecor> = text
+        .lines()
+        .map(|_| ui::text_area::LineDecor {
             text_color: Some(theme.text),
-            gutter: tip.is_some().then(|| ("{}".into(), theme.drift)),
-            tooltip: tip,
             ..Default::default()
         })
-        .collect()
+        .collect();
+    for d in &doc.decisions {
+        let Some(piece) = side_piece(doc, d, side).filter(|p| !p.range.is_empty()) else {
+            continue;
+        };
+        let bg = row_bg(d.kind, pane_side(side), &theme);
+        let first = line_of(text, piece.range.start);
+        let last = line_of(text, piece.range.end - 1);
+        for decor in decors.iter_mut().take(last + 1).skip(first) {
+            decor.bg = decor.bg.or(bg);
+        }
+    }
+    decors
+}
+
+/// The 0-based first line of decision `id` on each side, in
+/// `[Base, Ours, Theirs]` order; `None` where that side has no text for it.
+pub(super) fn jump_lines(doc: &StructuredDocument, id: usize) -> [Option<usize>; 3] {
+    let Some(d) = doc.decisions.get(id) else {
+        return [None; 3];
+    };
+    [Side::Base, Side::Ours, Side::Theirs]
+        .map(|side| side_piece(doc, d, side).map(|p| line_of(doc.side_text(side), p.range.start)))
 }
 
 /// The block that renders one structured strip inside the result editor.
@@ -444,10 +515,15 @@ mod tests {
     use std::collections::HashSet;
 
     use tomte_app::structured_state::StructuredState;
+    use tomte_app::theme::Theme;
+    use tomte_core::merge::RegionKind;
+    use tomte_core::structured::Side;
     use tomte_core::structured::{Pick, StructuredDocument};
 
+    use super::super::merge::{PaneSide, row_bg};
     use super::{
-        StripKind, detail_words, has_picks, pick_allowed, progress_text, strip_specs, text_row,
+        StripKind, detail_words, has_picks, jump_lines, pick_allowed, progress_text, strip_specs,
+        structured_pane_decors, text_row,
     };
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
@@ -534,6 +610,64 @@ mod tests {
             "no base in two-way"
         );
         assert!(!pick_allowed(&two, 7, Pick::Disk), "unknown id");
+    }
+
+    // MUTATION: tint by decision index instead of byte range (wash line
+    // `d.id`) → the wrong lines wash: lines 0 and 1 tint and font_size's
+    // line 2 stays bare.
+    // MUTATION: tint only the range's first line → the added `vim` object's
+    // closing lines stay bare.
+    #[test]
+    fn pane_decors_tint_exactly_the_lines_a_decision_covers() {
+        let theme = Theme::dark();
+        let base = "{\n  \"theme\": 1,\n  \"font_size\": 14\n}\n";
+        let ours = concat!(
+            "{\n",
+            "  \"theme\": 1,\n",
+            "  \"font_size\": 15,\n",
+            "  \"vim\": {\n",
+            "    \"on\": true\n",
+            "  }\n",
+            "}\n",
+        );
+        let doc = StructuredDocument::compute(Some(base), ours, base, None).expect("json");
+        let decors = structured_pane_decors(&doc, Side::Ours, theme);
+        assert_eq!(decors.len(), 7, "one decor per line of disk's text");
+        let wash = row_bg(RegionKind::OursOnly, PaneSide::Ours, &theme);
+        assert!(wash.is_some());
+        let bgs: Vec<_> = decors.iter().map(|d| d.bg).collect();
+        assert_eq!(
+            bgs,
+            vec![None, None, wash, wash, wash, wash, None],
+            "font_size's line and every line of the added vim object"
+        );
+        // Source has neither change: no wash there.
+        let theirs = structured_pane_decors(&doc, Side::Theirs, theme);
+        assert!(theirs.iter().all(|d| d.bg.is_none()));
+    }
+
+    // MUTATION: return the range's LAST line, or drop the `None` for a side
+    // without the entry (map it to line 0) → the asserted lines differ.
+    // MUTATION: ignore `degraded_base` → the two-way base names a line.
+    #[test]
+    fn jump_lines_name_each_sides_first_line_or_none_when_absent() {
+        let base = "{\n  \"a\": 1,\n  \"b\": 1\n}\n";
+        // `c` spans three lines on disk: the jump is to its first.
+        let ours = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": {\n    \"x\": 1\n  }\n}\n";
+        let theirs = "{\n  \"b\": 3,\n  \"a\": 1\n}\n";
+        let doc = StructuredDocument::compute(Some(base), ours, theirs, None).expect("json");
+        let id = |p: &str| doc.decisions.iter().find(|d| d.path == p).expect(p).id;
+        assert_eq!(jump_lines(&doc, id("b")), [Some(2), Some(2), Some(1)]);
+        assert_eq!(
+            jump_lines(&doc, id("c")),
+            [None, Some(3), None],
+            "added on disk: only disk has it"
+        );
+        assert_eq!(jump_lines(&doc, 99), [None; 3], "unknown id");
+
+        let two = StructuredDocument::compute(None, ours, theirs, None).expect("json");
+        let b = two.decisions.iter().find(|d| d.path == "b").expect("b").id;
+        assert_eq!(jump_lines(&two, b), [None, Some(2), Some(1)]);
     }
 
     // MUTATION: count strips strictly above the line → the row is one strip short.

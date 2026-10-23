@@ -32,7 +32,7 @@ use tomte_app::merge_state::MergeState;
 use tomte_app::structured_state::{Stage, StructuredState};
 use tomte_app::theme::Theme;
 use tomte_core::merge::{Choice, MergeDocument, RegionKind};
-use tomte_core::structured::{NotStructured, Pick, StructuredDocument};
+use tomte_core::structured::{NotStructured, Pick, Side, StructuredDocument};
 use tomte_core::template::anchor::{SpanMap, SpanOrigin};
 use tomte_core::template::lexer::Segment;
 use tomte_ui::components as ui;
@@ -49,7 +49,7 @@ use super::{Route, Shell};
 /// onto its regions, so it has its own row/decor builders
 /// ([`origin_pane_lines`], [`origin_pane_decors`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaneSide {
+pub(super) enum PaneSide {
     Theirs,
     Base,
     Ours,
@@ -82,7 +82,7 @@ struct PaneLine {
 /// on-disk pane, blue in the source pane, muted in the base pane — matching
 /// the provenance blocks in the result. Conflict rows use a stronger wash of
 /// the same side tint so they still read hotter than one-sided changes.
-fn row_bg(kind: RegionKind, side: PaneSide, theme: &Theme) -> Option<Rgba> {
+pub(super) fn row_bg(kind: RegionKind, side: PaneSide, theme: &Theme) -> Option<Rgba> {
     let side_tint = match side {
         PaneSide::Ours => theme.drift,
         PaneSide::Theirs => theme.accent,
@@ -1033,7 +1033,7 @@ pub struct MergeView {
     /// wheel on any pane mirrors its offset to the others so the columns
     /// compare without independent scrolling. The origin handle exists even
     /// when its pane is not drawn — syncing it is harmless.
-    pane_scrolls: [gpui::ScrollHandle; PANE_COLS],
+    pub(super) pane_scrolls: [gpui::ScrollHandle; PANE_COLS],
     /// Decided regions whose strip the user reopened (non-destructive).
     revisiting: std::collections::HashSet<usize>,
     /// The result IS the editor (2026-08-22): one persistent `TextArea`,
@@ -1564,6 +1564,9 @@ impl MergeView {
                 _ => loaded.state.cursor = Some(region),
             }
         }
+        if self.mode() == MergeMode::Structure {
+            self.jump_to(region);
+        }
         self.decor_dirty = true;
         cx.notify();
     }
@@ -1741,6 +1744,11 @@ impl MergeView {
         let Some(loaded) = &self.loaded else {
             return;
         };
+        // Structure mode has no line regions to align: the panes scroll
+        // independently and Next / a strip click jump them ([`Self::jump_to`]).
+        if loaded.mode == MergeMode::Structure {
+            return;
+        }
         let starts = &loaded.region_line_starts;
         // The result editor's per-region geometry must line up with the
         // panes' or the mapping is meaningless.
@@ -1818,6 +1826,28 @@ impl MergeView {
         self.row_of_line(start_line, !self.editing) as f32 + f * len
     }
 
+    /// Structure mode: bring decision `id` into view everywhere. Each input
+    /// pane scrolls to the decision's first line on its side (a side without
+    /// the entry stays put; origin is hidden here), and the result editor to
+    /// the decision's strip. Only writes scroll handles, so it is safe from
+    /// inside any update of this view.
+    fn jump_to(&mut self, id: usize) {
+        let Some(state) = self.loaded.as_ref().and_then(|l| l.structured.as_ref()) else {
+            return;
+        };
+        let lines = merge_structured::jump_lines(&state.doc, id);
+        for (col, line) in [BASE_COL, OURS_COL, THEIRS_COL].into_iter().zip(lines) {
+            if let Some(line) = line {
+                let mut offset = self.pane_scrolls[col].offset();
+                offset.y = px(-(line as f32 * PANE_ROW_H));
+                self.pane_scrolls[col].set_offset(offset);
+            }
+        }
+        let row = merge_structured::text_row(&state.result_lines(), id);
+        let y = row.saturating_sub(STRIP_ROWS) as f32 * PANE_ROW_H;
+        self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
+    }
+
     /// `Next ↓`: advance the cursor to the next unresolved conflict — or,
     /// once everything is resolved, to the next changed region, so every
     /// decision point stays reachable for revisiting (2026-08-08 feedback).
@@ -1827,9 +1857,7 @@ impl MergeView {
             && let (MergeMode::Structure, Some(state)) = (loaded.mode, &mut loaded.structured)
         {
             if let Some(id) = merge_structured::next_target(state) {
-                let row = merge_structured::text_row(&state.result_lines(), id);
-                let y = row.saturating_sub(STRIP_ROWS) as f32 * PANE_ROW_H;
-                self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
+                self.jump_to(id);
                 self.decor_dirty = true;
             }
             cx.notify();
@@ -2693,14 +2721,20 @@ impl MergeView {
             // built only when origin exists, and carries its own decors (the
             // merge's region kinds say nothing about the remote).
             let decors = |rows: &Rc<Vec<PaneLine>>, side: PaneSide| {
-                Rc::new(match loaded.mode {
-                    MergeMode::Lines => pane_decors(rows, side, theme),
-                    // Structure mode: each side's full text with only the
-                    // source pane's `{}` gutter (Task 11 adds the tints).
-                    MergeMode::Structure => merge_structured::pane_decors(
+                Rc::new(match (loaded.mode, &loaded.structured) {
+                    // Structure mode: each side's full text washed per
+                    // decision, plus the source pane's `{}` gutter.
+                    (MergeMode::Structure, Some(state)) => merge_structured::pane_decors(
+                        &state.doc,
+                        match side {
+                            PaneSide::Theirs => Side::Theirs,
+                            PaneSide::Base => Side::Base,
+                            PaneSide::Ours => Side::Ours,
+                        },
                         rows.iter().map(|r| r.protected.clone()),
                         theme,
                     ),
+                    _ => pane_decors(rows, side, theme),
                 })
             };
             let mut panes: Vec<PaneContent> = vec![
@@ -2931,7 +2965,7 @@ fn next_target(state: &mut MergeState) -> Option<usize> {
 
 /// Fixed mono row height (`h_5` = 20px) — the unit converting pane scroll
 /// offsets to line positions for region-aligned sync.
-const PANE_ROW_H: f32 = 20.;
+pub(super) const PANE_ROW_H: f32 = 20.;
 
 /// Rows a decision-strip block occupies (Zed's FILE_HEADER_HEIGHT).
 pub(super) const STRIP_ROWS: usize = 2;
@@ -2942,9 +2976,9 @@ pub(super) const STRIP_ROWS: usize = 2;
 /// Origin renders LEFTMOST all the same (remote → local source → last
 /// written → disk reads as one provenance gradient); render order and
 /// geometry column are simply two different things.
-const THEIRS_COL: usize = 0;
-const BASE_COL: usize = 1;
-const OURS_COL: usize = 2;
+pub(super) const THEIRS_COL: usize = 0;
+pub(super) const BASE_COL: usize = 1;
+pub(super) const OURS_COL: usize = 2;
 const ORIGIN_COL: usize = 3;
 pub(super) const PANE_COLS: usize = 4;
 

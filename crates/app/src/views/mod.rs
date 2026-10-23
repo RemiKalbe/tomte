@@ -6789,6 +6789,93 @@ mod render_smoke {
         assert_eq!(picks, vec![None; 4], "file B's resolution is untouched");
     }
 
+    /// Next ↓ in Structure mode moves every input pane to the decision's
+    /// first line on its side; a pane whose side lacks the entry stays put.
+    /// A revisit (the decided strip's click) jumps the panes the same way.
+    /// The offsets are read in the same update that moves them: the
+    /// fixture's text fits the panes, so the next layout clamps them to 0.
+    ///
+    /// MUTATION: `next` drops its `jump_to` call (scrolls only the result
+    /// editor) → the disk pane stays at 0 and the first offset assert fails.
+    /// MUTATION: `jump_to` writes every column even when the side has no
+    /// line (`unwrap_or(0)`) → the source pane snaps back to 0 on vim_mode
+    /// and the "stays put" assert fails.
+    /// MUTATION: `revisit` drops its `jump_to` → the panes stay on the last
+    /// Next target.
+    /// MUTATION: drop `sync_from`'s Structure-mode return AND its
+    /// `seed_line_starts` length guard → the probe drags the source pane off
+    /// its parked line. Dropping only the return survives: Structure mode
+    /// seeds no line starts, so the length guard also bails.
+    #[gpui::test]
+    fn next_in_structure_mode_moves_every_pane_to_the_decision(cx: &mut TestAppContext) {
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        // Resolve the one conflict so Next cycles every changed entry.
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
+        vis.run_until_parked();
+        // Park every pane at a sentinel, run `step`, then read the cursor,
+        // its jump lines and the pane offsets in [base, disk, source] order
+        // before any layout. A pane the step leaves alone reads `parked`.
+        let parked = px(-999.);
+        let cols = [merge::BASE_COL, merge::OURS_COL, merge::THEIRS_COL];
+        let step = |vis: &mut VisualTestContext,
+                    step: &dyn Fn(&mut merge::MergeView, &mut gpui::Context<merge::MergeView>)| {
+            vis.update(|_w, cx| {
+                merge.update(cx, |view, cx| {
+                    for c in cols {
+                        view.pane_scrolls[c].set_offset(gpui::point(px(0.), parked));
+                    }
+                    step(view, cx);
+                    let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
+                    let id = state.cursor.expect("the cursor is on a decision");
+                    let offsets = cols.map(|c| view.pane_scrolls[c].offset().y);
+                    (
+                        id,
+                        state.doc.decisions[id].path.clone(),
+                        merge_structured::jump_lines(&state.doc, id),
+                        offsets,
+                    )
+                })
+            })
+        };
+        let at = |line: usize| px(-(line as f32 * merge::PANE_ROW_H));
+        let mut saw_absent = false;
+        for _ in 0..4 {
+            let (_id, path, lines, offsets) = step(vis, &|v, cx| v.next(cx));
+            for (col, (line, offset)) in lines.iter().zip(offsets).enumerate() {
+                match line {
+                    Some(line) => assert_eq!(offset, at(*line), "{path}: column {col}"),
+                    None => {
+                        saw_absent = true;
+                        assert_eq!(offset, parked, "{path}: column {col} stays put");
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_absent,
+            "vim_mode is only on disk, copilot only in source"
+        );
+
+        // A revisit of the decided theme strip jumps the panes to it.
+        let (id, _path, lines, offsets) = step(vis, &|v, cx| v.revisit(0, cx));
+        assert_eq!(id, 0);
+        assert_eq!(
+            offsets,
+            lines.map(|l| at(l.expect("theme is on every side")))
+        );
+
+        // Scrolling one pane leaves the others where they are: the
+        // region-aligned sync stands down in Structure mode.
+        let source_line = vis.update(|_w, cx| {
+            merge.update(cx, |view, _cx| {
+                view.pane_scrolls[merge::THEIRS_COL].set_offset(gpui::point(px(0.), parked));
+                view.sync_probe(merge::OURS_COL, 1).panes[merge::THEIRS_COL]
+            })
+        });
+        assert_eq!(source_line, -f32::from(parked) / merge::PANE_ROW_H);
+    }
+
     /// A templated key's strip reads as locked and offers no buttons.
     ///
     /// MUTATION: `strip_specs` ignores `locked` (builds `Deciding`) → the
