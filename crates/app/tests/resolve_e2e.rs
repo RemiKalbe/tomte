@@ -1973,8 +1973,11 @@ fn story_x_a_structured_save_lands_a_disk_added_key_and_a_source_change() {
 /// template, leaving the expression intact.
 ///
 /// Mutation: skip the lock pass (`crates/core/src/structured/merge.rs`) →
-/// "name" is picked Disk, the write-back hits the protected span and
-/// `resolve_merged` returns `ProtectedSpan` instead of `Done`.
+/// "name" takes the auto Disk pick, so the story fails at the lock assertion
+/// and, with that removed, at the assembled-text assertion (`X` where the
+/// source has `tpl`); `resolve_merged` is never reached. The engine's own
+/// refusal path (`write_back` → `ProtectedSpanTouched` →
+/// `ResolveOutcome::ProtectedSpan`) is covered by story H.
 #[test]
 fn story_y_a_structured_save_on_a_templated_json_source_writes_back_the_literal_key() {
     let lab = DriftLab::new();
@@ -2003,6 +2006,8 @@ fn story_y_a_structured_save_on_a_templated_json_source_writes_back_the_literal_
         .find(|d| d.path == "tabs")
         .unwrap()
         .id;
+    // A no-op in this 3-way (OursOnly auto-resolves to Disk); kept to read
+    // as the user's action.
     state.pick(tabs, Pick::Disk);
     let resolved = state.assembled().unwrap().unwrap();
     assert_eq!(resolved.as_bytes(), JSON_TPL_DISK_SAVED);
