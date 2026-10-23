@@ -2460,6 +2460,27 @@ mod render_smoke {
             assert_eq!(locked, name == "merge-structured-locked", "{name}");
             assert_eq!(chip.is_some(), name == "merge-structured-text", "{name}");
         }
+
+        // The not-structured pose opens the line editor with the note.
+        // MUTATION: `not_structured_note` returns None → no note.
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("merge-not-structured", smoke_paths(), cx)
+                .expect("merge-not-structured builds")
+        });
+        vis.run_until_parked();
+        let merge = vis
+            .update(|_w, cx| shell.read(cx).merge.clone())
+            .expect("merge-not-structured poses a merge");
+        let (mode, note) = vis.update(|_w, cx| {
+            let view = merge.read(cx);
+            (view.mode(), view.not_structured_note())
+        });
+        assert_eq!(mode, merge::MergeMode::Lines);
+        assert_eq!(
+            note.as_deref(),
+            Some("disk is not valid JSON (line 5): line merge")
+        );
+        assert!(vis.debug_bounds("merge-not-structured").is_some());
     }
 
     /// The point of the whole queue: a second decision is accepted while the
@@ -6680,6 +6701,88 @@ mod render_smoke {
         assert!(banner.is_none());
     }
 
+    /// An unpicked conflict shows both sides as the line editor does: disk's
+    /// lines as amber rows in the strip's block, source's lines tinted in
+    /// the text below it. A pick collapses both to the chosen text.
+    ///
+    /// MUTATION: `install_result_decorator` installs `lines: Vec::new()`
+    /// again → no line carries the source rail.
+    /// MUTATION: `strip_specs` leaves `disk_rows` empty → the theme block is
+    /// two rows tall and holds no disk text.
+    #[gpui::test]
+    fn an_unpicked_structured_conflict_shows_disk_and_source_rows(cx: &mut TestAppContext) {
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let probe = |vis: &mut VisualTestContext| {
+            vis.update(|_w, cx| {
+                let view = merge.read(cx);
+                let text = view.result_text_for_test(cx);
+                let decoration = view
+                    .result_decoration_for_test(cx)
+                    .expect("the decorator is installed");
+                let railed: Vec<String> = decoration
+                    .lines
+                    .iter()
+                    .zip(text.lines())
+                    .filter(|(decor, _)| decor.rail.is_some())
+                    .map(|(_, line)| line.to_string())
+                    .collect();
+                let heights: Vec<u32> = decoration.blocks.iter().map(|b| b.height).collect();
+                let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
+                let disk = merge_structured::strip_specs(state, &HashSet::new(), None, None)[0]
+                    .disk_rows
+                    .clone();
+                (text, railed, heights, disk)
+            })
+        };
+        let (text, railed, heights, disk) = probe(vis);
+        assert!(text.contains("\"Solarized\"") && !text.contains("\"Gruvbox\""));
+        assert_eq!(railed, vec!["  \"theme\": \"Solarized\",".to_string()]);
+        assert_eq!(disk, vec![SharedString::from("  \"theme\": \"Gruvbox\",")]);
+        assert_eq!(
+            heights[0] as usize,
+            merge::STRIP_ROWS + 2,
+            "the strip, the on-disk label and one disk row"
+        );
+
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
+        vis.run_until_parked();
+        let (text, railed, heights, disk) = probe(vis);
+        assert!(text.contains("\"Gruvbox\"") && !text.contains("\"Solarized\""));
+        assert!(railed.is_empty(), "{railed:?}");
+        assert!(disk.is_empty());
+        assert!(heights.iter().all(|&h| h as usize == merge::STRIP_ROWS));
+    }
+
+    /// A save the write-back would refuse never reaches the queue: two free
+    /// picks on adjacent lines of different template literals read as one
+    /// edit. The message box names it and the picks stay.
+    ///
+    /// MUTATION: `save` skips `template_refusal` → the save is queued (the
+    /// engine would refuse it later) and `error` is None.
+    #[gpui::test]
+    fn a_structured_save_the_write_back_refuses_is_a_message_box(cx: &mut TestAppContext) {
+        let (shell, merge, vis) =
+            structured_merge_window(cx, fixtures::json_adjacent_literals_inputs());
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.save(cx)));
+        vis.run_until_parked();
+        let (error, mode) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            (v.error.clone(), v.loaded.as_ref().unwrap().mode)
+        });
+        let error = error.expect("a message box");
+        assert!(
+            error.starts_with("the merged text touches a templated line: "),
+            "{error}"
+        );
+        assert_eq!(mode, merge::MergeMode::Structure);
+        vis.update(|_w, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 0, "nothing was queued");
+            assert_eq!(s.route, Route::Merge, "the editor stays open");
+        });
+    }
+
     /// An assembly that does not re-parse is the message-box state: the
     /// picks stay, nothing is queued, and the header still offers Lines.
     ///
@@ -6889,6 +6992,28 @@ mod render_smoke {
         // A revisit of the decided theme strip jumps the panes to it.
         let (id, _path, lines, offsets) = step(vis, &|v, cx| v.revisit(0, cx));
         assert_eq!(id, 0);
+        assert_eq!(
+            offsets,
+            lines.map(|l| at(l.expect("theme is on every side")))
+        );
+
+        // A pick from the strip jumps all three too (spec §6, ruling R30).
+        // MUTATION: `apply_pick` drops its `jump_to` → every pane reads
+        // `parked`.
+        // (`pick` moves the cursor on, so read decision 0's lines directly.)
+        let (lines, offsets) = vis.update(|_w, cx| {
+            merge.update(cx, |view, cx| {
+                for c in cols {
+                    view.pane_scrolls[c].set_offset(gpui::point(px(0.), parked));
+                }
+                view.apply_pick(0, Pick::Source, cx);
+                let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
+                (
+                    merge_structured::jump_lines(&state.doc, 0),
+                    cols.map(|c| view.pane_scrolls[c].offset().y),
+                )
+            })
+        });
         assert_eq!(
             offsets,
             lines.map(|l| at(l.expect("theme is on every side")))

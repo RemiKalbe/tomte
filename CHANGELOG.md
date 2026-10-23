@@ -49,6 +49,10 @@ version without one.
   500 drifted files the tree used to lag on every mouse move. After a
   decision the next file scrolls into view instead of advancing
   off-screen.
+- **Escape and ⌘↩ work while you edit in the merge editor.** Both keys
+  were bound to a key context that nothing set, so during an edit they did
+  nothing. Escape now cancels a line edit and ⌘↩ applies it; in a settings
+  file's text view, Escape goes back to the per-key picks.
 
 ### Added
 

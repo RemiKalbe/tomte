@@ -5,11 +5,12 @@
 //! function over the state, so the rules are testable without a window;
 //! `merge.rs` keeps only thin branches on [`MergeMode`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
 use gpui::{App, ClickEvent, Context, Div, SharedString, WeakEntity, Window, div, prelude::*};
+use tomte_app::merge_inputs::MergeInputs;
 use tomte_app::structured_state::{Stage, StructuredState};
 use tomte_app::theme::Theme;
 use tomte_core::merge::RegionKind;
@@ -18,10 +19,12 @@ use tomte_core::structured::{
     Change, Decision, NotStructured, Pick, Side, SideText, StructuredDocument, looked_like_json,
 };
 use tomte_core::template::anchor::SpanMap;
+use tomte_core::template::writeback::{WriteBackError, write_back};
 use tomte_ui::components as ui;
 
 use super::merge::{
-    MergeMode, MergeView, PaneSide, STRIP_ROWS, SaveGate, row_bg, save_gate_for, span_reason,
+    MergeMode, MergeView, PANE_ROW_H, PaneSide, STRIP_ROWS, SaveGate, row_bg, save_gate_for,
+    span_reason,
 };
 
 /// What one structured strip renders as. Plain data so the plan is testable;
@@ -56,6 +59,42 @@ pub(super) struct StructuredStrip {
     /// The change in words ([`detail_words`]).
     pub(super) detail: SharedString,
     pub(super) kind: StripKind,
+    /// An unpicked conflict's disk lines, shown as amber provenance rows
+    /// under the strip, above source's lines in the text (spec §6, "as
+    /// today"); empty once picked, and on every other row.
+    pub(super) disk_rows: Vec<SharedString>,
+}
+
+impl StructuredStrip {
+    /// Rows the strip's block takes in the result editor: the strip, plus
+    /// an "on disk" label row and the disk rows when there are any.
+    pub(super) fn rows(&self) -> usize {
+        match self.disk_rows.len() {
+            0 => STRIP_ROWS,
+            n => STRIP_ROWS + 1 + n,
+        }
+    }
+}
+
+/// Whether decision `id` shows both sides as provenance rows: an unlocked
+/// conflict with no pick yet.
+fn shows_both_sides(state: &StructuredState, d: &Decision) -> bool {
+    d.kind == RegionKind::Conflict && d.locked.is_none() && state.resolution.get(d.id).is_none()
+}
+
+/// The whole lines of `text` that `range` touches, without line endings;
+/// none for an empty range.
+fn whole_lines(text: &str, range: &std::ops::Range<usize>) -> Vec<SharedString> {
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let first = line_of(text, range.start);
+    let last = line_of(text, range.end - 1);
+    text.lines()
+        .skip(first)
+        .take(last + 1 - first)
+        .map(|line| SharedString::from(line.to_string()))
+        .collect()
 }
 
 /// The strip display for a structured pick.
@@ -104,12 +143,19 @@ pub(super) fn strip_specs(
                     },
                 }
             };
+            let disk_rows = match &d.ours {
+                Some(ours) if shows_both_sides(state, d) => {
+                    whole_lines(state.doc.side_text(Side::Ours), &ours.range)
+                }
+                _ => Vec::new(),
+            };
             StructuredStrip {
                 id: d.id,
                 above_line: lines.get(d.id).copied().unwrap_or(0),
                 label: d.path.clone().into(),
                 detail: detail_words(d),
                 kind,
+                disk_rows,
             }
         })
         .collect()
@@ -190,13 +236,49 @@ pub(super) fn next_target(state: &mut StructuredState) -> Option<usize> {
 }
 
 /// The editor row of decision `id`'s first result line: its line plus the
-/// strip blocks at or above it (each strip sits above its own line).
-pub(super) fn text_row(result_lines: &[usize], id: usize) -> usize {
-    let Some(&line) = result_lines.get(id) else {
+/// rows of every strip block at or above it (each strip sits above its own
+/// line, and an unpicked conflict's block also holds disk's rows).
+pub(super) fn text_row(specs: &[StructuredStrip], id: usize) -> usize {
+    let Some(line) = specs.iter().find(|s| s.id == id).map(|s| s.above_line) else {
         return 0;
     };
-    let strips = result_lines.iter().filter(|&&l| l <= line).count();
-    line + strips * STRIP_ROWS
+    line + specs
+        .iter()
+        .filter(|s| s.above_line <= line)
+        .map(StructuredStrip::rows)
+        .sum::<usize>()
+}
+
+/// The result editor's line decorations in Structure mode: source's lines
+/// of every unpicked conflict as the line editor tints them (blue wash, rail,
+/// "source" on the first), under the disk rows its strip block carries.
+/// Every other line is plain; a pick collapses the rows to the chosen text.
+pub(super) fn result_decors(
+    state: &StructuredState,
+    seed: &str,
+    theme: Theme,
+) -> Vec<ui::text_area::LineDecor> {
+    let mut decors = vec![ui::text_area::LineDecor::default(); seed.lines().count()];
+    let ranges = state.doc.result_ranges(&state.resolution);
+    for d in &state.doc.decisions {
+        let Some(range) = ranges.get(d.id).filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        if !shows_both_sides(state, d) {
+            continue;
+        }
+        let first = line_of(seed, range.start);
+        let last = line_of(seed, range.end - 1);
+        for (k, decor) in decors.iter_mut().enumerate().take(last + 1).skip(first) {
+            *decor = ui::text_area::LineDecor {
+                bg: Some(Theme::wash(theme.accent, 0.07)),
+                rail: Some(theme.accent),
+                label: (k == first).then(|| ("source".into(), theme.accent)),
+                ..Default::default()
+            };
+        }
+    }
+    decors
 }
 
 /// The header's progress words over the structured state.
@@ -314,9 +396,10 @@ pub(super) fn strip_block(
     let kind = spec.kind.clone();
     let label = spec.label.clone();
     let detail = spec.detail.clone();
+    let disk_rows = spec.disk_rows.clone();
     ui::text_area::Block {
         above_line: spec.above_line,
-        height: STRIP_ROWS as u32,
+        height: spec.rows() as u32,
         render: Rc::new(move |_window, _cx| {
             let state = match &kind {
                 StripKind::Deciding {
@@ -375,21 +458,46 @@ pub(super) fn strip_block(
                     view.update(cx, |merge, cx| merge.revisit(id, cx)).ok();
                 }
             };
+            let strip = ui::decision_strip(
+                theme,
+                id,
+                state,
+                Some(label.clone()),
+                Some(detail.clone()),
+                Some("merge-strip".into()),
+                on_pick,
+                on_edit,
+                on_revisit,
+            );
+            // An unpicked conflict: disk's lines under the strip, in the
+            // line editor's provenance styling; source's lines follow in
+            // the text itself.
+            let disk = (!disk_rows.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(ui::provenance_label(theme, ui::Side::Ours))
+                    .child(ui::provenance_rows(
+                        theme,
+                        ui::Side::Ours,
+                        &disk_rows,
+                        &HashMap::new(),
+                    ))
+            });
             div()
                 .font_family(".SystemUIFont")
                 .h_full()
                 .w_full()
-                .child(ui::decision_strip(
-                    theme,
-                    id,
-                    state,
-                    Some(label.clone()),
-                    Some(detail.clone()),
-                    Some("merge-strip".into()),
-                    on_pick,
-                    on_edit,
-                    on_revisit,
-                ))
+                .flex()
+                .flex_col()
+                // The strip keeps its own two rows to centre itself in.
+                .child(
+                    div()
+                        .h(gpui::px(STRIP_ROWS as f32 * PANE_ROW_H))
+                        .w_full()
+                        .child(strip),
+                )
+                .children(disk)
                 .into_any_element()
         }),
     }
@@ -529,6 +637,19 @@ pub(super) fn not_structured_note(
     looked_like_json(target, ours, theirs).then(|| format!("{why}: line merge"))
 }
 
+/// The write-back's refusal of a Structure-stage save on a templated file,
+/// checked before anything is queued (ruling R27). Each unlocked decision
+/// writes back on its own; this catches what the per-decision lock rule
+/// cannot see, such as two free picks on adjacent lines of different
+/// template literals that the write-back reads as one edit. `None` for a
+/// plain file, or when the result writes back.
+pub(super) fn template_refusal(inputs: &MergeInputs, assembled: &str) -> Option<WriteBackError> {
+    let (Some(template), Some(map)) = (inputs.template.as_deref(), inputs.span_map.as_ref()) else {
+        return None;
+    };
+    write_back(template, map, &inputs.theirs, assembled).err()
+}
+
 /// The chip's words for an invalid line.
 pub(super) fn json_chip_text(line: usize) -> String {
     format!("not valid JSON · line {line}")
@@ -609,8 +730,9 @@ mod tests {
     use super::super::merge::{PaneSide, row_bg};
     use super::{
         StripKind, detail_words, has_picks, invalid_json_line, jump_lines, not_structured_note,
-        pick_allowed, progress_text, strip_specs, structured_pane_decors, text_row,
+        pick_allowed, progress_text, result_decors, strip_specs, structured_pane_decors, text_row,
     };
+    use gpui::SharedString;
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
         StructuredState::new(StructuredDocument::compute(base, ours, theirs, None).expect("json"))
@@ -756,11 +878,30 @@ mod tests {
         assert_eq!(jump_lines(&two, b), [None, Some(2), Some(1)]);
     }
 
-    // MUTATION: count strips strictly above the line → the row is one strip short.
+    // MUTATION: count strips strictly above the line → the row is one strip
+    // short. MUTATION: count STRIP_ROWS per strip instead of `rows()` → the
+    // second row misses the first block's disk rows.
     #[test]
     fn text_row_counts_the_strip_above_its_own_line() {
-        assert_eq!(text_row(&[1, 3], 0), 1 + super::STRIP_ROWS);
-        assert_eq!(text_row(&[1, 3], 1), 3 + 2 * super::STRIP_ROWS);
+        let strip = |id: usize, above_line: usize, disk: usize| super::StructuredStrip {
+            id,
+            above_line,
+            label: "k".into(),
+            detail: "conflict".into(),
+            kind: StripKind::Decided {
+                choice: tomte_ui::components::ChoiceKind::Ours,
+                focused: false,
+            },
+            disk_rows: vec!["  \"k\": 1,".into(); disk],
+        };
+        let specs = [strip(0, 1, 0), strip(1, 3, 0)];
+        assert_eq!(text_row(&specs, 0), 1 + super::STRIP_ROWS);
+        assert_eq!(text_row(&specs, 1), 3 + 2 * super::STRIP_ROWS);
+        // Two disk rows under the first strip, plus its "on disk" label.
+        let specs = [strip(0, 1, 2), strip(1, 3, 0)];
+        assert_eq!(specs[0].rows(), super::STRIP_ROWS + 3);
+        assert_eq!(text_row(&specs, 1), 3 + 2 * super::STRIP_ROWS + 3);
+        assert_eq!(text_row(&specs, 7), 0, "unknown id");
     }
 
     // MUTATION: report "N conflicts" with decided and total swapped, or
@@ -836,5 +977,90 @@ mod tests {
             None
         );
         assert_eq!(not_structured_note(json, "{}", "{}", None), None);
+        // MUTATION: treat TooDeep like BothEmpty → no note.
+        assert_eq!(
+            not_structured_note(
+                json,
+                "[]",
+                "[]",
+                Some(&NotStructured::TooDeep { depth: 300 })
+            )
+            .as_deref(),
+            Some("the JSON nests deeper than 256 levels: line merge")
+        );
+    }
+
+    // MUTATION: `template_refusal` returns None unconditionally → the
+    // adjacent-literals save is not refused.
+    #[test]
+    fn template_refusal_catches_free_picks_the_write_back_reads_as_one_edit() {
+        use super::super::fixtures;
+        use super::template_refusal;
+        use tomte_core::template::writeback::WriteBackError;
+        let inputs = fixtures::json_adjacent_literals_inputs();
+        let doc = StructuredDocument::compute(
+            inputs.base.as_deref(),
+            &inputs.ours,
+            &inputs.theirs,
+            inputs.span_map.as_ref(),
+        )
+        .expect("json");
+        assert!(
+            doc.decisions.iter().all(|d| d.locked.is_none()),
+            "each line sits in one literal"
+        );
+        let mut s = StructuredState::new(doc);
+        let both = s.assembled().expect("valid").expect("no conflicts");
+        assert!(matches!(
+            template_refusal(&inputs, &both),
+            Some(WriteBackError::EditOutsideLiteral { .. })
+        ));
+        // One of the two alone writes back.
+        let proxy = s
+            .doc
+            .decisions
+            .iter()
+            .find(|d| d.path == "proxy")
+            .unwrap()
+            .id;
+        s.pick(proxy, Pick::Source);
+        let one = s.assembled().expect("valid").expect("no conflicts");
+        assert!(template_refusal(&inputs, &one).is_none());
+        // A plain file has no template to refuse.
+        let plain = fixtures::json_inputs();
+        assert!(template_refusal(&plain, &plain.ours).is_none());
+    }
+
+    // MUTATION: `shows_both_sides` ignores the resolution → the disk rows
+    // and the source tint stay after the pick. MUTATION: `result_decors`
+    // tints every decision → the "b" line (changed on disk) is tinted.
+    #[test]
+    fn an_unpicked_conflict_shows_disk_rows_and_tints_source_lines() {
+        let mut s = state(
+            Some("{\n  \"a\": 1,\n  \"b\": 1\n}\n"),
+            "{\n  \"a\": 2,\n  \"b\": 5\n}\n",
+            "{\n  \"a\": 3,\n  \"b\": 1\n}\n",
+        );
+        let theme = Theme::dark();
+        let specs = strip_specs(&s, &HashSet::new(), None, None);
+        assert_eq!(specs[0].disk_rows, vec![SharedString::from("  \"a\": 2,")]);
+        assert!(specs[1].disk_rows.is_empty(), "b is not a conflict");
+        let seed = s.seed();
+        let decors = result_decors(&s, &seed, theme);
+        assert_eq!(decors.len(), 4);
+        assert_eq!(decors[1].rail, Some(theme.accent), "source's a line");
+        assert!(decors[1].label.is_some());
+        assert_eq!(decors[2].rail, None, "b's line stays plain");
+        s.pick(0, Pick::Source);
+        assert!(
+            strip_specs(&s, &HashSet::new(), None, None)[0]
+                .disk_rows
+                .is_empty()
+        );
+        assert!(
+            result_decors(&s, &s.seed(), theme)
+                .iter()
+                .all(|d| d.rail.is_none())
+        );
     }
 }

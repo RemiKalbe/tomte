@@ -156,7 +156,9 @@ sandboxed shell; run it unsandboxed. Every new view sub-state gets a pose in
 all of them. `merge-structured`, `merge-structured-locked`, and
 `merge-structured-text` pose Structure mode on a JSON settings file (a
 conflict, keys added and removed on disk, array rows), a templated source
-with a locked row, and the Text stage with its not-valid-JSON chip.
+with a locked row, and the Text stage with its not-valid-JSON chip;
+`merge-not-structured` poses a JSON-looking file that does not parse (the
+line editor with its "line merge" note).
 `review-multiselect`, `review-multiselect-closed`,
 `review-tree`, and `review-tree-selected` pose the sidebar's multi-select
 and folder-tree states (checkboxes ticked, ticked with no file open, a
@@ -430,6 +432,12 @@ Open, deliberately (design calls, not bugs):
 - The per-event path (`rescan_source_side`) and `handle_fetch`'s per-file
   probes still run under the lock — bounded by changed-file counts; give
   them the begin/apply split if one ever shows in a banner.
+- A merge-header path wider than about a third of the header still clips
+  mid-glyph. The fix is a definite width or an ellipsis inside `crates/ui`,
+  checked with its own Review screenshot.
+- `merge.rs` grew by about 600 lines with Structure mode. Its
+  Structure-mode branches, beside `merge_structured.rs`, are the next
+  split after the Review planner.
 - Free-text region editing in the merge editor (`tomte_ui::text_area`
   exists; integration remains), keyboard hints, tabular figures (gpui has no
   font-features hook), journal pruning, SMAppService instead of launchctl.

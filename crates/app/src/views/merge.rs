@@ -1437,6 +1437,9 @@ impl MergeView {
         self.redo.clear();
         self.disarm_mode_switch();
         self.seed_editor(cx);
+        // A pick from a strip brings the decision into view in all three
+        // panes and the result (spec §6), in the re-seeded geometry.
+        self.jump_to(id);
         cx.notify();
     }
 
@@ -1901,14 +1904,22 @@ impl MergeView {
                 self.pane_scrolls[col].set_offset(offset);
             }
         }
-        let lines = state.result_lines();
-        // The Text stage has no strip blocks: row == line there.
+        // The Text stage has no strip blocks: row == line there, and the
+        // view keeps two lines above it, where a strip would sit. Otherwise
+        // land on the top of the decision's strip block. The template only
+        // words a locked strip's hover, so the rows need none of it.
         let row = if self.editing {
-            lines.get(id).copied().unwrap_or(0)
+            let line = state.result_lines().get(id).copied().unwrap_or(0);
+            line.saturating_sub(STRIP_ROWS)
         } else {
-            merge_structured::text_row(&lines, id)
+            let specs = merge_structured::strip_specs(state, &self.revisiting, None, None);
+            let block = specs
+                .iter()
+                .find(|s| s.id == id)
+                .map_or(STRIP_ROWS, |s| s.rows());
+            merge_structured::text_row(&specs, id).saturating_sub(block)
         };
-        let y = row.saturating_sub(STRIP_ROWS) as f32 * PANE_ROW_H;
+        let y = row as f32 * PANE_ROW_H;
         self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
     }
 
@@ -2072,7 +2083,14 @@ impl MergeView {
                 Ok(editor.read(cx).text().to_owned())
             }
             (MergeMode::Structure, Some(state)) => match state.assembled() {
-                Ok(Some(text)) => Ok(text),
+                // The lock rule should leave nothing the write-back refuses;
+                // if it did, refuse here, before the engine (ruling R27).
+                Ok(Some(text)) => match merge_structured::template_refusal(&loaded.inputs, &text) {
+                    None => Ok(text),
+                    Some(e) => Err(Some(format!(
+                        "the merged text touches a templated line: {e}"
+                    ))),
+                },
                 Ok(None) => Err(None),
                 Err(e) => Err(Some(e.to_string())),
             },
@@ -2094,8 +2112,9 @@ impl MergeView {
             }
             Err(Some(message)) => {
                 // An engine bug, never user error (spec §7): the message
-                // box names the parse error, the picks stay, and the header
-                // still offers Lines.
+                // box names the error (an assembly that does not re-parse or
+                // could not place a decision, or a write-back refusal), the
+                // picks stay, and the header still offers Lines.
                 tomte_core::log_error!(
                     "merge",
                     "{}: structured assembly failed: {message}",
@@ -2659,6 +2678,13 @@ impl MergeView {
         self.editor_scroll.offset().y
     }
 
+    /// What the result editor's next frame draws (its installed decorator
+    /// run on the current text), for tests.
+    #[cfg(test)]
+    pub(super) fn result_decoration_for_test(&self, cx: &App) -> Option<ui::text_area::Decoration> {
+        self.result_editor.as_ref()?.read(cx).decoration()
+    }
+
     /// The result editor's text, for tests.
     #[cfg(test)]
     pub(super) fn result_text_for_test(&self, cx: &App) -> String {
@@ -2714,16 +2740,21 @@ impl MergeView {
             return;
         };
         if let (MergeMode::Structure, Some(state)) = (loaded.mode, &loaded.structured) {
-            // One strip per decision above its first result line; none
-            // while the Text stage is open. Line tints arrive with Task 11.
-            let specs = if self.editing {
-                Vec::new()
+            // One strip per decision above its first result line, and an
+            // unpicked conflict's provenance rows (disk's in its strip
+            // block, source's tinted in the text); none of either while the
+            // Text stage is open.
+            let (specs, lines) = if self.editing {
+                (Vec::new(), Vec::new())
             } else {
-                merge_structured::strip_specs(
-                    state,
-                    &self.revisiting,
-                    loaded.inputs.template.as_deref(),
-                    loaded.inputs.span_map.as_ref(),
+                (
+                    merge_structured::strip_specs(
+                        state,
+                        &self.revisiting,
+                        loaded.inputs.template.as_deref(),
+                        loaded.inputs.span_map.as_ref(),
+                    ),
+                    merge_structured::result_decors(state, &self.seed, theme),
                 )
             };
             #[cfg(test)]
@@ -2737,7 +2768,7 @@ impl MergeView {
                 .collect();
             editor.update(cx, |area, _| {
                 area.set_decorator(Box::new(move |_content| ui::text_area::Decoration {
-                    lines: Vec::new(),
+                    lines: lines.clone(),
                     blocks: blocks.clone(),
                 }));
             });

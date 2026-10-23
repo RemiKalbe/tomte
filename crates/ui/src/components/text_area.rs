@@ -526,6 +526,15 @@ impl TextArea {
         self.invalidate_decorations();
     }
 
+    /// What the next frame draws: the host decorator run on the current
+    /// content (`None` without one). Lets a host's tests read the rows and
+    /// blocks it installed without painting a frame.
+    pub fn decoration(&self) -> Option<Decoration> {
+        self.decorator
+            .as_ref()
+            .map(|decorator| decorator(&self.content))
+    }
+
     /// Force the decorator to run again on the next frame (host state that
     /// isn't text changed — e.g. which region is focused).
     pub fn invalidate_decorations(&mut self) {

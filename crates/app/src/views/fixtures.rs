@@ -117,6 +117,10 @@ pub const STATES: &[(&str, &str)] = &[
         "merge-structured-text",
         "Text stage after picks, with the not-valid-JSON chip",
     ),
+    (
+        "merge-not-structured",
+        "a JSON-looking file that does not parse: line editor with the note",
+    ),
     ("merge-loading", "inputs loading"),
     ("changelog", "the changelog window body, markdown-rendered"),
     ("settings", "live settings view (reads real settings/op)"),
@@ -521,6 +525,60 @@ pub(super) fn json_templated_inputs() -> MergeInputs {
         span_map,
         origin: None,
     }
+}
+
+/// A templated JSON source whose `{{ if }}` / `{{ end }}` sit at line starts,
+/// so each line belongs to one template literal and nothing locks, while
+/// "editor" and "proxy" end and start two different literals. Disk changed
+/// both, so their automatic Disk picks are adjacent lines that the
+/// write-back reads as ONE edit across two literals and refuses.
+#[cfg(test)]
+pub(super) fn json_adjacent_literals_inputs() -> MergeInputs {
+    let template = concat!(
+        "{\n",
+        "  \"editor\": \"hx\",\n",
+        "{{ if .work }}  \"proxy\": \"corp\",\n",
+        "{{ end }}  \"tabs\": 2\n",
+        "}\n",
+    );
+    let theirs = concat!(
+        "{\n",
+        "  \"editor\": \"hx\",\n",
+        "  \"proxy\": \"corp\",\n",
+        "  \"tabs\": 2\n",
+        "}\n",
+    );
+    let ours = concat!(
+        "{\n",
+        "  \"editor\": \"vi\",\n",
+        "  \"proxy\": \"home\",\n",
+        "  \"tabs\": 2\n",
+        "}\n",
+    );
+    let span_map = lex(template)
+        .ok()
+        .map(|segments| anchor(template, &segments, theirs));
+    MergeInputs {
+        target: home(".config/app/proxy.json"),
+        ours: ours.into(),
+        theirs: theirs.into(),
+        base: Some(theirs.into()),
+        source_path: home(".local/share/chezmoi/dot_config/app/proxy.json.tmpl"),
+        templated: true,
+        template: Some(template.into()),
+        span_map,
+        origin: None,
+    }
+}
+
+/// [`json_inputs`] with the comma after disk's "font_size" deleted, so disk
+/// does not parse and the line editor opens with the note naming the line.
+fn json_invalid_disk_inputs() -> MergeInputs {
+    let mut inputs = json_inputs();
+    inputs.ours = inputs
+        .ours
+        .replace("\"font_size\": 15,", "\"font_size\": 15");
+    inputs
 }
 
 pub(super) fn posed_merge(
@@ -1029,6 +1087,11 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "merge-structured-locked" => {
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, json_templated_inputs(), false));
+            s
+        }
+        "merge-not-structured" => {
+            let mut s = shell(Route::Merge, rich_model());
+            s.merge = Some(posed_merge(cx, json_invalid_disk_inputs(), false));
             s
         }
         "merge-structured-text" => {
