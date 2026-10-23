@@ -6,6 +6,7 @@
 //! `merge.rs` keeps only thin branches on [`MergeMode`].
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::rc::Rc;
 
 use gpui::{App, ClickEvent, Context, Div, SharedString, WeakEntity, Window, div, prelude::*};
@@ -13,7 +14,9 @@ use tomte_app::structured_state::{Stage, StructuredState};
 use tomte_app::theme::Theme;
 use tomte_core::merge::RegionKind;
 use tomte_core::structured::jsonc;
-use tomte_core::structured::{Change, Decision, Pick, Side, SideText, StructuredDocument};
+use tomte_core::structured::{
+    Change, Decision, NotStructured, Pick, Side, SideText, StructuredDocument, looked_like_json,
+};
 use tomte_core::template::anchor::SpanMap;
 use tomte_ui::components as ui;
 
@@ -505,6 +508,25 @@ pub(super) fn invalid_json_line(text: &str) -> Option<usize> {
     jsonc::parse(text).err().map(|e| e.line)
 }
 
+/// The line editor's header note for a file that does not merge
+/// structurally (spec §7): "disk is not valid JSON (line 12): line merge"
+/// or "disk and source are different JSON shapes: line merge". Shown only
+/// when the file looked like JSON (spec §4), so a shell file says nothing;
+/// a scalar root or two empty sides say nothing either.
+pub(super) fn not_structured_note(
+    target: &Path,
+    ours: &str,
+    theirs: &str,
+    why: Option<&NotStructured>,
+) -> Option<String> {
+    let why = why?;
+    let named = matches!(
+        why,
+        NotStructured::Parse { .. } | NotStructured::ShapeMismatch
+    );
+    (named && looked_like_json(target, ours, theirs)).then(|| format!("{why}: line merge"))
+}
+
 /// The chip's words for an invalid line.
 pub(super) fn json_chip_text(line: usize) -> String {
     format!("not valid JSON · line {line}")
@@ -584,8 +606,8 @@ mod tests {
 
     use super::super::merge::{PaneSide, row_bg};
     use super::{
-        StripKind, detail_words, has_picks, invalid_json_line, jump_lines, pick_allowed,
-        progress_text, strip_specs, structured_pane_decors, text_row,
+        StripKind, detail_words, has_picks, invalid_json_line, jump_lines, not_structured_note,
+        pick_allowed, progress_text, strip_specs, structured_pane_decors, text_row,
     };
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
@@ -774,5 +796,42 @@ mod tests {
         assert_eq!(invalid_json_line("{\n  \"a\": 1,\n  \"b\" 2\n}\n"), Some(3));
         assert_eq!(invalid_json_line("{\n  // c\n  \"a\": 1\n}\n"), None);
         assert_eq!(invalid_json_line("{}"), None);
+    }
+
+    // MUTATION: drop the `looked_like_json` check → the .zshrc parse error
+    // gets a note. MUTATION: drop the variant filter → the scalar root and
+    // the both-empty case get one. MUTATION: name the side wrongly in the
+    // Display text → the source line reads "disk".
+    #[test]
+    fn the_note_names_parse_errors_and_shapes_on_json_looking_files_only() {
+        use std::path::Path;
+        use tomte_core::structured::NotStructured;
+        let json = Path::new("settings.json");
+        let parse = |side| NotStructured::Parse { side, line: 12 };
+        assert_eq!(
+            not_structured_note(json, "{", "{}", Some(&parse(Side::Ours))).as_deref(),
+            Some("disk is not valid JSON (line 12): line merge")
+        );
+        assert_eq!(
+            not_structured_note(json, "{}", "{", Some(&parse(Side::Theirs))).as_deref(),
+            Some("source is not valid JSON (line 12): line merge")
+        );
+        assert_eq!(
+            not_structured_note(json, "{}", "[]", Some(&NotStructured::ShapeMismatch)).as_deref(),
+            Some("disk and source are different JSON shapes: line merge")
+        );
+        assert_eq!(
+            not_structured_note(json, "1", "2", Some(&NotStructured::ScalarRoot)),
+            None
+        );
+        assert_eq!(
+            not_structured_note(json, "", "", Some(&NotStructured::BothEmpty)),
+            None
+        );
+        assert_eq!(
+            not_structured_note(Path::new(".zshrc"), "x", "y", Some(&parse(Side::Ours))),
+            None
+        );
+        assert_eq!(not_structured_note(json, "{}", "{}", None), None);
     }
 }

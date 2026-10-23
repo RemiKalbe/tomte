@@ -2431,6 +2431,35 @@ mod render_smoke {
             });
             vis.run_until_parked();
         }
+
+        // The Structure-mode gallery poses build, render, and show what
+        // their descriptions promise: Structure mode on both JSON poses, and
+        // the Text stage with the not-valid-JSON chip on the third.
+        for name in [
+            "merge-structured",
+            "merge-structured-locked",
+            "merge-structured-text",
+        ] {
+            let (shell, vis) = cx.add_window_view(|_window, cx| {
+                fixtures::build(name, smoke_paths(), cx).unwrap_or_else(|| panic!("{name} builds"))
+            });
+            vis.run_until_parked();
+            let merge = vis
+                .update(|_w, cx| shell.read(cx).merge.clone())
+                .unwrap_or_else(|| panic!("{name} poses a merge"));
+            let (mode, locked, chip) = vis.update(|_w, cx| {
+                let view = merge.read(cx);
+                let loaded = view.loaded.as_ref().expect("loaded");
+                let locked = loaded
+                    .structured
+                    .as_ref()
+                    .is_some_and(|s| s.doc.decisions.iter().any(|d| d.locked.is_some()));
+                (loaded.mode, locked, view.json_chip(cx))
+            });
+            assert_eq!(mode, merge::MergeMode::Structure, "{name}");
+            assert_eq!(locked, name == "merge-structured-locked", "{name}");
+            assert_eq!(chip.is_some(), name == "merge-structured-text", "{name}");
+        }
     }
 
     /// The point of the whole queue: a second decision is accepted while the
@@ -6464,8 +6493,8 @@ mod render_smoke {
         assert_eq!(mode, merge::MergeMode::Structure);
         assert_eq!(
             ids.len(),
-            4,
-            "theme, font_size, vim_mode, one plugins element"
+            5,
+            "theme, font_size, vim_mode, one plugins element, tab_size"
         );
         assert_eq!(specs.len(), ids.len(), "one strip per decision");
         assert_eq!(specs[0].label.as_ref(), "theme");
@@ -7215,5 +7244,58 @@ mod render_smoke {
             })
         });
         assert_eq!(source_line, -f32::from(parked) / merge::PANE_ROW_H);
+    }
+
+    /// A JSON-looking file that does not parse opens in the line editor
+    /// with a muted header note naming why; a shell file whose sides are
+    /// just as unparseable says nothing (spec §7).
+    ///
+    /// MUTATION: show the note for every NotStructured (drop the
+    /// `looked_like_json` check in `merge_structured::not_structured_note`)
+    /// → the .zshrc case renders it.
+    #[gpui::test]
+    fn a_json_looking_file_that_does_not_parse_says_so_and_a_shell_file_does_not(
+        cx: &mut TestAppContext,
+    ) {
+        fn inputs(target: &str, ours: &str, theirs: &str) -> tomte_app::merge_inputs::MergeInputs {
+            tomte_app::merge_inputs::MergeInputs {
+                target: PathBuf::from(target),
+                ours: ours.into(),
+                theirs: theirs.into(),
+                base: None,
+                source_path: PathBuf::from("/tmp/smoke/src/file"),
+                templated: false,
+                template: None,
+                span_map: None,
+                origin: None,
+            }
+        }
+        {
+            let (_shell, merge, vis) =
+                structured_merge_window(cx, inputs("/tmp/smoke/settings.json", "{", "{}\n"));
+            let (mode, note) = vis.update(|_w, cx| {
+                let view = merge.read(cx);
+                let mode = view.loaded.as_ref().expect("loaded").mode;
+                (mode, view.not_structured_note())
+            });
+            assert_eq!(
+                mode,
+                merge::MergeMode::Lines,
+                "no Structure for a parse error"
+            );
+            assert_eq!(
+                note.as_deref(),
+                Some("disk is not valid JSON (line 1): line merge")
+            );
+            assert!(
+                vis.debug_bounds("merge-not-structured").is_some(),
+                "the chip renders"
+            );
+        }
+        let (_shell, merge, vis) =
+            structured_merge_window(cx, inputs("/tmp/smoke/.zshrc", "x\n", "y\n"));
+        let note = vis.update(|_w, cx| merge.read(cx).not_structured_note());
+        assert_eq!(note, None, "a shell file says nothing about JSON");
+        assert!(vis.debug_bounds("merge-not-structured").is_none());
     }
 }

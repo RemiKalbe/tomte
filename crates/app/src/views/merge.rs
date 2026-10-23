@@ -814,8 +814,8 @@ pub(super) struct LoadedMerge {
     pub(super) state: MergeState,
     /// The per-key editor's state, when the file merges structurally.
     pub(super) structured: Option<StructuredState>,
-    /// Why the file does not merge structurally (Task 13 renders the note).
-    #[expect(dead_code, reason = "Task 13 renders the header note from it")]
+    /// Why the file does not merge structurally: the line editor's header
+    /// note ([`merge_structured::not_structured_note`]).
     pub(super) not_structured: Option<NotStructured>,
     /// Which editor shows; Structure whenever `structured` exists.
     pub(super) mode: MergeMode,
@@ -2058,11 +2058,19 @@ impl MergeView {
         let resolved = match (loaded.mode, &loaded.structured) {
             // The Text stage saves what the user typed, verbatim — open
             // conflicts and invalid JSON included (spec §6).
-            (MergeMode::Structure, Some(state)) if state.stage == Stage::Text => Ok(self
-                .result_editor
-                .as_ref()
-                .map(|e| e.read(cx).text().to_owned())
-                .unwrap_or_default()),
+            (MergeMode::Structure, Some(state)) if state.stage == Stage::Text => {
+                // The Text stage always has an editor; without one there is
+                // no typed text to save, and an empty file is not it.
+                let Some(editor) = &self.result_editor else {
+                    tomte_core::log_error!(
+                        "merge",
+                        "{}: Text-stage save with no result editor; nothing saved",
+                        loaded.inputs.target.display()
+                    );
+                    return;
+                };
+                Ok(editor.read(cx).text().to_owned())
+            }
             (MergeMode::Structure, Some(state)) => match state.assembled() {
                 Ok(Some(text)) => Ok(text),
                 Ok(None) => Err(None),
@@ -2168,7 +2176,18 @@ impl MergeView {
             ),
             None => ("merge editor".into(), "".into()),
         };
-        let mut bar = ui::detail_header(theme, name, path, Vec::new());
+        // Every control goes in ONE wrapping trailing box capped at two
+        // thirds of the header, the way Review's header does it: the title
+        // column keeps a third, so the path is not hard-clipped mid-glyph
+        // when Structure mode's toggle and the Text stage's chip crowd the
+        // row; the controls wrap onto a second row instead.
+        let mut bar = div()
+            .flex()
+            .flex_wrap()
+            .max_w_2_3()
+            .items_center()
+            .justify_end()
+            .gap_2();
         // Structure | Lines, only when both exist; hidden while an edit is
         // open (switching would drop the text without a word).
         if let Some(loaded) = &self.loaded
@@ -2221,6 +2240,18 @@ impl MergeView {
                         format!("{total} conflict{s}, {} resolved", total - open)
                     }),
             );
+            if let Some(note) = self.not_structured_note() {
+                bar = bar.child(
+                    div()
+                        .id("merge-not-structured")
+                        .debug_selector(|| "merge-not-structured".into())
+                        .child(ui::chip(
+                            theme,
+                            note,
+                            ui::ChipVariant::Wash(theme.text_muted),
+                        )),
+                );
+            }
             let changed = loaded
                 .state
                 .doc
@@ -2317,7 +2348,7 @@ impl MergeView {
         if let Some(gate) = self.save_gate() {
             bar = bar.child(save_button(gate, theme, cx));
         }
-        bar
+        ui::detail_header(theme, name, path, vec![bar.into_any_element()])
     }
 
     /// Where the header's Save stands. Lines: enabled exactly when the
@@ -2544,6 +2575,41 @@ impl MergeView {
                 )
                 .into_any_element(),
         }
+    }
+
+    /// Gallery pose: seed the result editor, open the Text stage on
+    /// decision `id`, and replace the text with `typed(seed)` — what the
+    /// user would have typed. The editor is otherwise created lazily in
+    /// render, which a pose built inside `cx.new` has not reached yet.
+    pub(super) fn pose_text_stage(
+        &mut self,
+        id: usize,
+        typed: impl FnOnce(&str) -> String,
+        cx: &mut Context<Self>,
+    ) {
+        self.seed_editor(cx);
+        self.start_edit(id, cx);
+        let text = typed(&self.seed);
+        if let Some(editor) = &self.result_editor {
+            editor.update(cx, |area, _| area.set_content(text));
+        }
+    }
+
+    /// The line editor's note for a JSON-looking file that does not merge
+    /// structurally; `None` in Structure mode, or when the file did not look
+    /// like JSON. The header renders exactly this text.
+    pub(super) fn not_structured_note(&self) -> Option<String> {
+        let loaded = self.loaded.as_ref()?;
+        if loaded.mode != MergeMode::Lines {
+            return None;
+        }
+        let inputs = &loaded.inputs;
+        merge_structured::not_structured_note(
+            &inputs.target,
+            &inputs.ours,
+            &inputs.theirs,
+            loaded.not_structured.as_ref(),
+        )
     }
 
     /// The Text stage's chip words, for tests: the same line and copy the

@@ -12,6 +12,7 @@ use gpui::{AppContext as _, Context, Entity};
 use tomte_app::merge_inputs::MergeInputs;
 use tomte_app::model::{SyncModel, TimelineRow};
 use tomte_core::merge::{Choice, MergeDocument, MergeOptions};
+use tomte_core::structured::Pick;
 use tomte_core::template::{anchor::anchor, lexer::lex};
 use tomte_proto::DriftSummary;
 
@@ -103,6 +104,18 @@ pub const STATES: &[(&str, &str)] = &[
     (
         "merge-editing",
         "region editor open: free-text edit of a conflict",
+    ),
+    (
+        "merge-structured",
+        "JSON settings in Structure mode: a conflict, a key added on disk, one removed, array rows",
+    ),
+    (
+        "merge-structured-locked",
+        "templated JSON source: a locked row that follows source",
+    ),
+    (
+        "merge-structured-text",
+        "Text stage after picks, with the not-valid-JSON chip",
     ),
     ("merge-loading", "inputs loading"),
     ("changelog", "the changelog window body, markdown-rendered"),
@@ -421,21 +434,15 @@ fn templated_inputs() -> MergeInputs {
 
 /// A Zed-style JSONC settings file for Structure mode: a conflict on
 /// "theme" (both sides changed it differently), "font_size" changed on disk,
-/// "vim_mode" added on disk, and one "plugins" element added in source.
-/// Decision 0 is the "theme" conflict.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the gallery poses that use it arrive with Task 13"
-    )
-)]
+/// "vim_mode" added on disk, one "plugins" element added in source, and
+/// "tab_size" removed on disk. Decision 0 is the "theme" conflict.
 pub(super) fn json_inputs() -> MergeInputs {
     let base = concat!(
         "{\n",
         "  // Zed settings\n",
         "  \"theme\": \"One Dark\",\n",
         "  \"font_size\": 14,\n",
+        "  \"tab_size\": 4,\n",
         "  \"plugins\": [\n",
         "    \"git\"\n",
         "  ]\n",
@@ -457,6 +464,7 @@ pub(super) fn json_inputs() -> MergeInputs {
         "  // Zed settings\n",
         "  \"theme\": \"Solarized\",\n",
         "  \"font_size\": 14,\n",
+        "  \"tab_size\": 4,\n",
         "  \"plugins\": [\n",
         "    \"git\",\n",
         "    \"copilot\"\n",
@@ -480,13 +488,6 @@ pub(super) fn json_inputs() -> MergeInputs {
 /// [`templated_inputs`] does): "email" renders from a template action, so
 /// its decision (disk changed it) is locked to source; "font_size" changed
 /// on disk stays an ordinary row.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the gallery poses that use it arrive with Task 13"
-    )
-)]
 pub(super) fn json_templated_inputs() -> MergeInputs {
     let template = concat!(
         "{\n",
@@ -551,6 +552,13 @@ fn posed_merge_loading(cx: &mut Context<Shell>) -> Entity<MergeView> {
         view.loading = true;
         view
     })
+}
+
+/// The Text-stage pose's typed text: the seed with a value-less `"a":`
+/// added before the closing brace, so it no longer parses.
+fn invalid_json_from(seed: &str) -> String {
+    let close = seed.rfind('}').unwrap_or(seed.len());
+    format!("{}  \"a\":\n{}", &seed[..close], &seed[close..])
 }
 
 /// Build the posed Shell for a gallery state. `None` = unknown name.
@@ -1011,6 +1019,39 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         "merge-resolved" => {
             let mut s = shell(Route::Merge, rich_model());
             s.merge = Some(posed_merge(cx, conflict_inputs(), true));
+            s
+        }
+        "merge-structured" => {
+            let mut s = shell(Route::Merge, rich_model());
+            s.merge = Some(posed_merge(cx, json_inputs(), false));
+            s
+        }
+        "merge-structured-locked" => {
+            let mut s = shell(Route::Merge, rich_model());
+            s.merge = Some(posed_merge(cx, json_templated_inputs(), false));
+            s
+        }
+        "merge-structured-text" => {
+            // Every conflict picked, then the Text stage opened on decision 0
+            // with a trailing `"a":` typed before the closing brace, so the
+            // chip names a line and Save stays enabled.
+            let mut s = shell(Route::Merge, rich_model());
+            let shell_weak = cx.weak_entity();
+            let merge = cx.new(|cx| {
+                let inputs = json_inputs();
+                let mut view = MergeView::new(shell_weak, cx);
+                view.target = Some(inputs.target.clone());
+                let mut loaded = LoadedMerge::new(Arc::new(inputs));
+                if let Some(state) = loaded.structured.as_mut() {
+                    for id in state.conflicts() {
+                        state.pick(id, Pick::Disk);
+                    }
+                }
+                view.loaded = Some(loaded);
+                view.pose_text_stage(0, invalid_json_from, cx);
+                view
+            });
+            s.merge = Some(merge);
             s
         }
         "changelog" => shell(Route::Changelog, rich_model()),

@@ -6,6 +6,14 @@ version without one.
 
 ## Unreleased
 
+### Added
+
+- **Settings files merge per key.** A JSON or JSONC settings file opens
+  in Structure mode: one row per changed key or array entry, each with
+  its own disk, source or last written pick. Keys a template renders stay
+  locked and follow source. Edit opens the assembled file as text so you
+  can refine it before you save.
+
 ### Fixed
 
 - **Keep source works on a file that is not on disk yet.** A source file

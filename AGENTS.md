@@ -33,6 +33,7 @@ did.
 ```
 crates/core     tomte-core     chezmoi + git clients, drift classification, scanner,
                                structured 3-way merge, template span pipeline,
+                               structured/ = JSONC parser, per-key decisions, splicer,
                                SystemRunner (every subprocess goes through it),
                                rotating file logging. test-support feature = Scratch.
 crates/daemon   tomte-daemon   tomted: DaemonCore state machine (no clocks, callers
@@ -44,9 +45,11 @@ crates/ui       tomte-ui       Theme tokens, embedded SVG assets, every reusable
                                component (one file each under src/components/),
                                component previews for the gallery.
 crates/app      tomte-app      lib: ipc, model (pure), resolve (ResolveEngine),
-                               action_queue, merge_inputs/merge_state (pure), update.
+                               action_queue, merge_inputs/merge_state (pure),
+                               structured_state (pure, Structure mode's picks), update.
                                bin: main.rs (boot, reconnect loop, CLI flags),
                                views/ (mod.rs = Shell, dashboard, review, merge,
+                               merge_structured = Structure mode's strips and header,
                                settings, changelog, fixtures = gallery poses,
                                review_selection/review_tree = pure Review
                                multi-select + folder-tree projections),
@@ -150,7 +153,11 @@ Then READ the PNG. `shoot.sh` deletes a stale PNG when a capture fails, so
 an "OK" line means this run wrote the file. `screencapture` fails inside a
 sandboxed shell; run it unsandboxed. Every new view sub-state gets a pose in
 `crates/app/src/views/fixtures.rs` (`STATES`); the render-smoke test builds
-all of them. `review-multiselect`, `review-multiselect-closed`,
+all of them. `merge-structured`, `merge-structured-locked`, and
+`merge-structured-text` pose Structure mode on a JSON settings file (a
+conflict, keys added and removed on disk, array rows), a templated source
+with a locked row, and the Text stage with its not-valid-JSON chip.
+`review-multiselect`, `review-multiselect-closed`,
 `review-tree`, and `review-tree-selected` pose the sidebar's multi-select
 and folder-tree states (checkboxes ticked, ticked with no file open, a
 folder collapsed, a whole folder selected). `review-many` is the 500-file
@@ -390,14 +397,22 @@ the file Undo would revert, finish/roll-back/undo wait behind the latch.
 with Undo skipping refused attempts. 0.1.20 (2026-09-21) waits out a busy
 daemon for 90 s per request; a batch stops after the first exhausted budget.
 
-This branch adds multi-select of SAFE TO RESOLVE rows with bulk one-batch
-Keep disk / Keep source actions (the selection bar is pinned under the
-sidebar's rows, so it is there with no file open), Esc/⌘A, and a List/Tree
-folder sidebar. The sidebar is virtualized (gpui `list`) with a cached
-plan; the folder-tree toggle sits on the SAFE TO RESOLVE header.
-Scans run off the daemon lock, nested repositories are ignored by the
-watcher, a queued decision can be ✕'d, and the app replaces a daemon from
-another build at launch.
+Unreleased since 0.1.20 and carried on this branch: multi-select of SAFE
+TO RESOLVE rows with bulk one-batch Keep disk / Keep source (the selection
+bar is pinned under the sidebar's rows), Esc/⌘A, a virtualized List/Tree
+folder sidebar, scans off the daemon lock, nested repositories ignored by
+the watcher, a queued decision that can be ✕'d, and the app replacing a
+daemon from another build at launch.
+
+On top of that, this branch adds Structure mode to the merge editor for
+JSON and JSONC settings files (`2026-10-21-structured-merge-design.md`).
+Each changed key or array element is one decision with its own pick; keys
+a template renders are locked and follow source; Save splices the picks
+into the source text so comments and layout survive, and Edit opens a
+Text stage on the assembled file. A JSON-looking file that does not parse opens in
+the line editor with a note saying why. Deliberate limits: TOML comes
+later, origin is shown only in Lines ("origin differs · see Lines"), and
+objects inside array elements are not merged key by key.
 
 Open, deliberately (design calls, not bugs):
 
