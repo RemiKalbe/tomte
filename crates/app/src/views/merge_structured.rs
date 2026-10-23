@@ -9,14 +9,17 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::{App, ClickEvent, Context, Div, SharedString, WeakEntity, Window, div, prelude::*};
-use tomte_app::structured_state::StructuredState;
+use tomte_app::structured_state::{Stage, StructuredState};
 use tomte_app::theme::Theme;
 use tomte_core::merge::RegionKind;
+use tomte_core::structured::jsonc;
 use tomte_core::structured::{Change, Decision, Pick, Side, SideText, StructuredDocument};
 use tomte_core::template::anchor::SpanMap;
 use tomte_ui::components as ui;
 
-use super::merge::{MergeMode, MergeView, PaneSide, STRIP_ROWS, row_bg, span_reason};
+use super::merge::{
+    MergeMode, MergeView, PaneSide, STRIP_ROWS, SaveGate, row_bg, save_gate_for, span_reason,
+};
 
 /// What one structured strip renders as. Plain data so the plan is testable;
 /// [`strip_block`] turns it into a `ui::StripState`.
@@ -390,13 +393,17 @@ pub(super) fn strip_block(
 }
 
 /// Structure mode's header controls: progress over the decisions, the
-/// origin chip, Next ↓, and Edit (or, in the Text stage, Discard edit —
-/// the line editor's Apply maps regions and has no meaning here).
+/// origin chip, Next ↓, and Edit. In the Text stage (`text` is `Some`):
+/// the invalid-JSON chip when the text does not parse, and Back to
+/// structure (reading "Discard edits" once armed) — no Apply (the line
+/// editor's Apply maps regions and has no meaning here) and no Discard
+/// edit (Back to structure is the way out). Save sits after Cancel, drawn
+/// by the view.
 pub(super) fn header_controls(
     mut bar: Div,
     state: &StructuredState,
     has_origin: bool,
-    editing: bool,
+    text: Option<TextStage>,
     theme: Theme,
     cx: &mut Context<MergeView>,
 ) -> Div {
@@ -416,15 +423,35 @@ pub(super) fn header_controls(
             ui::ChipVariant::Wash(theme.remote),
         ));
     }
-    if editing {
-        return bar.child(ui::button(
-            theme,
-            "merge-edit-cancel",
-            "Discard edit".into(),
-            ui::ButtonVariant::Ghost,
-            ui::ButtonSize::Sm,
-            cx.listener(|view, _ev, _window, cx| view.cancel_edit(cx)),
-        ));
+    if let Some(text) = text {
+        if let Some(line) = text.invalid_line {
+            bar = bar.child(
+                div()
+                    .id("merge-json-chip")
+                    .debug_selector(|| "merge-json-chip".into())
+                    .child(ui::chip(
+                        theme,
+                        json_chip_text(line),
+                        ui::ChipVariant::Wash(theme.conflict),
+                    )),
+            );
+        }
+        let (label, variant) = if text.discard_armed {
+            ("Discard edits", ui::ButtonVariant::Solid(theme.conflict))
+        } else {
+            ("Back to structure", ui::ButtonVariant::Ghost)
+        };
+        return bar.child(
+            ui::button(
+                theme,
+                "merge-back-to-structure",
+                label.into(),
+                variant,
+                ui::ButtonSize::Sm,
+                cx.listener(|view, _ev, _window, cx| view.back_to_structure(cx)),
+            )
+            .debug_selector(|| "merge-back-to-structure".into()),
+        );
     }
     if !state.doc.decisions.is_empty() {
         let tint = if open > 0 {
@@ -458,6 +485,41 @@ pub(super) fn header_controls(
         }),
     ))
 }
+
+/// Structure mode's Save gate. The Structure stage: enabled once no
+/// conflict is open (an assembly that then fails to re-parse must reach
+/// `save`, which shows it, spec §7). The Text stage: always enabled — Save
+/// takes the editor text verbatim, open conflicts and invalid JSON included
+/// (the user may save an invalid file on purpose, spec §6).
+pub(super) fn save_gate(state: &StructuredState, editing: bool) -> SaveGate {
+    if state.stage == Stage::Text {
+        return SaveGate::Enabled;
+    }
+    let unresolved = state.unresolved().len();
+    save_gate_for(unresolved == 0, unresolved, editing)
+}
+
+/// The 1-based line of the first JSON(C) parse error in `text`, or `None`
+/// when it parses. Drives the Text stage's "not valid JSON · line N" chip.
+pub(super) fn invalid_json_line(text: &str) -> Option<usize> {
+    jsonc::parse(text).err().map(|e| e.line)
+}
+
+/// The chip's words for an invalid line.
+pub(super) fn json_chip_text(line: usize) -> String {
+    format!("not valid JSON · line {line}")
+}
+
+/// What the Text stage's header shows beside Save: the chip when the text
+/// does not parse, and whether Back to structure is armed.
+pub(super) struct TextStage {
+    pub(super) invalid_line: Option<usize>,
+    pub(super) discard_armed: bool,
+}
+
+/// The armed Back to structure's banner text.
+pub(super) const TEXT_DISCARD_WARNING: &str =
+    "Discard the text edits and return to the structure picks?";
 
 /// The "Structure | Lines" control: the selected mode tonal, the other
 /// ghost. A press goes through [`MergeView::set_mode`], which arms a
@@ -522,8 +584,8 @@ mod tests {
 
     use super::super::merge::{PaneSide, row_bg};
     use super::{
-        StripKind, detail_words, has_picks, jump_lines, pick_allowed, progress_text, strip_specs,
-        structured_pane_decors, text_row,
+        StripKind, detail_words, has_picks, invalid_json_line, jump_lines, pick_allowed,
+        progress_text, strip_specs, structured_pane_decors, text_row,
     };
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
@@ -701,5 +763,16 @@ mod tests {
             progress_text(&same),
             "same settings, formatting differs · Save keeps the source layout"
         );
+    }
+
+    // MUTATION: return the error's byte offset (or a 0-based line) instead
+    // of its 1-based line → the "line 3" asserts fail.
+    // MUTATION: `Some` on a valid text → the JSONC-with-comments case fails.
+    #[test]
+    fn invalid_json_line_names_the_parse_errors_line() {
+        assert_eq!(invalid_json_line("{\n  \"a\": \n}"), Some(3));
+        assert_eq!(invalid_json_line("{\n  \"a\": 1,\n  \"b\" 2\n}\n"), Some(3));
+        assert_eq!(invalid_json_line("{\n  // c\n  \"a\": 1\n}\n"), None);
+        assert_eq!(invalid_json_line("{}"), None);
     }
 }

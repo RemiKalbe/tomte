@@ -6926,4 +6926,294 @@ mod render_smoke {
                 .is_none()
         );
     }
+
+    // ---- Structure mode's Text stage (structured-merge Task 12) ----
+
+    /// Click decision `id`'s strip Edit button and let the frame settle.
+    fn click_strip_edit(vis: &mut VisualTestContext, id: usize) {
+        let edit = vis
+            .debug_bounds(leak(format!("merge-strip-edit:{id}")))
+            .expect("the strip offers Edit");
+        vis.simulate_click(edit.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+    }
+
+    /// Replace the result editor's text from the test's own update (never
+    /// from inside the editor's closure), then let the frame settle.
+    fn type_into_result(merge: &Entity<merge::MergeView>, vis: &mut VisualTestContext, text: &str) {
+        let text = text.to_owned();
+        vis.update(|_w, cx| {
+            let editor = merge.read(cx).result_editor_for_test();
+            // Typing notifies the editor; `set_content` alone does not.
+            editor.update(cx, |area, cx| {
+                area.set_content(text);
+                cx.notify();
+            });
+        });
+        vis.run_until_parked();
+    }
+
+    fn stage_of(
+        merge: &Entity<merge::MergeView>,
+        vis: &mut VisualTestContext,
+    ) -> tomte_app::structured_state::Stage {
+        vis.update(|_w, cx| {
+            merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap()
+                .stage
+        })
+    }
+
+    fn queued_merge_text(shell: &Entity<Shell>, vis: &mut VisualTestContext) -> String {
+        let action = vis
+            .update(|_w, cx| {
+                shell.update(cx, |s, _| {
+                    s.queue
+                        .running()
+                        .first()
+                        .cloned()
+                        .or_else(|| s.queue.take_batch().into_iter().next())
+                })
+            })
+            .expect("the save is on the queue");
+        match action.decision {
+            Decision::Merged { resolved, .. } => resolved,
+            other => panic!("expected a merged decision, got {:?}", other.label()),
+        }
+    }
+
+    /// Save in the Text stage queues what the user typed, not the picks'
+    /// assembly — with the theme conflict still open, which the Text stage
+    /// does not require to be decided.
+    ///
+    /// MUTATION: Save in Text stage uses `structured.assembled()` → the
+    /// typed text is lost (the open conflict assembles to nothing, nothing
+    /// is queued, and the `expect` on the queued action fails).
+    #[gpui::test]
+    fn edit_then_save_enqueues_the_editor_text_verbatim(cx: &mut TestAppContext) {
+        use tomte_app::structured_state::Stage;
+        let (shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        click_strip_edit(vis, 0);
+        assert_eq!(stage_of(&merge, vis), Stage::Text);
+        let typed = format!("{}\n// hand\n", result_text(&merge, vis));
+        type_into_result(&merge, vis, &typed);
+        vis.update(|_w, cx| merge.update(cx, |view, cx| view.save(cx)));
+        vis.run_until_parked();
+        let resolved = queued_merge_text(&shell, vis);
+        assert!(resolved.ends_with("// hand\n"), "{resolved}");
+        assert_eq!(resolved, typed, "the editor text, verbatim");
+    }
+
+    /// Back to structure with the text untouched returns at once: the
+    /// strips come back and the pick made before Edit stands.
+    ///
+    /// MUTATION: `back_to_structure` resets the resolution (or reloads the
+    /// structured state) → `resolution.get(0)` is None.
+    /// MUTATION: `back_to_structure` leaves `editing` set → the decorator
+    /// installs no strip block and `structured_blocks` stays 0.
+    #[gpui::test]
+    fn back_to_structure_restores_the_strips_and_keeps_the_picks(cx: &mut TestAppContext) {
+        use tomte_app::structured_state::Stage;
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
+        vis.run_until_parked();
+        click_strip_edit(vis, 0);
+        assert_eq!(stage_of(&merge, vis), Stage::Text);
+        assert_eq!(vis.update(|_w, cx| merge.read(cx).structured_blocks), 0);
+        let back = vis
+            .debug_bounds("merge-back-to-structure")
+            .expect("the Text stage offers Back to structure");
+        vis.simulate_click(back.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(stage_of(&merge, vis), Stage::Structure);
+        let (blocks, banner, pick) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            let state = v.loaded.as_ref().unwrap().structured.as_ref().unwrap();
+            (
+                v.structured_blocks,
+                v.banner.clone(),
+                state.resolution.get(0),
+            )
+        });
+        assert!(blocks > 0, "the strips are back");
+        assert!(banner.is_none(), "an untouched text needs no confirmation");
+        assert_eq!(pick, Some(Pick::Disk), "the pick survives the round trip");
+    }
+
+    /// Back to structure with edited text arms a confirmation first; the
+    /// second press (here Escape, the Text stage's CancelEdit) discards the
+    /// edit and re-seeds the picks' text. ⌘↩ (ApplyEdit) does nothing here.
+    ///
+    /// MUTATION: `back_to_structure` returns to the strips without arming →
+    /// the stage is Structure after the first click and the banner is None.
+    /// MUTATION: `cancel_edit`'s Structure branch keeps Task 10's direct
+    /// return (not `back_to_structure`) → Escape skips the arming, which the
+    /// first-press assertion on Escape catches.
+    /// MUTATION: `commit_edit` drops its Structure-mode return → ⌘↩ maps the
+    /// edit onto line regions and leaves the Text stage.
+    /// MUTATION: bind Escape back to the "RegionEditor" context no element
+    /// carries → Escape does nothing and the first-press assertion fails.
+    /// MUTATION: `start_session` keeps `text_discard_armed` → the flag
+    /// survives into the next file.
+    #[gpui::test]
+    fn back_to_structure_arms_when_the_text_changed(cx: &mut TestAppContext) {
+        use tomte_app::structured_state::Stage;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let seed = result_text(&merge, vis);
+        let banner_text = |vis: &mut VisualTestContext| {
+            vis.update(|_w, cx| merge.read(cx).banner.as_ref().map(|b| b.text.to_string()))
+        };
+        let warning = "Discard the text edits and return to the structure picks?";
+
+        // Escape as the first press arms too.
+        click_strip_edit(vis, 0);
+        type_into_result(&merge, vis, &format!("{seed}// a\n"));
+        vis.simulate_keystrokes("escape");
+        vis.run_until_parked();
+        assert_eq!(stage_of(&merge, vis), Stage::Text, "escape only arms");
+        assert_eq!(banner_text(vis).as_deref(), Some(warning));
+
+        // ⌘↩ is not Apply here: still the Text stage, the typed text stays.
+        vis.simulate_keystrokes("cmd-enter");
+        vis.run_until_parked();
+        assert_eq!(stage_of(&merge, vis), Stage::Text);
+        assert_eq!(result_text(&merge, vis), format!("{seed}// a\n"));
+
+        // The second press (Escape again) discards and re-seeds.
+        vis.simulate_keystrokes("escape");
+        vis.run_until_parked();
+        assert_eq!(stage_of(&merge, vis), Stage::Structure);
+        assert_eq!(result_text(&merge, vis), seed, "the text edit is gone");
+        assert!(banner_text(vis).is_none());
+
+        // The header button arms on the first click and confirms on the second.
+        click_strip_edit(vis, 0);
+        type_into_result(&merge, vis, &format!("{seed}// b\n"));
+        let back = vis
+            .debug_bounds("merge-back-to-structure")
+            .expect("the Text stage offers Back to structure");
+        vis.simulate_click(back.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(stage_of(&merge, vis), Stage::Text, "the first click arms");
+        assert_eq!(banner_text(vis).as_deref(), Some(warning));
+        assert!(vis.update(|_w, cx| merge.read(cx).text_discard_armed));
+        let back = vis
+            .debug_bounds("merge-back-to-structure")
+            .expect("the armed button is still there");
+        vis.simulate_click(back.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(stage_of(&merge, vis), Stage::Structure);
+        assert_eq!(result_text(&merge, vis), seed);
+        assert!(banner_text(vis).is_none());
+        assert!(!vis.update(|_w, cx| merge.read(cx).text_discard_armed));
+
+        // An armed confirmation does not survive into the next file.
+        click_strip_edit(vis, 0);
+        type_into_result(&merge, vis, &format!("{seed}// c\n"));
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.back_to_structure(cx)));
+        assert!(vis.update(|_w, cx| merge.read(cx).text_discard_armed));
+        vis.update(|_w, cx| {
+            merge.update(cx, |v, cx| {
+                v.present_repo_conflict(std::sync::Arc::new(fixtures::json_templated_inputs()), cx)
+            })
+        });
+        vis.run_until_parked();
+        assert!(!vis.update(|_w, cx| merge.read(cx).text_discard_armed));
+    }
+
+    /// A text that no longer parses shows the chip with its line, and Save
+    /// stays enabled: the user may save an invalid file on purpose.
+    ///
+    /// MUTATION: the Text stage's Save gate keeps Task 10's "apply or cancel
+    /// the edit first" (Disabled while editing) → the gate is not Enabled.
+    /// MUTATION: `invalid_json_line` returns the error's byte offset instead
+    /// of its line → the chip reads "line 12".
+    /// MUTATION: the chip parses the seed (`self.seed`) instead of the
+    /// editor's text → the seed parses and the chip is None.
+    #[gpui::test]
+    fn the_invalid_json_chip_names_the_line_and_save_stays_enabled(cx: &mut TestAppContext) {
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        assert_eq!(
+            vis.update(|_w, cx| merge.read(cx).json_chip(cx)),
+            None,
+            "no chip in the Structure stage"
+        );
+        click_strip_edit(vis, 0);
+        type_into_result(&merge, vis, "{\n  \"a\": \n}");
+        let (chip, gate) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            (v.json_chip(cx), v.save_gate())
+        });
+        assert_eq!(chip.as_deref(), Some("not valid JSON · line 3"));
+        assert!(vis.debug_bounds("merge-json-chip").is_some());
+        assert_eq!(gate, Some(merge::SaveGate::Enabled), "chip or not, Save");
+        assert!(vis.debug_bounds("merge-save").is_some());
+        // Typing a valid text again clears the chip (the editor is the
+        // source of truth, read at render).
+        type_into_result(&merge, vis, "{\n  \"a\": 1\n}\n");
+        assert_eq!(vis.update(|_w, cx| merge.read(cx).json_chip(cx)), None);
+    }
+
+    /// Entering the Text stage keeps the decision in view: the editor
+    /// scrolls to the decision's line in the strip-less geometry and the
+    /// panes jump to it. And the panes do not follow a result-editor scroll
+    /// in the Text stage: the `sync_from` return is keyed on the mode.
+    ///
+    /// MUTATION: `start_edit`'s Structure branch drops its `jump_to` → the
+    /// editor stays at the parked offset.
+    /// MUTATION: `jump_to` keeps the strip geometry while editing (always
+    /// `text_row`) → the editor lands strips-many rows too far down.
+    /// MUTATION: key `sync_from`'s return on `!self.editing` instead of the
+    /// mode AND drop its `seed_line_starts` length guard → the result-leader
+    /// probe moves the source pane off its parked line. (Dropping only one
+    /// survives: the Text stage seeds no line starts either.)
+    #[gpui::test]
+    fn entering_the_text_stage_keeps_the_decision_in_view_and_the_panes_unsynced(
+        cx: &mut TestAppContext,
+    ) {
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let parked = px(-999.);
+        let last = vis.update(|_w, cx| {
+            merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap()
+                .doc
+                .decisions
+                .len()
+                - 1
+        });
+        // Read the offset in the same update that enters the stage: the
+        // fixture fits the editor, so the next layout clamps it to 0.
+        let (offset, line) = vis.update(|_w, cx| {
+            merge.update(cx, |view, cx| {
+                view.set_editor_offset_for_test(parked);
+                view.start_edit(last, cx);
+                let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
+                let line = state.result_lines()[last];
+                (view.editor_offset_for_test(), line)
+            })
+        });
+        let want = line.saturating_sub(merge::STRIP_ROWS) as f32 * merge::PANE_ROW_H;
+        assert_eq!(offset, px(-want), "decision line {line} sits in view");
+
+        let source_line = vis.update(|_w, cx| {
+            merge.update(cx, |view, _cx| {
+                view.pane_scrolls[merge::THEIRS_COL].set_offset(gpui::point(px(0.), parked));
+                view.sync_probe(merge::RESULT_LEADER, 1).panes[merge::THEIRS_COL]
+            })
+        });
+        assert_eq!(source_line, -f32::from(parked) / merge::PANE_ROW_H);
+    }
 }

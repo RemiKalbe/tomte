@@ -282,11 +282,12 @@ pub fn register_keys(cx: &mut App) {
         KeyBinding::new("n", NextConflict, Some("MergeEditor")),
         KeyBinding::new("cmd-z", UndoChoice, Some("MergeEditor")),
         KeyBinding::new("cmd-shift-z", RedoChoice, Some("MergeEditor")),
-        // Region editor session (the root swaps its context to
-        // MergeEditorEditing while one is open, so the single-letter picks
-        // above can't shadow typing).
-        KeyBinding::new("escape", CancelEdit, Some("RegionEditor")),
-        KeyBinding::new("cmd-enter", ApplyEdit, Some("RegionEditor")),
+        // Edit session (the root swaps its context to MergeEditorEditing
+        // while one is open, so the single-letter picks above can't shadow
+        // typing). Until 2026-10-22 these named a "RegionEditor" context no
+        // element has carried since 0.1.14, so neither key fired.
+        KeyBinding::new("escape", CancelEdit, Some("MergeEditorEditing")),
+        KeyBinding::new("cmd-enter", ApplyEdit, Some("MergeEditorEditing")),
     ]);
     cx.bind_keys(tomte_ui::components::text_area::bindings());
 }
@@ -1025,6 +1026,10 @@ pub struct MergeView {
     /// payload is the mode a second press switches to (the `cancel_armed`
     /// pattern). Any pick or Save disarms it.
     pub(super) mode_switch_armed: Option<MergeMode>,
+    /// Back to structure was pressed in the Text stage with edited text:
+    /// the banner asks, and a second press discards the edit (the
+    /// `cancel_armed` pattern). Save and a new session disarm it.
+    pub(super) text_discard_armed: bool,
     /// Test seam: how many structured strip blocks the last decorator
     /// install carried (0 in Lines mode and while editing).
     #[cfg(test)]
@@ -1107,6 +1112,7 @@ impl MergeView {
             banner: None,
             cancel_armed: None,
             mode_switch_armed: None,
+            text_discard_armed: false,
             #[cfg(test)]
             structured_blocks: 0,
             pane_scrolls: std::array::from_fn(|_| gpui::ScrollHandle::new()),
@@ -1159,6 +1165,7 @@ impl MergeView {
         self.banner = None;
         self.cancel_armed = None;
         self.mode_switch_armed = None;
+        self.text_discard_armed = false;
         self.editing = false;
         self.undo.clear();
         self.redo.clear();
@@ -1596,6 +1603,9 @@ impl MergeView {
                     area.place_cursor(cursor_byte);
                 });
             }
+            // Land where Edit was clicked: the decision's line in the
+            // strip-less geometry, the panes on its side.
+            self.jump_to(region);
             self.decor_dirty = true;
             cx.notify();
             return;
@@ -1665,14 +1675,9 @@ impl MergeView {
         if !self.editing {
             return;
         }
-        if let Some(loaded) = &mut self.loaded
-            && let (MergeMode::Structure, Some(state)) = (loaded.mode, &mut loaded.structured)
-        {
-            // Back to the strips with the picks intact; the text edit goes.
-            state.stage = Stage::Structure;
-            self.editing = false;
-            self.seed_editor(cx);
-            cx.notify();
+        if self.mode() == MergeMode::Structure {
+            // Escape in the Text stage is Back to structure, arming included.
+            self.back_to_structure(cx);
             return;
         }
         self.editing = false;
@@ -1687,6 +1692,59 @@ impl MergeView {
         self.rescroll_anchored(anchor, true);
         self.seed_editor(cx);
         cx.notify();
+    }
+
+    /// The Text stage's way back: the strips return with the picks intact
+    /// and the text edit is discarded. When the text differs from the
+    /// picks' seed, the first press only arms a confirmation banner; the
+    /// second (button or Escape) discards.
+    pub(super) fn back_to_structure(&mut self, cx: &mut Context<Self>) {
+        if !self.editing || !self.in_text_stage() {
+            return;
+        }
+        let edited = {
+            let seed = self
+                .loaded
+                .as_ref()
+                .and_then(|l| l.structured.as_ref())
+                .map(|s| s.seed())
+                .unwrap_or_default();
+            self.result_editor
+                .as_ref()
+                .is_some_and(|e| e.read(cx).text() != seed)
+        };
+        if edited && !self.text_discard_armed {
+            self.text_discard_armed = true;
+            self.banner = Some(OutcomeBanner {
+                text: merge_structured::TEXT_DISCARD_WARNING.into(),
+                tint: BannerTint::Drift,
+                undoable: false,
+            });
+            cx.notify();
+            return;
+        }
+        self.disarm_text_discard();
+        if let Some(state) = self.loaded.as_mut().and_then(|l| l.structured.as_mut()) {
+            state.stage = Stage::Structure;
+        }
+        self.editing = false;
+        self.seed_editor(cx);
+        if let Some(id) = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.structured.as_ref())
+            .and_then(|s| s.cursor)
+        {
+            self.jump_to(id);
+        }
+        cx.notify();
+    }
+
+    /// Drop an armed Back to structure (and its banner).
+    fn disarm_text_discard(&mut self) {
+        if std::mem::take(&mut self.text_discard_armed) {
+            self.banner = None;
+        }
     }
 
     /// A pick key (1/2/3/b): the structured pick at the structured cursor in
@@ -1843,7 +1901,13 @@ impl MergeView {
                 self.pane_scrolls[col].set_offset(offset);
             }
         }
-        let row = merge_structured::text_row(&state.result_lines(), id);
+        let lines = state.result_lines();
+        // The Text stage has no strip blocks: row == line there.
+        let row = if self.editing {
+            lines.get(id).copied().unwrap_or(0)
+        } else {
+            merge_structured::text_row(&lines, id)
+        };
         let y = row.saturating_sub(STRIP_ROWS) as f32 * PANE_ROW_H;
         self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
     }
@@ -1992,6 +2056,13 @@ impl MergeView {
             return;
         };
         let resolved = match (loaded.mode, &loaded.structured) {
+            // The Text stage saves what the user typed, verbatim — open
+            // conflicts and invalid JSON included (spec §6).
+            (MergeMode::Structure, Some(state)) if state.stage == Stage::Text => Ok(self
+                .result_editor
+                .as_ref()
+                .map(|e| e.read(cx).text().to_owned())
+                .unwrap_or_default()),
             (MergeMode::Structure, Some(state)) => match state.assembled() {
                 Ok(Some(text)) => Ok(text),
                 Ok(None) => Err(None),
@@ -2046,6 +2117,7 @@ impl MergeView {
         // not survive to catch the next Cancel press unwarned.
         self.cancel_armed = None;
         self.mode_switch_armed = None;
+        self.text_discard_armed = false;
         cx.notify();
 
         let name = display_name(&target);
@@ -2108,11 +2180,15 @@ impl MergeView {
         if let Some(loaded) = &self.loaded
             && let (MergeMode::Structure, Some(state)) = (loaded.mode, &loaded.structured)
         {
+            let text = (state.stage == Stage::Text).then(|| merge_structured::TextStage {
+                invalid_line: self.invalid_json_line(cx),
+                discard_armed: self.text_discard_armed,
+            });
             bar = merge_structured::header_controls(
                 bar,
                 state,
                 loaded.inputs.origin.is_some(),
-                self.editing,
+                text,
                 theme,
                 cx,
             );
@@ -2238,76 +2314,34 @@ impl MergeView {
                 cx.listener(|view, _ev, _window, cx| view.cancel(cx)),
             ));
         }
-        if let Some(loaded) = &self.loaded
-            && let (MergeMode::Structure, Some(state)) = (loaded.mode, &loaded.structured)
-        {
-            // Enabled once no conflict is open: an assembly that then fails
-            // to re-parse must reach `save`, which shows it (spec §7).
-            let unresolved = state.unresolved().len();
-            let editing = self.editing;
-            bar = bar.child(self.save_button(
-                unresolved == 0 && !editing,
-                unresolved,
-                editing,
-                theme,
-                cx,
-            ));
-        } else if let Some(loaded) = &self.loaded {
-            let unresolved = {
-                let (decided, total) = loaded.state.progress();
-                total - decided
-            };
-            // No "saving…" state to swap in any more: the Save records the
-            // decision and leaves for Review in the same frame, so there is
-            // no in-flight window here to render. The work's own progress is
-            // Review's PROCESSING row.
-            let editing = self.editing;
-            bar = bar.child(self.save_button(
-                loaded.state.assembled().is_some() && !editing,
-                unresolved,
-                editing,
-                theme,
-                cx,
-            ));
+        if let Some(gate) = self.save_gate() {
+            bar = bar.child(save_button(gate, theme, cx));
         }
         bar
     }
 
-    /// Save is enabled exactly when the document is fully resolved and no
-    /// edit session is pending (an open editor holds text the resolution
-    /// doesn't have yet — saving under it would lie).
-    fn save_button(
-        &self,
-        enabled: bool,
-        unresolved: usize,
-        editing: bool,
-        theme: Theme,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        if enabled {
-            ui::button(
-                theme,
-                "merge-save",
-                "Save".into(),
-                ui::ButtonVariant::Tonal(theme.accent),
-                ui::ButtonSize::Sm,
-                cx.listener(|view, _ev, _window, cx| view.save(cx)),
-            )
-        } else {
-            let reason = if editing {
-                "apply or cancel the edit first".to_string()
-            } else {
-                let s = if unresolved == 1 { "" } else { "s" };
-                format!("{unresolved} conflict{s} left")
-            };
-            ui::disabled_button(
-                theme,
-                "merge-save",
-                "Save".into(),
-                ui::ButtonSize::Sm,
-                Some(reason.into()),
-            )
-        }
+    /// Where the header's Save stands. Lines: enabled exactly when the
+    /// document is fully resolved and no edit is pending (an open editor
+    /// holds text the resolution does not have yet — saving under it would
+    /// lie). Structure: see [`merge_structured::save_gate`]. `None` with
+    /// nothing loaded (no Save at all).
+    pub(super) fn save_gate(&self) -> Option<SaveGate> {
+        let loaded = self.loaded.as_ref()?;
+        Some(match (loaded.mode, &loaded.structured) {
+            (MergeMode::Structure, Some(state)) => merge_structured::save_gate(state, self.editing),
+            _ => {
+                // No "saving…" state to swap in any more: the Save records
+                // the decision and leaves for Review in the same frame, so
+                // there is no in-flight window here to render. The work's
+                // own progress is Review's PROCESSING row.
+                let (decided, total) = loaded.state.progress();
+                save_gate_for(
+                    loaded.state.assembled().is_some(),
+                    total - decided,
+                    self.editing,
+                )
+            }
+        })
     }
 
     fn body(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -2510,6 +2544,53 @@ impl MergeView {
                 )
                 .into_any_element(),
         }
+    }
+
+    /// The Text stage's chip words, for tests: the same line and copy the
+    /// header renders.
+    #[cfg(test)]
+    pub(super) fn json_chip(&self, cx: &App) -> Option<String> {
+        self.invalid_json_line(cx)
+            .map(merge_structured::json_chip_text)
+    }
+
+    /// The Text stage's first parse-error line, read from the editor's
+    /// current text at render (the editor is the source of truth). Typing
+    /// notifies the editor, and gpui 0.2.2 marks every ancestor view dirty
+    /// on a notify (`Window::mark_view_dirty`), so the header re-renders
+    /// with it. `None` outside the Text stage or when the text parses.
+    fn invalid_json_line(&self, cx: &App) -> Option<usize> {
+        if !self.in_text_stage() {
+            return None;
+        }
+        let editor = self.result_editor.as_ref()?;
+        merge_structured::invalid_json_line(editor.read(cx).text())
+    }
+
+    /// Structure mode with the editor open on the assembled text.
+    fn in_text_stage(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| {
+            l.mode == MergeMode::Structure
+                && l.structured
+                    .as_ref()
+                    .is_some_and(|s| s.stage == Stage::Text)
+        })
+    }
+
+    /// The result editor entity, for tests that type into it.
+    #[cfg(test)]
+    pub(super) fn result_editor_for_test(&self) -> Entity<ui::TextArea> {
+        self.result_editor.clone().expect("a seeded result editor")
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_editor_offset_for_test(&mut self, y: gpui::Pixels) {
+        self.editor_scroll.set_offset(gpui::point(px(0.), y));
+    }
+
+    #[cfg(test)]
+    pub(super) fn editor_offset_for_test(&self) -> gpui::Pixels {
+        self.editor_scroll.offset().y
     }
 
     /// The result editor's text, for tests.
@@ -2870,6 +2951,50 @@ pub(super) struct SyncProbe {
     pub(super) want_result: f32,
 }
 
+/// Where the header's Save button stands; [`MergeView::save_gate`] decides,
+/// [`save_button`] draws it, and tests read the same value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SaveGate {
+    Enabled,
+    /// Disabled, with the hover text saying why.
+    Disabled(SharedString),
+}
+
+/// The Save gate shared by both modes' resolution views: `ready` when the
+/// result assembles. An open edit blocks it first, then open conflicts.
+pub(super) fn save_gate_for(ready: bool, unresolved: usize, editing: bool) -> SaveGate {
+    if editing {
+        SaveGate::Disabled("apply or cancel the edit first".into())
+    } else if ready {
+        SaveGate::Enabled
+    } else {
+        let s = if unresolved == 1 { "" } else { "s" };
+        SaveGate::Disabled(format!("{unresolved} conflict{s} left").into())
+    }
+}
+
+/// The header's Save button for `gate` (`merge-save` either way).
+fn save_button(gate: SaveGate, theme: Theme, cx: &mut Context<MergeView>) -> Stateful<Div> {
+    let button = match gate {
+        SaveGate::Enabled => ui::button(
+            theme,
+            "merge-save",
+            "Save".into(),
+            ui::ButtonVariant::Tonal(theme.accent),
+            ui::ButtonSize::Sm,
+            cx.listener(|view, _ev, _window, cx| view.save(cx)),
+        ),
+        SaveGate::Disabled(reason) => ui::disabled_button(
+            theme,
+            "merge-save",
+            "Save".into(),
+            ui::ButtonSize::Sm,
+            Some(reason),
+        ),
+    };
+    button.debug_selector(|| "merge-save".into())
+}
+
 /// Merge-local banner: same shape as Review's, minus the Undo button (the
 /// banners that stay here — protected span, errors — are never undoable).
 fn banner_el(banner: &OutcomeBanner, theme: Theme) -> Div {
@@ -2984,7 +3109,7 @@ pub(super) const PANE_COLS: usize = 4;
 
 /// `sync_from` leader id for the result editor (0..PANE_COLS are the input
 /// panes, whether or not each is currently drawn).
-const RESULT_LEADER: usize = PANE_COLS;
+pub(super) const RESULT_LEADER: usize = PANE_COLS;
 
 /// Which draggable divider a gesture belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
