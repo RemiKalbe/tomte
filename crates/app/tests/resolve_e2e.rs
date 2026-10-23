@@ -20,8 +20,9 @@ use tomte_app::resolve::{
 use tomte_core::cmd::SystemRunner;
 use tomte_core::drift::{ContentHash, DriftClass};
 use tomte_core::git::GitClient;
-use tomte_core::merge::Choice;
+use tomte_core::merge::{Choice, RegionKind};
 use tomte_core::scanner::FileDrift;
+use tomte_core::structured::{Pick, StructuredDocument};
 use tomte_core::testsupport::{Scratch, git, sh};
 use tomte_daemon::core::DaemonCore;
 use tomte_daemon::server::{ServeCtx, serve};
@@ -1710,15 +1711,21 @@ const TPL_VALUE_DRIFT: &[u8] = b"a=1\nvalue=changed\n";
 /// states with it, then drift the destination to `drift` and make the daemon
 /// see it.
 fn templatize_and_drift(lab: &DriftLab, drift: &[u8]) {
+    templatize_with_and_drift(lab, TPL_SOURCE, TPL_RENDERED, drift);
+}
+
+/// `templatize_and_drift` for any template text and its rendering with
+/// `testvalue = "tpl"`.
+fn templatize_with_and_drift(lab: &DriftLab, template: &[u8], rendered: &[u8], drift: &[u8]) {
     // The scratch config exists (empty) since Scratch::new — give the
     // template its variable, template_roundtrip's scratch_chezmoi pattern.
     std::fs::write(lab.s.config_path(), "[data]\ntestvalue = \"tpl\"\n").unwrap();
     git(&lab.s.source, &["mv", "dot_testrc", "dot_testrc.tmpl"]);
-    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), TPL_SOURCE).unwrap();
+    std::fs::write(lab.s.source.join("dot_testrc.tmpl"), template).unwrap();
     git(&lab.s.source, &["add", "."]);
     git(&lab.s.source, &["commit", "-m", "templatize"]);
     lab.s.chezmoi().apply(None).unwrap();
-    assert_eq!(std::fs::read(&lab.target).unwrap(), TPL_RENDERED);
+    assert_eq!(std::fs::read(&lab.target).unwrap(), rendered);
 
     std::fs::write(&lab.target, drift).unwrap();
     assert_eq!(
@@ -1859,6 +1866,156 @@ fn story_h_templated_value_edit_is_rejected_and_touches_nothing() {
     let drifted = lab.settled_status();
     assert_eq!(drifted.len(), 1);
     assert_eq!(drifted[0].target, lab.target);
+}
+
+/// Story X/Y fixtures: a JSON managed file.
+const JSON_BASE: &[u8] = b"{\n  \"theme\": \"one\",\n  \"tabs\": 2\n}\n";
+const JSON_SOURCE: &[u8] = b"{\n  \"theme\": \"two\",\n  \"tabs\": 2\n}\n";
+const JSON_DISK: &[u8] = b"{\n  \"theme\": \"one\",\n  \"tabs\": 2,\n  \"vim\": true\n}\n";
+const JSON_MERGED: &[u8] = b"{\n  \"theme\": \"two\",\n  \"tabs\": 2,\n  \"vim\": true\n}\n";
+/// Story Y: a JSON template with one expression, its rendering, the drifted
+/// disk (tabs AND the rendered name edited) and the expected template/disk.
+const JSON_TPL: &[u8] = b"{\n  \"name\": \"{{ .testvalue }}\",\n  \"tabs\": 2\n}\n";
+const JSON_TPL_RENDERED: &[u8] = b"{\n  \"name\": \"tpl\",\n  \"tabs\": 2\n}\n";
+const JSON_TPL_DRIFT: &[u8] = b"{\n  \"name\": \"X\",\n  \"tabs\": 4\n}\n";
+const JSON_TPL_SAVED: &[u8] = b"{\n  \"name\": \"{{ .testvalue }}\",\n  \"tabs\": 4\n}\n";
+const JSON_TPL_DISK_SAVED: &[u8] = b"{\n  \"name\": \"tpl\",\n  \"tabs\": 4\n}\n";
+
+/// Replace the managed file's content in the source, commit, apply and let
+/// the daemon settle, so source, disk and last-written all equal `content`.
+fn set_managed_content(lab: &DriftLab, content: &[u8]) {
+    std::fs::write(lab.s.source.join("dot_testrc"), content).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "set managed content"]);
+    lab.s.chezmoi().apply(None).unwrap();
+    assert_eq!(std::fs::read(&lab.target).unwrap(), content);
+    assert!(lab.rescan_and_settle().is_empty());
+}
+
+/// Compute the structured document for the lab's current merge inputs.
+fn structured_state(
+    inputs: &merge_inputs::MergeInputs,
+) -> tomte_app::structured_state::StructuredState {
+    let doc = StructuredDocument::compute(
+        inputs.base.as_deref(),
+        &inputs.ours,
+        &inputs.theirs,
+        inputs.span_map.as_ref(),
+    )
+    .expect("JSON inputs must be structured");
+    tomte_app::structured_state::StructuredState::new(doc)
+}
+
+/// Story X: a structured save lands BOTH a disk-added key and a source-side
+/// change, through the real engine, and Undo restores the disk.
+///
+/// Mutation: the assemble step drops the Added splice
+/// (`crates/core/src/structured/splice.rs`) → the assembled text lacks "vim"
+/// and the first assertion on `resolved` fails.
+#[test]
+fn story_x_a_structured_save_lands_a_disk_added_key_and_a_source_change() {
+    let lab = DriftLab::new();
+    set_managed_content(&lab, JSON_BASE);
+
+    // Source changes (committed); the daemon sees it first, snapshotting the
+    // last-written disk as the 3-way base.
+    std::fs::write(lab.s.source.join("dot_testrc"), JSON_SOURCE).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "source edit"]);
+    let drifted = lab.rescan_and_settle();
+    assert_eq!(drifted[0].class, "source_ahead");
+    // Then the disk adds a key.
+    std::fs::write(&lab.target, JSON_DISK).unwrap();
+    let drifted = lab.rescan_and_settle();
+    assert_eq!(drifted[0].class, "conflict");
+
+    let inputs = lab.load_merge_inputs();
+    let state = structured_state(&inputs);
+    let decisions: Vec<_> = state
+        .doc
+        .decisions
+        .iter()
+        .map(|d| (d.path.as_str(), d.kind))
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![
+            ("theme", RegionKind::TheirsOnly),
+            ("vim", RegionKind::OursOnly)
+        ]
+    );
+    let resolved = state.assembled().unwrap().unwrap();
+    assert_eq!(resolved.as_bytes(), JSON_MERGED);
+
+    let outcome = lab.engine.resolve_merged(&inputs, &resolved).unwrap();
+    let ResolveOutcome::Done {
+        committed, pushed, ..
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(committed && pushed);
+    assert_eq!(std::fs::read(&lab.target).unwrap(), JSON_MERGED);
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc")).unwrap(),
+        JSON_MERGED
+    );
+
+    lab.engine
+        .undo_last()
+        .unwrap()
+        .expect("the merge is undoable");
+    assert_eq!(std::fs::read(&lab.target).unwrap(), JSON_DISK);
+}
+
+/// Story Y: a structured save on a templated JSON source locks the key the
+/// template pins ("name") and writes the literal key ("tabs") back into the
+/// template, leaving the expression intact.
+///
+/// Mutation: skip the lock pass (`crates/core/src/structured/merge.rs`) →
+/// "name" is picked Disk, the write-back hits the protected span and
+/// `resolve_merged` returns `ProtectedSpan` instead of `Done`.
+#[test]
+fn story_y_a_structured_save_on_a_templated_json_source_writes_back_the_literal_key() {
+    let lab = DriftLab::new();
+    templatize_with_and_drift(&lab, JSON_TPL, JSON_TPL_RENDERED, JSON_TPL_DRIFT);
+
+    let inputs = lab.load_merge_inputs();
+    assert!(inputs.templated);
+    assert!(inputs.span_map.is_some());
+    let mut state = structured_state(&inputs);
+    let locked_of = |state: &tomte_app::structured_state::StructuredState, path: &str| {
+        state
+            .doc
+            .decisions
+            .iter()
+            .find(|d| d.path == path)
+            .unwrap_or_else(|| panic!("no decision for {path}"))
+            .locked
+            .is_some()
+    };
+    assert!(locked_of(&state, "name"), "the template pins name");
+    assert!(!locked_of(&state, "tabs"), "tabs is a literal");
+    let tabs = state
+        .doc
+        .decisions
+        .iter()
+        .find(|d| d.path == "tabs")
+        .unwrap()
+        .id;
+    state.pick(tabs, Pick::Disk);
+    let resolved = state.assembled().unwrap().unwrap();
+    assert_eq!(resolved.as_bytes(), JSON_TPL_DISK_SAVED);
+
+    let outcome = lab.engine.resolve_merged(&inputs, &resolved).unwrap();
+    let ResolveOutcome::Done { .. } = outcome else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_testrc.tmpl")).unwrap(),
+        JSON_TPL_SAVED
+    );
+    assert_eq!(std::fs::read(&lab.target).unwrap(), JSON_TPL_DISK_SAVED);
 }
 
 /// Stories I/J: ORIGIN holds its own version of the managed file.
