@@ -188,8 +188,8 @@ pub(super) fn template_line_at(template: &str, pos: usize) -> &str {
     template[start..end].trim_end()
 }
 
-/// Why a protected span is protected, preferably as the template's own line
-/// for it. `segments` is the template's lex (for an action's source range).
+/// Why a protected span is protected (or why an unrepeated literal locks a
+/// structured row), preferably as the template's own line for it. `segments` is the template's lex (for an action's source range).
 /// Shared by the source pane's `{}` hover and Structure mode's locked strips.
 pub(super) fn span_reason(
     origin: &SpanOrigin,
@@ -202,6 +202,22 @@ pub(super) fn span_reason(
             .map(|seg| template_line_at(t, seg.src.start).to_string())
             .unwrap_or_else(|| "template expression".to_string()),
         (SpanOrigin::Action { .. }, _, _) => "template expression".to_string(),
+        // Only a Structure-mode lock from the two-spans rule (ruling R32)
+        // names an unrepeated literal: the one that starts right after the
+        // directive splitting the line, so its first template line is that
+        // directive's.
+        (
+            SpanOrigin::Literal {
+                src,
+                repeated: false,
+                ..
+            },
+            Some(t),
+            _,
+        ) => format!(
+            "beside a template directive: {}",
+            template_line_at(t, src.start).trim_start()
+        ),
         (SpanOrigin::Literal { src, .. }, Some(t), _) => {
             format!("repeated literal: {}", template_line_at(t, src.start))
         }

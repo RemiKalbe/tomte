@@ -43,7 +43,8 @@ pub enum NotStructured {
     #[error("both sides are empty")]
     BothEmpty,
     /// Building and comparing values recurses once per level, so a deeper
-    /// document could overflow the background thread's stack (ruling R28).
+    /// disk or source could overflow the background thread's stack (ruling
+    /// R28). A too-deep base degrades to two-way instead (ruling R33).
     #[error("the JSON nests deeper than {} levels", MAX_DEPTH)]
     TooDeep { depth: usize },
 }
@@ -260,8 +261,8 @@ pub struct StructuredDocument {
 
 impl StructuredDocument {
     /// Compares `ours` (disk) and `theirs` (source) against `base`, the last
-    /// written text. A missing or unparseable base degrades to two-way: base
-    /// becomes source, so every difference is `OursOnly`.
+    /// written text. A missing, unparseable or too-deep base degrades to
+    /// two-way: base becomes source, so every difference is `OursOnly`.
     ///
     /// With a `span_map` (the template that renders `theirs`), a decision
     /// whose splice would touch a templated line is locked; see
@@ -282,12 +283,12 @@ impl StructuredDocument {
         // A base of another root shape than the sides cannot be compared key
         // by key, so it degrades like an unparseable one. An empty base is a
         // real, empty base.
+        // A base nested deeper than MAX_DEPTH is unusable in the same way
+        // and degrades too (ruling R33); only a too-deep side refuses.
         let parsed_base = base
             .and_then(|text| jsonc::parse(text).ok())
-            .filter(|doc| matches!(root_of(doc), Root::Empty) || root_of(doc) == root);
-        if let Some(doc) = &parsed_base {
-            check_depth(doc)?;
-        }
+            .filter(|doc| matches!(root_of(doc), Root::Empty) || root_of(doc) == root)
+            .filter(|doc| check_depth(doc).is_ok());
         let degraded_base = parsed_base.is_none();
         let base = match parsed_base {
             Some(doc) => doc,
@@ -1528,6 +1529,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Ruling R33. Mutation: return TooDeep for the base
+    // (`check_depth(doc)?` on the parsed base instead of the filter) ->
+    // compute errs and the `expect` fails.
+    #[test]
+    fn a_too_deep_base_degrades_to_two_way() {
+        let deep = format!("[{}]", nested(300));
+        let d = StructuredDocument::compute(Some(&deep), "[1, 2]", "[1, 3]", None)
+            .expect("a too-deep base does not refuse");
+        assert!(d.degraded_base);
+        assert_eq!(d.side_text(Side::Base), "[1, 3]", "source stands in");
+        assert!(
+            d.decisions
+                .iter()
+                .all(|row| row.kind == RegionKind::OursOnly)
+        );
     }
 
     fn nested(depth: usize) -> String {
