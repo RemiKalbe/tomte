@@ -95,3 +95,34 @@ fn every_unlocked_disk_pick_writes_back_and_re_renders() {
         1,
     );
 }
+
+// `{{- if }}` / `{{- end }}` trim the newline before them, so the line above
+// each directive belongs to two literal spans and write_back refuses any
+// edit of it with EditOutsideLiteral (ruling R27). Mutation: drop
+// `.or_else(|| hit.get(1).copied())` from merge.rs's offending_span -> the
+// split lines stay unlocked and this test's write_back call refuses their
+// Disk picks.
+#[test]
+fn block_directives_lock_the_lines_they_split() {
+    // The reviewer's probe: every entry sits on a split line or reaches one.
+    round_trip(
+        "{\n  \"editor\": \"hx\",\n  {{- if .work }}\n  \"proxy\": \"corp\",\n  {{- end }}\n  \"tabs\": 2\n}\n",
+        "{\n  \"editor\": \"vi\",\n  \"proxy\": \"home\",\n  \"tabs\": 4\n}\n",
+        &["editor", "proxy"],
+        1,
+    );
+    // Removing the entry after the block rewrites the comma on a split line.
+    round_trip(
+        "{\n  \"editor\": \"hx\",\n  {{- if .work }}\n  \"proxy\": \"corp\",\n  {{- end }}\n  \"tabs\": 2\n}\n",
+        "{\n  \"editor\": \"hx\",\n  \"proxy\": \"corp\"\n}\n",
+        &["tabs"],
+        0,
+    );
+    // Lines away from the directives stay free on both sides of them.
+    round_trip(
+        "{\n  \"editor\": \"hx\",\n  \"font\": 12,\n  {{- if .work }}\n  \"proxy\": \"corp\",\n  \"retries\": 3,\n  {{- end }}\n  \"tabs\": 2,\n  \"theme\": \"dark\"\n}\n",
+        "{\n  \"editor\": \"vi\",\n  \"font\": 14,\n  \"proxy\": \"home\",\n  \"retries\": 5,\n  \"tabs\": 4,\n  \"theme\": \"light\"\n}\n",
+        &["font", "retries"],
+        4,
+    );
+}

@@ -24,6 +24,12 @@ pub enum AssembleError {
     Unresolved { id: usize, path: String },
     #[error("the merged JSON does not parse: {error}")]
     Invalid { error: ParseError },
+    /// The splicer could not find the chosen side's text it was handed. The
+    /// decisions `compute` builds always point at real entries, so this is
+    /// an engine bug; the result would silently keep source, so assembly
+    /// refuses instead (ruling R29).
+    #[error("internal: {reason} at {path}")]
+    Internal { path: String, reason: String },
 }
 
 impl StructuredDocument {
@@ -41,14 +47,23 @@ impl StructuredDocument {
                 }
             }
         }
-        let text = self.render(&picks).text;
-        jsonc::parse(&text).map_err(|error| AssembleError::Invalid { error })?;
-        Ok(text)
+        let out = self.render(&picks);
+        if let Some(lost) = out.lost.into_iter().next() {
+            return Err(AssembleError::Internal {
+                path: lost.path,
+                reason: lost.reason,
+            });
+        }
+        jsonc::parse(&out.text).map_err(|error| AssembleError::Invalid { error })?;
+        Ok(out.text)
     }
 
     /// Like assemble, but an unresolved conflict takes Source so the text is always valid (the editor seed).
+    ///
+    /// A display path: a decision the splicer cannot place keeps source here
+    /// and is logged; [`Self::assemble`] refuses it.
     pub fn seed(&self, res: &Resolution) -> String {
-        self.render(&self.seed_picks(res)).text
+        self.logged_render(&self.seed_picks(res)).text
     }
 
     /// For each decision in order, its byte range in `seed(res)`; empty at the insertion point when absent from the result.
@@ -58,7 +73,7 @@ impl StructuredDocument {
     /// element row covers its element's value, and a conflict run from its
     /// first value through its last.
     pub fn result_ranges(&self, res: &Resolution) -> Vec<Range<usize>> {
-        let out = self.render(&self.seed_picks(res));
+        let out = self.logged_render(&self.seed_picks(res));
         self.decisions
             .iter()
             .map(|d| match out.marks.get(&d.id) {
@@ -234,13 +249,29 @@ impl StructuredDocument {
             .collect()
     }
 
+    /// [`Self::render`] for a display path, which cannot return an error:
+    /// every decision the splicer could not place is logged and keeps source.
+    fn logged_render(&self, picks: &[Pick]) -> Out {
+        let out = self.render(picks);
+        for lost in &out.lost {
+            crate::log_error!(
+                "structured",
+                "{} at {}; the display keeps source",
+                lost.reason,
+                lost.path
+            );
+        }
+        out
+    }
+
     /// The result for `picks` (one per decision, never Both), with where
-    /// each decision's text landed.
+    /// each decision's text landed, and the decisions it could not place.
     fn render(&self, picks: &[Pick]) -> Out {
         let src = self.theirs.text.as_str();
         let mut by_container: BTreeMap<NodeId, Vec<usize>> = BTreeMap::new();
         let mut rootless = Vec::new();
         let mut rebuilt = Rebuilt::new();
+        let mut lost = Vec::new();
         for d in &self.decisions {
             match d.site.container {
                 None => rootless.push(d.id),
@@ -254,7 +285,8 @@ impl StructuredDocument {
         let mut containers: Vec<NodeId> = by_container.keys().copied().collect();
         containers.sort_by_key(|&c| self.theirs.node(c).range.len());
         for container in containers {
-            let plan = self.plan(container, &by_container[&container], picks);
+            let mut plan = self.plan(container, &by_container[&container], picks);
+            lost.append(&mut plan.lost);
             if plan.changes() {
                 let range = self.theirs.node(container).range.clone();
                 let out = self.rebuild(container, &plan, &mut rebuilt);
@@ -263,7 +295,8 @@ impl StructuredDocument {
         }
         let mut out = Out::default();
         out.copy_with(src, 0..src.len(), &mut rebuilt);
-        self.append_root(&rootless, picks, &mut out);
+        self.append_root(&rootless, picks, &mut out, &mut lost);
+        out.lost = lost;
         out
     }
 
@@ -284,7 +317,7 @@ impl StructuredDocument {
     /// The source has no root: the chosen entries become a new object after
     /// whatever comments the source holds (or the chosen array, for a root
     /// array decided whole). LF endings, two-space indent, no BOM.
-    fn append_root(&self, ids: &[usize], picks: &[Pick], out: &mut Out) {
+    fn append_root(&self, ids: &[usize], picks: &[Pick], out: &mut Out, lost: &mut Vec<Lost>) {
         let mut inserts = Vec::new();
         let mut whole = None;
         for &id in ids {
@@ -295,7 +328,7 @@ impl StructuredDocument {
                     Some(entry) => {
                         inserts.push(insertion(doc, &Item::of_entry(doc, entry), id, "  ", false))
                     }
-                    None => lost_entry(d, text),
+                    None => lost.push(lost_entry(d, text)),
                 },
                 None => {}
             }
@@ -334,6 +367,7 @@ impl StructuredDocument {
             marks: vec![None; n],
             inserts: (0..=n).map(|_| Vec::new()).collect(),
             absent: vec![Vec::new(); n + 1],
+            lost: Vec::new(),
         };
         for &id in ids {
             let d = &self.decisions[id];
@@ -352,7 +386,7 @@ impl StructuredDocument {
                 let insert = self.chosen(d, pick).and_then(|(doc, text)| {
                     let entry = find_entry(doc, text.range.start, Span::Entry);
                     if entry.is_none() {
-                        lost_entry(d, text);
+                        plan.lost.push(lost_entry(d, text));
                     }
                     entry.map(|entry| {
                         insertion(doc, &Item::of_entry(doc, entry), id, &indent, src.crlf)
@@ -378,7 +412,7 @@ impl StructuredDocument {
                         plan.fates[k] =
                             replacement(&src.text, &items[k], doc, entry, span, src.crlf);
                     }
-                    None => lost_entry(d, text),
+                    None => plan.lost.push(lost_entry(d, text)),
                 },
             }
         }
@@ -403,7 +437,7 @@ impl StructuredDocument {
         for (doc, text) in splice.inserts {
             let items = run_items(doc, text);
             if items.is_empty() {
-                lost_entry(d, text);
+                plan.lost.push(lost_entry(d, text));
             }
             for item in &items {
                 let insert = insertion(doc, item, d.id, indent, self.theirs.crlf);
@@ -588,14 +622,26 @@ fn replaced_span(item: &Item, what: &Change) -> Range<usize> {
     }
 }
 
-fn lost_entry(d: &Decision, text: &SideText) {
-    crate::log_error!(
-        "structured",
-        "decision {} ({}): no entry starts at byte {} of the chosen side; source kept",
-        d.id,
-        d.path,
-        text.range.start
-    );
+/// A decision whose chosen text the splicer could not find: [`Out::lost`].
+#[derive(Debug)]
+struct Lost {
+    path: String,
+    reason: String,
+}
+
+/// Records a chosen side's text that no entry or element starts at. The
+/// decision keeps source in the text; `assemble` turns the record into
+/// `AssembleError::Internal`, the display paths log it. Unreachable while
+/// `compute` builds every `SideText` from a real entry or element range,
+/// so no unit test reaches it (ruling R29).
+fn lost_entry(d: &Decision, text: &SideText) -> Lost {
+    Lost {
+        path: d.path.clone(),
+        reason: format!(
+            "decision {}: no entry starts at byte {} of the chosen side",
+            d.id, text.range.start
+        ),
+    }
 }
 
 /// One member of a container, seen the same way for an object entry and an
@@ -768,6 +814,8 @@ struct Plan {
     inserts: Vec<Vec<Insert>>,
     /// Decisions absent from the result, by the gap they would occupy.
     absent: Vec<Vec<usize>>,
+    /// Decisions whose chosen text could not be found; they keep source.
+    lost: Vec<Lost>,
 }
 
 impl Plan {
@@ -1031,6 +1079,8 @@ struct Out {
     text: String,
     copies: Vec<Verbatim>,
     marks: HashMap<usize, Range<usize>>,
+    /// Set by [`StructuredDocument::render`] on the whole result only.
+    lost: Vec<Lost>,
 }
 
 /// A run of source text copied unchanged.

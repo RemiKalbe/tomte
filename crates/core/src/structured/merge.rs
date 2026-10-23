@@ -42,6 +42,40 @@ pub enum NotStructured {
     ScalarRoot,
     #[error("both sides are empty")]
     BothEmpty,
+    /// Building and comparing values recurses once per level, so a deeper
+    /// document could overflow the background thread's stack (ruling R28).
+    #[error("the JSON nests deeper than {} levels", MAX_DEPTH)]
+    TooDeep { depth: usize },
+}
+
+/// The deepest nesting of objects and arrays [`StructuredDocument::compute`]
+/// accepts. [`detect`] does not check it: it builds no values, so it cannot
+/// overflow, and `compute` reports `TooDeep` on its own.
+pub const MAX_DEPTH: usize = 256;
+
+/// How many objects and arrays nest at the deepest point (a flat object is
+/// 1), counted with an explicit stack so any depth is safe to measure.
+fn nesting_depth(doc: &Document) -> usize {
+    let mut deepest = 0;
+    let mut stack: Vec<(NodeId, usize)> = doc.root.map(|root| (root, 1)).into_iter().collect();
+    while let Some((id, depth)) = stack.pop() {
+        let children: Vec<NodeId> = match &doc.node(id).kind {
+            NodeKind::Object { entries } => entries.iter().map(|e| e.value).collect(),
+            NodeKind::Array { elements } => elements.iter().map(|e| e.value).collect(),
+            _ => continue,
+        };
+        deepest = deepest.max(depth);
+        stack.extend(children.into_iter().map(|child| (child, depth + 1)));
+    }
+    deepest
+}
+
+/// `TooDeep` when `doc` nests deeper than [`MAX_DEPTH`].
+fn check_depth(doc: &Document) -> Result<(), NotStructured> {
+    match nesting_depth(doc) {
+        depth if depth > MAX_DEPTH => Err(NotStructured::TooDeep { depth }),
+        _ => Ok(()),
+    }
 }
 
 fn side_name(side: Side) -> &'static str {
@@ -241,12 +275,19 @@ impl StructuredDocument {
         let ours = parse_side(ours, Side::Ours)?;
         let theirs = parse_side(theirs, Side::Theirs)?;
         let root = check_roots(&ours, &theirs)?;
+        // Before any `Value` is built: building, comparing and dropping one
+        // recurses per level.
+        check_depth(&ours)?;
+        check_depth(&theirs)?;
         // A base of another root shape than the sides cannot be compared key
         // by key, so it degrades like an unparseable one. An empty base is a
         // real, empty base.
         let parsed_base = base
             .and_then(|text| jsonc::parse(text).ok())
             .filter(|doc| matches!(root_of(doc), Root::Empty) || root_of(doc) == root);
+        if let Some(doc) = &parsed_base {
+            check_depth(doc)?;
+        }
         let degraded_base = parsed_base.is_none();
         let base = match parsed_base {
             Some(doc) => doc,
@@ -279,27 +320,24 @@ impl StructuredDocument {
         Ok(document)
     }
 
-    /// Locks every decision whose splice would edit a protected line of
-    /// source. A line is protected when it overlaps a rendered span whose
-    /// origin is anything but an unrepeated template literal, because
-    /// `write_back` refuses an edit there.
+    /// Locks every decision whose splice `write_back` would refuse (ruling
+    /// R27). `write_back` maps each changed run of lines into ONE rendered
+    /// span, and only into an unrepeated template literal. So a decision is
+    /// locked when a run of adjacent lines its splice touches overlaps a span
+    /// that is not `Literal { repeated: false }`, or overlaps more than one
+    /// span. The second case is a line that a block directive such as
+    /// `{{- if .work }}` splits: the literal before the directive ends inside
+    /// the line and the next literal starts there.
     ///
     /// The picks checked are Disk always, LastWritten when the base has the
     /// entry, Both when the row allows it, and Source only for a key that
-    /// source repeats (collapsing the copies edits their lines). The lock
-    /// records the lowest-indexed protected span the touched lines overlap.
+    /// source repeats (collapsing the copies edits their lines). Under the
+    /// current splices Both and Source touch a subset of Disk's lines, so
+    /// their checks only guard a future splice change; LastWritten is not a
+    /// subset (an element removed on both sides: Disk touches nothing, Last
+    /// written puts it back). The lock records the lowest offending span:
+    /// a protected span the run overlaps, else the second span it reaches.
     fn lock_against(&mut self, map: &SpanMap) {
-        let protected: Vec<usize> = (0..map.spans.len())
-            .filter(|&i| {
-                !matches!(
-                    map.spans[i].origin,
-                    SpanOrigin::Literal {
-                        repeated: false,
-                        ..
-                    }
-                )
-            })
-            .collect();
         let locks: Vec<Option<Lock>> = (0..self.decisions.len())
             .map(|id| {
                 let d = &self.decisions[id];
@@ -315,13 +353,7 @@ impl StructuredDocument {
                 }
                 picks
                     .into_iter()
-                    .flat_map(|pick| self.touched_lines(id, pick))
-                    .flat_map(|line| {
-                        protected.iter().copied().filter(move |&i| {
-                            let span = &map.spans[i].range;
-                            line.start < span.end && span.start < line.end
-                        })
-                    })
+                    .filter_map(|pick| offending_span(map, &self.touched_lines(id, pick)))
                     .min()
                     .map(|span| Lock { span })
             })
@@ -371,6 +403,40 @@ impl StructuredDocument {
             Side::Theirs => &self.theirs.text,
         }
     }
+}
+
+/// The span that makes `write_back` refuse an edit of `lines` (sorted,
+/// distinct whole lines), or `None` when every run of adjacent lines sits
+/// inside one unrepeated literal. Overlap is `write_back`'s: an empty span
+/// counts only strictly inside the run.
+fn offending_span(map: &SpanMap, lines: &[Range<usize>]) -> Option<usize> {
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    for line in lines {
+        match runs.last_mut() {
+            Some(run) if run.end == line.start => run.end = line.end,
+            _ => runs.push(line.clone()),
+        }
+    }
+    runs.iter()
+        .filter_map(|run| {
+            let hit: Vec<usize> = (0..map.spans.len())
+                .filter(|&i| {
+                    let span = &map.spans[i].range;
+                    run.start < span.end && span.start < run.end
+                })
+                .collect();
+            let protected = hit.iter().copied().find(|&i| {
+                !matches!(
+                    map.spans[i].origin,
+                    SpanOrigin::Literal {
+                        repeated: false,
+                        ..
+                    }
+                )
+            });
+            protected.or_else(|| hit.get(1).copied())
+        })
+        .min()
 }
 
 /// `Some(root node)` when the document's root has the given type.
@@ -1360,5 +1426,132 @@ mod tests {
         let d = doc(Some(&base), ours, EMAIL_THEIRS);
         assert!(d.decisions.iter().all(|d| d.locked.is_none()));
         assert_eq!(d.required_decisions(), vec![0]);
+    }
+
+    /// `{{- if .work }}` and `{{- end }}` trim the newline before them, so
+    /// the literal before each directive ends inside the line above it and
+    /// the next literal starts there: lines 2 and 3 each belong to two spans.
+    const BLOCK_TMPL: &str = "{\n  \"editor\": \"hx\",\n  {{- if .work }}\n  \"proxy\": \"corp\",\n  {{- end }}\n  \"tabs\": 2\n}\n";
+    const BLOCK_THEIRS: &str =
+        "{\n  \"editor\": \"hx\",\n  \"proxy\": \"corp\",\n  \"tabs\": 2\n}\n";
+
+    fn locked_paths(d: &StructuredDocument) -> Vec<&str> {
+        d.decisions
+            .iter()
+            .filter(|d| d.locked.is_some())
+            .map(|d| d.path.as_str())
+            .collect()
+    }
+
+    // Mutation: drop `.or_else(|| hit.get(1).copied())` from offending_span
+    // (only protected spans lock, the pre-R27 rule) -> "editor" and "proxy"
+    // are unlocked, and write_back refuses their Disk picks.
+    #[test]
+    fn a_line_split_by_a_block_directive_is_locked() {
+        let map = map_for(BLOCK_TMPL, BLOCK_THEIRS);
+        assert!(map.spans.iter().all(|s| matches!(
+            s.origin,
+            SpanOrigin::Literal {
+                repeated: false,
+                ..
+            }
+        )));
+        // A value change on each line of the block's edges.
+        let ours = "{\n  \"editor\": \"vi\",\n  \"proxy\": \"home\",\n  \"tabs\": 4\n}\n";
+        let d = locked_doc(BLOCK_TMPL, ours, BLOCK_THEIRS);
+        assert_eq!(locked_paths(&d), vec!["editor", "proxy"]);
+        // The recorded span is the literal the line reaches into: the one
+        // that starts after `{{- if .work }}`.
+        let editor = d.decisions[0].locked.unwrap();
+        assert_eq!(editor.span, 1);
+        // "tabs" sits on a line inside the last literal alone.
+        let tabs = d.decisions.iter().find(|d| d.path == "tabs").unwrap();
+        assert!(tabs.locked.is_none());
+        // Removing the last entry rewrites the comma on the "proxy" line.
+        let ours = "{\n  \"editor\": \"hx\",\n  \"proxy\": \"corp\"\n}\n";
+        let d = locked_doc(BLOCK_TMPL, ours, BLOCK_THEIRS);
+        assert_eq!(locked_paths(&d), vec!["tabs"]);
+    }
+
+    // Mutation: delete the `picks.push(Pick::LastWritten)` line in
+    // lock_against -> the row stays unlocked, because its Disk pick (keep
+    // the element removed) touches no line at all.
+    #[test]
+    fn a_last_written_only_splice_onto_a_templated_line_locks() {
+        let tmpl = "{\n  \"a\": [\n    {{ .one }},\n    3\n  ]\n}\n";
+        let theirs = "{\n  \"a\": [\n    1,\n    3\n  ]\n}\n";
+        let base = "{\n  \"a\": [\n    1,\n    2,\n    3\n  ]\n}\n";
+        let map = map_for(tmpl, theirs);
+        let d = StructuredDocument::compute(Some(base), theirs, theirs, Some(&map)).unwrap();
+        assert_eq!(
+            kinds(&d),
+            vec![row("a[1]", RegionKind::BothSame, Change::Removed)]
+        );
+        assert!(d.touched_lines(0, Pick::Disk).is_empty());
+        let lock = d.decisions[0]
+            .locked
+            .expect("last written would edit {{ .one }}'s line");
+        assert!(matches!(
+            map.spans[lock.span].origin,
+            SpanOrigin::Action { .. }
+        ));
+        // Without the template line the same row is free.
+        let plain = map_for(theirs, theirs);
+        let d = StructuredDocument::compute(Some(base), theirs, theirs, Some(&plain)).unwrap();
+        assert!(d.decisions[0].locked.is_none());
+    }
+
+    // Both and Source have no lock-only case to test: under the current
+    // splices their touched lines are a subset of Disk's. This pins that
+    // claim (the lock_against doc comment relies on it). Mutations, each in
+    // touched_lines: (1) collapse the repeated "k" only under Source -> Source
+    // touches the first copy's line and Disk does not; (2) skip the
+    // insertion span under Disk -> Both touches the "1," line and Disk does
+    // not.
+    #[test]
+    fn both_and_source_touch_no_line_disk_does_not() {
+        let base = "{\n  \"a\": [\n    1,\n    2,\n    3\n  ],\n  \"k\": 1,\n  \"k\": 2\n}\n";
+        let ours = "{\n  \"a\": [\n    1,\n    9,\n    3\n  ],\n  \"k\": 5\n}\n";
+        let theirs = "{\n  \"a\": [\n    1,\n    8,\n    3\n  ],\n  \"k\": 1,\n  \"k\": 3\n}\n";
+        let d = doc(Some(base), ours, theirs);
+        assert!(d.decisions.iter().any(|d| d.both_allowed));
+        assert!(
+            d.decisions
+                .iter()
+                .any(|d| d.duplicated == Some(Side::Theirs))
+        );
+        for row in &d.decisions {
+            let disk = d.touched_lines(row.id, Pick::Disk);
+            for pick in [Pick::Both, Pick::Source] {
+                for line in d.touched_lines(row.id, pick) {
+                    assert!(disk.contains(&line), "{} {pick:?} {line:?}", row.path);
+                }
+            }
+        }
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    // Mutation: drop the two `check_depth` calls on the sides in compute ->
+    // the 300-deep pair is accepted (the test build's main thread has room
+    // for 300 levels), so the TooDeep assertion fails.
+    #[test]
+    fn compute_refuses_nesting_deeper_than_the_cap() {
+        let deep = nested(300);
+        assert_eq!(
+            StructuredDocument::compute(None, &deep, &deep, None).err(),
+            Some(NotStructured::TooDeep { depth: 300 })
+        );
+        assert_eq!(
+            NotStructured::TooDeep { depth: 300 }.to_string(),
+            "the JSON nests deeper than 256 levels"
+        );
+        let edge = nested(MAX_DEPTH);
+        assert!(StructuredDocument::compute(None, &edge, &edge, None).is_ok());
+        let over = nested(MAX_DEPTH + 1);
+        assert!(StructuredDocument::compute(None, &over, &edge, None).is_err());
+        assert_eq!(nesting_depth(&jsonc::parse("{\"a\":[{}]}").unwrap()), 3);
     }
 }

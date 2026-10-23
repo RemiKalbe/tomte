@@ -225,9 +225,10 @@ Rules:
 For each decision, the engine computes the splice (§5.4) that every
 non-source pick would make, including glue on neighbouring entries. The
 write-back maps edits at line granularity, so the rule is at line
-granularity: a pick is offered only if every line of the source text that
-the splice touches lies entirely inside unrepeated literal spans
-(`SpanOrigin::Literal { repeated: false }`) of the span map. Otherwise the
+granularity: a pick is offered only if every run of adjacent source lines
+that the splice touches overlaps exactly one span of the span map, and that
+span is an unrepeated literal (`SpanOrigin::Literal { repeated: false }`),
+matching `write_back`'s one-literal-per-hunk rule (ruling R27). Otherwise the
 decision is `locked`, resolves to source, counts as neither a conflict nor
 a decision owed, and records the offending span's index. The view turns
 that into the template line with the lookup the line editor already uses

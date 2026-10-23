@@ -104,12 +104,14 @@ impl StructuredState {
     }
 
     /// The assembled result once every conflict has a pick; `Ok(None)` while
-    /// any is open. A result that does not re-parse is an error, never `None`.
+    /// any is open. Every other error passes through unchanged (a result
+    /// that does not re-parse, a decision the splicer could not place),
+    /// never `None`.
     pub fn assembled(&self) -> Result<Option<String>, AssembleError> {
         match self.doc.assemble(&self.resolution) {
             Ok(text) => Ok(Some(text)),
             Err(AssembleError::Unresolved { .. }) => Ok(None),
-            Err(invalid @ AssembleError::Invalid { .. }) => Err(invalid),
+            Err(other) => Err(other),
         }
     }
 
