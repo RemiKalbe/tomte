@@ -419,7 +419,110 @@ fn templated_inputs() -> MergeInputs {
     }
 }
 
-fn posed_merge(
+/// A Zed-style JSONC settings file for Structure mode: a conflict on
+/// "theme" (both sides changed it differently), "font_size" changed on disk,
+/// "vim_mode" added on disk, and one "plugins" element added in source.
+/// Decision 0 is the "theme" conflict.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the gallery poses that use it arrive with Task 13"
+    )
+)]
+pub(super) fn json_inputs() -> MergeInputs {
+    let base = concat!(
+        "{\n",
+        "  // Zed settings\n",
+        "  \"theme\": \"One Dark\",\n",
+        "  \"font_size\": 14,\n",
+        "  \"plugins\": [\n",
+        "    \"git\"\n",
+        "  ]\n",
+        "}\n",
+    );
+    let ours = concat!(
+        "{\n",
+        "  // Zed settings\n",
+        "  \"theme\": \"Gruvbox\",\n",
+        "  \"font_size\": 15,\n",
+        "  \"vim_mode\": true,\n",
+        "  \"plugins\": [\n",
+        "    \"git\"\n",
+        "  ]\n",
+        "}\n",
+    );
+    let theirs = concat!(
+        "{\n",
+        "  // Zed settings\n",
+        "  \"theme\": \"Solarized\",\n",
+        "  \"font_size\": 14,\n",
+        "  \"plugins\": [\n",
+        "    \"git\",\n",
+        "    \"copilot\"\n",
+        "  ]\n",
+        "}\n",
+    );
+    MergeInputs {
+        target: home(".config/zed/settings.json"),
+        ours: ours.into(),
+        theirs: theirs.into(),
+        base: Some(base.into()),
+        source_path: home(".local/share/chezmoi/dot_config/zed/settings.json"),
+        templated: false,
+        template: None,
+        span_map: None,
+        origin: None,
+    }
+}
+
+/// A templated JSON source with a real span map (lex + anchor, as
+/// [`templated_inputs`] does): "email" renders from a template action, so
+/// its decision (disk changed it) is locked to source; "font_size" changed
+/// on disk stays an ordinary row.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the gallery poses that use it arrive with Task 13"
+    )
+)]
+pub(super) fn json_templated_inputs() -> MergeInputs {
+    let template = concat!(
+        "{\n",
+        "  \"email\": \"{{ .email }}\",\n",
+        "  \"font_size\": 14\n",
+        "}\n",
+    );
+    let theirs = concat!(
+        "{\n",
+        "  \"email\": \"me@example.com\",\n",
+        "  \"font_size\": 14\n",
+        "}\n",
+    );
+    let ours = concat!(
+        "{\n",
+        "  \"email\": \"other@example.com\",\n",
+        "  \"font_size\": 15\n",
+        "}\n",
+    );
+    let span_map = lex(template)
+        .ok()
+        .map(|segments| anchor(template, &segments, theirs));
+    MergeInputs {
+        target: home(".config/app/settings.json"),
+        ours: ours.into(),
+        theirs: theirs.into(),
+        base: Some(theirs.into()),
+        source_path: home(".local/share/chezmoi/dot_config/app/settings.json.tmpl"),
+        templated: true,
+        template: Some(template.into()),
+        span_map,
+        origin: None,
+    }
+}
+
+pub(super) fn posed_merge(
     cx: &mut Context<Shell>,
     inputs: MergeInputs,
     resolve_all: bool,

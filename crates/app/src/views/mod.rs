@@ -5,6 +5,7 @@ pub mod changelog;
 pub mod dashboard;
 pub mod fixtures;
 pub mod merge;
+mod merge_structured;
 pub mod review;
 mod review_selection;
 mod review_tree;
@@ -6403,5 +6404,384 @@ mod render_smoke {
         });
         assert_ne!(rows, before, "the change altered the row count");
         assert_eq!(items, rows + 1, "rows plus the In sync footer");
+    }
+
+    // ---- Structure mode in the merge editor (structured-merge Task 10) ----
+
+    /// `debug_bounds` wants a `&'static str`; leaking a short selector per
+    /// lookup is the price of keying it by decision id.
+    fn leak(selector: String) -> &'static str {
+        Box::leak(selector.into_boxed_str())
+    }
+
+    /// A merge editor posed on `inputs` inside a Shell on the merge route,
+    /// with the merge editor's key bindings registered.
+    fn structured_merge_window(
+        cx: &mut TestAppContext,
+        inputs: tomte_app::merge_inputs::MergeInputs,
+    ) -> (
+        Entity<Shell>,
+        Entity<merge::MergeView>,
+        &mut VisualTestContext,
+    ) {
+        cx.update(merge::register_keys);
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            let mut s = fixtures::build("merge-resolved", smoke_paths(), cx)
+                .expect("merge-resolved fixture");
+            s.merge = Some(fixtures::posed_merge(cx, inputs, false));
+            s
+        });
+        let merge = vis
+            .update(|_w, cx| shell.read(cx).merge.clone())
+            .expect("posed merge");
+        vis.run_until_parked();
+        (shell, merge, vis)
+    }
+
+    fn result_text(merge: &Entity<merge::MergeView>, vis: &mut VisualTestContext) -> String {
+        vis.update(|_w, cx| merge.read(cx).result_text_for_test(cx))
+    }
+
+    /// A JSON file opens in Structure mode with one strip per decision,
+    /// each strip labelled with its key path.
+    ///
+    /// MUTATION: `LoadedMerge::new` never runs `detect` (the structured load
+    /// returns an error) → mode stays Lines, `structured` is None and no
+    /// `merge-strip:<id>` selector renders.
+    #[gpui::test]
+    fn json_inputs_open_in_structure_mode_with_one_strip_per_decision(cx: &mut TestAppContext) {
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let (mode, ids, specs) = vis.update(|_w, cx| {
+            let view = merge.read(cx);
+            let loaded = view.loaded.as_ref().expect("loaded");
+            let state = loaded.structured.as_ref().expect("a structured document");
+            (
+                loaded.mode,
+                state.doc.decisions.iter().map(|d| d.id).collect::<Vec<_>>(),
+                merge_structured::strip_specs(state, &HashSet::new(), None, None),
+            )
+        });
+        assert_eq!(mode, merge::MergeMode::Structure);
+        assert_eq!(
+            ids.len(),
+            4,
+            "theme, font_size, vim_mode, one plugins element"
+        );
+        assert_eq!(specs.len(), ids.len(), "one strip per decision");
+        assert_eq!(specs[0].label.as_ref(), "theme");
+        assert_eq!(specs[0].detail.as_ref(), "conflict");
+        for id in ids {
+            let selector = leak(format!("merge-strip:{id}"));
+            assert!(vis.debug_bounds(selector).is_some(), "{selector} renders");
+        }
+    }
+
+    /// A real click on a strip's disk button rewrites the result text, and
+    /// ⌘Z through the merge editor's binding puts source back.
+    ///
+    /// MUTATION: `apply_pick` writes to the LINE resolution
+    /// (`loaded.state`) instead of the structured one → the result text
+    /// still reads "Solarized" after the click.
+    #[gpui::test]
+    fn a_strip_pick_changes_the_result_text(cx: &mut TestAppContext) {
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let before = result_text(&merge, vis);
+        assert!(
+            before.contains("\"Solarized\"") && !before.contains("\"Gruvbox\""),
+            "an open conflict seeds source: {before}"
+        );
+        let pick = vis
+            .debug_bounds("merge-strip-pick:0:disk")
+            .expect("the theme conflict offers disk");
+        vis.simulate_click(pick.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        let picked = result_text(&merge, vis);
+        assert!(
+            picked.contains("\"Gruvbox\"") && !picked.contains("\"Solarized\""),
+            "disk's theme replaced source's: {picked}"
+        );
+
+        vis.simulate_keystrokes("cmd-z");
+        vis.run_until_parked();
+        let undone = result_text(&merge, vis);
+        assert_eq!(undone, before, "undo restores the source value");
+        let pick_after_undo = vis.update(|_w, cx| {
+            merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap()
+                .resolution
+                .get(0)
+        });
+        assert_eq!(pick_after_undo, None);
+    }
+
+    /// Save in Structure mode queues the structured assembly, not the line
+    /// merge's text.
+    ///
+    /// MUTATION: `save` ignores the mode and assembles the LINE state → the
+    /// line merge still has an open conflict, nothing is queued and the
+    /// `expect` on the queued action fails.
+    #[gpui::test]
+    fn save_in_structure_mode_enqueues_the_assembled_json(cx: &mut TestAppContext) {
+        use tomte_core::structured::Pick;
+        let (shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let expected = vis.update(|_w, cx| {
+            merge.update(cx, |view, cx| {
+                let conflicts = view
+                    .loaded
+                    .as_ref()
+                    .unwrap()
+                    .structured
+                    .as_ref()
+                    .unwrap()
+                    .conflicts();
+                assert_eq!(conflicts, vec![0]);
+                for id in conflicts {
+                    view.apply_pick(id, Pick::Disk, cx);
+                }
+                let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
+                state.assembled().expect("valid").expect("fully resolved")
+            })
+        });
+        vis.update(|_w, cx| merge.update(cx, |view, cx| view.save(cx)));
+        vis.run_until_parked();
+        let action = vis
+            .update(|_w, cx| {
+                shell.update(cx, |s, _| {
+                    s.queue
+                        .running()
+                        .first()
+                        .cloned()
+                        .or_else(|| s.queue.take_batch().into_iter().next())
+                })
+            })
+            .expect("the save is on the queue");
+        match action.decision {
+            Decision::Merged { resolved, .. } => {
+                assert_eq!(resolved, expected);
+                assert!(resolved.contains("\"Gruvbox\""));
+                assert!(tomte_core::structured::jsonc::parse(&resolved).is_ok());
+            }
+            other => panic!("expected a merged decision, got {:?}", other.label()),
+        }
+    }
+
+    /// The Lines toggle switches at once with no picks made; with a pick it
+    /// arms a confirmation first and switches on the second click.
+    ///
+    /// MUTATION: `set_mode` switches without arming when picks exist → the
+    /// mode is Lines after the first click and the banner assertion fails.
+    /// MUTATION: `install_result_decorator` keeps installing the structured
+    /// strips in Lines mode → `structured_blocks` is not 0.
+    #[gpui::test]
+    fn the_lines_toggle_shows_the_line_editor_and_arms_a_confirmation_when_picks_exist(
+        cx: &mut TestAppContext,
+    ) {
+        use tomte_core::structured::Pick;
+        {
+            let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+            assert!(vis.update(|_w, cx| merge.read(cx).structured_blocks) > 0);
+            let lines = vis
+                .debug_bounds("merge-mode-lines")
+                .expect("the toggle renders");
+            vis.simulate_click(lines.center(), gpui::Modifiers::default());
+            vis.run_until_parked();
+            let (mode, blocks, banner) = vis.update(|_w, cx| {
+                let v = merge.read(cx);
+                (
+                    v.loaded.as_ref().unwrap().mode,
+                    v.structured_blocks,
+                    v.banner.clone(),
+                )
+            });
+            assert_eq!(
+                mode,
+                merge::MergeMode::Lines,
+                "no picks: one click switches"
+            );
+            assert_eq!(blocks, 0, "no structured strip in the line editor");
+            assert!(banner.is_none(), "nothing to confirm");
+            let text = result_text(&merge, vis);
+            assert!(
+                text.contains("\"Gruvbox\"") && text.contains("\"Solarized\""),
+                "the line editor inlines disk then source for the open conflict: {text}"
+            );
+        }
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
+        vis.run_until_parked();
+        let lines = vis
+            .debug_bounds("merge-mode-lines")
+            .expect("the toggle renders");
+        vis.simulate_click(lines.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        let (mode, banner) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            (v.loaded.as_ref().unwrap().mode, v.banner.clone())
+        });
+        assert_eq!(
+            mode,
+            merge::MergeMode::Structure,
+            "the first click only arms"
+        );
+        let banner = banner.expect("the armed switch says what it discards");
+        assert!(
+            banner.text.starts_with("Switching to Lines discards"),
+            "{}",
+            banner.text
+        );
+        vis.simulate_click(lines.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        let (mode, pick, banner) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            let loaded = v.loaded.as_ref().unwrap();
+            (
+                loaded.mode,
+                loaded.structured.as_ref().unwrap().resolution.get(0),
+                v.banner.clone(),
+            )
+        });
+        assert_eq!(mode, merge::MergeMode::Lines, "the second click switches");
+        assert_eq!(pick, None, "the structure picks are discarded");
+        assert!(banner.is_none());
+    }
+
+    /// An assembly that does not re-parse is the message-box state: the
+    /// picks stay, nothing is queued, and the header still offers Lines.
+    ///
+    /// MUTATION: map `Err(Invalid)` to a disabled Save (return early without
+    /// setting `error`) → no message box (`error` is None), nothing logged.
+    #[gpui::test]
+    fn an_invalid_assembly_is_a_message_box_that_keeps_the_picks_and_offers_lines(
+        cx: &mut TestAppContext,
+    ) {
+        use tomte_core::structured::Pick;
+        let (shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        vis.update(|_w, cx| {
+            merge.update(cx, |v, cx| {
+                v.loaded
+                    .as_mut()
+                    .unwrap()
+                    .structured
+                    .as_mut()
+                    .unwrap()
+                    .doc
+                    .corrupt_source_for_tests();
+                v.apply_pick(0, Pick::Disk, cx);
+                v.save(cx);
+            })
+        });
+        vis.run_until_parked();
+        let (error, pick, mode) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            let loaded = v.loaded.as_ref().unwrap();
+            (
+                v.error.clone(),
+                loaded.structured.as_ref().unwrap().resolution.get(0),
+                loaded.mode,
+            )
+        });
+        let error = error.expect("a message box");
+        assert!(error.contains("does not parse"), "{error}");
+        assert_eq!(pick, Some(Pick::Disk), "the picks stay");
+        assert_eq!(mode, merge::MergeMode::Structure);
+        vis.update(|_w, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.depth(), 0, "nothing was queued");
+            assert_eq!(s.route, Route::Merge, "the editor stays open");
+        });
+        assert!(
+            vis.debug_bounds("merge-mode-lines").is_some(),
+            "the header offers Lines"
+        );
+    }
+
+    /// The pick keys land on the structured cursor in Structure mode; a key
+    /// the decision cannot take (b on a key row) is ignored and leaves the
+    /// line resolution alone.
+    ///
+    /// MUTATION: `pick_key` drops the Structure branch's `apply_pick` →
+    /// "1" changes nothing and the resolution stays None.
+    /// MUTATION: `pick_allowed` accepts Both on a key row → "b" lands a pick.
+    #[gpui::test]
+    fn pick_keys_route_to_the_structured_cursor(cx: &mut TestAppContext) {
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let picks = |vis: &mut VisualTestContext| {
+            vis.update(|_w, cx| {
+                let loaded = merge.read(cx).loaded.as_ref().unwrap();
+                (
+                    loaded.structured.as_ref().unwrap().resolution.get(0),
+                    loaded.state.resolution.get(0).cloned(),
+                )
+            })
+        };
+        vis.simulate_keystrokes("b");
+        vis.run_until_parked();
+        assert_eq!(picks(vis), (None, None), "a key row has no both");
+        vis.simulate_keystrokes("1");
+        vis.run_until_parked();
+        assert_eq!(
+            picks(vis),
+            (Some(Pick::Disk), None),
+            "1 picks disk on the theme conflict"
+        );
+        assert!(result_text(&merge, vis).contains("\"Gruvbox\""));
+    }
+
+    /// A templated key's strip reads as locked and offers no buttons.
+    ///
+    /// MUTATION: `strip_specs` ignores `locked` (builds `Deciding`) → the
+    /// locked strip renders a disk button.
+    #[gpui::test]
+    fn a_locked_strip_has_no_buttons(cx: &mut TestAppContext) {
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_templated_inputs());
+        let (locked, specs) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            let loaded = v.loaded.as_ref().unwrap();
+            assert_eq!(loaded.mode, merge::MergeMode::Structure);
+            let state = loaded.structured.as_ref().unwrap();
+            let locked = state
+                .doc
+                .decisions
+                .iter()
+                .find(|d| d.locked.is_some())
+                .map(|d| d.id)
+                .expect("the templated email is locked");
+            (
+                locked,
+                merge_structured::strip_specs(
+                    state,
+                    &HashSet::new(),
+                    loaded.inputs.template.as_deref(),
+                    loaded.inputs.span_map.as_ref(),
+                ),
+            )
+        });
+        match &specs[locked].kind {
+            merge_structured::StripKind::Locked { reason, .. } => assert!(
+                reason.contains("{{ .email }}"),
+                "the hover names the template line: {reason}"
+            ),
+            other => panic!("expected a locked strip, got {other:?}"),
+        }
+        assert!(
+            vis.debug_bounds(leak(format!("merge-strip:{locked}")))
+                .is_some()
+        );
+        assert!(
+            vis.debug_bounds(leak(format!("merge-strip-pick:{locked}:disk")))
+                .is_none(),
+            "a locked strip has no buttons"
+        );
+        assert!(
+            vis.debug_bounds(leak(format!("merge-strip-edit:{locked}")))
+                .is_none()
+        );
     }
 }

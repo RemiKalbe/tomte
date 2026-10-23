@@ -169,6 +169,12 @@ fn state_words(detail: Option<SharedString>, fallback: &'static str) -> SharedSt
 ///
 /// All behavior arrives via `on_pick` / `on_edit` / `on_revisit` so the
 /// builder stays pure.
+///
+/// `selector_prefix` gives tests a handle on the strip (a no-op outside
+/// test-support builds): with `Some("p")` the strip root carries the debug
+/// selector `p:<region_ix>`, each pick button `p-pick:<region_ix>:<pick>`
+/// (`disk`, `source`, `origin`, `last-written`, `both`), the edit button
+/// `p-edit:<region_ix>` and the revisit button `p-revisit:<region_ix>`.
 #[allow(clippy::too_many_arguments)]
 pub fn decision_strip(
     theme: Theme,
@@ -176,6 +182,7 @@ pub fn decision_strip(
     state: StripState,
     label: Option<SharedString>,
     detail: Option<SharedString>,
+    selector_prefix: Option<SharedString>,
     on_pick: impl Fn(Pick, &ClickEvent, &mut Window, &mut App) + Clone + 'static,
     on_edit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_revisit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -243,6 +250,7 @@ pub fn decision_strip(
             let pick_button = |id: &'static str, pick: Pick, label: &'static str, tint: Rgba| {
                 let on_pick = on_pick.clone();
                 let selected = current == Some(pick.kind());
+                let selector = pick_selector(&pick);
                 button(
                     theme,
                     ElementId::named_usize(id, region_ix),
@@ -252,7 +260,11 @@ pub fn decision_strip(
                     move |ev, window, cx| on_pick(pick.clone(), ev, window, cx),
                 )
                 .when(selected, |el| el.bg(Theme::wash(tint, 0.2)))
+                .when_some(selector_prefix.clone(), |el, prefix| {
+                    el.debug_selector(|| format!("{prefix}-pick:{region_ix}:{selector}"))
+                })
             };
+            let edit_selector = selector_prefix.clone();
             card.child(lead(Some((
                 state_words(
                     detail,
@@ -295,37 +307,52 @@ pub fn decision_strip(
                 el.child(pick_button("pick-both", Pick::Both, "both", theme.ok))
             })
             .child(divider(theme))
-            .child(button(
-                theme,
-                ElementId::named_usize("edit-region", region_ix),
-                "edit".into(),
-                ButtonVariant::Ghost,
-                ButtonSize::Micro,
-                on_edit,
-            ))
+            .child(
+                button(
+                    theme,
+                    ElementId::named_usize("edit-region", region_ix),
+                    "edit".into(),
+                    ButtonVariant::Ghost,
+                    ButtonSize::Micro,
+                    on_edit,
+                )
+                .when_some(edit_selector, |el, prefix| {
+                    el.debug_selector(|| format!("{prefix}-edit:{region_ix}"))
+                }),
+            )
         }
         StripState::Decided { choice, .. } => card
             .child(lead(Some((
                 SharedString::from(format!("resolved · {}", choice.label())),
                 theme.text_muted,
             ))))
-            .child(button(
-                theme,
-                ElementId::named_usize("revisit-region", region_ix),
-                "revisit".into(),
-                ButtonVariant::Ring(theme.text_muted),
-                ButtonSize::Micro,
-                on_revisit,
-            ))
+            .child(
+                button(
+                    theme,
+                    ElementId::named_usize("revisit-region", region_ix),
+                    "revisit".into(),
+                    ButtonVariant::Ring(theme.text_muted),
+                    ButtonSize::Micro,
+                    on_revisit,
+                )
+                .when_some(selector_prefix.clone(), |el, prefix| {
+                    el.debug_selector(|| format!("{prefix}-revisit:{region_ix}"))
+                }),
+            )
             .child(divider(theme))
-            .child(button(
-                theme,
-                ElementId::named_usize("edit-region", region_ix),
-                "edit".into(),
-                ButtonVariant::Ghost,
-                ButtonSize::Micro,
-                on_edit,
-            )),
+            .child(
+                button(
+                    theme,
+                    ElementId::named_usize("edit-region", region_ix),
+                    "edit".into(),
+                    ButtonVariant::Ghost,
+                    ButtonSize::Micro,
+                    on_edit,
+                )
+                .when_some(selector_prefix.clone(), |el, prefix| {
+                    el.debug_selector(|| format!("{prefix}-edit:{region_ix}"))
+                }),
+            ),
         StripState::Locked { reason, .. } => card
             .child(lead(detail.map(|d| (d, theme.text_muted))))
             // The hover text names the template line that owns the entry.
@@ -350,7 +377,21 @@ pub fn decision_strip(
         .px_1()
         .flex()
         .items_center()
+        .when_some(selector_prefix, |el, prefix| {
+            el.debug_selector(|| format!("{prefix}:{region_ix}"))
+        })
         .child(body)
+}
+
+/// The suffix a pick button's debug selector ends in.
+fn pick_selector(pick: &Pick) -> &'static str {
+    match pick {
+        Pick::Ours => "disk",
+        Pick::Theirs => "source",
+        Pick::Origin(_) => "origin",
+        Pick::Base => "last-written",
+        Pick::Both => "both",
+    }
 }
 
 /// Hairline vertical rule separating action groups inside a strip.
