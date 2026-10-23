@@ -356,9 +356,10 @@ impl StructuredDocument {
     }
 
     /// Whether the last written text had this entry, so `LastWritten` can be
-    /// offered.
+    /// offered. False whenever the base is degraded: the substituted source
+    /// is not a last-written state.
     pub fn has_base(&self, id: usize) -> bool {
-        self.decisions[id].base.is_some()
+        !self.degraded_base && self.decisions[id].base.is_some()
     }
 
     /// The full text of a side. `Base` is the effective base: source when the
@@ -1041,6 +1042,18 @@ mod tests {
         );
         assert!(d.decisions[0].ours.is_none());
         assert!(!d.decisions[0].both_allowed);
+    }
+
+    // Mutation: drop the degraded check in `has_base`.
+    #[test]
+    fn has_base_is_false_in_two_way() {
+        let two_way = doc(None, "{\"a\":1}", "{\"a\":2}");
+        assert!(two_way.degraded_base);
+        assert_eq!(two_way.decisions.len(), 1);
+        assert!(!two_way.has_base(0));
+        let three_way = doc(Some("{\"a\":0}"), "{\"a\":1}", "{\"a\":2}");
+        assert!(!three_way.degraded_base);
+        assert!(three_way.has_base(0));
     }
 
     // Mutation: has_base always returns true.

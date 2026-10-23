@@ -320,8 +320,14 @@ mod tests {
         assert_eq!(state.progress(), (0, 0));
         assert_eq!(state.cursor, None);
         assert!(!state.nothing_to_decide(), "disk differs from source");
-        // The engine stands source in for the missing base, so `has_base`
-        // is true here; the view must gate LastWritten on `degraded_base`.
+        assert!(
+            state
+                .doc
+                .decisions
+                .iter()
+                .all(|d| !state.doc.has_base(d.id)),
+            "no decision has a last-written side"
+        );
         assert!(
             state
                 .doc
