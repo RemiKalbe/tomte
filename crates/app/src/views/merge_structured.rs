@@ -510,21 +510,23 @@ pub(super) fn invalid_json_line(text: &str) -> Option<usize> {
 
 /// The line editor's header note for a file that does not merge
 /// structurally (spec §7): "disk is not valid JSON (line 12): line merge"
-/// or "disk and source are different JSON shapes: line merge". Shown only
-/// when the file looked like JSON (spec §4), so a shell file says nothing;
-/// a scalar root or two empty sides say nothing either.
+/// or "disk and source are different JSON shapes: line merge". A scalar
+/// root gets the shapes wording too (spec §7 names both under one note);
+/// [`NotStructured`]'s own text for it stays more specific. Shown only when
+/// the file looked like JSON (spec §4), so a shell file says nothing; two
+/// empty sides say nothing either.
 pub(super) fn not_structured_note(
     target: &Path,
     ours: &str,
     theirs: &str,
     why: Option<&NotStructured>,
 ) -> Option<String> {
-    let why = why?;
-    let named = matches!(
-        why,
-        NotStructured::Parse { .. } | NotStructured::ShapeMismatch
-    );
-    (named && looked_like_json(target, ours, theirs)).then(|| format!("{why}: line merge"))
+    let why = match why? {
+        NotStructured::BothEmpty => return None,
+        NotStructured::ScalarRoot => &NotStructured::ShapeMismatch,
+        other => other,
+    };
+    looked_like_json(target, ours, theirs).then(|| format!("{why}: line merge"))
 }
 
 /// The chip's words for an invalid line.
@@ -799,9 +801,10 @@ mod tests {
     }
 
     // MUTATION: drop the `looked_like_json` check → the .zshrc parse error
-    // gets a note. MUTATION: drop the variant filter → the scalar root and
-    // the both-empty case get one. MUTATION: name the side wrongly in the
-    // Display text → the source line reads "disk".
+    // gets a note. MUTATION: drop the BothEmpty arm → the both-empty case
+    // gets one. MUTATION: treat ScalarRoot like BothEmpty → the scalar root
+    // has no note. MUTATION: name the side wrongly in the Display text →
+    // the source line reads "disk".
     #[test]
     fn the_note_names_parse_errors_and_shapes_on_json_looking_files_only() {
         use std::path::Path;
@@ -821,8 +824,8 @@ mod tests {
             Some("disk and source are different JSON shapes: line merge")
         );
         assert_eq!(
-            not_structured_note(json, "1", "2", Some(&NotStructured::ScalarRoot)),
-            None
+            not_structured_note(json, "1", "2", Some(&NotStructured::ScalarRoot)).as_deref(),
+            Some("disk and source are different JSON shapes: line merge")
         );
         assert_eq!(
             not_structured_note(json, "", "", Some(&NotStructured::BothEmpty)),
