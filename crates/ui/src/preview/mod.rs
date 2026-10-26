@@ -24,7 +24,10 @@ pub const COMPONENTS: &[(&str, &str)] = &[
         "off / partial / on, and forced-visible in a row",
     ),
     ("folder-row", "expanded, collapsed, partial-checked, n of m"),
-    ("icon-button", "folder-tree toggle: off and on"),
+    (
+        "icon-button",
+        "folder-tree and fold-identical toggles: off and on",
+    ),
     (
         "structure-row",
         "tree rows: same, open conflict, picked, locked, folded",
@@ -452,6 +455,32 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                     folder_tree(theme),
                     true,
                     "Folder tree".into(),
+                    noop,
+                )
+                .into_any_element(),
+            ))
+            .child(variant(
+                theme,
+                "fold identical, off",
+                icon_button(
+                    theme,
+                    "prev-ib-fold-off",
+                    chevrons_down_up(theme),
+                    false,
+                    "Fold identical".into(),
+                    noop,
+                )
+                .into_any_element(),
+            ))
+            .child(variant(
+                theme,
+                "fold identical, on",
+                icon_button(
+                    theme,
+                    "prev-ib-fold-on",
+                    chevrons_down_up(theme),
+                    true,
+                    "Fold identical".into(),
                     noop,
                 )
                 .into_any_element(),

@@ -19,6 +19,18 @@ pub fn chevron_down(theme: Theme) -> Svg {
         .text_color(theme.text_muted)
 }
 
+/// Two chevrons pointing at each other (Lucide `chevrons-down-up`), 12px,
+/// muted: the merge editor's "Fold identical" toggle. The button tints it
+/// accent when active.
+pub fn chevrons_down_up(theme: Theme) -> Svg {
+    svg()
+        .path("icons/chevrons_down_up.svg")
+        .w(px(12.))
+        .h(px(12.))
+        .flex_none()
+        .text_color(theme.text_muted)
+}
+
 /// Folder tree (Lucide `folder-tree`), 12px, muted: the Review sidebar's
 /// flat-list / folder-tree toggle. The button tints it accent when active.
 pub fn folder_tree(theme: Theme) -> Svg {

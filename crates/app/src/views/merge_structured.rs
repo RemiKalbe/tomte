@@ -570,17 +570,15 @@ pub(super) fn header_controls(
             .debug_selector(|| "merge-back-to-structure".into()),
         );
     }
+    // An icon toggle, the Review sidebar's List/Tree shape: the words
+    // live in its tooltip, so the header keeps one row.
     bar = bar.child(
-        ui::button(
+        ui::icon_button(
             theme,
             "merge-fold-identical",
+            ui::chevrons_down_up(theme),
+            fold_identical,
             "Fold identical".into(),
-            if fold_identical {
-                ui::ButtonVariant::Tonal(theme.accent)
-            } else {
-                ui::ButtonVariant::Ghost
-            },
-            ui::ButtonSize::Sm,
             cx.listener(|view, _ev, _window, cx| view.toggle_fold_identical(cx)),
         )
         .debug_selector(|| "merge-fold-identical".into()),
