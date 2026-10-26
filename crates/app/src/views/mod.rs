@@ -6523,8 +6523,9 @@ mod render_smoke {
     /// (the tree rows still render) → a `merge-pane-divider` bound exists.
     /// A body that draws the panes INSTEAD of the tree fails earlier, on
     /// the missing `tree-row:<id>`.
-    /// MUTATION: `LoadedMerge::new` never runs `detect` (the structured load
-    /// returns an error) → mode stays Lines and no `tree-row:<id>` renders.
+    /// MUTATION: `structured_load` returns an error instead of running
+    /// `detect` → no structured document, and the "a structured document"
+    /// expectation fails before any row is checked.
     #[gpui::test]
     fn json_inputs_open_in_structure_mode_as_a_tree_with_no_panes(cx: &mut TestAppContext) {
         use tomte_app::structured_tree::TreeRow;
