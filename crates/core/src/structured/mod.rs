@@ -5,7 +5,7 @@ pub mod merge;
 pub mod splice;
 
 pub use merge::{
-    Change, Decision, Format, Lock, NotStructured, Pick, Resolution, Side, SideText,
+    Change, Decision, Format, Lock, NotStructured, Pick, Resolution, Side, SideText, Site,
     StructuredDocument, detect, looked_like_json,
 };
 pub use splice::AssembleError;

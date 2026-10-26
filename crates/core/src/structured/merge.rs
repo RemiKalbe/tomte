@@ -155,6 +155,9 @@ pub struct SideText {
     /// The entry range for `Added`, `Removed`, `TypeChanged` and `Elements`;
     /// the value range for `Value`.
     pub range: Range<usize>,
+    /// The value node's byte range on that side. Equal to `range` for
+    /// `Value` and for element rows.
+    pub value: Range<usize>,
     pub text: String,
 }
 
@@ -180,22 +183,22 @@ pub struct Lock {
 /// element row (its `container` is a source array and its path is not
 /// empty) uses `elements` only; `entry` and `after` are `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Site {
+pub struct Site {
     /// The source object that holds the key, or the source array that holds
     /// the elements. `None` when the source is empty.
-    pub(crate) container: Option<NodeId>,
+    pub container: Option<NodeId>,
     /// The index of the key's entry in the source container, the last copy
     /// when the key repeats. `None` when the key is absent from source.
-    pub(crate) entry: Option<usize>,
+    pub entry: Option<usize>,
     /// For a key absent from source: the source entry index to insert after.
     /// `None` means the end of the container.
-    pub(crate) after: Option<usize>,
+    pub after: Option<usize>,
     /// Element rows: the source element indices the row covers. A single
     /// element present in source is `k..k + 1`; an element absent from
     /// source is the empty range at its insertion point (the source index
     /// it goes before); a conflict run is the source run, empty at an
     /// insertion point when source has none.
-    pub(crate) elements: Range<usize>,
+    pub elements: Range<usize>,
 }
 
 /// One place where the three sides disagree.
@@ -216,7 +219,7 @@ pub struct Decision {
     pub both_allowed: bool,
     /// Follows source because a template pins the span.
     pub locked: Option<Lock>,
-    pub(crate) site: Site,
+    pub site: Site,
 }
 
 /// The user's choice for one decision.
@@ -404,6 +407,15 @@ impl StructuredDocument {
             Side::Theirs => &self.theirs.text,
         }
     }
+
+    /// The parsed document of a side. `Base` is the effective base.
+    pub fn side_doc(&self, side: Side) -> &Document {
+        match side {
+            Side::Base => &self.base,
+            Side::Ours => &self.ours,
+            Side::Theirs => &self.theirs,
+        }
+    }
 }
 
 /// The span that makes `write_back` refuse an edit of `lines` (sorted,
@@ -469,6 +481,7 @@ impl Found<'_> {
         };
         SideText {
             text: self.doc.slice(&range).to_string(),
+            value: self.doc.node(self.node).range.clone(),
             range,
         }
     }
@@ -625,6 +638,7 @@ impl<'a> ArrayView<'a> {
         let range = self.elements[run.start].range.start..self.elements[run.end - 1].range.end;
         Some(SideText {
             text: self.doc.slice(&range).to_string(),
+            value: range.clone(),
             range,
         })
     }
@@ -937,6 +951,39 @@ impl<'a> Walker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MUTATION: `side_doc` returns `ours` for every side → the Theirs text
+    /// assertion fails.
+    #[test]
+    fn side_doc_returns_each_sides_parsed_document() {
+        let doc = StructuredDocument::compute(Some("{}"), "{\"a\":1}", "{\"a\":2}", None).unwrap();
+        assert_eq!(doc.side_doc(Side::Ours).text, "{\"a\":1}");
+        assert_eq!(doc.side_doc(Side::Theirs).text, "{\"a\":2}");
+        assert_eq!(doc.side_doc(Side::Base).text, "{}");
+    }
+
+    /// MUTATION: `value` is set to `range` for every change → the Added row's
+    /// value slice still starts with the key.
+    #[test]
+    fn side_text_value_is_the_value_only() {
+        let doc = StructuredDocument::compute(
+            Some("{\"a\": 1}"),
+            "{\"a\": 1, \"b\": {\"c\": 2}}",
+            "{\"a\": 1}",
+            None,
+        )
+        .unwrap();
+        let d = &doc.decisions[0]; // "b" added on disk
+        let ours = d.ours.as_ref().unwrap();
+        assert_eq!(doc.side_doc(Side::Ours).slice(&ours.value), "{\"c\": 2}");
+        assert!(
+            ours.range.start < ours.value.start,
+            "range covers the key too"
+        );
+        assert_eq!(d.site.container, doc.side_doc(Side::Theirs).root);
+        assert_eq!(d.site.entry, None);
+        assert_eq!(d.site.after, Some(0));
+    }
 
     fn doc(base: Option<&str>, ours: &str, theirs: &str) -> StructuredDocument {
         StructuredDocument::compute(base, ours, theirs, None).expect("structured")
