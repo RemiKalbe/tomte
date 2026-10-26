@@ -2324,4 +2324,151 @@ mod tests {
             check_group(name, &st, &rows, 0, source.root.expect("source root"));
         }
     }
+
+    /// MUTATION: `FoldWhat::Elements` → `Keys` in the array walk → both
+    /// Fold rows read `Keys`.
+    /// MUTATION: `first` → `k - 1` for the first element after a decision's
+    /// run → the second Fold's `first` is 2, not 3.
+    #[test]
+    fn fold_identical_folds_array_elements_with_their_first_index() {
+        // A scalar element changed on disk is two decisions: source's `3`
+        // removed (covering element 2) and disk's `9` inserted before
+        // element 3. The second run resumes at element 3.
+        let base = "{\n  \"p\": [\n    1,\n    2,\n    3,\n    4,\n    5\n  ]\n}\n";
+        let ours = "{\n  \"p\": [\n    1,\n    2,\n    9,\n    4,\n    5\n  ]\n}\n";
+        let st = state(Some(base), ours, base);
+        let p = NodeKey {
+            side: Side::Theirs,
+            node: source_value(&st, "p"),
+        };
+        let view = TreeView {
+            fold_identical: true,
+            ..TreeView::default()
+        };
+        let elements = |first: usize| TreeRow::Fold {
+            depth: 2,
+            count: 2,
+            what: FoldWhat::Elements,
+            key: FoldKey {
+                container: p,
+                first,
+            },
+        };
+        assert_eq!(
+            plan(&st, &view),
+            vec![
+                root_open(&st, "1 key", false),
+                array_open(&st, "p", "5 elements"),
+                elements(0),
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "3", false),
+                        chip(ChipSide::Disk, "removed", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 1,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "absent", false),
+                        chip(ChipSide::Disk, "9", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                elements(3),
+                array_close(1),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: share one `Runs` across nesting levels, i.e. fold across a
+    /// container boundary → `"p"` and `"q"` join the root's run and no
+    /// Fold row sits inside `"o"`.
+    #[test]
+    fn a_fold_never_crosses_a_container_boundary() {
+        let base = concat!(
+            "{\n",
+            "  \"a\": 1,\n",
+            "  \"o\": {\n",
+            "    \"p\": 1,\n",
+            "    \"q\": 1\n",
+            "  },\n",
+            "  \"b\": 1,\n",
+            "  \"c\": 1\n",
+            "}\n",
+        );
+        let ours = base.replace("\"c\": 1", "\"c\": 2");
+        let st = state(Some(base), &ours, base);
+        let root = NodeKey {
+            side: Side::Theirs,
+            node: st.doc.side_doc(Side::Theirs).root.expect("root"),
+        };
+        let o = NodeKey {
+            side: Side::Theirs,
+            node: source_value(&st, "o"),
+        };
+        // The user opened the identical `"o"` and expanded the root's run.
+        let view = TreeView {
+            fold_identical: true,
+            folded_overrides: [(o, false)].into_iter().collect(),
+            expanded_folds: [FoldKey {
+                container: root,
+                first: 0,
+            }]
+            .into_iter()
+            .collect(),
+            ..TreeView::default()
+        };
+        assert_eq!(
+            plan(&st, &view),
+            vec![
+                root_open(&st, "4 keys", false),
+                same(1, "\"a\": 1,"),
+                TreeRow::Open {
+                    depth: 1,
+                    key: key("\"o\""),
+                    bracket: Bracket::Object,
+                    folded: false,
+                    summary: "2 keys".to_string(),
+                    same: true,
+                    node: o,
+                },
+                TreeRow::Fold {
+                    depth: 2,
+                    count: 2,
+                    what: FoldWhat::Keys,
+                    key: FoldKey {
+                        container: o,
+                        first: 0,
+                    },
+                },
+                TreeRow::Close {
+                    depth: 1,
+                    bracket: Bracket::Object,
+                    comma: true,
+                },
+                same(1, "\"b\": 1,"),
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 0,
+                    key: key("\"c\""),
+                    chips: vec![
+                        chip(ChipSide::Source, "1", false),
+                        chip(ChipSide::Disk, "2", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                root_close(),
+            ]
+        );
+    }
 }
