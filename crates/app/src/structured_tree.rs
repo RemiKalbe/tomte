@@ -116,8 +116,13 @@ pub enum TreeRow {
         /// Nothing inside differs between the sides.
         same: bool,
         node: NodeKey,
+        /// The entry's trailing comma (`false` for the root). A folded
+        /// container is this one row, so it carries the comma its `Close`
+        /// row would have.
+        comma: bool,
     },
-    /// `}` / `]`, with the entry's trailing comma when it has one.
+    /// `}` / `]`, with the entry's trailing comma when it has one. A folded
+    /// container has none.
     Close {
         depth: usize,
         bracket: Bracket,
@@ -604,6 +609,7 @@ impl<'a> Planner<'a> {
             summary,
             same: side == Side::Theirs && !self.holding.contains(&root),
             node: NodeKey { side, node: root },
+            comma: false,
         });
         if side == Side::Ours {
             for d in &self.state.doc.decisions {
@@ -758,10 +764,13 @@ impl<'a> Planner<'a> {
             summary,
             same,
             node,
+            comma: item.comma,
         });
-        if !folded {
-            self.children(rows, item.value, depth + 1);
+        // Folded, the `Open` row stands for the whole container.
+        if folded {
+            return;
         }
+        self.children(rows, item.value, depth + 1);
         rows.push(TreeRow::Close {
             depth,
             bracket,
@@ -1043,6 +1052,7 @@ mod tests {
             key: None,
             bracket: Bracket::Object,
             folded: false,
+            comma: false,
             summary: summary.to_string(),
             same,
             node: NodeKey {
@@ -1427,6 +1437,7 @@ mod tests {
     }
 
     /// MUTATION: identical container opens by default → `folded` is false.
+    /// MUTATION: emit Close after a folded Open → an extra row.
     #[test]
     fn an_identical_object_is_a_folded_open_row_with_a_summary() {
         let base = "{\n  \"o\": {\n    \"p\": 1,\n    \"q\": 2\n  },\n  \"a\": 1\n}\n";
@@ -1442,17 +1453,13 @@ mod tests {
                     key: key("\"o\""),
                     bracket: Bracket::Object,
                     folded: true,
+                    comma: true,
                     summary: "2 keys".to_string(),
                     same: true,
                     node: NodeKey {
                         side: Side::Theirs,
                         node: source_value(&st, "o"),
                     },
-                },
-                TreeRow::Close {
-                    depth: 1,
-                    bracket: Bracket::Object,
-                    comma: true,
                 },
                 TreeRow::Decision {
                     depth: 1,
@@ -1486,6 +1493,7 @@ mod tests {
                     key: key("\"o\""),
                     bracket: Bracket::Object,
                     folded: false,
+                    comma: false,
                     summary: "2 keys".to_string(),
                     same: false,
                     node: NodeKey {
@@ -1533,6 +1541,7 @@ mod tests {
                     key: key("\"o\""),
                     bracket: Bracket::Object,
                     folded: false,
+                    comma: true,
                     summary: "2 keys".to_string(),
                     same: false,
                     node: NodeKey {
@@ -1571,6 +1580,7 @@ mod tests {
             key: key(&format!("\"{name}\"")),
             bracket: Bracket::Array,
             folded: false,
+            comma: false,
             summary: summary.to_string(),
             same: false,
             node: NodeKey {
@@ -1794,6 +1804,7 @@ mod tests {
                     key: None,
                     bracket: Bracket::Array,
                     folded: false,
+                    comma: false,
                     summary: "2 elements".to_string(),
                     same: false,
                     node: NodeKey {
@@ -1844,6 +1855,7 @@ mod tests {
                     key: None,
                     bracket: Bracket::Array,
                     folded: false,
+                    comma: false,
                     summary: "2 elements".to_string(),
                     same: false,
                     node: NodeKey {
@@ -2037,6 +2049,7 @@ mod tests {
 
     /// MUTATION: expanding one fold expands all → the other Fold disappears.
     /// (Applied as: any non-empty `expanded_folds` expands every run.)
+    /// MUTATION: emit Close after a folded Open → an extra row after `o`.
     #[test]
     fn an_expanded_fold_opens_only_its_run() {
         let base = concat!(
@@ -2074,17 +2087,13 @@ mod tests {
                     key: key("\"o\""),
                     bracket: Bracket::Object,
                     folded: true,
+                    comma: true,
                     summary: "1 key".to_string(),
                     same: true,
                     node: NodeKey {
                         side: Side::Theirs,
                         node: source_value(&st, "o"),
                     },
-                },
-                TreeRow::Close {
-                    depth: 1,
-                    bracket: Bracket::Object,
-                    comma: true,
                 },
                 TreeRow::Comment {
                     depth: 1,
@@ -2437,6 +2446,7 @@ mod tests {
                     key: key("\"o\""),
                     bracket: Bracket::Object,
                     folded: false,
+                    comma: true,
                     summary: "2 keys".to_string(),
                     same: true,
                     node: o,

@@ -1488,6 +1488,9 @@ impl MergeView {
         let prev_cursor = state.cursor;
         let prev = state.resolution.get(id);
         state.pick(id, pick);
+        // `pick` moves the cursor on to the next open conflict; that row is
+        // where the next pick key lands, so it is the one to keep in view.
+        let target = state.cursor.unwrap_or(id);
         self.revisiting.remove(&id);
         self.undo.push(UndoEntry {
             changes: Vec::new(),
@@ -1497,8 +1500,7 @@ impl MergeView {
         self.redo.clear();
         self.disarm_mode_switch();
         self.seed_editor(cx);
-        // The picked row stays in view (a pick key may land off screen).
-        self.scroll_to_decision(id);
+        self.scroll_to_decision(target);
         cx.notify();
     }
 

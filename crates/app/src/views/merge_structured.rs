@@ -166,15 +166,23 @@ fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
             summary,
             same,
             node,
+            comma,
         } => {
+            let (open, close) = match bracket {
+                Bracket::Object => ("{", "}"),
+                Bracket::Array => ("[", "]"),
+            };
             let mut text = String::from(if *folded { "▸ " } else { "▾ " });
             if let Some(key) = key {
                 text.push_str(key);
                 text.push_str(": ");
             }
-            text.push_str(match bracket {
-                Bracket::Object => "{",
-                Bracket::Array => "[",
+            text.push_str(open);
+            // Folded, the row stands for the whole container (the planner
+            // emits no `Close` for it): `▸ "key": { 2 keys },`.
+            let tail = folded.then(|| {
+                let comma = if *comma { "," } else { "" };
+                (summary.clone(), format!("{close}{comma}"))
             });
             let tone = if *same {
                 ui::RowTone::Same
@@ -198,14 +206,14 @@ fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
             .cursor_pointer()
             .debug_selector(move || format!("tree-line:{ix}"))
             .child(text)
-            // Folded, the summary stands in for the hidden rows; the close
-            // row follows.
-            .when(*folded, |el| {
+            .when_some(tail, |el, (summary, close)| {
                 el.child(
                     div()
+                        .flex()
                         .flex_none()
-                        .text_color(theme.text_muted)
-                        .child(summary.clone()),
+                        .gap_2()
+                        .child(div().text_color(theme.text_muted).child(summary))
+                        .child(close),
                 )
             })
             .into_any_element()
@@ -295,13 +303,16 @@ fn value_chip(chip: &Chip, id: usize, frame: &TreeFrame) -> Stateful<Div> {
         chip.picked,
         prefix,
         move |_, _, cx| {
-            // The row's own click (cursor only) must not follow: a pick
-            // moves the cursor on, and the row would pull it back.
+            // The row's own click (cursor only) must not follow: the pick
+            // below moves the cursor on, and the row would pull it back.
             cx.stop_propagation();
             view.update(cx, |merge, cx| {
                 if container {
                     merge.toggle_chip(id, side, cx);
                 } else {
+                    // A pick lands where the cursor is, as a pick key does:
+                    // the cursor comes to this row, then advances from it.
+                    merge.select_decision(id, cx);
                     merge.apply_pick(id, side.pick(), cx);
                 }
             })

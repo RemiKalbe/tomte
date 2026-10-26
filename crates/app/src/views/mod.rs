@@ -6663,6 +6663,8 @@ mod render_smoke {
     ///
     /// MUTATION: `toggle_container` never flips the override → the row
     /// count is unchanged.
+    /// MUTATION: the planner emits a `Close` after a folded `Open` → the
+    /// unfolded count is `folded + 2`.
     #[gpui::test]
     fn clicking_an_identical_container_row_folds_and_unfolds_it(cx: &mut TestAppContext) {
         use tomte_app::structured_tree::TreeRow;
@@ -6705,7 +6707,13 @@ mod render_smoke {
         };
         click(vis);
         let rows = tree_rows(&merge, vis);
-        assert_eq!(rows.len(), folded + 2, "p and q are listed in place");
+        // The folded row was the whole container; open, it is the `Open`
+        // row, p, q and the `Close` row.
+        assert_eq!(
+            rows.len(),
+            folded + 3,
+            "p, q and the close are listed in place"
+        );
         assert!(matches!(rows[ix], TreeRow::Open { folded: false, .. }));
         click(vis);
         assert_eq!(tree_rows(&merge, vis).len(), folded, "folded again");
@@ -6840,6 +6848,118 @@ mod render_smoke {
         assert_eq!(mode, merge::MergeMode::Lines, "the second click switches");
         assert_eq!(pick, None, "the structure picks are discarded");
         assert!(banner.is_none());
+    }
+
+    /// JSON inputs whose keys `names` are each a conflict (base 1, disk 2,
+    /// source 3), with `filler` identical keys after the first.
+    fn conflicts_inputs(names: &[&str], filler: usize) -> tomte_app::merge_inputs::MergeInputs {
+        let side = |v: u8| {
+            let mut entries: Vec<String> = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                entries.push(format!("  \"{name}\": {v}"));
+                if i == 0 {
+                    entries.extend((0..filler).map(|k| format!("  \"same{k}\": 0")));
+                }
+            }
+            format!("{{\n{}\n}}\n", entries.join(",\n"))
+        };
+        tomte_app::merge_inputs::MergeInputs {
+            target: PathBuf::from("/tmp/smoke/settings.json"),
+            ours: side(2),
+            theirs: side(3),
+            base: Some(side(1)),
+            source_path: PathBuf::from("/tmp/smoke/src/settings.json"),
+            templated: false,
+            template: None,
+            span_map: None,
+            origin: None,
+        }
+    }
+
+    fn structured_cursor(
+        merge: &Entity<merge::MergeView>,
+        vis: &mut VisualTestContext,
+    ) -> Option<usize> {
+        vis.update(|_w, cx| {
+            merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap()
+                .cursor
+        })
+    }
+
+    /// A chip click on a row the cursor is not on picks there and moves
+    /// the cursor the way a pick key would from that row: to the next open
+    /// conflict after it.
+    ///
+    /// MUTATION: the chip handler drops its `select_decision` → `pick` sees
+    /// the cursor elsewhere, leaves it on `a`, and the cursor reads 0.
+    #[gpui::test]
+    fn a_chip_click_moves_the_cursor_from_that_row(cx: &mut TestAppContext) {
+        let (_shell, merge, vis) =
+            structured_merge_window(cx, conflicts_inputs(&["a", "b", "c"], 0));
+        assert_eq!(
+            structured_cursor(&merge, vis),
+            Some(0),
+            "the cursor starts on a"
+        );
+        let chip = vis.debug_bounds("chip:1:disk").expect("b offers disk");
+        vis.simulate_click(chip.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        let pick = vis.update(|_w, cx| {
+            merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap()
+                .resolution
+                .get(1)
+        });
+        assert_eq!(pick, Some(tomte_core::structured::Pick::Disk));
+        assert_eq!(
+            structured_cursor(&merge, vis),
+            Some(2),
+            "on to c, the next open row after b"
+        );
+    }
+
+    /// A pick that moves the cursor to an off-screen conflict scrolls the
+    /// tree to that conflict, where the next pick key lands.
+    ///
+    /// MUTATION: `apply_pick` scrolls to the picked id → `last_scroll_row`
+    /// is a's row and the list stays at the top.
+    #[gpui::test]
+    fn a_pick_scrolls_to_where_the_cursor_went(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::scroll_target;
+        let (_shell, merge, vis) = structured_merge_window(cx, conflicts_inputs(&["a", "b"], 200));
+        let b_row = scroll_target(&tree_rows(&merge, vis), 1).expect("b has a row");
+        assert!(b_row > 200, "b sits below the filler: row {b_row}");
+        vis.simulate_keystrokes("1");
+        vis.run_until_parked();
+        assert_eq!(
+            structured_cursor(&merge, vis),
+            Some(1),
+            "the pick moved the cursor to b"
+        );
+        let (last, offset) = vis.update(|_w, cx| {
+            let v = merge.read(cx);
+            let offset = v.tree_scroll.0.borrow().base_handle.offset().y;
+            (v.last_scroll_row, offset)
+        });
+        assert_eq!(last, Some(b_row));
+        // b's row is centred: the list scrolled about b_row rows down.
+        assert!(
+            offset < px(-(b_row as f32 - 60.) * tomte_ui::components::TREE_ROW_H),
+            "the list scrolled down to b (offset {offset:?})"
+        );
     }
 
     /// A save the write-back would refuse never reaches the queue: two free
