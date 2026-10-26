@@ -495,32 +495,28 @@ pub(super) fn anchor_row(rows: &[TreeRow], anchor: &Anchor, was_top: bool) -> Op
 /// The row of `new` to put at the viewport's top after a "Fold identical"
 /// replan, given the `old` rows and the old top row (spec §3.6).
 /// - A row with an identity keeps it: the same row in `new`.
-/// - A `Fold` the replan expanded (folding turned off): the first row of the
-///   restored run, at the fold's distance from the identified row above it.
 /// - A `Close` of a container that is not identical keeps its container:
 ///   that container's `Close` in `new`.
 /// - A row a fold can absorb ([`foldable`]) goes to the `Fold` that took
 ///   it, the first one after the identified row above it ([`anchor_row`]).
-/// - Anything else (a `Preview` line, a row no fold took) keeps its
-///   distance from the identified row above it.
+/// - Anything else (a `Fold` the replan expanded, a `Preview` line, a row
+///   no fold took) is found by walking from the nearest row above it that
+///   `new` still has ([`walk_to`]).
 pub(super) fn kept_top(old: &[TreeRow], new: &[TreeRow], top: usize) -> Option<usize> {
     let top = top.min(old.len().checked_sub(1)?);
     let last = new.len().checked_sub(1)?;
     let row = &old[top];
-    if let Some(anchor) = row_anchor(row) {
-        if let Some(ix) = position_of(new, &anchor) {
-            return Some(ix);
-        }
-        return offset_from_above(old, new, top, top).map(|ix| ix.min(last));
+    if let Some(anchor) = row_anchor(row)
+        && let Some(ix) = position_of(new, &anchor)
+    {
+        return Some(ix);
     }
     if let TreeRow::Close { .. } = row
         && let Some(open) = matching_open(old, top)
-        && let TreeRow::Open {
-            same: false, node, ..
-        } = &old[open]
+        && let TreeRow::Open { same: false, .. } = &old[open]
+        && let Some(ix) = kept_in_new(old, new, top)
     {
-        let at = position_of(new, &Anchor::Open(*node))?;
-        return Some(matching_close(new, at).unwrap_or(at));
+        return Some(ix);
     }
     if foldable(old, top)
         && let Some((anchor, at)) = surviving_anchor(old, new, top)
@@ -530,7 +526,72 @@ pub(super) fn kept_top(old: &[TreeRow], new: &[TreeRow], top: usize) -> Option<u
     {
         return Some(ix);
     }
-    offset_from_above(old, new, top, top).map(|ix| ix.min(last))
+    Some(walk_to(old, new, top).min(last))
+}
+
+/// Where old row `k` sits in `new` when the replan kept it: an identified
+/// row by its identity, a `Close` through its container's `Open` (when
+/// that container is open in `new`).
+fn kept_in_new(old: &[TreeRow], new: &[TreeRow], k: usize) -> Option<usize> {
+    match &old[k] {
+        TreeRow::Close { .. } => {
+            let TreeRow::Open { node, .. } = &old[matching_open(old, k)?] else {
+                return None;
+            };
+            let open = position_of(new, &Anchor::Open(*node))?;
+            match &new[open] {
+                TreeRow::Open { folded: false, .. } => matching_close(new, open),
+                _ => None,
+            }
+        }
+        row => position_of(new, &row_anchor(row)?),
+    }
+}
+
+/// Old row `top`'s place in `new`: from the nearest row above it that
+/// `new` kept, step down the old rows one by one, counting in `new` the
+/// rows each one became. A row the replan kept is one row; a `Fold` it
+/// expanded is the `count` children it stood for ([`skip_children`]).
+/// Every row counted is a row of `new`, so a removed fold between the
+/// anchor and `top` cannot shift the answer.
+fn walk_to(old: &[TreeRow], new: &[TreeRow], top: usize) -> usize {
+    let (mut k, mut j) = (0..top)
+        .rev()
+        .find_map(|k| kept_in_new(old, new, k).map(|j| (k, j)))
+        .map_or((0, 0), |(k, j)| (k + 1, j + 1));
+    while k < top {
+        j = match &old[k] {
+            TreeRow::Fold {
+                depth, count, key, ..
+            } if position_of(new, &Anchor::Fold(*key)).is_none() => {
+                skip_children(new, j, *depth, *count)
+            }
+            _ => j + 1,
+        };
+        k += 1;
+    }
+    j
+}
+
+/// The index just past `count` children at `depth` starting at `rows[j]`:
+/// each child is its leading `Comment` rows, then one `Same` row, or an
+/// `Open` row with, when it is open, its children and its `Close`.
+fn skip_children(rows: &[TreeRow], mut j: usize, depth: usize, count: usize) -> usize {
+    for _ in 0..count {
+        while matches!(rows.get(j), Some(TreeRow::Comment { depth: d, .. }) if *d == depth) {
+            j += 1;
+        }
+        j = match rows.get(j) {
+            Some(TreeRow::Open {
+                depth: d,
+                folded: false,
+                ..
+            }) if *d == depth => matching_close(rows, j).map_or(j + 1, |close| close + 1),
+            Some(_) => j + 1,
+            None => return j,
+        };
+    }
+    j
 }
 
 /// Whether a fold can have absorbed `rows[ix]`: a `Same` or `Comment` row,
@@ -589,23 +650,6 @@ fn matching_close(rows: &[TreeRow], open: usize) -> Option<usize> {
         .skip(open + 1)
         .find(|(_, row)| matches!(row, TreeRow::Close { depth: d, .. } if *d == depth))
         .map(|(ix, _)| ix)
-}
-
-/// `top`'s place in `new` at its old distance from the nearest identified
-/// row above `end` in `old` (the root when there is none). An identified
-/// row the replan removed hands over to the one above it.
-fn offset_from_above(old: &[TreeRow], new: &[TreeRow], top: usize, end: usize) -> Option<usize> {
-    let mut end = end;
-    loop {
-        let Some(above) = old[..end].iter().rposition(|row| row_anchor(row).is_some()) else {
-            return Some(top);
-        };
-        let anchor = row_anchor(&old[above]).expect("an identified row");
-        if let Some(at) = position_of(new, &anchor) {
-            return Some(at + (top - above));
-        }
-        end = above;
-    }
 }
 
 /// Structure mode's header controls: progress over the decisions, the
@@ -1163,6 +1207,126 @@ mod tests {
         ];
         // The `Close` at 4 sits inside the run that became the fold at 2.
         assert_eq!(kept_top(&old, &new, 4), Some(2));
+    }
+
+    fn fold_of(depth: usize, count: usize, container: usize, first: usize) -> TreeRow {
+        TreeRow::Fold {
+            depth,
+            count,
+            what: FoldWhat::Keys,
+            key: FoldKey {
+                container: node(container),
+                first,
+            },
+        }
+    }
+
+    /// Folding off with a `Fold` at the top that follows an object holding
+    /// a fold of its own (one change, then identical siblings): the view
+    /// lands on the first restored row after the object's `}`, not inside
+    /// the object's restored run.
+    ///
+    /// MUTATION: measure the old-row distance from the nearest identified
+    /// row (the round-1 rule) → decision 0 at 2 plus 3, Some(5).
+    #[test]
+    fn kept_top_counts_a_restored_run_above_the_top_fold() {
+        let old = vec![
+            open_row(0, 0),
+            container_row(1, 1, false),
+            decision_row(2, 0),
+            fold_of(2, 3, 1, 1),
+            close_row(1),
+            fold_of(1, 2, 0, 1),
+            close_row(0),
+        ];
+        let new = vec![
+            open_row(0, 0),
+            container_row(1, 1, false),
+            decision_row(2, 0),
+            same_row(2),
+            same_row(2),
+            same_row(2),
+            close_row(1),
+            same_row(1),
+            same_row(1),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &new, 5), Some(7));
+    }
+
+    /// Folding off with a `Same` row of a run the user expanded at the top,
+    /// after an object that held a fold: the row keeps its place.
+    ///
+    /// MUTATION: measure the old-row distance from the nearest identified
+    /// row (the round-1 rule) → decision 0 at 2 plus 4, Some(6).
+    #[test]
+    fn kept_top_keeps_an_expanded_row_after_a_restored_run() {
+        let old = vec![
+            open_row(0, 0),
+            container_row(1, 1, false),
+            decision_row(2, 0),
+            fold_of(2, 3, 1, 1),
+            close_row(1),
+            same_row(1),
+            same_row(1),
+            close_row(0),
+        ];
+        let new = vec![
+            open_row(0, 0),
+            container_row(1, 1, false),
+            decision_row(2, 0),
+            same_row(2),
+            same_row(2),
+            same_row(2),
+            close_row(1),
+            same_row(1),
+            same_row(1),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &new, 6), Some(8));
+    }
+
+    /// Folding off with the next entry's comment at the top, right under a
+    /// fold: no kept row sits between the fold and the comment, so only
+    /// counting the fold's restored rows finds it.
+    ///
+    /// MUTATION: `walk_to` counts a removed `Fold` as one row → Some(3).
+    #[test]
+    fn kept_top_counts_the_rows_a_fold_restores() {
+        let old = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            fold_of(1, 3, 0, 1),
+            TreeRow::Comment {
+                depth: 1,
+                text: "// next".into(),
+            },
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        // The fold's three children: a Same, a commented Same, and an open
+        // identical container.
+        let new = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            same_row(1),
+            TreeRow::Comment {
+                depth: 1,
+                text: "// a".into(),
+            },
+            same_row(1),
+            // The third child: an identical container the user opened.
+            container_row(1, 7, true),
+            same_row(2),
+            close_row(1),
+            TreeRow::Comment {
+                depth: 1,
+                text: "// next".into(),
+            },
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &new, 3), Some(8));
     }
 
     /// Folding off with a `Same` row of an expanded run at the top: the
