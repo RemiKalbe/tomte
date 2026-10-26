@@ -1599,6 +1599,45 @@ impl MergeView {
         cx.notify();
     }
 
+    /// "Fold identical": collapse (or restore) every run of identical rows,
+    /// keeping the row at the viewport's top in place (spec §3.6). When the
+    /// top row had no identity and a fold absorbed it, the fold row goes to
+    /// the top instead.
+    pub(super) fn toggle_fold_identical(&mut self, cx: &mut Context<Self>) {
+        let top = self.tree_top_row();
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let old = loaded.tree_rows.clone();
+        loaded.tree.fold_identical = !loaded.tree.fold_identical;
+        loaded.tree_dirty = true;
+        loaded.replan();
+        if let Some(ix) = merge_structured::kept_top(&old, &loaded.tree_rows, top) {
+            // Strict: the row goes to the top even when it is already in
+            // view, or the old pixel offset would show other rows there.
+            self.tree_scroll
+                .scroll_to_item_strict(ix, ScrollStrategy::Top);
+            #[cfg(test)]
+            {
+                self.last_scroll_row = Some(ix);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The index of the tree row at the viewport's top: a scroll still
+    /// waiting for the next layout wins, as in gpui's own
+    /// `logical_scroll_top_index` (which exists only under test-support).
+    /// Every tree row is [`ui::TREE_ROW_H`] tall.
+    fn tree_top_row(&self) -> usize {
+        let state = self.tree_scroll.0.borrow();
+        if let Some(deferred) = &state.deferred_scroll_to_item {
+            return deferred.item_index;
+        }
+        let scrolled = -f32::from(state.base_handle.offset().y);
+        (scrolled / ui::TREE_ROW_H).floor().max(0.) as usize
+    }
+
     /// The tree's rows as last planned, for tests.
     #[cfg(test)]
     pub(super) fn tree_rows_for_test(&self) -> Vec<TreeRow> {
@@ -2361,6 +2400,7 @@ impl MergeView {
                 bar,
                 state,
                 loaded.inputs.origin.is_some(),
+                loaded.tree.fold_identical,
                 text,
                 theme,
                 cx,

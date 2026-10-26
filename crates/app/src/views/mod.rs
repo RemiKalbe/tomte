@@ -6965,6 +6965,108 @@ mod render_smoke {
         );
     }
 
+    /// Next ↓ in Structure mode scrolls the tree to the row it moved the
+    /// cursor to: first the open conflict, then, once it is picked, every
+    /// changed row in turn.
+    ///
+    /// MUTATION: `next` keeps calling the removed pane jump → last_scroll_row stays None.
+    #[gpui::test]
+    fn next_scrolls_the_tree_to_the_target_row(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::scroll_target;
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let mut landed = Vec::new();
+        for press in 0..4 {
+            if press == 1 {
+                // Pick the one open conflict, so Next walks the changed rows.
+                vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
+                vis.run_until_parked();
+            }
+            vis.update(|_w, cx| merge.update(cx, |v, _| v.last_scroll_row = None));
+            vis.update(|_w, cx| merge.update(cx, |v, cx| v.next(cx)));
+            vis.run_until_parked();
+            let cursor = structured_cursor(&merge, vis).expect("Next lands on a decision");
+            let last = vis.update(|_w, cx| merge.read(cx).last_scroll_row);
+            let target = scroll_target(&tree_rows(&merge, vis), cursor);
+            assert!(
+                target.is_some(),
+                "press {press}: decision {cursor} has a row"
+            );
+            assert_eq!(
+                last, target,
+                "press {press}: the tree scrolled to the cursor"
+            );
+            landed.push(cursor);
+        }
+        assert_eq!(landed[0], 0, "the open conflict first");
+        assert!(
+            landed[1] != landed[2] && landed[2] != landed[3],
+            "Next walks the changed rows: {landed:?}"
+        );
+    }
+
+    /// "Fold identical" collapses every run of identical rows into one
+    /// `Fold` row and keeps every decision row; a second click restores
+    /// the runs. One click, one plan.
+    ///
+    /// MUTATION: the toggle flips `fold_identical` but not `tree_dirty` → rows unchanged.
+    /// MUTATION: the toggle skips the `kept_top` scroll → `last_scroll_row`
+    /// stays None.
+    #[gpui::test]
+    fn fold_identical_collapses_identical_runs_and_keeps_decisions(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::{TreeRow, scroll_target};
+        // json_inputs' identical runs are one row each; three identical keys
+        // between two conflicts make a run that folds shorter.
+        let (_shell, merge, vis) = structured_merge_window(cx, conflicts_inputs(&["a", "b"], 3));
+        let runs = |vis: &mut VisualTestContext| {
+            vis.update(|_w, cx| merge.read(cx).loaded.as_ref().unwrap().plan_runs)
+        };
+        let ids: Vec<usize> = vis.update(|_w, cx| {
+            let loaded = merge.read(cx).loaded.as_ref().unwrap();
+            let state = loaded.structured.as_ref().unwrap();
+            state.doc.decisions.iter().map(|d| d.id).collect()
+        });
+        let folds = |rows: &[TreeRow]| {
+            rows.iter()
+                .filter(|row| matches!(row, TreeRow::Fold { .. }))
+                .count()
+        };
+        let unfolded = tree_rows(&merge, vis);
+        assert_eq!(folds(&unfolded), 0, "Fold identical starts off");
+        let before = runs(vis);
+
+        vis.update(|_w, cx| merge.update(cx, |v, _| v.last_scroll_row = None));
+        let toggle = vis
+            .debug_bounds("merge-fold-identical")
+            .expect("the header draws Fold identical");
+        vis.simulate_click(toggle.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(
+            vis.update(|_w, cx| merge.read(cx).last_scroll_row),
+            Some(0),
+            "the root row, at the top before, stays at the top"
+        );
+        let folded = tree_rows(&merge, vis);
+        assert!(folds(&folded) > 0, "an identical run folded: {folded:?}");
+        assert!(folded.len() < unfolded.len());
+        for &id in &ids {
+            assert!(
+                scroll_target(&folded, id).is_some(),
+                "decision {id} keeps its row"
+            );
+            let selector = leak(format!("tree-row:{id}"));
+            assert!(vis.debug_bounds(selector).is_some(), "{selector} renders");
+        }
+        assert_eq!(runs(vis), before + 1, "one click, one plan");
+
+        let toggle = vis.debug_bounds("merge-fold-identical").unwrap();
+        vis.simulate_click(toggle.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        let restored = tree_rows(&merge, vis);
+        assert_eq!(folds(&restored), 0, "the second click restores the runs");
+        assert_eq!(restored, unfolded);
+    }
+
     /// A save the write-back would refuse never reaches the queue: two free
     /// picks on adjacent lines of different template literals read as one
     /// edit. The message box names it and the picks stay.

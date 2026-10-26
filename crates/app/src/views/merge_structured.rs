@@ -15,7 +15,7 @@ use gpui::{
 };
 use tomte_app::merge_inputs::MergeInputs;
 use tomte_app::structured_state::{Stage, StructuredState};
-use tomte_app::structured_tree::{Bracket, Chip, ChipSide, FoldWhat, TreeRow};
+use tomte_app::structured_tree::{Bracket, Chip, ChipSide, FoldKey, FoldWhat, NodeKey, TreeRow};
 use tomte_app::theme::Theme;
 use tomte_core::structured::jsonc;
 use tomte_core::structured::{Decision, NotStructured, Pick, looked_like_json};
@@ -389,23 +389,128 @@ pub(super) fn next_target(state: &mut StructuredState) -> Option<usize> {
     }
 }
 
-/// The header's progress words over the structured state.
+/// The header's progress words over the structured state: "4 of 5 picked
+/// · 1 to decide", counting every unlocked decision (a row whose effective
+/// pick is automatic counts as picked), and "5 of 5 picked" once nothing is
+/// open.
 pub(super) fn progress_text(state: &StructuredState) -> String {
     if state.nothing_to_decide() {
         return "same settings, formatting differs · Save keeps the source layout".to_string();
     }
-    let (decided, total) = state.progress();
-    if total == 0 {
-        let changed = state.doc.decisions.len();
-        let noun = if changed == 1 { "entry" } else { "entries" };
-        return format!("auto-resolved · {changed} changed {noun} · review below");
+    let changed = state.changed().len();
+    let open = state.unresolved().len();
+    let picked = changed.saturating_sub(open);
+    if open == 0 {
+        format!("{picked} of {changed} picked")
+    } else {
+        format!("{picked} of {changed} picked · {open} to decide")
     }
-    let s = if total == 1 { "" } else { "s" };
-    format!("{total} conflict{s}, {decided} resolved")
+}
+
+/// A row "Fold identical" can keep in view: one with an identity that
+/// survives a replan (spec §3.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Anchor {
+    Decision(usize),
+    Open(NodeKey),
+    Fold(FoldKey),
+    /// No identified row at or above the viewport's top.
+    Top,
+}
+
+/// `row`'s identity, `None` for rows a replan may renumber or absorb.
+pub(super) fn row_anchor(row: &TreeRow) -> Option<Anchor> {
+    match row {
+        TreeRow::Decision { id, .. } => Some(Anchor::Decision(*id)),
+        TreeRow::Open { node, .. } => Some(Anchor::Open(*node)),
+        TreeRow::Fold { key, .. } => Some(Anchor::Fold(*key)),
+        TreeRow::Close { .. }
+        | TreeRow::Comment { .. }
+        | TreeRow::Same { .. }
+        | TreeRow::Preview { .. } => None,
+    }
+}
+
+fn row_depth(row: &TreeRow) -> usize {
+    match row {
+        TreeRow::Open { depth, .. }
+        | TreeRow::Close { depth, .. }
+        | TreeRow::Comment { depth, .. }
+        | TreeRow::Same { depth, .. }
+        | TreeRow::Decision { depth, .. }
+        | TreeRow::Preview { depth, .. }
+        | TreeRow::Fold { depth, .. } => *depth,
+    }
+}
+
+/// The nearest row at or before `top` that has an identity, `Top` when
+/// none does.
+pub(super) fn fold_anchor(rows: &[TreeRow], top: usize) -> Anchor {
+    rows.iter()
+        .take(top.saturating_add(1))
+        .rev()
+        .find_map(row_anchor)
+        .unwrap_or(Anchor::Top)
+}
+
+/// Where `anchor` sits in the replanned `rows`. When the old top row was
+/// not the anchor itself (`was_top == false`: it had no identity, so a fold
+/// may have absorbed it), the first `Fold` row after the anchor, before
+/// the next identified row and inside the anchor's container, stands in
+/// for it. `None` when the anchor is gone from `rows`.
+pub(super) fn anchor_row(rows: &[TreeRow], anchor: &Anchor, was_top: bool) -> Option<usize> {
+    let (at, start, depth) = match anchor {
+        Anchor::Top => {
+            if rows.is_empty() {
+                return None;
+            }
+            (0, 0, 0)
+        }
+        _ => {
+            let at = rows
+                .iter()
+                .position(|row| row_anchor(row).as_ref() == Some(anchor))?;
+            (at, at + 1, row_depth(&rows[at]))
+        }
+    };
+    if was_top {
+        return Some(at);
+    }
+    for (ix, row) in rows.iter().enumerate().skip(start) {
+        match row {
+            TreeRow::Fold { .. } => return Some(ix),
+            TreeRow::Decision { .. } | TreeRow::Open { .. } => break,
+            TreeRow::Close { depth: d, .. } if *d < depth => break,
+            _ => {}
+        }
+    }
+    Some(at)
+}
+
+/// The row of `new` to put at the viewport's top after a "Fold identical"
+/// replan, given the `old` rows and the old top row. An anchor that the
+/// replan removed (a `Fold` row once folding is off) hands over to the
+/// identified row before it, which sits just above the unfolded run.
+pub(super) fn kept_top(old: &[TreeRow], new: &[TreeRow], top: usize) -> Option<usize> {
+    let mut top = top.min(old.len().checked_sub(1)?);
+    let mut was_top = row_anchor(&old[top]).is_some();
+    loop {
+        let anchor = fold_anchor(old, top);
+        if let Some(ix) = anchor_row(new, &anchor, was_top) {
+            return Some(ix);
+        }
+        // Only an identified anchor can go missing; step above it.
+        let at = old
+            .iter()
+            .take(top + 1)
+            .rposition(|row| row_anchor(row).as_ref() == Some(&anchor))?;
+        top = at.checked_sub(1)?;
+        was_top = false;
+    }
 }
 
 /// Structure mode's header controls: progress over the decisions, the
-/// origin chip, Next ↓, and Edit. In the Text stage (`text` is `Some`):
+/// origin chip, Fold identical, Next ↓, and Edit. In the Text stage (`text` is `Some`):
 /// the invalid-JSON chip when the text does not parse, and Back to
 /// structure (reading "Discard edits" once armed) — no Apply (the line
 /// editor's Apply maps regions and has no meaning here) and no Discard
@@ -415,12 +520,12 @@ pub(super) fn header_controls(
     mut bar: Div,
     state: &StructuredState,
     has_origin: bool,
+    fold_identical: bool,
     text: Option<TextStage>,
     theme: Theme,
     cx: &mut Context<MergeView>,
 ) -> Div {
-    let (decided, total) = state.progress();
-    let open = total - decided;
+    let open = state.unresolved().len();
     bar = bar.child(
         div()
             .text_xs()
@@ -465,6 +570,21 @@ pub(super) fn header_controls(
             .debug_selector(|| "merge-back-to-structure".into()),
         );
     }
+    bar = bar.child(
+        ui::button(
+            theme,
+            "merge-fold-identical",
+            "Fold identical".into(),
+            if fold_identical {
+                ui::ButtonVariant::Tonal(theme.accent)
+            } else {
+                ui::ButtonVariant::Ghost
+            },
+            ui::ButtonSize::Sm,
+            cx.listener(|view, _ev, _window, cx| view.toggle_fold_identical(cx)),
+        )
+        .debug_selector(|| "merge-fold-identical".into()),
+    );
     if !state.doc.decisions.is_empty() {
         let tint = if open > 0 {
             theme.conflict
@@ -627,7 +747,12 @@ mod tests {
     use tomte_core::structured::Side;
     use tomte_core::structured::{Pick, StructuredDocument};
 
-    use super::{has_picks, invalid_json_line, not_structured_note, pick_allowed, progress_text};
+    use tomte_app::structured_tree::{Bracket, FoldKey, FoldWhat, NodeKey, TreeRow};
+
+    use super::{
+        Anchor, anchor_row, fold_anchor, has_picks, invalid_json_line, kept_top,
+        not_structured_note, pick_allowed, progress_text,
+    };
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
         StructuredState::new(StructuredDocument::compute(base, ours, theirs, None).expect("json"))
@@ -650,30 +775,163 @@ mod tests {
         assert!(!pick_allowed(&two, 7, Pick::Disk), "unknown id");
     }
 
-    // MUTATION: report "N conflicts" with decided and total swapped, or
-    // drop the nothing-to-decide copy.
+    /// MUTATION: m counts conflicts only → "0 of 1 picked" on json_inputs.
     #[test]
-    fn progress_text_uses_the_spec_copy() {
-        let mut s = state(
-            Some("{\"a\": 1, \"b\": 1}"),
-            "{\"a\": 2, \"b\": 2}",
-            "{\"a\": 3, \"b\": 3}",
+    fn progress_text_counts_every_unlocked_decision() {
+        let inputs = super::super::fixtures::json_inputs();
+        let mut s = StructuredState::new(
+            StructuredDocument::compute(inputs.base.as_deref(), &inputs.ours, &inputs.theirs, None)
+                .expect("json"),
         );
-        assert_eq!(progress_text(&s), "2 conflicts, 0 resolved");
+        assert_eq!(progress_text(&s), "4 of 5 picked · 1 to decide");
         assert!(!has_picks(&s));
-        s.pick(0, Pick::Disk);
-        assert_eq!(progress_text(&s), "2 conflicts, 1 resolved");
+        let open = s.unresolved()[0];
+        s.pick(open, Pick::Disk);
+        assert_eq!(progress_text(&s), "5 of 5 picked");
         assert!(has_picks(&s));
-        let auto = state(None, "{\"a\": 2}", "{\"a\": 3}");
-        assert_eq!(
-            progress_text(&auto),
-            "auto-resolved · 1 changed entry · review below"
-        );
         let same = state(Some("{\"a\": 1}"), "{ \"a\":1 }", "{\"a\": 1}");
         assert_eq!(
             progress_text(&same),
             "same settings, formatting differs · Save keeps the source layout"
         );
+    }
+
+    fn node(n: usize) -> NodeKey {
+        NodeKey {
+            side: Side::Theirs,
+            node: n,
+        }
+    }
+
+    fn open_row(depth: usize, n: usize) -> TreeRow {
+        TreeRow::Open {
+            depth,
+            key: None,
+            bracket: Bracket::Object,
+            folded: false,
+            summary: "3 keys".into(),
+            same: false,
+            node: node(n),
+            comma: false,
+        }
+    }
+
+    fn decision_row(depth: usize, id: usize) -> TreeRow {
+        TreeRow::Decision {
+            depth,
+            id,
+            key: None,
+            chips: Vec::new(),
+            open: false,
+            locked: false,
+        }
+    }
+
+    fn same_row(depth: usize) -> TreeRow {
+        TreeRow::Same {
+            depth,
+            text: "\"x\": 1,".into(),
+        }
+    }
+
+    fn fold_row(depth: usize, first: usize) -> TreeRow {
+        TreeRow::Fold {
+            depth,
+            count: 3,
+            what: FoldWhat::Keys,
+            key: FoldKey {
+                container: node(0),
+                first,
+            },
+        }
+    }
+
+    fn close_row(depth: usize) -> TreeRow {
+        TreeRow::Close {
+            depth,
+            bracket: Bracket::Object,
+            comma: false,
+        }
+    }
+
+    /// MUTATION: `fold_anchor` always returns `Top` → the decision, open
+    /// and fold anchors all read `Top`.
+    #[test]
+    fn fold_anchor_prefers_the_nearest_identified_row() {
+        let rows = vec![
+            open_row(0, 0),
+            same_row(1),
+            decision_row(1, 4),
+            TreeRow::Comment {
+                depth: 1,
+                text: "// c".into(),
+            },
+            same_row(1),
+            fold_row(1, 5),
+            same_row(1),
+            close_row(0),
+        ];
+        assert_eq!(fold_anchor(&rows, 0), Anchor::Open(node(0)));
+        assert_eq!(fold_anchor(&rows, 1), Anchor::Open(node(0)));
+        assert_eq!(fold_anchor(&rows, 2), Anchor::Decision(4));
+        assert_eq!(
+            fold_anchor(&rows, 4),
+            Anchor::Decision(4),
+            "past the comment"
+        );
+        assert_eq!(
+            fold_anchor(&rows, 6),
+            Anchor::Fold(FoldKey {
+                container: node(0),
+                first: 5
+            })
+        );
+        assert_eq!(fold_anchor(&rows, 99), fold_anchor(&rows, 7), "clamped");
+        assert_eq!(fold_anchor(&[same_row(0)], 0), Anchor::Top);
+        assert_eq!(fold_anchor(&[], 0), Anchor::Top);
+    }
+
+    /// MUTATION: `anchor_row` returns the anchor's index even when
+    /// `was_top` is false → the absorbed top row maps to decision 0's row
+    /// (1), not the fold (2).
+    #[test]
+    fn anchor_row_lands_on_the_fold_that_absorbed_the_top_row() {
+        // Folded: the three `Same` rows after decision 0 became one fold.
+        let folded = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            fold_row(1, 1),
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        assert_eq!(anchor_row(&folded, &Anchor::Decision(0), false), Some(2));
+        assert_eq!(anchor_row(&folded, &Anchor::Decision(0), true), Some(1));
+        assert_eq!(anchor_row(&folded, &Anchor::Decision(1), false), Some(3));
+        assert_eq!(anchor_row(&folded, &Anchor::Decision(9), false), None);
+        // A decision before the fold: the top row was not in that run.
+        let later = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            decision_row(1, 1),
+            fold_row(1, 2),
+            close_row(0),
+        ];
+        assert_eq!(anchor_row(&later, &Anchor::Decision(0), false), Some(1));
+        // The whole pipeline: old top on the second identical row.
+        let old = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            same_row(1),
+            same_row(1),
+            same_row(1),
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &folded, 3), Some(2));
+        assert_eq!(kept_top(&old, &folded, 5), Some(3), "a decision stays put");
+        // Unfolding: the top fold is gone, the row above it takes over.
+        assert_eq!(kept_top(&folded, &old, 2), Some(1));
+        assert_eq!(kept_top(&[], &old, 0), None);
     }
 
     // MUTATION: return the error's byte offset (or a 0-based line) instead
