@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use gpui::{
-    AnyElement, Context, Div, Rgba, SharedString, Stateful, WeakEntity, div, prelude::*,
+    AnyElement, Context, Div, Rgba, SharedString, Stateful, WeakEntity, div, prelude::*, px,
     uniform_list,
 };
 use tomte_app::merge_inputs::MergeInputs;
@@ -34,6 +34,11 @@ pub(super) fn chip_tint(theme: Theme, side: ChipSide) -> Rgba {
         ChipSide::Both => theme.ok,
     }
 }
+
+/// The tree list's top and bottom padding. gpui places row `i` at
+/// `TREE_PAD_Y + i * TREE_ROW_H` (`uniform_list.rs`), so the view
+/// subtracts it when it reads the top row from the scroll offset.
+pub(super) const TREE_PAD_Y: f32 = 4.;
 
 /// What every row of one frame's tree shares: the list's closure owns it.
 struct TreeFrame {
@@ -72,7 +77,7 @@ pub(super) fn render_tree(
     .track_scroll(view.tree_scroll.clone())
     .flex_1()
     .min_h_0()
-    .py_1()
+    .py(px(TREE_PAD_Y))
     .font_family("Menlo")
     .text_xs()
     .into_any_element()
@@ -488,24 +493,118 @@ pub(super) fn anchor_row(rows: &[TreeRow], anchor: &Anchor, was_top: bool) -> Op
 }
 
 /// The row of `new` to put at the viewport's top after a "Fold identical"
-/// replan, given the `old` rows and the old top row. An anchor that the
-/// replan removed (a `Fold` row once folding is off) hands over to the
-/// identified row before it, which sits just above the unfolded run.
+/// replan, given the `old` rows and the old top row (spec §3.6).
+/// - A row with an identity keeps it: the same row in `new`.
+/// - A `Fold` the replan expanded (folding turned off): the first row of the
+///   restored run, at the fold's distance from the identified row above it.
+/// - A `Close` of a container that is not identical keeps its container:
+///   that container's `Close` in `new`.
+/// - A row a fold can absorb ([`foldable`]) goes to the `Fold` that took
+///   it, the first one after the identified row above it ([`anchor_row`]).
+/// - Anything else (a `Preview` line, a row no fold took) keeps its
+///   distance from the identified row above it.
 pub(super) fn kept_top(old: &[TreeRow], new: &[TreeRow], top: usize) -> Option<usize> {
-    let mut top = top.min(old.len().checked_sub(1)?);
-    let mut was_top = row_anchor(&old[top]).is_some();
-    loop {
-        let anchor = fold_anchor(old, top);
-        if let Some(ix) = anchor_row(new, &anchor, was_top) {
+    let top = top.min(old.len().checked_sub(1)?);
+    let last = new.len().checked_sub(1)?;
+    let row = &old[top];
+    if let Some(anchor) = row_anchor(row) {
+        if let Some(ix) = position_of(new, &anchor) {
             return Some(ix);
         }
-        // Only an identified anchor can go missing; step above it.
-        let at = old
-            .iter()
-            .take(top + 1)
-            .rposition(|row| row_anchor(row).as_ref() == Some(&anchor))?;
-        top = at.checked_sub(1)?;
-        was_top = false;
+        return offset_from_above(old, new, top, top).map(|ix| ix.min(last));
+    }
+    if let TreeRow::Close { .. } = row
+        && let Some(open) = matching_open(old, top)
+        && let TreeRow::Open {
+            same: false, node, ..
+        } = &old[open]
+    {
+        let at = position_of(new, &Anchor::Open(*node))?;
+        return Some(matching_close(new, at).unwrap_or(at));
+    }
+    if foldable(old, top)
+        && let Some((anchor, at)) = surviving_anchor(old, new, top)
+        // `anchor_row` answers the anchor's own row when no fold follows it.
+        && let Some(ix) = anchor_row(new, &anchor, false)
+        && ix != at
+    {
+        return Some(ix);
+    }
+    offset_from_above(old, new, top, top).map(|ix| ix.min(last))
+}
+
+/// Whether a fold can have absorbed `rows[ix]`: a `Same` or `Comment` row,
+/// or the `Close` of an identical container (`same: true`), which folds
+/// with its run.
+fn foldable(rows: &[TreeRow], ix: usize) -> bool {
+    match &rows[ix] {
+        TreeRow::Same { .. } | TreeRow::Comment { .. } => true,
+        TreeRow::Close { .. } => matching_open(rows, ix)
+            .is_some_and(|open| matches!(rows[open], TreeRow::Open { same: true, .. })),
+        TreeRow::Open { .. }
+        | TreeRow::Decision { .. }
+        | TreeRow::Preview { .. }
+        | TreeRow::Fold { .. } => false,
+    }
+}
+
+/// The nearest identified row at or above `top` in `old` that `new` still
+/// has, with its index in `new`: an identical container's `Open` folds
+/// away with its run, so the row above it stands in.
+fn surviving_anchor(old: &[TreeRow], new: &[TreeRow], top: usize) -> Option<(Anchor, usize)> {
+    let mut top = top;
+    loop {
+        let anchor = fold_anchor(old, top);
+        if anchor == Anchor::Top {
+            return None;
+        }
+        if let Some(at) = position_of(new, &anchor) {
+            return Some((anchor, at));
+        }
+        top = position_of(old, &anchor)?.checked_sub(1)?;
+    }
+}
+
+/// The index of `anchor`'s row in `rows`.
+fn position_of(rows: &[TreeRow], anchor: &Anchor) -> Option<usize> {
+    rows.iter()
+        .position(|row| row_anchor(row).as_ref() == Some(anchor))
+}
+
+/// The `Open` row of the `Close` at `close`: the nearest `Open` above it
+/// at its depth (deeper rows belong to its children).
+fn matching_open(rows: &[TreeRow], close: usize) -> Option<usize> {
+    let depth = row_depth(&rows[close]);
+    rows[..close]
+        .iter()
+        .rposition(|row| matches!(row, TreeRow::Open { depth: d, .. } if *d == depth))
+}
+
+/// The `Close` row of the unfolded `Open` at `open`: the first `Close`
+/// below it at its depth.
+fn matching_close(rows: &[TreeRow], open: usize) -> Option<usize> {
+    let depth = row_depth(&rows[open]);
+    rows.iter()
+        .enumerate()
+        .skip(open + 1)
+        .find(|(_, row)| matches!(row, TreeRow::Close { depth: d, .. } if *d == depth))
+        .map(|(ix, _)| ix)
+}
+
+/// `top`'s place in `new` at its old distance from the nearest identified
+/// row above `end` in `old` (the root when there is none). An identified
+/// row the replan removed hands over to the one above it.
+fn offset_from_above(old: &[TreeRow], new: &[TreeRow], top: usize, end: usize) -> Option<usize> {
+    let mut end = end;
+    loop {
+        let Some(above) = old[..end].iter().rposition(|row| row_anchor(row).is_some()) else {
+            return Some(top);
+        };
+        let anchor = row_anchor(&old[above]).expect("an identified row");
+        if let Some(at) = position_of(new, &anchor) {
+            return Some(at + (top - above));
+        }
+        end = above;
     }
 }
 
@@ -927,9 +1026,172 @@ mod tests {
         ];
         assert_eq!(kept_top(&old, &folded, 3), Some(2));
         assert_eq!(kept_top(&old, &folded, 5), Some(3), "a decision stays put");
-        // Unfolding: the top fold is gone, the row above it takes over.
-        assert_eq!(kept_top(&folded, &old, 2), Some(1));
         assert_eq!(kept_top(&[], &old, 0), None);
+    }
+
+    fn preview_row(depth: usize) -> TreeRow {
+        TreeRow::Preview {
+            depth,
+            text: "\"x\": 1".into(),
+        }
+    }
+
+    fn container_row(depth: usize, n: usize, same: bool) -> TreeRow {
+        match open_row(depth, n) {
+            TreeRow::Open {
+                depth,
+                key,
+                bracket,
+                folded,
+                summary,
+                node,
+                comma,
+                ..
+            } => TreeRow::Open {
+                depth,
+                key,
+                bracket,
+                folded,
+                summary,
+                same,
+                node,
+                comma,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Folding off with a `Fold` row at the top: the first row of the
+    /// restored run goes to the top.
+    ///
+    /// MUTATION: a removed fold answers its predecessor's own row → Some(1).
+    #[test]
+    fn kept_top_puts_an_expanded_fold_s_first_row_at_the_top() {
+        let folded = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            fold_row(1, 1),
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        let unfolded = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            same_row(1),
+            same_row(1),
+            same_row(1),
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&folded, &unfolded, 2), Some(2));
+    }
+
+    /// A chip's preview line at the top stays beside its decision; a fold
+    /// further down did not absorb it.
+    ///
+    /// MUTATION: treat a `Preview` row as foldable → the fold below, Some(4).
+    #[test]
+    fn kept_top_keeps_a_preview_line_beside_its_decision() {
+        let old = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            preview_row(2),
+            preview_row(2),
+            same_row(1),
+            same_row(1),
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        let new = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            preview_row(2),
+            preview_row(2),
+            fold_row(1, 1),
+            decision_row(1, 1),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &new, 3), Some(3));
+    }
+
+    /// The `Close` of a container that differs keeps its container even
+    /// when its identical children fold; the `Close` of an identical
+    /// container folds with its run.
+    ///
+    /// MUTATION: drop the `Close` branch of `kept_top` → the offset from
+    /// decision 0 lands on the sibling fold, Some(5).
+    /// MUTATION: `foldable` says false for every `Close` → the identical
+    /// container's `Close` keeps its offset instead of joining the fold,
+    /// Some(3).
+    #[test]
+    fn kept_top_keeps_a_close_row_with_its_container() {
+        let old = vec![
+            open_row(0, 0),
+            container_row(1, 1, false),
+            decision_row(2, 0),
+            same_row(2),
+            same_row(2),
+            close_row(1),
+            same_row(1),
+            close_row(0),
+        ];
+        let new = vec![
+            open_row(0, 0),
+            container_row(1, 1, false),
+            decision_row(2, 0),
+            fold_row(2, 1),
+            close_row(1),
+            fold_row(1, 2),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &new, 5), Some(4));
+        // An identical container after decision 0: its rows fold into one.
+        let old = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            container_row(1, 2, true),
+            same_row(2),
+            close_row(1),
+            same_row(1),
+            close_row(0),
+        ];
+        let new = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            fold_row(1, 1),
+            close_row(0),
+        ];
+        // The `Close` at 4 sits inside the run that became the fold at 2.
+        assert_eq!(kept_top(&old, &new, 4), Some(2));
+    }
+
+    /// Folding off with a `Same` row of an expanded run at the top: the
+    /// row keeps its place, no fold in sight.
+    ///
+    /// MUTATION: return `anchor_row`'s answer when no fold follows the
+    /// anchor → the anchor's own row, Some(1).
+    #[test]
+    fn kept_top_keeps_a_row_no_fold_took() {
+        let old = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            same_row(1),
+            same_row(1),
+            decision_row(1, 1),
+            fold_row(1, 4),
+            close_row(0),
+        ];
+        let new = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            same_row(1),
+            same_row(1),
+            decision_row(1, 1),
+            same_row(1),
+            same_row(1),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &new, 3), Some(3));
     }
 
     // MUTATION: return the error's byte offset (or a 0-based line) instead

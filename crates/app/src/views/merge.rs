@@ -1628,13 +1628,15 @@ impl MergeView {
     /// The index of the tree row at the viewport's top: a scroll still
     /// waiting for the next layout wins, as in gpui's own
     /// `logical_scroll_top_index` (which exists only under test-support).
-    /// Every tree row is [`ui::TREE_ROW_H`] tall.
+    /// Every tree row is [`ui::TREE_ROW_H`] tall, below the list's
+    /// [`merge_structured::TREE_PAD_Y`] top padding.
     fn tree_top_row(&self) -> usize {
         let state = self.tree_scroll.0.borrow();
         if let Some(deferred) = &state.deferred_scroll_to_item {
             return deferred.item_index;
         }
-        let scrolled = -f32::from(state.base_handle.offset().y);
+        // Row `i` starts at the list's top padding plus `i` rows.
+        let scrolled = -f32::from(state.base_handle.offset().y) - merge_structured::TREE_PAD_Y;
         (scrolled / ui::TREE_ROW_H).floor().max(0.) as usize
     }
 

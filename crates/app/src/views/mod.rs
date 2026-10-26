@@ -7067,6 +7067,49 @@ mod render_smoke {
         assert_eq!(restored, unfolded);
     }
 
+    /// "Fold identical" keeps the row at the viewport's top: scrolled so
+    /// decision a's row is at the top (offset 40 px, inside the list's 4 px
+    /// top padding plus one 20 px row), the toggle keeps a at the top
+    /// instead of the 200-row identical run below it.
+    ///
+    /// MUTATION: `tree_top_row` returns 0 → the root row, Some(0).
+    /// MUTATION: `tree_top_row` ignores the list's top padding → row 2, the
+    /// first identical row, which folds: the fold row, Some(2).
+    #[gpui::test]
+    fn fold_identical_keeps_the_scrolled_top_row(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::{TreeRow, scroll_target};
+        let (_shell, merge, vis) = structured_merge_window(cx, conflicts_inputs(&["a", "b"], 200));
+        let old = tree_rows(&merge, vis);
+        assert_eq!(scroll_target(&old, 0), Some(1), "a is row 1");
+        assert!(
+            matches!(old[2], TreeRow::Same { .. }),
+            "the run starts at 2"
+        );
+        vis.update(|_w, cx| {
+            merge.update(cx, |v, _| {
+                v.tree_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(gpui::point(px(0.), px(-40.)));
+                v.last_scroll_row = None;
+            })
+        });
+        vis.run_until_parked();
+        let offset =
+            vis.update(|_w, cx| merge.read(cx).tree_scroll.0.borrow().base_handle.offset().y);
+        assert_eq!(offset, px(-40.), "the offset held through a frame");
+
+        let toggle = vis.debug_bounds("merge-fold-identical").unwrap();
+        vis.simulate_click(toggle.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        let new = tree_rows(&merge, vis);
+        assert!(new.len() < old.len(), "the run folded");
+        let last = vis.update(|_w, cx| merge.read(cx).last_scroll_row);
+        assert_eq!(last, merge_structured::kept_top(&old, &new, 1));
+        assert_eq!(last, scroll_target(&new, 0), "a stays at the top");
+    }
+
     /// A save the write-back would refuse never reaches the queue: two free
     /// picks on adjacent lines of different template literals read as one
     /// edit. The message box names it and the picks stay.
