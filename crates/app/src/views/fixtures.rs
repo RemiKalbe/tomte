@@ -107,7 +107,15 @@ pub const STATES: &[(&str, &str)] = &[
     ),
     (
         "merge-structured",
-        "JSON settings in Structure mode: a conflict, a key added on disk, one removed, array rows",
+        "JSON settings as a tree: every row kind, a conflict row edged",
+    ),
+    (
+        "merge-structured-folded",
+        "the same settings with Fold identical on: unchanged runs fold to one row",
+    ),
+    (
+        "merge-structured-same",
+        "disk equals source, origin differs: Lines with the note",
     ),
     (
         "merge-structured-locked",
@@ -488,11 +496,122 @@ pub(super) fn json_inputs() -> MergeInputs {
     }
 }
 
+/// A Claude Code `settings.json` that poses every Structure-mode row kind
+/// at once, each from one difference between the three texts:
+/// "editor.formatOnSave" changed the same way on both sides (one
+/// `source · disk` chip), "theme" changed differently on each (a conflict:
+/// three chips, the red edge), "font_size" changed on disk, "tab_size"
+/// removed on disk, "vim_mode" added on disk, "telemetry" a string in
+/// source and an object on disk, "permissions" an object added on disk,
+/// "model" written twice in source (` ×2`) and changed on disk, in
+/// "lastSelectedAgents" "antigravity" removed on disk and a conflicting
+/// insertion at the end ("gemini" in source, "cursor" on disk), in "hooks"
+/// a different object appended on each side, the `// editor` comment above
+/// the first key, two identical scalar keys (dim rows in place), and an
+/// identical "keybindings" object (one folded row, placed before the last
+/// key so the row shows its trailing comma). Fold identical turns those
+/// three into one `▸ 3 identical keys` row.
+pub(super) fn json_tree_inputs() -> MergeInputs {
+    let base = concat!(
+        "{\n",
+        "  // editor\n",
+        "  \"editor.formatOnSave\": true,\n",
+        "  \"theme\": \"Solarized\",\n",
+        "  \"font_size\": 14,\n",
+        "  \"tab_size\": 4,\n",
+        "  \"telemetry\": \"auto\",\n",
+        "  \"model\": \"sonnet\",\n",
+        "  \"cleanupPeriodDays\": 30,\n",
+        "  \"includeCoAuthoredBy\": true,\n",
+        "  \"keybindings\": {\n",
+        "    \"cmd-k\": \"palette\",\n",
+        "    \"cmd-p\": \"files\"\n",
+        "  },\n",
+        "  \"lastSelectedAgents\": [\n",
+        "    \"claude\",\n",
+        "    \"antigravity\",\n",
+        "    \"codex\"\n",
+        "  ],\n",
+        "  \"hooks\": [\n",
+        "    { \"event\": \"PreToolUse\", \"command\": \"lint\" }\n",
+        "  ]\n",
+        "}\n",
+    );
+    let theirs = concat!(
+        "{\n",
+        "  // editor\n",
+        "  \"editor.formatOnSave\": false,\n",
+        "  \"theme\": \"One Dark\",\n",
+        "  \"font_size\": 14,\n",
+        "  \"tab_size\": 4,\n",
+        "  \"telemetry\": \"auto\",\n",
+        "  \"model\": \"sonnet\",\n",
+        "  \"model\": \"sonnet\",\n",
+        "  \"cleanupPeriodDays\": 30,\n",
+        "  \"includeCoAuthoredBy\": true,\n",
+        "  \"keybindings\": {\n",
+        "    \"cmd-k\": \"palette\",\n",
+        "    \"cmd-p\": \"files\"\n",
+        "  },\n",
+        "  \"lastSelectedAgents\": [\n",
+        "    \"claude\",\n",
+        "    \"antigravity\",\n",
+        "    \"codex\",\n",
+        "    \"gemini\"\n",
+        "  ],\n",
+        "  \"hooks\": [\n",
+        "    { \"event\": \"PreToolUse\", \"command\": \"lint\" },\n",
+        "    { \"event\": \"Stop\", \"command\": \"notify\" }\n",
+        "  ]\n",
+        "}\n",
+    );
+    let ours = concat!(
+        "{\n",
+        "  // editor\n",
+        "  \"editor.formatOnSave\": false,\n",
+        "  \"theme\": \"Ayu Dark\",\n",
+        "  \"font_size\": 15,\n",
+        "  \"vim_mode\": true,\n",
+        "  \"telemetry\": { \"level\": \"off\", \"share\": false },\n",
+        "  \"permissions\": {\n",
+        "    \"allow\": [\"Bash(cargo test:*)\"],\n",
+        "    \"deny\": [],\n",
+        "    \"defaultMode\": \"acceptEdits\"\n",
+        "  },\n",
+        "  \"model\": \"opus\",\n",
+        "  \"cleanupPeriodDays\": 30,\n",
+        "  \"includeCoAuthoredBy\": true,\n",
+        "  \"keybindings\": {\n",
+        "    \"cmd-k\": \"palette\",\n",
+        "    \"cmd-p\": \"files\"\n",
+        "  },\n",
+        "  \"lastSelectedAgents\": [\n",
+        "    \"claude\",\n",
+        "    \"codex\",\n",
+        "    \"cursor\"\n",
+        "  ],\n",
+        "  \"hooks\": [\n",
+        "    { \"event\": \"PreToolUse\", \"command\": \"lint\" },\n",
+        "    { \"event\": \"PostToolUse\", \"command\": \"fmt\" }\n",
+        "  ]\n",
+        "}\n",
+    );
+    MergeInputs {
+        target: home(".claude/settings.json"),
+        ours: ours.into(),
+        theirs: theirs.into(),
+        base: Some(base.into()),
+        source_path: home(".local/share/chezmoi/dot_claude/settings.json"),
+        templated: false,
+        template: None,
+        span_map: None,
+        origin: None,
+    }
+}
+
 /// [`json_inputs`] after the user re-added: disk equals source byte for
 /// byte, and only git origin differs ("font_size" is 16 there). The
 /// merge editor opens it in Lines with the "disk matches source" note.
-// Only the Shell tests use it until a gallery pose does.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn json_same_inputs() -> MergeInputs {
     let mut inputs = json_inputs();
     inputs.ours = inputs.theirs.clone();
@@ -1096,7 +1215,24 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         }
         "merge-structured" => {
             let mut s = shell(Route::Merge, rich_model());
-            s.merge = Some(posed_merge(cx, json_inputs(), false));
+            s.merge = Some(posed_merge(cx, json_tree_inputs(), false));
+            s
+        }
+        "merge-structured-folded" => {
+            let mut s = shell(Route::Merge, rich_model());
+            let merge = posed_merge(cx, json_tree_inputs(), false);
+            merge.update(cx, |view, _| {
+                if let Some(loaded) = view.loaded.as_mut() {
+                    loaded.tree.fold_identical = true;
+                    loaded.tree_dirty = true;
+                }
+            });
+            s.merge = Some(merge);
+            s
+        }
+        "merge-structured-same" => {
+            let mut s = shell(Route::Merge, rich_model());
+            s.merge = Some(posed_merge(cx, json_same_inputs(), false));
             s
         }
         "merge-structured-locked" => {
@@ -1194,4 +1330,174 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tomte_app::structured_tree::{Chip, ChipSide, TreeRow, TreeView, plan};
+
+    /// The chips and open flag of the keyed decision `key` (as written,
+    /// quotes included).
+    fn keyed<'a>(rows: &'a [TreeRow], key: &str) -> (&'a [Chip], bool) {
+        rows.iter()
+            .find_map(|row| match row {
+                TreeRow::Decision {
+                    key: Some(k),
+                    chips,
+                    open,
+                    ..
+                } if k == key => Some((chips.as_slice(), *open)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{key} has a decision row"))
+    }
+
+    fn chip(chips: &[Chip], side: ChipSide) -> &Chip {
+        chips
+            .iter()
+            .find(|c| c.side == side)
+            .unwrap_or_else(|| panic!("a {side:?} chip in {chips:?}"))
+    }
+
+    /// The rows inside the container `key` opens, up to its `Close`.
+    fn inside<'a>(rows: &'a [TreeRow], key: &str) -> &'a [TreeRow] {
+        let start = rows
+            .iter()
+            .position(|row| matches!(row, TreeRow::Open { key: Some(k), .. } if k == key))
+            .unwrap_or_else(|| panic!("{key} opens a container"));
+        let end = rows[start..]
+            .iter()
+            .position(|row| matches!(row, TreeRow::Close { depth: 1, .. }))
+            .expect("the container closes");
+        &rows[start + 1..start + end]
+    }
+
+    /// The keyless (element) decisions among `rows`.
+    fn elements(rows: &[TreeRow]) -> Vec<(&[Chip], bool)> {
+        rows.iter()
+            .filter_map(|row| match row {
+                TreeRow::Decision {
+                    key: None,
+                    chips,
+                    open,
+                    ..
+                } => Some((chips.as_slice(), *open)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `merge-structured` pose's inputs plan every row kind the tree
+    /// has, each from the one difference its doc comment names.
+    /// MUTATION: disk's "theme" set to source's "One Dark" → the theme row
+    /// is no open three-chip conflict and the theme assertions fail.
+    /// MUTATION: source's second "model" line dropped → no ` ×2` chip.
+    /// MUTATION: the "cleanupPeriodDays" lines dropped → no dim key row and
+    /// a two-key fold run.
+    #[test]
+    fn json_tree_inputs_plan_every_row_kind() {
+        let loaded = LoadedMerge::new(Arc::new(json_tree_inputs()));
+        let state = loaded.structured.as_ref().expect("the texts parse");
+        let rows = plan(state, &TreeView::default());
+
+        assert_eq!(
+            rows[1],
+            TreeRow::Comment {
+                depth: 1,
+                text: "// editor".into()
+            },
+            "the comment sits above the first key"
+        );
+        assert!(
+            matches!(&rows[2], TreeRow::Decision { key: Some(k), .. } if k == "\"editor.formatOnSave\""),
+            "the first key follows its comment: {:?}",
+            rows[2]
+        );
+
+        let (chips, open) = keyed(&rows, "\"editor.formatOnSave\"");
+        assert!(!open);
+        assert!(chips.iter().any(|c| c.agreed), "one source · disk chip");
+        assert_eq!(chip(chips, ChipSide::LastWritten).text, "true");
+
+        let (chips, open) = keyed(&rows, "\"theme\"");
+        assert!(open, "the theme conflict waits for a pick");
+        assert_eq!(chips.len(), 3, "source, disk and last written");
+
+        let (chips, _) = keyed(&rows, "\"font_size\"");
+        assert_eq!(chip(chips, ChipSide::Disk).text, "15");
+        let (chips, _) = keyed(&rows, "\"tab_size\"");
+        assert_eq!(chip(chips, ChipSide::Disk).text, "removed");
+        assert_eq!(chip(chips, ChipSide::Source).text, "4");
+        let (chips, _) = keyed(&rows, "\"vim_mode\"");
+        assert_eq!(chip(chips, ChipSide::Source).text, "absent");
+        let (chips, _) = keyed(&rows, "\"telemetry\"");
+        assert_eq!(chip(chips, ChipSide::Source).text, "\"auto\"");
+        assert_eq!(chip(chips, ChipSide::Disk).text, "{ 2 keys }");
+        let (chips, _) = keyed(&rows, "\"permissions\"");
+        assert_eq!(chip(chips, ChipSide::Source).text, "absent");
+        assert_eq!(chip(chips, ChipSide::Disk).text, "{ 3 keys }");
+        let (chips, _) = keyed(&rows, "\"model\"");
+        assert!(
+            chip(chips, ChipSide::Source).text.ends_with(" ×2"),
+            "{chips:?}"
+        );
+
+        let agents = elements(inside(&rows, "\"lastSelectedAgents\""));
+        assert!(
+            agents
+                .iter()
+                .any(|(c, open)| !open && chip(c, ChipSide::Disk).text == "removed"),
+            "antigravity removed on disk: {agents:?}"
+        );
+        assert!(
+            agents
+                .iter()
+                .any(|(c, open)| *open && c.iter().any(|c| c.side == ChipSide::Both)),
+            "gemini against cursor, with a both chip: {agents:?}"
+        );
+
+        let hooks = elements(inside(&rows, "\"hooks\""));
+        assert!(
+            hooks.iter().any(|(c, open)| *open
+                && chip(c, ChipSide::Source).text.ends_with("keys }")
+                && chip(c, ChipSide::Disk).text.ends_with("keys }")),
+            "each side appends its own object: {hooks:?}"
+        );
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                TreeRow::Open { key: Some(k), folded: true, same: true, summary, comma: true, .. }
+                    if k == "\"keybindings\"" && summary == "2 keys"
+            )),
+            "identical keybindings fold to one row, with its comma"
+        );
+        assert!(
+            rows.contains(&TreeRow::Same {
+                depth: 1,
+                text: "\"cleanupPeriodDays\": 30,".into()
+            }),
+            "an identical key stays dim in place"
+        );
+
+        let folded = plan(
+            state,
+            &TreeView {
+                fold_identical: true,
+                ..TreeView::default()
+            },
+        );
+        assert!(
+            folded.iter().any(|row| matches!(
+                row,
+                TreeRow::Fold {
+                    depth: 1,
+                    count: 3,
+                    ..
+                }
+            )),
+            "the two identical keys and keybindings fold into one run"
+        );
+    }
 }

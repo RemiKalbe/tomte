@@ -95,7 +95,7 @@ fn tree_rows(rows: &[TreeRow], range: Range<usize>, frame: &TreeFrame) -> Vec<An
 fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
     let theme = frame.theme;
     let line = |depth: usize, tone: ui::RowTone| {
-        ui::tree_row(theme, ("tree-line", ix), depth, tone, false, |_, _, _| {})
+        ui::inert_tree_row(theme, ("tree-line", ix), depth, tone)
             .w_full()
             .debug_selector(move || format!("tree-line:{ix}"))
     };
@@ -128,7 +128,6 @@ fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
                 },
             )
             .w_full()
-            .cursor_pointer()
             .debug_selector(move || format!("tree-row:{id}"))
             .when_some(key.as_ref(), |el, key| {
                 el.child(div().flex_none().child(format!("{key}:")))
@@ -189,7 +188,6 @@ fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
                 },
             )
             .w_full()
-            .cursor_pointer()
             .debug_selector(move || format!("tree-line:{ix}"))
             .child(text)
             .when_some(tail, |el, (summary, close)| {
@@ -254,7 +252,6 @@ fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
                 },
             )
             .w_full()
-            .cursor_pointer()
             .debug_selector(move || format!("tree-line:{ix}"))
             .child(format!("▸ {count} identical {noun}"))
             .into_any_element()

@@ -489,8 +489,13 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
         "structure-row" => {
             let key = |text: &'static str| div().flex_none().child(text);
             let long: gpui::SharedString = "x".repeat(120).into();
-            let row = |ix: usize, depth: usize, tone: RowTone| {
-                tree_row(theme, ("prev-sr", ix), depth, tone, false, noop)
+            // Identical and comment rows are inert in the view; the rest
+            // take the pointer and the hover wash.
+            let row = |ix: usize, depth: usize, tone: RowTone| match tone {
+                RowTone::Same | RowTone::Comment => {
+                    inert_tree_row(theme, ("prev-sr", ix), depth, tone)
+                }
+                _ => tree_row(theme, ("prev-sr", ix), depth, tone, false, noop),
             };
             let chip = |ix: usize,
                         tint: gpui::Rgba,
@@ -543,7 +548,14 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 .child(
                     row(3, 1, RowTone::Changed)
                         .child(key("\"tab_size\":"))
-                        .child(chip(5, theme.ok, "source · disk", "4".into(), true, None)),
+                        .child(chip(
+                            5,
+                            theme.accent,
+                            "source · disk",
+                            "4".into(),
+                            true,
+                            None,
+                        )),
                 )
                 .child(
                     row(4, 1, RowTone::Changed)

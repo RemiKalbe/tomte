@@ -47,10 +47,8 @@ pub enum RowTone {
     Fold,
 }
 
-/// One tree row: Menlo text_xs, [`TREE_ROW_H`] tall, indented by `depth`.
-/// Every row carries a 2px left border so the open row's red edge does not
-/// shift its text. The tone colour sits on the row; children (key text,
-/// chips) inherit it or set their own. `cursor` takes the list-row
+/// One clickable tree row: [`inert_tree_row`] plus the pointer, the
+/// `list_row` hover wash, and `on_click`. `cursor` takes the list-row
 /// selected wash.
 pub fn tree_row(
     theme: Theme,
@@ -60,17 +58,30 @@ pub fn tree_row(
     cursor: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let row = inert_tree_row(theme, id, depth, tone);
+    row.when(cursor, |el| el.bg(Theme::wash(theme.text, 0.08)))
+        .cursor_pointer()
+        .hover(|el| el.bg(Theme::wash(theme.text, 0.06)))
+        .on_click(on_click)
+}
+
+/// One tree row that nothing happens on (identical rows, comments,
+/// previews, closing brackets): Menlo text_xs, [`TREE_ROW_H`] tall,
+/// indented by `depth`. Every row carries a 2px left border so the open
+/// row's red edge does not shift its text. The tone colour sits on the row;
+/// children (key text, chips) inherit it or set their own.
+pub fn inert_tree_row(
+    theme: Theme,
+    id: impl Into<ElementId>,
+    depth: usize,
+    tone: RowTone,
+) -> Stateful<Div> {
     let text_color = match tone {
         RowTone::Plain | RowTone::Changed | RowTone::Open => theme.text,
         RowTone::Same | RowTone::Comment | RowTone::Fold => theme.text_muted,
     };
-    let wash = if cursor {
-        Some(Theme::wash(theme.text, 0.08))
-    } else if matches!(tone, RowTone::Changed | RowTone::Open) {
-        Some(Theme::wash(theme.text, 0.05))
-    } else {
-        None
-    };
+    let wash =
+        matches!(tone, RowTone::Changed | RowTone::Open).then(|| Theme::wash(theme.text, 0.05));
     let row = div()
         .id(id)
         .h(px(TREE_ROW_H))
@@ -85,8 +96,7 @@ pub fn tree_row(
         .text_xs()
         .text_color(text_color)
         .border_l_2()
-        .when_some(wash, |el, wash| el.bg(wash))
-        .on_click(on_click);
+        .when_some(wash, |el, wash| el.bg(wash));
     match tone {
         RowTone::Open => row.border_color(theme.conflict),
         RowTone::Fold => row.border_color(transparent_black()).italic(),
@@ -161,13 +171,15 @@ pub fn value_chip(
 }
 
 /// The lock on a row whose value a template renders: it follows source.
-/// Returns `Stateful` because a tooltip needs an element id.
+/// `⚿`, the line editor's protected marker, so both editors share one
+/// mark; a text glyph, unlike an emoji, takes the muted colour. Returns
+/// `Stateful` because a tooltip needs an element id.
 pub fn lock_mark(theme: Theme, reason: SharedString) -> Stateful<Div> {
     div()
         .id("lock-mark")
         .flex_none()
         .text_color(theme.text_muted)
-        .child("🔒")
+        .child("⚿")
         .tooltip(text_tooltip(reason))
 }
 

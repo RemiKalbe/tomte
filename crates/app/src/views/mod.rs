@@ -2437,6 +2437,7 @@ mod render_smoke {
         // the Text stage with the not-valid-JSON chip on the third.
         for name in [
             "merge-structured",
+            "merge-structured-folded",
             "merge-structured-locked",
             "merge-structured-text",
         ] {
@@ -2459,7 +2460,30 @@ mod render_smoke {
             assert_eq!(mode, merge::MergeMode::Structure, "{name}");
             assert_eq!(locked, name == "merge-structured-locked", "{name}");
             assert_eq!(chip.is_some(), name == "merge-structured-text", "{name}");
+            // MUTATION: the folded pose leaves `fold_identical` off → no
+            // `Fold` row in its plan.
+            let folds = vis.update(|_w, cx| {
+                merge
+                    .read(cx)
+                    .tree_rows_for_test()
+                    .iter()
+                    .any(|row| matches!(row, tomte_app::structured_tree::TreeRow::Fold { .. }))
+            });
+            assert_eq!(folds, name == "merge-structured-folded", "{name}");
         }
+
+        // The disk-equals-source pose opens in Lines, where the note shows.
+        // MUTATION: the pose builds from `json_tree_inputs` → Structure.
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("merge-structured-same", smoke_paths(), cx)
+                .expect("merge-structured-same builds")
+        });
+        vis.run_until_parked();
+        let merge = vis
+            .update(|_w, cx| shell.read(cx).merge.clone())
+            .expect("merge-structured-same poses a merge");
+        let mode = vis.update(|_w, cx| merge.read(cx).loaded.as_ref().expect("loaded").mode);
+        assert_eq!(mode, merge::MergeMode::Lines);
 
         // The not-structured pose opens the line editor with the note.
         // MUTATION: `not_structured_note` returns None → no note.
