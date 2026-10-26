@@ -432,9 +432,6 @@ Open, deliberately (design calls, not bugs):
 - The per-event path (`rescan_source_side`) and `handle_fetch`'s per-file
   probes still run under the lock — bounded by changed-file counts; give
   them the begin/apply split if one ever shows in a banner.
-- A merge-header path wider than about a third of the header still clips
-  mid-glyph. The fix is a definite width or an ellipsis inside `crates/ui`,
-  checked with its own Review screenshot.
 - `merge.rs` grew by about 600 lines with Structure mode. Its
   Structure-mode branches, beside `merge_structured.rs`, are the next
   split after the Review planner.

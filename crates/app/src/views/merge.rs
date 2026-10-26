@@ -2369,15 +2369,13 @@ impl MergeView {
             ),
             None => ("merge editor".into(), "".into()),
         };
-        // Every control goes in ONE wrapping trailing box capped at two
-        // thirds of the header, the way Review's header does it: the title
-        // column keeps a third, so the path is not hard-clipped mid-glyph
-        // when Structure mode's toggle and the Text stage's chip crowd the
-        // row; the controls wrap onto a second row instead.
+        // Every control goes in ONE trailing box on one row, at its full
+        // width: the title column takes what is left, and its name and path
+        // end in an ellipsis when that is too narrow (`detail_header`).
         let mut bar = div()
             .flex()
-            .flex_wrap()
-            .max_w_2_3()
+            .flex_shrink_0()
+            .flex_nowrap()
             .items_center()
             .justify_end()
             .gap_2();
