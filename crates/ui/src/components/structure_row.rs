@@ -17,6 +17,8 @@ pub const TREE_INDENT_PX: f32 = 12.;
 /// out of the pane.
 pub const TREE_MAX_INDENT_DEPTH: usize = 24;
 
+/// Height of a value chip: four px under [`TREE_ROW_H`].
+const CHIP_H: f32 = 16.;
 /// Widest a value chip grows before its text ellipsizes.
 const CHIP_MAX_W: f32 = 360.;
 /// A chip text longer than this many characters gets a tooltip with the
@@ -120,6 +122,9 @@ pub fn value_chip(
     shown.push_str(&text);
     div()
         .id(id)
+        // A fixed height under the row's, so chips on consecutive rows keep
+        // a gap between their borders.
+        .h(px(CHIP_H))
         .flex()
         .flex_shrink()
         .items_center()

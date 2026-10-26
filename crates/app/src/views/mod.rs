@@ -6492,23 +6492,48 @@ mod render_smoke {
         vis.update(|_w, cx| merge.read(cx).result_text_for_test(cx))
     }
 
-    /// A JSON file opens in Structure mode with one strip per decision,
-    /// each strip labelled with its key path.
+    /// The rows the merge editor planned last, for tests.
+    fn tree_rows(
+        merge: &Entity<merge::MergeView>,
+        vis: &mut VisualTestContext,
+    ) -> Vec<tomte_app::structured_tree::TreeRow> {
+        vis.update(|_w, cx| merge.read(cx).tree_rows_for_test())
+    }
+
+    /// Decision `id`'s row in `rows`.
+    fn decision_row(
+        rows: &[tomte_app::structured_tree::TreeRow],
+        id: usize,
+    ) -> (Vec<tomte_app::structured_tree::Chip>, bool) {
+        use tomte_app::structured_tree::TreeRow;
+        rows.iter()
+            .find_map(|row| match row {
+                TreeRow::Decision {
+                    id: d, chips, open, ..
+                } if *d == id => Some((chips.clone(), *open)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("decision {id} has a row"))
+    }
+
+    /// A JSON file opens in Structure mode as one tree of rows: a row per
+    /// decision, no input panes and no result pane.
     ///
+    /// MUTATION: `body` still renders the pane row in Structure mode → a
+    /// `merge-pane-divider` bound exists.
     /// MUTATION: `LoadedMerge::new` never runs `detect` (the structured load
-    /// returns an error) → mode stays Lines, `structured` is None and no
-    /// `merge-strip:<id>` selector renders.
+    /// returns an error) → mode stays Lines and no `tree-row:<id>` renders.
     #[gpui::test]
-    fn json_inputs_open_in_structure_mode_with_one_strip_per_decision(cx: &mut TestAppContext) {
+    fn json_inputs_open_in_structure_mode_as_a_tree_with_no_panes(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::TreeRow;
         let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
-        let (mode, ids, specs) = vis.update(|_w, cx| {
+        let (mode, ids) = vis.update(|_w, cx| {
             let view = merge.read(cx);
             let loaded = view.loaded.as_ref().expect("loaded");
             let state = loaded.structured.as_ref().expect("a structured document");
             (
                 loaded.mode,
                 state.doc.decisions.iter().map(|d| d.id).collect::<Vec<_>>(),
-                merge_structured::strip_specs(state, &HashSet::new(), None, None),
             )
         });
         assert_eq!(mode, merge::MergeMode::Structure);
@@ -6517,57 +6542,173 @@ mod render_smoke {
             5,
             "theme, font_size, vim_mode, one plugins element, tab_size"
         );
-        assert_eq!(specs.len(), ids.len(), "one strip per decision");
-        assert_eq!(specs[0].label.as_ref(), "theme");
-        assert_eq!(specs[0].detail.as_ref(), "conflict");
         for id in ids {
-            let selector = leak(format!("merge-strip:{id}"));
+            let selector = leak(format!("tree-row:{id}"));
             assert!(vis.debug_bounds(selector).is_some(), "{selector} renders");
         }
+        assert!(
+            vis.debug_bounds("merge-pane-divider").is_none(),
+            "no input panes"
+        );
+        assert!(
+            vis.debug_bounds("merge-result-scroll").is_none(),
+            "no result pane"
+        );
+        let first_key = tree_rows(&merge, vis)
+            .into_iter()
+            .find_map(|row| match row {
+                TreeRow::Decision { key, .. } => Some(key),
+                _ => None,
+            });
+        assert_eq!(first_key, Some(Some("\"theme\"".to_string())));
     }
 
-    /// A real click on a strip's disk button rewrites the result text, and
-    /// ⌘Z through the merge editor's binding puts source back.
+    /// A real click on a chip picks that side: the assembled text changes,
+    /// the row's chip reads picked and its edge goes, and ⌘Z through the
+    /// merge editor's binding puts it back.
     ///
-    /// MUTATION: `apply_pick` writes to the LINE resolution
-    /// (`loaded.state`) instead of the structured one → the result text
-    /// still reads "Solarized" after the click.
+    /// MUTATION: the chip click handler moves the cursor only → the
+    /// assembled text still reads "Solarized".
     #[gpui::test]
-    fn a_strip_pick_changes_the_result_text(cx: &mut TestAppContext) {
+    fn a_chip_click_picks_that_side_and_changes_the_assembled_text(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::ChipSide;
         let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
-        let before = result_text(&merge, vis);
-        assert!(
-            before.contains("\"Solarized\"") && !before.contains("\"Gruvbox\""),
-            "an open conflict seeds source: {before}"
-        );
-        let pick = vis
-            .debug_bounds("merge-strip-pick:0:disk")
+        let assembled = |vis: &mut VisualTestContext| {
+            vis.update(|_w, cx| {
+                let state = merge
+                    .read(cx)
+                    .loaded
+                    .as_ref()
+                    .unwrap()
+                    .structured
+                    .as_ref()
+                    .unwrap();
+                state.assembled().expect("valid")
+            })
+        };
+        assert_eq!(assembled(vis), None, "the theme conflict is open");
+        let chip = vis
+            .debug_bounds("chip:0:disk")
             .expect("the theme conflict offers disk");
-        vis.simulate_click(pick.center(), gpui::Modifiers::default());
+        vis.simulate_click(chip.center(), gpui::Modifiers::default());
         vis.run_until_parked();
-        let picked = result_text(&merge, vis);
+        let text = assembled(vis).expect("every conflict picked");
         assert!(
-            picked.contains("\"Gruvbox\"") && !picked.contains("\"Solarized\""),
-            "disk's theme replaced source's: {picked}"
+            text.contains("\"Gruvbox\"") && !text.contains("\"Solarized\""),
+            "disk's theme replaced source's: {text}"
         );
+        let (chips, open) = decision_row(&tree_rows(&merge, vis), 0);
+        assert!(!open, "a picked row loses its edge");
+        let disk = chips.iter().find(|c| c.side == ChipSide::Disk).unwrap();
+        assert!(disk.picked, "the disk chip reads picked");
 
         vis.simulate_keystrokes("cmd-z");
         vis.run_until_parked();
-        let undone = result_text(&merge, vis);
-        assert_eq!(undone, before, "undo restores the source value");
-        let pick_after_undo = vis.update(|_w, cx| {
-            merge
-                .read(cx)
-                .loaded
-                .as_ref()
-                .unwrap()
-                .structured
-                .as_ref()
-                .unwrap()
-                .resolution
-                .get(0)
-        });
-        assert_eq!(pick_after_undo, None);
+        assert_eq!(assembled(vis), None, "undo reopens the conflict");
+        let (chips, open) = decision_row(&tree_rows(&merge, vis), 0);
+        assert!(open);
+        assert!(chips.iter().all(|c| !c.picked));
+    }
+
+    /// An unpicked conflict offers source, disk and last written, none of
+    /// them picked.
+    ///
+    /// MUTATION: `open` chips drawn with a pick → the conflict row has a
+    /// picked chip.
+    #[gpui::test]
+    fn an_open_conflict_row_shows_three_chips_and_no_pick(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::ChipSide;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        for side in ["source", "disk", "last-written"] {
+            let selector = leak(format!("chip:0:{side}"));
+            assert!(vis.debug_bounds(selector).is_some(), "{selector} renders");
+        }
+        let (chips, open) = decision_row(&tree_rows(&merge, vis), 0);
+        assert!(open, "the theme conflict needs the user");
+        assert_eq!(
+            chips.iter().map(|c| c.side).collect::<Vec<_>>(),
+            vec![ChipSide::Source, ChipSide::Disk, ChipSide::LastWritten]
+        );
+        assert!(chips.iter().all(|c| !c.picked), "{chips:?}");
+    }
+
+    /// The tree is planned once per change, not once per frame.
+    ///
+    /// MUTATION: `replan` ignores `tree_dirty` and plans every render →
+    /// plan_runs grows across two idle frames.
+    #[gpui::test]
+    fn the_plan_is_computed_once_per_change(cx: &mut TestAppContext) {
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
+        let runs = |vis: &mut VisualTestContext| {
+            vis.update(|_w, cx| merge.read(cx).loaded.as_ref().unwrap().plan_runs)
+        };
+        // Two more frames with nothing changed.
+        for _ in 0..2 {
+            vis.update(|_w, cx| merge.update(cx, |_, cx| cx.notify()));
+            vis.run_until_parked();
+        }
+        assert_eq!(
+            runs(vis),
+            1,
+            "the first frame planned, the idle ones did not"
+        );
+        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
+        vis.run_until_parked();
+        assert_eq!(runs(vis), 2, "one pick, one plan");
+    }
+
+    /// A container identical on every side opens folded; a click on its row
+    /// unfolds it in place and a second click folds it again.
+    ///
+    /// MUTATION: `toggle_container` never flips the override → the row
+    /// count is unchanged.
+    #[gpui::test]
+    fn clicking_an_identical_container_row_folds_and_unfolds_it(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::TreeRow;
+        let base = "{\n  \"o\": {\n    \"p\": 1,\n    \"q\": 2\n  },\n  \"a\": 1\n}\n";
+        let ours = "{\n  \"o\": {\n    \"p\": 1,\n    \"q\": 2\n  },\n  \"a\": 2\n}\n";
+        let inputs = tomte_app::merge_inputs::MergeInputs {
+            target: PathBuf::from("/tmp/smoke/settings.json"),
+            ours: ours.into(),
+            theirs: base.into(),
+            base: Some(base.into()),
+            source_path: PathBuf::from("/tmp/smoke/src/settings.json"),
+            templated: false,
+            template: None,
+            span_map: None,
+            origin: None,
+        };
+        let (_shell, merge, vis) = structured_merge_window(cx, inputs);
+        let rows = tree_rows(&merge, vis);
+        let ix = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    TreeRow::Open {
+                        same: true,
+                        folded: true,
+                        ..
+                    }
+                )
+            })
+            .expect("the identical object opens folded");
+        let folded = rows.len();
+        let selector = leak(format!("tree-line:{ix}"));
+        let click = |vis: &mut VisualTestContext| {
+            let row = vis
+                .debug_bounds(selector)
+                .expect("the container row renders");
+            vis.simulate_click(row.center(), gpui::Modifiers::default());
+            vis.run_until_parked();
+        };
+        click(vis);
+        let rows = tree_rows(&merge, vis);
+        assert_eq!(rows.len(), folded + 2, "p and q are listed in place");
+        assert!(matches!(rows[ix], TreeRow::Open { folded: false, .. }));
+        click(vis);
+        assert_eq!(tree_rows(&merge, vis).len(), folded, "folded again");
     }
 
     /// Save in Structure mode queues the structured assembly, not the line
@@ -6626,8 +6767,8 @@ mod render_smoke {
     ///
     /// MUTATION: `set_mode` switches without arming when picks exist → the
     /// mode is Lines after the first click and the banner assertion fails.
-    /// MUTATION: `install_result_decorator` keeps installing the structured
-    /// strips in Lines mode → `structured_blocks` is not 0.
+    /// MUTATION: `body` keeps drawing the tree in Lines mode → no
+    /// `merge-pane-divider` renders.
     #[gpui::test]
     fn the_lines_toggle_shows_the_line_editor_and_arms_a_confirmation_when_picks_exist(
         cx: &mut TestAppContext,
@@ -6635,26 +6776,26 @@ mod render_smoke {
         use tomte_core::structured::Pick;
         {
             let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
-            assert!(vis.update(|_w, cx| merge.read(cx).structured_blocks) > 0);
+            assert!(vis.debug_bounds("tree-row:0").is_some(), "the tree renders");
+            assert!(vis.debug_bounds("merge-pane-divider").is_none());
             let lines = vis
                 .debug_bounds("merge-mode-lines")
                 .expect("the toggle renders");
             vis.simulate_click(lines.center(), gpui::Modifiers::default());
             vis.run_until_parked();
-            let (mode, blocks, banner) = vis.update(|_w, cx| {
+            let (mode, banner) = vis.update(|_w, cx| {
                 let v = merge.read(cx);
-                (
-                    v.loaded.as_ref().unwrap().mode,
-                    v.structured_blocks,
-                    v.banner.clone(),
-                )
+                (v.loaded.as_ref().unwrap().mode, v.banner.clone())
             });
             assert_eq!(
                 mode,
                 merge::MergeMode::Lines,
                 "no picks: one click switches"
             );
-            assert_eq!(blocks, 0, "no structured strip in the line editor");
+            assert!(
+                vis.debug_bounds("merge-pane-divider").is_some(),
+                "the line editor's panes render"
+            );
             assert!(banner.is_none(), "nothing to confirm");
             let text = result_text(&merge, vis);
             assert!(
@@ -6699,59 +6840,6 @@ mod render_smoke {
         assert_eq!(mode, merge::MergeMode::Lines, "the second click switches");
         assert_eq!(pick, None, "the structure picks are discarded");
         assert!(banner.is_none());
-    }
-
-    /// An unpicked conflict shows both sides as the line editor does: disk's
-    /// lines as amber rows in the strip's block, source's lines tinted in
-    /// the text below it. A pick collapses both to the chosen text.
-    ///
-    /// MUTATION: `install_result_decorator` installs `lines: Vec::new()`
-    /// again → no line carries the source rail.
-    /// MUTATION: `strip_specs` leaves `disk_rows` empty → the theme block is
-    /// two rows tall and holds no disk text.
-    #[gpui::test]
-    fn an_unpicked_structured_conflict_shows_disk_and_source_rows(cx: &mut TestAppContext) {
-        use tomte_core::structured::Pick;
-        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
-        let probe = |vis: &mut VisualTestContext| {
-            vis.update(|_w, cx| {
-                let view = merge.read(cx);
-                let text = view.result_text_for_test(cx);
-                let decoration = view
-                    .result_decoration_for_test(cx)
-                    .expect("the decorator is installed");
-                let railed: Vec<String> = decoration
-                    .lines
-                    .iter()
-                    .zip(text.lines())
-                    .filter(|(decor, _)| decor.rail.is_some())
-                    .map(|(_, line)| line.to_string())
-                    .collect();
-                let heights: Vec<u32> = decoration.blocks.iter().map(|b| b.height).collect();
-                let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
-                let disk = merge_structured::strip_specs(state, &HashSet::new(), None, None)[0]
-                    .disk_rows
-                    .clone();
-                (text, railed, heights, disk)
-            })
-        };
-        let (text, railed, heights, disk) = probe(vis);
-        assert!(text.contains("\"Solarized\"") && !text.contains("\"Gruvbox\""));
-        assert_eq!(railed, vec!["  \"theme\": \"Solarized\",".to_string()]);
-        assert_eq!(disk, vec![SharedString::from("  \"theme\": \"Gruvbox\",")]);
-        assert_eq!(
-            heights[0] as usize,
-            merge::STRIP_ROWS + 2,
-            "the strip, the on-disk label and one disk row"
-        );
-
-        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
-        vis.run_until_parked();
-        let (text, railed, heights, disk) = probe(vis);
-        assert!(text.contains("\"Gruvbox\"") && !text.contains("\"Solarized\""));
-        assert!(railed.is_empty(), "{railed:?}");
-        assert!(disk.is_empty());
-        assert!(heights.iter().all(|&h| h as usize == merge::STRIP_ROWS));
     }
 
     /// A save the write-back would refuse never reaches the queue: two free
@@ -6921,173 +7009,68 @@ mod render_smoke {
         assert_eq!(picks, vec![None; 4], "file B's resolution is untouched");
     }
 
-    /// Next ↓ in Structure mode moves every input pane to the decision's
-    /// first line on its side; a pane whose side lacks the entry stays put.
-    /// A revisit (the decided strip's click) jumps the panes the same way.
-    /// The offsets are read in the same update that moves them: the
-    /// fixture's text fits the panes, so the next layout clamps them to 0.
+    /// A templated key's row offers only its source value, with the lock
+    /// whose hover names the template line.
     ///
-    /// MUTATION: `next` drops its `jump_to` call (scrolls only the result
-    /// editor) → the disk pane stays at 0 and the first offset assert fails.
-    /// MUTATION: `jump_to` writes every column even when the side has no
-    /// line (`unwrap_or(0)`) → the source pane snaps back to 0 on vim_mode
-    /// and the "stays put" assert fails.
-    /// MUTATION: `revisit` drops its `jump_to` → the panes stay on the last
-    /// Next target.
-    /// MUTATION: drop `sync_from`'s Structure-mode return AND its
-    /// `seed_line_starts` length guard → the probe drags the source pane off
-    /// its parked line. Dropping only the return survives: Structure mode
-    /// seeds no line starts, so the length guard also bails.
+    /// MUTATION: `render_tree` drops the `lock_mark` on a locked row → no
+    /// `lock:<id>` bound.
     #[gpui::test]
-    fn next_in_structure_mode_moves_every_pane_to_the_decision(cx: &mut TestAppContext) {
-        use tomte_core::structured::Pick;
-        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
-        // Resolve the one conflict so Next cycles every changed entry.
-        vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
-        vis.run_until_parked();
-        // Park every pane at a sentinel, run `step`, then read the cursor,
-        // its jump lines and the pane offsets in [base, disk, source] order
-        // before any layout. A pane the step leaves alone reads `parked`.
-        let parked = px(-999.);
-        let cols = [merge::BASE_COL, merge::OURS_COL, merge::THEIRS_COL];
-        let step = |vis: &mut VisualTestContext,
-                    step: &dyn Fn(&mut merge::MergeView, &mut gpui::Context<merge::MergeView>)| {
-            vis.update(|_w, cx| {
-                merge.update(cx, |view, cx| {
-                    for c in cols {
-                        view.pane_scrolls[c].set_offset(gpui::point(px(0.), parked));
-                    }
-                    step(view, cx);
-                    let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
-                    let id = state.cursor.expect("the cursor is on a decision");
-                    let offsets = cols.map(|c| view.pane_scrolls[c].offset().y);
-                    (
-                        id,
-                        state.doc.decisions[id].path.clone(),
-                        merge_structured::jump_lines(&state.doc, id),
-                        offsets,
-                    )
-                })
-            })
-        };
-        let at = |line: usize| px(-(line as f32 * merge::PANE_ROW_H));
-        let mut saw_absent = false;
-        for _ in 0..4 {
-            let (_id, path, lines, offsets) = step(vis, &|v, cx| v.next(cx));
-            for (col, (line, offset)) in lines.iter().zip(offsets).enumerate() {
-                match line {
-                    Some(line) => assert_eq!(offset, at(*line), "{path}: column {col}"),
-                    None => {
-                        saw_absent = true;
-                        assert_eq!(offset, parked, "{path}: column {col} stays put");
-                    }
-                }
-            }
-        }
-        assert!(
-            saw_absent,
-            "vim_mode is only on disk, copilot only in source"
-        );
-
-        // A revisit of the decided theme strip jumps the panes to it.
-        let (id, _path, lines, offsets) = step(vis, &|v, cx| v.revisit(0, cx));
-        assert_eq!(id, 0);
-        assert_eq!(
-            offsets,
-            lines.map(|l| at(l.expect("theme is on every side")))
-        );
-
-        // A pick from the strip jumps all three too (spec §6, ruling R30).
-        // MUTATION: `apply_pick` drops its `jump_to` → every pane reads
-        // `parked`.
-        // (`pick` moves the cursor on, so read decision 0's lines directly.)
-        let (lines, offsets) = vis.update(|_w, cx| {
-            merge.update(cx, |view, cx| {
-                for c in cols {
-                    view.pane_scrolls[c].set_offset(gpui::point(px(0.), parked));
-                }
-                view.apply_pick(0, Pick::Source, cx);
-                let state = view.loaded.as_ref().unwrap().structured.as_ref().unwrap();
-                (
-                    merge_structured::jump_lines(&state.doc, 0),
-                    cols.map(|c| view.pane_scrolls[c].offset().y),
-                )
-            })
-        });
-        assert_eq!(
-            offsets,
-            lines.map(|l| at(l.expect("theme is on every side")))
-        );
-
-        // Scrolling one pane leaves the others where they are: the
-        // region-aligned sync stands down in Structure mode.
-        let source_line = vis.update(|_w, cx| {
-            merge.update(cx, |view, _cx| {
-                view.pane_scrolls[merge::THEIRS_COL].set_offset(gpui::point(px(0.), parked));
-                view.sync_probe(merge::OURS_COL, 1).panes[merge::THEIRS_COL]
-            })
-        });
-        assert_eq!(source_line, -f32::from(parked) / merge::PANE_ROW_H);
-    }
-
-    /// A templated key's strip reads as locked and offers no buttons.
-    ///
-    /// MUTATION: `strip_specs` ignores `locked` (builds `Deciding`) → the
-    /// locked strip renders a disk button.
-    #[gpui::test]
-    fn a_locked_strip_has_no_buttons(cx: &mut TestAppContext) {
+    fn a_locked_row_offers_only_source_and_a_lock(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::ChipSide;
         let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_templated_inputs());
-        let (locked, specs) = vis.update(|_w, cx| {
+        let (locked, reason) = vis.update(|_w, cx| {
             let v = merge.read(cx);
             let loaded = v.loaded.as_ref().unwrap();
             assert_eq!(loaded.mode, merge::MergeMode::Structure);
             let state = loaded.structured.as_ref().unwrap();
-            let locked = state
+            let d = state
                 .doc
                 .decisions
                 .iter()
                 .find(|d| d.locked.is_some())
-                .map(|d| d.id)
                 .expect("the templated email is locked");
             (
-                locked,
-                merge_structured::strip_specs(
-                    state,
-                    &HashSet::new(),
+                d.id,
+                merge_structured::lock_reason(
+                    d,
                     loaded.inputs.template.as_deref(),
                     loaded.inputs.span_map.as_ref(),
                 ),
             )
         });
-        match &specs[locked].kind {
-            merge_structured::StripKind::Locked { reason, .. } => assert!(
-                reason.contains("{{ .email }}"),
-                "the hover names the template line: {reason}"
-            ),
-            other => panic!("expected a locked strip, got {other:?}"),
-        }
         assert!(
-            vis.debug_bounds(leak(format!("merge-strip:{locked}")))
+            reason.contains("{{ .email }}"),
+            "the hover names the template line: {reason}"
+        );
+        let (chips, open) = decision_row(&tree_rows(&merge, vis), locked);
+        assert!(!open, "a locked row never needs the user");
+        assert_eq!(
+            chips.iter().map(|c| c.side).collect::<Vec<_>>(),
+            vec![ChipSide::Source]
+        );
+        assert!(
+            vis.debug_bounds(leak(format!("chip:{locked}:source")))
                 .is_some()
         );
         assert!(
-            vis.debug_bounds(leak(format!("merge-strip-pick:{locked}:disk")))
+            vis.debug_bounds(leak(format!("chip:{locked}:disk")))
                 .is_none(),
-            "a locked strip has no buttons"
+            "a locked row has no disk chip"
         );
         assert!(
-            vis.debug_bounds(leak(format!("merge-strip-edit:{locked}")))
-                .is_none()
+            vis.debug_bounds(leak(format!("lock:{locked}"))).is_some(),
+            "the lock renders"
         );
     }
 
     // ---- Structure mode's Text stage (structured-merge Task 12) ----
 
-    /// Click decision `id`'s strip Edit button and let the frame settle.
-    fn click_strip_edit(vis: &mut VisualTestContext, id: usize) {
+    /// Click the header's Edit button (the Text stage opens on the cursor's
+    /// decision) and let the frame settle.
+    fn click_header_edit(vis: &mut VisualTestContext) {
         let edit = vis
-            .debug_bounds(leak(format!("merge-strip-edit:{id}")))
-            .expect("the strip offers Edit");
+            .debug_bounds("merge-edit")
+            .expect("the header offers Edit");
         vis.simulate_click(edit.center(), gpui::Modifiers::default());
         vis.run_until_parked();
     }
@@ -7153,7 +7136,7 @@ mod render_smoke {
     fn edit_then_save_enqueues_the_editor_text_verbatim(cx: &mut TestAppContext) {
         use tomte_app::structured_state::Stage;
         let (shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
-        click_strip_edit(vis, 0);
+        click_header_edit(vis);
         assert_eq!(stage_of(&merge, vis), Stage::Text);
         let typed = format!("{}\n// hand\n", result_text(&merge, vis));
         type_into_result(&merge, vis, &typed);
@@ -7164,39 +7147,48 @@ mod render_smoke {
         assert_eq!(resolved, typed, "the editor text, verbatim");
     }
 
-    /// Back to structure with the text untouched returns at once: the
-    /// strips come back and the pick made before Edit stands.
+    /// Back to structure with the text untouched returns at once: the tree
+    /// renders again and the pick made before Edit stands.
     ///
+    /// MUTATION: `back_to_structure` leaves `editing` true → the tree is
+    /// absent after the round trip (no tree row renders).
     /// MUTATION: `back_to_structure` resets the resolution (or reloads the
     /// structured state) → `resolution.get(0)` is None.
-    /// MUTATION: `back_to_structure` leaves `editing` set → the decorator
-    /// installs no strip block and `structured_blocks` stays 0.
     #[gpui::test]
-    fn back_to_structure_restores_the_strips_and_keeps_the_picks(cx: &mut TestAppContext) {
+    fn edit_then_back_to_structure_restores_the_tree_and_keeps_the_picks(cx: &mut TestAppContext) {
         use tomte_app::structured_state::Stage;
         use tomte_core::structured::Pick;
         let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
         vis.update(|_w, cx| merge.update(cx, |v, cx| v.apply_pick(0, Pick::Disk, cx)));
         vis.run_until_parked();
-        click_strip_edit(vis, 0);
+        // `debug_bounds` keeps a selector from an earlier frame, so the
+        // tree's presence is read from the rows its list drew.
+        let drawn =
+            |vis: &mut VisualTestContext| vis.update(|_w, cx| merge.read(cx).tree_rows_drawn.get());
+        assert!(drawn(vis) > 0, "the Structure stage draws the tree");
+        assert!(vis.debug_bounds("tree-row:0").is_some());
+        click_header_edit(vis);
         assert_eq!(stage_of(&merge, vis), Stage::Text);
-        assert_eq!(vis.update(|_w, cx| merge.read(cx).structured_blocks), 0);
+        assert!(
+            vis.debug_bounds("merge-result-scroll").is_some(),
+            "the Text stage shows the result pane"
+        );
+        let before = drawn(vis);
+        vis.update(|_w, cx| merge.update(cx, |_, cx| cx.notify()));
+        vis.run_until_parked();
+        assert_eq!(drawn(vis), before, "no tree row in the Text stage");
         let back = vis
             .debug_bounds("merge-back-to-structure")
             .expect("the Text stage offers Back to structure");
         vis.simulate_click(back.center(), gpui::Modifiers::default());
         vis.run_until_parked();
         assert_eq!(stage_of(&merge, vis), Stage::Structure);
-        let (blocks, banner, pick) = vis.update(|_w, cx| {
+        assert!(drawn(vis) > before, "the tree is back");
+        let (banner, pick) = vis.update(|_w, cx| {
             let v = merge.read(cx);
             let state = v.loaded.as_ref().unwrap().structured.as_ref().unwrap();
-            (
-                v.structured_blocks,
-                v.banner.clone(),
-                state.resolution.get(0),
-            )
+            (v.banner.clone(), state.resolution.get(0))
         });
-        assert!(blocks > 0, "the strips are back");
         assert!(banner.is_none(), "an untouched text needs no confirmation");
         assert_eq!(pick, Some(Pick::Disk), "the pick survives the round trip");
     }
@@ -7205,7 +7197,7 @@ mod render_smoke {
     /// second press (here Escape, the Text stage's CancelEdit) discards the
     /// edit and re-seeds the picks' text. ⌘↩ (ApplyEdit) does nothing here.
     ///
-    /// MUTATION: `back_to_structure` returns to the strips without arming →
+    /// MUTATION: `back_to_structure` returns to the tree without arming →
     /// the stage is Structure after the first click and the banner is None.
     /// MUTATION: `cancel_edit`'s Structure branch keeps Task 10's direct
     /// return (not `back_to_structure`) → Escape skips the arming, which the
@@ -7227,7 +7219,7 @@ mod render_smoke {
         let warning = "Discard the text edits and return to the structure picks?";
 
         // Escape as the first press arms too.
-        click_strip_edit(vis, 0);
+        click_header_edit(vis);
         type_into_result(&merge, vis, &format!("{seed}// a\n"));
         vis.simulate_keystrokes("escape");
         vis.run_until_parked();
@@ -7248,7 +7240,7 @@ mod render_smoke {
         assert!(banner_text(vis).is_none());
 
         // The header button arms on the first click and confirms on the second.
-        click_strip_edit(vis, 0);
+        click_header_edit(vis);
         type_into_result(&merge, vis, &format!("{seed}// b\n"));
         let back = vis
             .debug_bounds("merge-back-to-structure")
@@ -7269,7 +7261,7 @@ mod render_smoke {
         assert!(!vis.update(|_w, cx| merge.read(cx).text_discard_armed));
 
         // An armed confirmation does not survive into the next file.
-        click_strip_edit(vis, 0);
+        click_header_edit(vis);
         type_into_result(&merge, vis, &format!("{seed}// c\n"));
         vis.update(|_w, cx| merge.update(cx, |v, cx| v.back_to_structure(cx)));
         assert!(vis.update(|_w, cx| merge.read(cx).text_discard_armed));
@@ -7299,7 +7291,7 @@ mod render_smoke {
             None,
             "no chip in the Structure stage"
         );
-        click_strip_edit(vis, 0);
+        click_header_edit(vis);
         type_into_result(&merge, vis, "{\n  \"a\": \n}");
         let (chip, gate) = vis.update(|_w, cx| {
             let v = merge.read(cx);
@@ -7316,22 +7308,12 @@ mod render_smoke {
     }
 
     /// Entering the Text stage keeps the decision in view: the editor
-    /// scrolls to the decision's line in the strip-less geometry and the
-    /// panes jump to it. And the panes do not follow a result-editor scroll
-    /// in the Text stage: the `sync_from` return is keyed on the mode.
+    /// scrolls so the decision's line sits two lines below the top.
     ///
-    /// MUTATION: `start_edit`'s Structure branch drops its `jump_to` → the
-    /// editor stays at the parked offset.
-    /// MUTATION: `jump_to` keeps the strip geometry while editing (always
-    /// `text_row`) → the editor lands strips-many rows too far down.
-    /// MUTATION: key `sync_from`'s return on `!self.editing` instead of the
-    /// mode AND drop its `seed_line_starts` length guard → the result-leader
-    /// probe moves the source pane off its parked line. (Dropping only one
-    /// survives: the Text stage seeds no line starts either.)
+    /// MUTATION: `start_edit`'s Structure branch drops its editor scroll →
+    /// the editor stays at the parked offset.
     #[gpui::test]
-    fn entering_the_text_stage_keeps_the_decision_in_view_and_the_panes_unsynced(
-        cx: &mut TestAppContext,
-    ) {
+    fn entering_the_text_stage_keeps_the_decision_in_view(cx: &mut TestAppContext) {
         let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_inputs());
         let parked = px(-999.);
         let last = vis.update(|_w, cx| {
@@ -7361,14 +7343,6 @@ mod render_smoke {
         });
         let want = line.saturating_sub(merge::STRIP_ROWS) as f32 * merge::PANE_ROW_H;
         assert_eq!(offset, px(-want), "decision line {line} sits in view");
-
-        let source_line = vis.update(|_w, cx| {
-            merge.update(cx, |view, _cx| {
-                view.pane_scrolls[merge::THEIRS_COL].set_offset(gpui::point(px(0.), parked));
-                view.sync_probe(merge::RESULT_LEADER, 1).panes[merge::THEIRS_COL]
-            })
-        });
-        assert_eq!(source_line, -f32::from(parked) / merge::PANE_ROW_H);
     }
 
     /// A JSON-looking file that does not parse opens in the line editor

@@ -1,187 +1,317 @@
-//! Structure mode of the merge editor (structured-merge spec §6): the strip
-//! plan for a [`StructuredState`], the words each strip shows, the lock
-//! hover text, the mode toggle, and the small pure rules the view's
-//! Structure branches call. Everything here that needs no gpui is a plain
-//! function over the state, so the rules are testable without a window;
-//! `merge.rs` keeps only thin branches on [`MergeMode`].
+//! Structure mode of the merge editor (spec 2026-10-25): the tree of the
+//! file with a chip per side, the lock hover text, the header controls, the
+//! mode toggle, and the small pure rules the view's Structure branches
+//! call. The rows themselves are planned by [`tomte_app::structured_tree`];
+//! this module draws them as given. `merge.rs` keeps only thin branches on
+//! [`MergeMode`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
-use std::rc::Rc;
 
-use gpui::{App, ClickEvent, Context, Div, SharedString, WeakEntity, Window, div, prelude::*};
+use gpui::{
+    AnyElement, Context, Div, Rgba, SharedString, Stateful, WeakEntity, div, prelude::*,
+    uniform_list,
+};
 use tomte_app::merge_inputs::MergeInputs;
 use tomte_app::structured_state::{Stage, StructuredState};
+use tomte_app::structured_tree::{Bracket, Chip, ChipSide, FoldWhat, TreeRow};
 use tomte_app::theme::Theme;
-use tomte_core::merge::RegionKind;
 use tomte_core::structured::jsonc;
-use tomte_core::structured::{
-    Change, Decision, NotStructured, Pick, Side, SideText, StructuredDocument, looked_like_json,
-};
+use tomte_core::structured::{Decision, NotStructured, Pick, looked_like_json};
 use tomte_core::template::anchor::SpanMap;
 use tomte_core::template::writeback::{WriteBackError, write_back};
 use tomte_ui::components as ui;
 
-use super::merge::{
-    MergeMode, MergeView, PANE_ROW_H, PaneSide, STRIP_ROWS, SaveGate, row_bg, save_gate_for,
-    span_reason,
-};
+use super::merge::{LoadedMerge, MergeMode, MergeView, SaveGate, save_gate_for, span_reason};
 
-/// What one structured strip renders as. Plain data so the plan is testable;
-/// [`strip_block`] turns it into a `ui::StripState`.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum StripKind {
-    /// Open: an unpicked conflict, an auto-resolved row, or a revisited one.
-    Deciding {
-        has_base: bool,
-        current: Option<ui::ChoiceKind>,
-        focused: bool,
-        both: bool,
-    },
-    /// The user picked; the strip names the pick and offers revisit.
-    Decided {
-        choice: ui::ChoiceKind,
-        focused: bool,
-    },
-    /// A template pins the entry: no buttons, follows source.
-    Locked { reason: SharedString, focused: bool },
+/// A chip's tint: the colour the line editor gives that side.
+pub(super) fn chip_tint(theme: Theme, side: ChipSide) -> Rgba {
+    match side {
+        ChipSide::Disk => theme.drift,
+        ChipSide::Source => theme.accent,
+        ChipSide::LastWritten => theme.text_muted,
+        ChipSide::Both => theme.ok,
+    }
 }
 
-/// One decision's strip in the result editor.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct StructuredStrip {
-    /// The decision id.
-    pub(super) id: usize,
-    /// The 0-based result line the strip sits above.
-    pub(super) above_line: usize,
-    /// The key path (`editor.fontSize`).
-    pub(super) label: SharedString,
-    /// The change in words ([`detail_words`]).
-    pub(super) detail: SharedString,
-    pub(super) kind: StripKind,
-    /// An unpicked conflict's disk lines, shown as amber provenance rows
-    /// under the strip, above source's lines in the text (spec §6, "as
-    /// today"); empty once picked, and on every other row.
-    pub(super) disk_rows: Vec<SharedString>,
+/// What every row of one frame's tree shares: the list's closure owns it.
+struct TreeFrame {
+    theme: Theme,
+    /// The structured cursor, drawn with the selected wash.
+    cursor: Option<usize>,
+    /// Each locked decision's hover text ([`lock_reason`]).
+    locks: HashMap<usize, SharedString>,
+    view: WeakEntity<MergeView>,
+    #[cfg(test)]
+    drawn: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
-impl StructuredStrip {
-    /// Rows the strip's block takes in the result editor: the strip, plus
-    /// an "on disk" label row and the disk rows when there are any.
-    pub(super) fn rows(&self) -> usize {
-        match self.disk_rows.len() {
-            0 => STRIP_ROWS,
-            n => STRIP_ROWS + 1 + n,
+/// Structure mode's body: the planned rows in one `uniform_list`, one
+/// [`ui::TREE_ROW_H`] row per [`TreeRow`]. The closure only reads the rows;
+/// every click upgrades the view's weak handle in a fresh update.
+pub(super) fn render_tree(
+    view: &MergeView,
+    loaded: &LoadedMerge,
+    theme: Theme,
+    cx: &mut Context<MergeView>,
+) -> AnyElement {
+    let rows = loaded.tree_rows.clone();
+    let state = loaded.structured.as_ref();
+    // A lock's hover lexes the template, so it is worded once per frame
+    // here rather than once per drawn row.
+    let locks = state
+        .map(|s| {
+            s.doc
+                .decisions
+                .iter()
+                .filter(|d| d.locked.is_some())
+                .map(|d| {
+                    let reason = lock_reason(
+                        d,
+                        loaded.inputs.template.as_deref(),
+                        loaded.inputs.span_map.as_ref(),
+                    );
+                    (d.id, reason)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let frame = TreeFrame {
+        theme,
+        cursor: state.and_then(|s| s.cursor),
+        locks,
+        view: cx.weak_entity(),
+        #[cfg(test)]
+        drawn: view.tree_rows_drawn.clone(),
+    };
+    uniform_list("merge-tree", rows.len(), move |range, _window, _cx| {
+        tree_rows(&rows, range, &frame)
+    })
+    .track_scroll(view.tree_scroll.clone())
+    .flex_1()
+    .min_h_0()
+    .py_1()
+    .font_family("Menlo")
+    .text_xs()
+    .into_any_element()
+}
+
+/// The elements for `rows[range]`, the part of the tree in view.
+fn tree_rows(rows: &[TreeRow], range: Range<usize>, frame: &TreeFrame) -> Vec<AnyElement> {
+    #[cfg(test)]
+    frame.drawn.set(frame.drawn.get() + range.len());
+    range.map(|ix| tree_row(&rows[ix], ix, frame)).collect()
+}
+
+/// One planned row as drawn. Decision rows are keyed by decision id
+/// (`tree-row:<id>`), every other row by its index (`tree-line:<ix>`).
+fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
+    let theme = frame.theme;
+    let line = |depth: usize, tone: ui::RowTone| {
+        ui::tree_row(theme, ("tree-line", ix), depth, tone, false, |_, _, _| {})
+            .w_full()
+            .debug_selector(move || format!("tree-line:{ix}"))
+    };
+    match row {
+        TreeRow::Decision {
+            depth,
+            id,
+            key,
+            chips,
+            open,
+            locked,
+        } => {
+            let id = *id;
+            let tone = if *open {
+                ui::RowTone::Open
+            } else {
+                ui::RowTone::Changed
+            };
+            let view = frame.view.clone();
+            // Outside the chips, a click moves the cursor without picking.
+            let row = ui::tree_row(
+                theme,
+                ("tree-row", id),
+                *depth,
+                tone,
+                frame.cursor == Some(id),
+                move |_, _, cx| {
+                    view.update(cx, |merge, cx| merge.select_decision(id, cx))
+                        .ok();
+                },
+            )
+            .w_full()
+            .cursor_pointer()
+            .debug_selector(move || format!("tree-row:{id}"))
+            .when_some(key.as_ref(), |el, key| {
+                el.child(div().flex_none().child(format!("{key}:")))
+            })
+            .children(chips.iter().map(|chip| value_chip(chip, id, frame)));
+            if !*locked {
+                return row.into_any_element();
+            }
+            let reason = frame.locks.get(&id).cloned().unwrap_or_else(|| {
+                tomte_core::log_error!("merge", "locked decision {id} has no lock reason");
+                "generated by template".into()
+            });
+            row.child(ui::lock_mark(theme, reason).debug_selector(move || format!("lock:{id}")))
+                .into_any_element()
+        }
+        TreeRow::Open {
+            depth,
+            key,
+            bracket,
+            folded,
+            summary,
+            same,
+            node,
+        } => {
+            let mut text = String::from(if *folded { "▸ " } else { "▾ " });
+            if let Some(key) = key {
+                text.push_str(key);
+                text.push_str(": ");
+            }
+            text.push_str(match bracket {
+                Bracket::Object => "{",
+                Bracket::Array => "[",
+            });
+            let tone = if *same {
+                ui::RowTone::Same
+            } else {
+                ui::RowTone::Plain
+            };
+            let node = *node;
+            let view = frame.view.clone();
+            ui::tree_row(
+                theme,
+                ("tree-line", ix),
+                *depth,
+                tone,
+                false,
+                move |_, _, cx| {
+                    view.update(cx, |merge, cx| merge.toggle_container(node, cx))
+                        .ok();
+                },
+            )
+            .w_full()
+            .cursor_pointer()
+            .debug_selector(move || format!("tree-line:{ix}"))
+            .child(text)
+            // Folded, the summary stands in for the hidden rows; the close
+            // row follows.
+            .when(*folded, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.text_muted)
+                        .child(summary.clone()),
+                )
+            })
+            .into_any_element()
+        }
+        TreeRow::Close {
+            depth,
+            bracket,
+            comma,
+        } => {
+            let close = match bracket {
+                Bracket::Object => "}",
+                Bracket::Array => "]",
+            };
+            line(*depth, ui::RowTone::Plain)
+                .child(if *comma {
+                    format!("{close},")
+                } else {
+                    close.to_string()
+                })
+                .into_any_element()
+        }
+        TreeRow::Comment { depth, text } => line(*depth, ui::RowTone::Comment)
+            .child(text.clone())
+            .into_any_element(),
+        TreeRow::Same { depth, text } | TreeRow::Preview { depth, text } => {
+            line(*depth, ui::RowTone::Same)
+                .child(text.clone())
+                .into_any_element()
+        }
+        TreeRow::Fold {
+            depth,
+            count,
+            what,
+            key,
+        } => {
+            let noun = match (what, *count == 1) {
+                (FoldWhat::Keys, true) => "key",
+                (FoldWhat::Keys, false) => "keys",
+                (FoldWhat::Elements, true) => "element",
+                (FoldWhat::Elements, false) => "elements",
+            };
+            let key = *key;
+            let view = frame.view.clone();
+            ui::tree_row(
+                theme,
+                ("tree-line", ix),
+                *depth,
+                ui::RowTone::Fold,
+                false,
+                move |_, _, cx| {
+                    view.update(cx, |merge, cx| merge.expand_fold(key, cx)).ok();
+                },
+            )
+            .w_full()
+            .cursor_pointer()
+            .debug_selector(move || format!("tree-line:{ix}"))
+            .child(format!("▸ {count} identical {noun}"))
+            .into_any_element()
         }
     }
 }
 
-/// Whether decision `id` shows both sides as provenance rows: an unlocked
-/// conflict with no pick yet.
-fn shows_both_sides(state: &StructuredState, d: &Decision) -> bool {
-    d.kind == RegionKind::Conflict && d.locked.is_none() && state.resolution.get(d.id).is_none()
-}
-
-/// The whole lines of `text` that `range` touches, without line endings;
-/// none for an empty range.
-fn whole_lines(text: &str, range: &std::ops::Range<usize>) -> Vec<SharedString> {
-    if range.is_empty() {
-        return Vec::new();
-    }
-    let first = line_of(text, range.start);
-    let last = line_of(text, range.end - 1);
-    text.lines()
-        .skip(first)
-        .take(last + 1 - first)
-        .map(|line| SharedString::from(line.to_string()))
-        .collect()
-}
-
-/// The strip display for a structured pick.
-pub(super) fn choice_kind(pick: Pick) -> ui::ChoiceKind {
-    match pick {
-        Pick::Disk => ui::ChoiceKind::Ours,
-        Pick::Source => ui::ChoiceKind::Theirs,
-        Pick::LastWritten => ui::ChoiceKind::Base,
-        Pick::Both => ui::ChoiceKind::Both,
-    }
-}
-
-/// One strip per decision, in decision order, each above the decision's
-/// first line in the current seed.
-pub(super) fn strip_specs(
-    state: &StructuredState,
-    revisiting: &HashSet<usize>,
-    template: Option<&str>,
-    span_map: Option<&SpanMap>,
-) -> Vec<StructuredStrip> {
-    let lines = state.result_lines();
-    state
-        .doc
-        .decisions
-        .iter()
-        .map(|d| {
-            let focused = state.cursor == Some(d.id);
-            let kind = if d.locked.is_some() {
-                StripKind::Locked {
-                    reason: lock_reason(d, template, span_map),
-                    focused,
-                }
-            } else {
-                match state.resolution.get(d.id) {
-                    Some(pick) if !revisiting.contains(&d.id) => StripKind::Decided {
-                        choice: choice_kind(pick),
-                        focused,
-                    },
-                    explicit => StripKind::Deciding {
-                        has_base: state.doc.has_base(d.id),
-                        current: explicit
-                            .or_else(|| state.doc.auto_pick(d.id))
-                            .map(choice_kind),
-                        focused,
-                        both: d.both_allowed,
-                    },
-                }
-            };
-            let disk_rows = match &d.ours {
-                Some(ours) if shows_both_sides(state, d) => {
-                    whole_lines(state.doc.side_text(Side::Ours), &ours.range)
-                }
-                _ => Vec::new(),
-            };
-            StructuredStrip {
-                id: d.id,
-                above_line: lines.get(d.id).copied().unwrap_or(0),
-                label: d.path.clone().into(),
-                detail: detail_words(d),
-                kind,
-                disk_rows,
-            }
-        })
-        .collect()
-}
-
-/// The change in words (spec §6). A duplicated key says so first, because
-/// that is what the user cannot see from the value alone; a conflict says
-/// "conflict"; otherwise the side that changed and how.
-pub(super) fn detail_words(d: &Decision) -> SharedString {
-    let words = match (d.duplicated, d.kind, &d.what) {
-        (Some(Side::Ours), _, _) => "appears twice on disk · last value used",
-        (Some(Side::Theirs), _, _) => "appears twice in source · last value used",
-        (_, RegionKind::Conflict, _) => "conflict",
-        (_, _, Change::TypeChanged) => "type changed",
-        (_, RegionKind::OursOnly, Change::Added) => "added on disk",
-        (_, RegionKind::OursOnly, Change::Removed) => "removed on disk",
-        (_, RegionKind::OursOnly, _) => "changed on disk",
-        (_, RegionKind::TheirsOnly, Change::Added) => "added in source",
-        (_, RegionKind::TheirsOnly, Change::Removed) => "removed in source",
-        (_, RegionKind::TheirsOnly, _) => "changed in source",
-        (_, RegionKind::BothSame | RegionKind::Unchanged, _) => "same change on disk and source",
+/// One side's chip on decision `id`'s row. A container chip unfolds or
+/// folds its preview; every other chip picks its side.
+fn value_chip(chip: &Chip, id: usize, frame: &TreeFrame) -> Stateful<Div> {
+    let side = chip.side;
+    let label = if chip.agreed {
+        "source · disk"
+    } else {
+        side.label()
     };
-    words.into()
+    let prefix = if chip.unfolded {
+        Some("▾")
+    } else if chip.container {
+        Some("▸")
+    } else {
+        None
+    };
+    let container = chip.container;
+    let view = frame.view.clone();
+    ui::value_chip(
+        frame.theme,
+        (SharedString::from(format!("chip-{}", side.selector())), id),
+        chip_tint(frame.theme, side),
+        label,
+        chip.text.clone().into(),
+        chip.picked,
+        prefix,
+        move |_, _, cx| {
+            // The row's own click (cursor only) must not follow: a pick
+            // moves the cursor on, and the row would pull it back.
+            cx.stop_propagation();
+            view.update(cx, |merge, cx| {
+                if container {
+                    merge.toggle_chip(id, side, cx);
+                } else {
+                    merge.apply_pick(id, side.pick(), cx);
+                }
+            })
+            .ok();
+        },
+    )
+    .debug_selector(move || format!("chip:{id}:{}", side.selector()))
 }
 
-/// The locked strip's hover text: the template line behind the span that
+/// A locked row's hover text: the template line behind the span that
 /// pins the decision, in the same words the source pane's `{}` gutter uses.
 pub(super) fn lock_reason(
     d: &Decision,
@@ -235,52 +365,6 @@ pub(super) fn next_target(state: &mut StructuredState) -> Option<usize> {
     }
 }
 
-/// The editor row of decision `id`'s first result line: its line plus the
-/// rows of every strip block at or above it (each strip sits above its own
-/// line, and an unpicked conflict's block also holds disk's rows).
-pub(super) fn text_row(specs: &[StructuredStrip], id: usize) -> usize {
-    let Some(line) = specs.iter().find(|s| s.id == id).map(|s| s.above_line) else {
-        return 0;
-    };
-    line + specs
-        .iter()
-        .filter(|s| s.above_line <= line)
-        .map(StructuredStrip::rows)
-        .sum::<usize>()
-}
-
-/// The result editor's line decorations in Structure mode: source's lines
-/// of every unpicked conflict as the line editor tints them (blue wash, rail,
-/// "source" on the first), under the disk rows its strip block carries.
-/// Every other line is plain; a pick collapses the rows to the chosen text.
-pub(super) fn result_decors(
-    state: &StructuredState,
-    seed: &str,
-    theme: Theme,
-) -> Vec<ui::text_area::LineDecor> {
-    let mut decors = vec![ui::text_area::LineDecor::default(); seed.lines().count()];
-    let ranges = state.doc.result_ranges(&state.resolution);
-    for d in &state.doc.decisions {
-        let Some(range) = ranges.get(d.id).filter(|r| !r.is_empty()) else {
-            continue;
-        };
-        if !shows_both_sides(state, d) {
-            continue;
-        }
-        let first = line_of(seed, range.start);
-        let last = line_of(seed, range.end - 1);
-        for (k, decor) in decors.iter_mut().enumerate().take(last + 1).skip(first) {
-            *decor = ui::text_area::LineDecor {
-                bg: Some(Theme::wash(theme.accent, 0.07)),
-                rail: Some(theme.accent),
-                label: (k == first).then(|| ("source".into(), theme.accent)),
-                ..Default::default()
-            };
-        }
-    }
-    decors
-}
-
 /// The header's progress words over the structured state.
 pub(super) fn progress_text(state: &StructuredState) -> String {
     if state.nothing_to_decide() {
@@ -294,213 +378,6 @@ pub(super) fn progress_text(state: &StructuredState) -> String {
     }
     let s = if total == 1 { "" } else { "s" };
     format!("{total} conflict{s}, {decided} resolved")
-}
-
-/// Input-pane decorations in Structure mode: [`structured_pane_decors`]'s
-/// per-decision washes plus the source pane's `{}` gutter on lines a
-/// template generated. `protected[i]` is line `i`'s hover text (all `None`
-/// on the other panes).
-pub(super) fn pane_decors(
-    doc: &StructuredDocument,
-    side: Side,
-    protected: impl Iterator<Item = Option<SharedString>>,
-    theme: Theme,
-) -> Vec<ui::text_area::LineDecor> {
-    let mut decors = structured_pane_decors(doc, side, theme);
-    for (decor, tip) in decors.iter_mut().zip(protected) {
-        decor.gutter = tip.is_some().then(|| ("{}".into(), theme.drift));
-        decor.tooltip = tip;
-    }
-    decors
-}
-
-/// The pane side a structured side shows in.
-fn pane_side(side: Side) -> PaneSide {
-    match side {
-        Side::Base => PaneSide::Base,
-        Side::Ours => PaneSide::Ours,
-        Side::Theirs => PaneSide::Theirs,
-    }
-}
-
-/// Decision `d`'s piece of `side`. A degraded base is source standing in,
-/// not a last-written state, so it carries no decision of its own.
-fn side_piece<'a>(doc: &StructuredDocument, d: &'a Decision, side: Side) -> Option<&'a SideText> {
-    match side {
-        Side::Base if doc.degraded_base => None,
-        Side::Base => d.base.as_ref(),
-        Side::Ours => d.ours.as_ref(),
-        Side::Theirs => d.theirs.as_ref(),
-    }
-}
-
-/// The 0-based line of byte `offset` in `text`.
-fn line_of(text: &str, offset: usize) -> usize {
-    text.as_bytes()[..offset.min(text.len())]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
-}
-
-/// One decor per line of `side`'s full text: every line a decision's byte
-/// range on that side covers (first line through last) gets the line
-/// editor's wash for the decision's kind ([`row_bg`]); an empty range (an
-/// insertion point) tints nothing. Where two decisions share a line the
-/// first one's wash stays.
-pub(super) fn structured_pane_decors(
-    doc: &StructuredDocument,
-    side: Side,
-    theme: Theme,
-) -> Vec<ui::text_area::LineDecor> {
-    let text = doc.side_text(side);
-    let mut decors: Vec<ui::text_area::LineDecor> = text
-        .lines()
-        .map(|_| ui::text_area::LineDecor {
-            text_color: Some(theme.text),
-            ..Default::default()
-        })
-        .collect();
-    for d in &doc.decisions {
-        let Some(piece) = side_piece(doc, d, side).filter(|p| !p.range.is_empty()) else {
-            continue;
-        };
-        let bg = row_bg(d.kind, pane_side(side), &theme);
-        let first = line_of(text, piece.range.start);
-        let last = line_of(text, piece.range.end - 1);
-        for decor in decors.iter_mut().take(last + 1).skip(first) {
-            decor.bg = decor.bg.or(bg);
-        }
-    }
-    decors
-}
-
-/// The 0-based first line of decision `id` on each side, in
-/// `[Base, Ours, Theirs]` order; `None` where that side has no text for it.
-pub(super) fn jump_lines(doc: &StructuredDocument, id: usize) -> [Option<usize>; 3] {
-    let Some(d) = doc.decisions.get(id) else {
-        return [None; 3];
-    };
-    [Side::Base, Side::Ours, Side::Theirs]
-        .map(|side| side_piece(doc, d, side).map(|p| line_of(doc.side_text(side), p.range.start)))
-}
-
-/// The block that renders one structured strip inside the result editor.
-/// Buttons route back through the view's weak handle: a pick lands through
-/// [`MergeView::apply_pick`], edit enters the text stage, revisit reopens.
-pub(super) fn strip_block(
-    spec: &StructuredStrip,
-    theme: Theme,
-    view: WeakEntity<MergeView>,
-) -> ui::text_area::Block {
-    let id = spec.id;
-    let kind = spec.kind.clone();
-    let label = spec.label.clone();
-    let detail = spec.detail.clone();
-    let disk_rows = spec.disk_rows.clone();
-    ui::text_area::Block {
-        above_line: spec.above_line,
-        height: spec.rows() as u32,
-        render: Rc::new(move |_window, _cx| {
-            let state = match &kind {
-                StripKind::Deciding {
-                    has_base,
-                    current,
-                    focused,
-                    both,
-                } => ui::StripState::Deciding {
-                    has_base: *has_base,
-                    current: *current,
-                    focused: *focused,
-                    // Origin is not offered in Structure mode (spec §6).
-                    origin: None,
-                    both: *both,
-                },
-                StripKind::Decided { choice, focused } => ui::StripState::Decided {
-                    choice: *choice,
-                    focused: *focused,
-                },
-                StripKind::Locked { reason, focused } => ui::StripState::Locked {
-                    reason: reason.clone(),
-                    focused: *focused,
-                },
-            };
-            let on_pick = {
-                let view = view.clone();
-                move |pick: ui::Pick, _: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    let pick = match pick {
-                        ui::Pick::Ours => Pick::Disk,
-                        ui::Pick::Theirs => Pick::Source,
-                        ui::Pick::Base => Pick::LastWritten,
-                        ui::Pick::Both => Pick::Both,
-                        ui::Pick::Origin(_) => {
-                            // The strip is built with `origin: None`, so this
-                            // button does not exist; a click here is a bug.
-                            tomte_core::log_error!(
-                                "merge",
-                                "an origin pick reached a structured strip (decision {id})"
-                            );
-                            return;
-                        }
-                    };
-                    view.update(cx, |merge, cx| merge.apply_pick(id, pick, cx))
-                        .ok();
-                }
-            };
-            let on_edit = {
-                let view = view.clone();
-                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    view.update(cx, |merge, cx| merge.start_edit(id, cx)).ok();
-                }
-            };
-            let on_revisit = {
-                let view = view.clone();
-                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    view.update(cx, |merge, cx| merge.revisit(id, cx)).ok();
-                }
-            };
-            let strip = ui::decision_strip(
-                theme,
-                id,
-                state,
-                Some(label.clone()),
-                Some(detail.clone()),
-                Some("merge-strip".into()),
-                on_pick,
-                on_edit,
-                on_revisit,
-            );
-            // An unpicked conflict: disk's lines under the strip, in the
-            // line editor's provenance styling; source's lines follow in
-            // the text itself.
-            let disk = (!disk_rows.is_empty()).then(|| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(ui::provenance_label(theme, ui::Side::Ours))
-                    .child(ui::provenance_rows(
-                        theme,
-                        ui::Side::Ours,
-                        &disk_rows,
-                        &HashMap::new(),
-                    ))
-            });
-            div()
-                .font_family(".SystemUIFont")
-                .h_full()
-                .w_full()
-                .flex()
-                .flex_col()
-                // The strip keeps its own two rows to centre itself in.
-                .child(
-                    div()
-                        .h(gpui::px(STRIP_ROWS as f32 * PANE_ROW_H))
-                        .w_full()
-                        .child(strip),
-                )
-                .children(disk)
-                .into_any_element()
-        }),
-    }
 }
 
 /// Structure mode's header controls: progress over the decisions, the
@@ -579,22 +456,25 @@ pub(super) fn header_controls(
             cx.listener(|view, _ev, _window, cx| view.next(cx)),
         ));
     }
-    bar.child(ui::button(
-        theme,
-        "merge-edit",
-        "Edit".into(),
-        ui::ButtonVariant::Tonal(theme.text_muted),
-        ui::ButtonSize::Sm,
-        cx.listener(|view, _ev, _window, cx| {
-            let id = view
-                .loaded
-                .as_ref()
-                .and_then(|l| l.structured.as_ref())
-                .and_then(|s| s.cursor)
-                .unwrap_or(0);
-            view.start_edit(id, cx);
-        }),
-    ))
+    bar.child(
+        ui::button(
+            theme,
+            "merge-edit",
+            "Edit".into(),
+            ui::ButtonVariant::Tonal(theme.text_muted),
+            ui::ButtonSize::Sm,
+            cx.listener(|view, _ev, _window, cx| {
+                let id = view
+                    .loaded
+                    .as_ref()
+                    .and_then(|l| l.structured.as_ref())
+                    .and_then(|s| s.cursor)
+                    .unwrap_or(0);
+                view.start_edit(id, cx);
+            }),
+        )
+        .debug_selector(|| "merge-edit".into()),
+    )
 }
 
 /// Structure mode's Save gate. The Structure stage: enabled once no
@@ -719,88 +599,14 @@ pub(super) fn switch_warning(to: MergeMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use tomte_app::structured_state::StructuredState;
-    use tomte_app::theme::Theme;
-    use tomte_core::merge::RegionKind;
     use tomte_core::structured::Side;
     use tomte_core::structured::{Pick, StructuredDocument};
 
-    use super::super::merge::{PaneSide, row_bg};
-    use super::{
-        StripKind, detail_words, has_picks, invalid_json_line, jump_lines, not_structured_note,
-        pick_allowed, progress_text, result_decors, strip_specs, structured_pane_decors, text_row,
-    };
-    use gpui::SharedString;
+    use super::{has_picks, invalid_json_line, not_structured_note, pick_allowed, progress_text};
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
         StructuredState::new(StructuredDocument::compute(base, ours, theirs, None).expect("json"))
-    }
-
-    // MUTATION: swap the OursOnly and TheirsOnly arms, or drop the
-    // duplicate arm → the words name the wrong side.
-    #[test]
-    fn detail_words_name_the_side_and_the_change() {
-        let s = state(
-            Some("{\"a\": 1, \"b\": 1, \"c\": 1}"),
-            "{\"a\": 2, \"b\": 1, \"c\": 1, \"d\": 1}",
-            "{\"a\": 1, \"b\": 3}",
-        );
-        let words: Vec<String> = s
-            .doc
-            .decisions
-            .iter()
-            .map(|d| detail_words(d).to_string())
-            .collect();
-        let by_path = |p: &str| {
-            let d = s.doc.decisions.iter().find(|d| d.path == p).expect(p);
-            words[d.id].clone()
-        };
-        assert_eq!(by_path("a"), "changed on disk");
-        assert_eq!(by_path("b"), "changed in source");
-        assert_eq!(by_path("c"), "removed in source");
-        assert_eq!(by_path("d"), "added on disk");
-
-        let dup = state(Some("{\"a\": 1}"), "{\"a\": 1, \"a\": 2}", "{\"a\": 1}");
-        assert_eq!(
-            detail_words(&dup.doc.decisions[0]),
-            "appears twice on disk · last value used"
-        );
-        let conflict = state(Some("{\"a\": 1}"), "{\"a\": 2}", "{\"a\": 3}");
-        assert_eq!(detail_words(&conflict.doc.decisions[0]), "conflict");
-    }
-
-    // MUTATION: drop the `revisiting` guard → a picked row stays Decided
-    // while revisited; or ignore the resolution → it never reads Decided.
-    #[test]
-    fn strip_specs_follow_picks_and_revisits() {
-        let mut s = state(Some("{\"a\": 1}"), "{\"a\": 2}", "{\"a\": 3}");
-        let specs = strip_specs(&s, &HashSet::new(), None, None);
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].label.as_ref(), "a");
-        assert!(matches!(
-            specs[0].kind,
-            StripKind::Deciding {
-                current: None,
-                has_base: true,
-                focused: true,
-                both: false
-            }
-        ));
-        s.pick(0, Pick::Disk);
-        assert!(matches!(
-            strip_specs(&s, &HashSet::new(), None, None)[0].kind,
-            StripKind::Decided { .. }
-        ));
-        let revisiting: HashSet<usize> = [0].into();
-        assert!(matches!(
-            strip_specs(&s, &revisiting, None, None)[0].kind,
-            StripKind::Deciding {
-                current: Some(_),
-                ..
-            }
-        ));
     }
 
     // MUTATION: allow LastWritten in two-way, or Both on a key row.
@@ -818,90 +624,6 @@ mod tests {
             "no base in two-way"
         );
         assert!(!pick_allowed(&two, 7, Pick::Disk), "unknown id");
-    }
-
-    // MUTATION: tint by decision index instead of byte range (wash line
-    // `d.id`) → the wrong lines wash: lines 0 and 1 tint and font_size's
-    // line 2 stays bare.
-    // MUTATION: tint only the range's first line → the added `vim` object's
-    // closing lines stay bare.
-    #[test]
-    fn pane_decors_tint_exactly_the_lines_a_decision_covers() {
-        let theme = Theme::dark();
-        let base = "{\n  \"theme\": 1,\n  \"font_size\": 14\n}\n";
-        let ours = concat!(
-            "{\n",
-            "  \"theme\": 1,\n",
-            "  \"font_size\": 15,\n",
-            "  \"vim\": {\n",
-            "    \"on\": true\n",
-            "  }\n",
-            "}\n",
-        );
-        let doc = StructuredDocument::compute(Some(base), ours, base, None).expect("json");
-        let decors = structured_pane_decors(&doc, Side::Ours, theme);
-        assert_eq!(decors.len(), 7, "one decor per line of disk's text");
-        let wash = row_bg(RegionKind::OursOnly, PaneSide::Ours, &theme);
-        assert!(wash.is_some());
-        let bgs: Vec<_> = decors.iter().map(|d| d.bg).collect();
-        assert_eq!(
-            bgs,
-            vec![None, None, wash, wash, wash, wash, None],
-            "font_size's line and every line of the added vim object"
-        );
-        // Source has neither change: no wash there.
-        let theirs = structured_pane_decors(&doc, Side::Theirs, theme);
-        assert!(theirs.iter().all(|d| d.bg.is_none()));
-    }
-
-    // MUTATION: return the range's LAST line, or drop the `None` for a side
-    // without the entry (map it to line 0) → the asserted lines differ.
-    // MUTATION: ignore `degraded_base` → the two-way base names a line.
-    #[test]
-    fn jump_lines_name_each_sides_first_line_or_none_when_absent() {
-        let base = "{\n  \"a\": 1,\n  \"b\": 1\n}\n";
-        // `c` spans three lines on disk: the jump is to its first.
-        let ours = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": {\n    \"x\": 1\n  }\n}\n";
-        let theirs = "{\n  \"b\": 3,\n  \"a\": 1\n}\n";
-        let doc = StructuredDocument::compute(Some(base), ours, theirs, None).expect("json");
-        let id = |p: &str| doc.decisions.iter().find(|d| d.path == p).expect(p).id;
-        assert_eq!(jump_lines(&doc, id("b")), [Some(2), Some(2), Some(1)]);
-        assert_eq!(
-            jump_lines(&doc, id("c")),
-            [None, Some(3), None],
-            "added on disk: only disk has it"
-        );
-        assert_eq!(jump_lines(&doc, 99), [None; 3], "unknown id");
-
-        let two = StructuredDocument::compute(None, ours, theirs, None).expect("json");
-        let b = two.decisions.iter().find(|d| d.path == "b").expect("b").id;
-        assert_eq!(jump_lines(&two, b), [None, Some(2), Some(1)]);
-    }
-
-    // MUTATION: count strips strictly above the line → the row is one strip
-    // short. MUTATION: count STRIP_ROWS per strip instead of `rows()` → the
-    // second row misses the first block's disk rows.
-    #[test]
-    fn text_row_counts_the_strip_above_its_own_line() {
-        let strip = |id: usize, above_line: usize, disk: usize| super::StructuredStrip {
-            id,
-            above_line,
-            label: "k".into(),
-            detail: "conflict".into(),
-            kind: StripKind::Decided {
-                choice: tomte_ui::components::ChoiceKind::Ours,
-                focused: false,
-            },
-            disk_rows: vec!["  \"k\": 1,".into(); disk],
-        };
-        let specs = [strip(0, 1, 0), strip(1, 3, 0)];
-        assert_eq!(text_row(&specs, 0), 1 + super::STRIP_ROWS);
-        assert_eq!(text_row(&specs, 1), 3 + 2 * super::STRIP_ROWS);
-        // Two disk rows under the first strip, plus its "on disk" label.
-        let specs = [strip(0, 1, 2), strip(1, 3, 0)];
-        assert_eq!(specs[0].rows(), super::STRIP_ROWS + 3);
-        assert_eq!(text_row(&specs, 1), 3 + 2 * super::STRIP_ROWS + 3);
-        assert_eq!(text_row(&specs, 7), 0, "unknown id");
     }
 
     // MUTATION: report "N conflicts" with decided and total swapped, or
@@ -1055,38 +777,5 @@ mod tests {
         // A plain file has no template to refuse.
         let plain = fixtures::json_inputs();
         assert!(template_refusal(&plain, &plain.ours).is_none());
-    }
-
-    // MUTATION: `shows_both_sides` ignores the resolution → the disk rows
-    // and the source tint stay after the pick. MUTATION: `result_decors`
-    // tints every decision → the "b" line (changed on disk) is tinted.
-    #[test]
-    fn an_unpicked_conflict_shows_disk_rows_and_tints_source_lines() {
-        let mut s = state(
-            Some("{\n  \"a\": 1,\n  \"b\": 1\n}\n"),
-            "{\n  \"a\": 2,\n  \"b\": 5\n}\n",
-            "{\n  \"a\": 3,\n  \"b\": 1\n}\n",
-        );
-        let theme = Theme::dark();
-        let specs = strip_specs(&s, &HashSet::new(), None, None);
-        assert_eq!(specs[0].disk_rows, vec![SharedString::from("  \"a\": 2,")]);
-        assert!(specs[1].disk_rows.is_empty(), "b is not a conflict");
-        let seed = s.seed();
-        let decors = result_decors(&s, &seed, theme);
-        assert_eq!(decors.len(), 4);
-        assert_eq!(decors[1].rail, Some(theme.accent), "source's a line");
-        assert!(decors[1].label.is_some());
-        assert_eq!(decors[2].rail, None, "b's line stays plain");
-        s.pick(0, Pick::Source);
-        assert!(
-            strip_specs(&s, &HashSet::new(), None, None)[0]
-                .disk_rows
-                .is_empty()
-        );
-        assert!(
-            result_decors(&s, &s.seed(), theme)
-                .iter()
-                .all(|d| d.rail.is_none())
-        );
     }
 }

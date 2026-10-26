@@ -24,15 +24,17 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, KeyBinding, Rgba,
-    SharedString, Stateful, WeakEntity, Window, actions, div, prelude::*, px,
+    ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, WeakEntity, Window, actions,
+    div, prelude::*, px,
 };
 use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::merge_inputs::{self, MergeInputs};
 use tomte_app::merge_state::MergeState;
 use tomte_app::structured_state::{Stage, StructuredState};
+use tomte_app::structured_tree::{self, ChipSide, FoldKey, NodeKey, TreeRow, TreeView};
 use tomte_app::theme::Theme;
 use tomte_core::merge::{Choice, MergeDocument, RegionKind};
-use tomte_core::structured::{NotStructured, Pick, Side, StructuredDocument};
+use tomte_core::structured::{NotStructured, Pick, StructuredDocument};
 use tomte_core::template::anchor::{SpanMap, SpanOrigin};
 use tomte_core::template::lexer::Segment;
 use tomte_ui::components as ui;
@@ -835,6 +837,16 @@ pub(super) struct LoadedMerge {
     pub(super) not_structured: Option<NotStructured>,
     /// Which editor shows; Structure whenever `structured` exists.
     pub(super) mode: MergeMode,
+    /// Structure mode's fold choices, kept for the editor session.
+    pub(super) tree: TreeView,
+    /// The tree's rows as last planned ([`Self::replan`]); the list's
+    /// closure shares them.
+    pub(super) tree_rows: Rc<Vec<TreeRow>>,
+    /// A change since the last plan: the next [`Self::replan`] plans.
+    pub(super) tree_dirty: bool,
+    /// Test seam: how many times the tree was planned.
+    #[cfg(test)]
+    pub(super) plan_runs: usize,
     theirs_rows: Rc<Vec<PaneLine>>,
     base_rows: Rc<Vec<PaneLine>>,
     ours_rows: Rc<Vec<PaneLine>>,
@@ -998,6 +1010,27 @@ impl LoadedMerge {
             structured,
             not_structured,
             mode,
+            tree: TreeView::default(),
+            tree_rows: Rc::new(Vec::new()),
+            tree_dirty: true,
+            #[cfg(test)]
+            plan_runs: 0,
+        }
+    }
+
+    /// Plan the tree again when something changed since the last plan.
+    pub(super) fn replan(&mut self) {
+        if !self.tree_dirty {
+            return;
+        }
+        let Some(state) = &self.structured else {
+            return;
+        };
+        self.tree_rows = Rc::new(structured_tree::plan(state, &self.tree));
+        self.tree_dirty = false;
+        #[cfg(test)]
+        {
+            self.plan_runs += 1;
         }
     }
 }
@@ -1046,10 +1079,14 @@ pub struct MergeView {
     /// the banner asks, and a second press discards the edit (the
     /// `cancel_armed` pattern). Save and a new session disarm it.
     pub(super) text_discard_armed: bool,
-    /// Test seam: how many structured strip blocks the last decorator
-    /// install carried (0 in Lines mode and while editing).
+    /// Scrolls Structure mode's tree (Next ↓, a pick, a revisit).
+    pub(super) tree_scroll: UniformListScrollHandle,
+    /// Test seam: the row the last [`Self::scroll_to_decision`] asked for.
     #[cfg(test)]
-    pub(super) structured_blocks: usize,
+    pub(super) last_scroll_row: Option<usize>,
+    /// Test seam: how many tree rows the list has drawn, all frames summed.
+    #[cfg(test)]
+    pub(super) tree_rows_drawn: Rc<std::cell::Cell<usize>>,
     /// One scroll handle per input pane column (see the `*_COL` constants);
     /// wheel on any pane mirrors its offset to the others so the columns
     /// compare without independent scrolling. The origin handle exists even
@@ -1129,8 +1166,11 @@ impl MergeView {
             cancel_armed: None,
             mode_switch_armed: None,
             text_discard_armed: false,
+            tree_scroll: UniformListScrollHandle::new(),
             #[cfg(test)]
-            structured_blocks: 0,
+            last_scroll_row: None,
+            #[cfg(test)]
+            tree_rows_drawn: Rc::default(),
             pane_scrolls: std::array::from_fn(|_| gpui::ScrollHandle::new()),
             revisiting: std::collections::HashSet::new(),
             result_editor: None,
@@ -1431,16 +1471,20 @@ impl MergeView {
     }
 
     /// Structure-mode twin of [`Self::apply`]: record one undo entry, land
-    /// the pick, close any revisit, re-seed the result. A pick the decision
-    /// cannot take (locked, last written without a base, both on a key row)
-    /// is ignored and leaves no undo entry.
+    /// the pick, close any revisit, re-seed the result, re-plan the tree. A
+    /// pick the decision cannot take (locked, last written without a base,
+    /// both on a key row) is ignored and leaves no undo entry.
     pub(super) fn apply_pick(&mut self, id: usize, pick: Pick, cx: &mut Context<Self>) {
-        let Some(state) = self.loaded.as_mut().and_then(|l| l.structured.as_mut()) else {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(state) = loaded.structured.as_mut() else {
             return;
         };
         if !merge_structured::pick_allowed(state, id, pick) {
             return;
         }
+        loaded.tree_dirty = true;
         let prev_cursor = state.cursor;
         let prev = state.resolution.get(id);
         state.pick(id, pick);
@@ -1453,10 +1497,103 @@ impl MergeView {
         self.redo.clear();
         self.disarm_mode_switch();
         self.seed_editor(cx);
-        // A pick from a strip brings the decision into view in all three
-        // panes and the result (spec §6), in the re-seeded geometry.
-        self.jump_to(id);
+        // The picked row stays in view (a pick key may land off screen).
+        self.scroll_to_decision(id);
         cx.notify();
+    }
+
+    /// Bring decision `id`'s row into view: open every container on its
+    /// path, plan, and scroll the tree to the row unless it is visible.
+    pub(super) fn scroll_to_decision(&mut self, id: usize) {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(state) = loaded.structured.as_ref() else {
+            return;
+        };
+        structured_tree::reveal(&mut loaded.tree, state, id);
+        loaded.tree_dirty = true;
+        loaded.replan();
+        match structured_tree::scroll_target(&loaded.tree_rows, id) {
+            Some(ix) => {
+                self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+                #[cfg(test)]
+                {
+                    self.last_scroll_row = Some(ix);
+                }
+            }
+            // `reveal` opened the path, so a missing row is a planner bug.
+            None => tomte_core::log_error!(
+                "merge",
+                "decision {id} has no tree row after reveal ({} rows)",
+                loaded.tree_rows.len()
+            ),
+        }
+    }
+
+    /// A click on a decision row outside its chips: the cursor moves there
+    /// without a pick.
+    pub(super) fn select_decision(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(state) = loaded.structured.as_mut() else {
+            return;
+        };
+        state.cursor = Some(id);
+        loaded.tree_dirty = true;
+        cx.notify();
+    }
+
+    /// Fold an open container row, or open a folded one.
+    pub(super) fn toggle_container(&mut self, node: NodeKey, cx: &mut Context<Self>) {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let folded = loaded.tree_rows.iter().find_map(|row| match row {
+            TreeRow::Open {
+                node: n, folded, ..
+            } if *n == node => Some(*folded),
+            _ => None,
+        });
+        let Some(folded) = folded else {
+            return;
+        };
+        loaded.tree.folded_overrides.insert(node, !folded);
+        loaded.tree_dirty = true;
+        cx.notify();
+    }
+
+    /// Unfold a container chip's preview rows, or fold them again.
+    pub(super) fn toggle_chip(&mut self, id: usize, side: ChipSide, cx: &mut Context<Self>) {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let chips = &mut loaded.tree.unfolded_chips;
+        if !chips.remove(&(id, side)) {
+            chips.insert((id, side));
+        }
+        loaded.tree_dirty = true;
+        cx.notify();
+    }
+
+    /// Expand one folded run of identical rows for the session.
+    pub(super) fn expand_fold(&mut self, key: FoldKey, cx: &mut Context<Self>) {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        loaded.tree.expanded_folds.insert(key);
+        loaded.tree_dirty = true;
+        cx.notify();
+    }
+
+    /// The tree's rows as last planned, for tests.
+    #[cfg(test)]
+    pub(super) fn tree_rows_for_test(&self) -> Vec<TreeRow> {
+        self.loaded
+            .as_ref()
+            .map(|l| l.tree_rows.as_ref().clone())
+            .unwrap_or_default()
     }
 
     /// Drop an armed mode switch (and its banner): the user moved on.
@@ -1511,6 +1648,7 @@ impl MergeView {
             MergeMode::Lines => loaded.state = MergeState::new(&loaded.inputs),
         }
         loaded.mode = mode;
+        loaded.tree_dirty = true;
         // Input panes rebuild with the new mode's decorations.
         loaded.pane_appearance = None;
         self.disarm_mode_switch();
@@ -1542,6 +1680,7 @@ impl MergeView {
                 }
             }
             state.cursor = entry.prev_cursor;
+            loaded.tree_dirty = true;
             self.redo.push(entry);
             self.seed_editor(cx);
             cx.notify();
@@ -1566,10 +1705,13 @@ impl MergeView {
         let Some(loaded) = &mut self.loaded else {
             return;
         };
-        if let Some(state) = loaded.structured.as_mut() {
+        if let Some(state) = loaded.structured.as_mut()
+            && !entry.structured.is_empty()
+        {
             for (id, _prev, next) in &entry.structured {
                 state.pick(*id, *next);
             }
+            loaded.tree_dirty = true;
         }
         for (region, _prev, next) in &entry.changes {
             loaded.state.pick(*region, next.clone());
@@ -1591,7 +1733,7 @@ impl MergeView {
             }
         }
         if self.mode() == MergeMode::Structure {
-            self.jump_to(region);
+            self.scroll_to_decision(region);
         }
         self.decor_dirty = true;
         cx.notify();
@@ -1604,10 +1746,11 @@ impl MergeView {
         if let Some(loaded) = &mut self.loaded
             && let (MergeMode::Structure, Some(state)) = (loaded.mode, &mut loaded.structured)
         {
-            // Structure mode's Text stage: the assembled text turns
-            // editable with the caret on the decision's first line, and the
-            // strips go (the decorator drops its blocks while editing).
+            // Structure mode's Text stage: the tree gives way to the
+            // assembled text, editable, with the caret on the decision's
+            // first line.
             state.stage = Stage::Text;
+            loaded.tree_dirty = true;
             let line = state.result_lines().get(region).copied().unwrap_or(0);
             self.editing = true;
             let cursor_byte: usize = self
@@ -1622,9 +1765,10 @@ impl MergeView {
                     area.place_cursor(cursor_byte);
                 });
             }
-            // Land where Edit was clicked: the decision's line in the
-            // strip-less geometry, the panes on its side.
-            self.jump_to(region);
+            // Land where Edit was clicked: the decision's line, with two
+            // lines of context above it.
+            let y = line.saturating_sub(STRIP_ROWS) as f32 * PANE_ROW_H;
+            self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
             self.decor_dirty = true;
             cx.notify();
             return;
@@ -1713,7 +1857,7 @@ impl MergeView {
         cx.notify();
     }
 
-    /// The Text stage's way back: the strips return with the picks intact
+    /// The Text stage's way back: the tree returns with the picks intact
     /// and the text edit is discarded. When the text differs from the
     /// picks' seed, the first press only arms a confirmation banner; the
     /// second (button or Escape) discards.
@@ -1743,8 +1887,11 @@ impl MergeView {
             return;
         }
         self.disarm_text_discard();
-        if let Some(state) = self.loaded.as_mut().and_then(|l| l.structured.as_mut()) {
+        if let Some(loaded) = self.loaded.as_mut()
+            && let Some(state) = loaded.structured.as_mut()
+        {
             state.stage = Stage::Structure;
+            loaded.tree_dirty = true;
         }
         self.editing = false;
         self.seed_editor(cx);
@@ -1754,7 +1901,7 @@ impl MergeView {
             .and_then(|l| l.structured.as_ref())
             .and_then(|s| s.cursor)
         {
-            self.jump_to(id);
+            self.scroll_to_decision(id);
         }
         cx.notify();
     }
@@ -1821,14 +1968,10 @@ impl MergeView {
         let Some(loaded) = &self.loaded else {
             return;
         };
-        // Structure mode has no line regions to align: the panes scroll
-        // independently and Next / a strip click jump them ([`Self::jump_to`]).
-        if loaded.mode == MergeMode::Structure {
-            return;
-        }
         let starts = &loaded.region_line_starts;
         // The result editor's per-region geometry must line up with the
-        // panes' or the mapping is meaningless.
+        // panes' or the mapping is meaningless. Structure mode seeds no line
+        // starts, so its Text stage bails here.
         if starts.len() < 2 || self.seed_line_starts.len() != starts.len() {
             return;
         }
@@ -1903,42 +2046,6 @@ impl MergeView {
         self.row_of_line(start_line, !self.editing) as f32 + f * len
     }
 
-    /// Structure mode: bring decision `id` into view everywhere. Each input
-    /// pane scrolls to the decision's first line on its side (a side without
-    /// the entry stays put; origin is hidden here), and the result editor to
-    /// the decision's strip. Only writes scroll handles, so it is safe from
-    /// inside any update of this view.
-    fn jump_to(&mut self, id: usize) {
-        let Some(state) = self.loaded.as_ref().and_then(|l| l.structured.as_ref()) else {
-            return;
-        };
-        let lines = merge_structured::jump_lines(&state.doc, id);
-        for (col, line) in [BASE_COL, OURS_COL, THEIRS_COL].into_iter().zip(lines) {
-            if let Some(line) = line {
-                let mut offset = self.pane_scrolls[col].offset();
-                offset.y = px(-(line as f32 * PANE_ROW_H));
-                self.pane_scrolls[col].set_offset(offset);
-            }
-        }
-        // The Text stage has no strip blocks: row == line there, and the
-        // view keeps two lines above it, where a strip would sit. Otherwise
-        // land on the top of the decision's strip block. The template only
-        // words a locked strip's hover, so the rows need none of it.
-        let row = if self.editing {
-            let line = state.result_lines().get(id).copied().unwrap_or(0);
-            line.saturating_sub(STRIP_ROWS)
-        } else {
-            let specs = merge_structured::strip_specs(state, &self.revisiting, None, None);
-            let block = specs
-                .iter()
-                .find(|s| s.id == id)
-                .map_or(STRIP_ROWS, |s| s.rows());
-            merge_structured::text_row(&specs, id).saturating_sub(block)
-        };
-        let y = row as f32 * PANE_ROW_H;
-        self.editor_scroll.set_offset(gpui::point(px(0.), px(-y)));
-    }
-
     /// `Next ↓`: advance the cursor to the next unresolved conflict — or,
     /// once everything is resolved, to the next changed region, so every
     /// decision point stays reachable for revisiting (2026-08-08 feedback).
@@ -1948,8 +2055,8 @@ impl MergeView {
             && let (MergeMode::Structure, Some(state)) = (loaded.mode, &mut loaded.structured)
         {
             if let Some(id) = merge_structured::next_target(state) {
-                self.jump_to(id);
-                self.decor_dirty = true;
+                loaded.tree_dirty = true;
+                self.scroll_to_decision(id);
             }
             cx.notify();
             return;
@@ -2440,12 +2547,22 @@ impl MergeView {
             );
         };
 
-        let structure = loaded.mode == MergeMode::Structure;
-        let degraded = match (&loaded.structured, structure) {
-            (Some(state), true) => state.degraded_base,
-            _ => loaded.state.degraded_base,
-        };
         let view = cx.weak_entity();
+        if loaded.mode == MergeMode::Structure && loaded.structured.is_some() {
+            // The tree is the result (spec 2026-10-25 §2): no input panes and
+            // no result pane. The Text stage is the assembled text alone.
+            if self.editing {
+                return div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.result_pane(theme, &view))
+                    .into_any_element();
+            }
+            return merge_structured::render_tree(self, loaded, theme, cx);
+        }
+        let degraded = loaded.state.degraded_base;
         let widths = self.pane_widths.unwrap_or([0.; PANE_COLS]);
         let dragging = self.dragging.map(|d| d.id);
         // The vertical handle on column `i`'s trailing edge.
@@ -2466,10 +2583,10 @@ impl MergeView {
                     .ok();
                 },
             )
+            .debug_selector(|| "merge-pane-divider".into())
         };
         let editor = |col: usize| loaded.pane_editors.as_ref().and_then(|e| e.get(col));
-        // Origin's pane stays with the line editor (spec §6).
-        let has_origin = loaded.origin_rows.is_some() && !structure;
+        let has_origin = loaded.origin_rows.is_some();
         // One shared grid of hairlines (2026-08-08 feedback): the input
         // columns split by vertical dividers, one horizontal rule, then the
         // result flowing as the pane's own content — no floating boxes. Every
@@ -2576,6 +2693,7 @@ impl MergeView {
     fn result_pane(&self, theme: Theme, view: &WeakEntity<MergeView>) -> AnyElement {
         let container = div()
             .id("merge-result-scroll")
+            .debug_selector(|| "merge-result-scroll".into())
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -2694,13 +2812,6 @@ impl MergeView {
         self.editor_scroll.offset().y
     }
 
-    /// What the result editor's next frame draws (its installed decorator
-    /// run on the current text), for tests.
-    #[cfg(test)]
-    pub(super) fn result_decoration_for_test(&self, cx: &App) -> Option<ui::text_area::Decoration> {
-        self.result_editor.as_ref()?.read(cx).decoration()
-    }
-
     /// The result editor's text, for tests.
     #[cfg(test)]
     pub(super) fn result_text_for_test(&self, cx: &App) -> String {
@@ -2747,7 +2858,8 @@ impl MergeView {
     /// (via [`editor_decors`], which flips edited regions to the ok wash) and
     /// — in read-only mode only — a decision-strip block above every changed
     /// region. Rebuilt on every resolution/mode/appearance change so the
-    /// captured strip states stay current.
+    /// captured strip states stay current. Structure mode installs an empty
+    /// decoration.
     fn install_result_decorator(&mut self, theme: Theme, cx: &mut Context<Self>) {
         let Some(loaded) = &self.loaded else {
             return;
@@ -2755,44 +2867,13 @@ impl MergeView {
         let Some(editor) = &self.result_editor else {
             return;
         };
-        if let (MergeMode::Structure, Some(state)) = (loaded.mode, &loaded.structured) {
-            // One strip per decision above its first result line, and an
-            // unpicked conflict's provenance rows (disk's in its strip
-            // block, source's tinted in the text); none of either while the
-            // Text stage is open.
-            let (specs, lines) = if self.editing {
-                (Vec::new(), Vec::new())
-            } else {
-                (
-                    merge_structured::strip_specs(
-                        state,
-                        &self.revisiting,
-                        loaded.inputs.template.as_deref(),
-                        loaded.inputs.span_map.as_ref(),
-                    ),
-                    merge_structured::result_decors(state, &self.seed, theme),
-                )
-            };
-            #[cfg(test)]
-            {
-                self.structured_blocks = specs.len();
-            }
-            let view = cx.weak_entity();
-            let blocks: Vec<ui::text_area::Block> = specs
-                .iter()
-                .map(|spec| merge_structured::strip_block(spec, theme, view.clone()))
-                .collect();
+        if loaded.mode == MergeMode::Structure && loaded.structured.is_some() {
+            // The editor shows only in the Text stage, where the text is
+            // free-form: nothing to decorate.
             editor.update(cx, |area, _| {
-                area.set_decorator(Box::new(move |_content| ui::text_area::Decoration {
-                    lines: lines.clone(),
-                    blocks: blocks.clone(),
-                }));
+                area.set_decorator(Box::new(|_| ui::text_area::Decoration::default()));
             });
             return;
-        }
-        #[cfg(test)]
-        {
-            self.structured_blocks = 0;
         }
         let n = loaded.state.doc.regions.len();
         let patterns: Vec<Vec<ui::text_area::LineDecor>> = (0..n)
@@ -2908,29 +2989,17 @@ impl MergeView {
         }
         // Build the input panes' read-only editors once per load (and again
         // on a theme flip): render is where the appearance is known.
+        // Structure mode draws no panes; `set_mode` clears the appearance so
+        // a switch to Lines builds them.
         if let Some(loaded) = &mut self.loaded
+            && loaded.mode == MergeMode::Lines
             && loaded.pane_appearance != Some(window.appearance())
         {
             // Geometry-column order, so index == `*_COL`; origin's editor is
             // built only when origin exists, and carries its own decors (the
             // merge's region kinds say nothing about the remote).
-            let decors = |rows: &Rc<Vec<PaneLine>>, side: PaneSide| {
-                Rc::new(match (loaded.mode, &loaded.structured) {
-                    // Structure mode: each side's full text washed per
-                    // decision, plus the source pane's `{}` gutter.
-                    (MergeMode::Structure, Some(state)) => merge_structured::pane_decors(
-                        &state.doc,
-                        match side {
-                            PaneSide::Theirs => Side::Theirs,
-                            PaneSide::Base => Side::Base,
-                            PaneSide::Ours => Side::Ours,
-                        },
-                        rows.iter().map(|r| r.protected.clone()),
-                        theme,
-                    ),
-                    _ => pane_decors(rows, side, theme),
-                })
-            };
+            let decors =
+                |rows: &Rc<Vec<PaneLine>>, side: PaneSide| Rc::new(pane_decors(rows, side, theme));
             let mut panes: Vec<PaneContent> = vec![
                 (
                     loaded.theirs_rows.clone(),
@@ -2977,17 +3046,28 @@ impl MergeView {
             self.decor_dirty = false;
             self.decor_appearance = Some(window.appearance());
         }
-        // The result editor holds focus whenever loaded: read-only, single
-        // keys (1/2/3/b/n) still reach the root's MergeEditor context via
-        // the ancestor chain; editable, the root drops that context so the
-        // keys type instead.
-        if let Some(editor) = &self.result_editor {
-            let editor_focus = editor.read(cx).focus_handle();
-            if !editor_focus.is_focused(window) {
-                editor_focus.focus(window);
+        // The result editor holds focus whenever it is drawn (Lines, or
+        // Structure's Text stage): read-only, single keys (1/2/3/b/n) still
+        // reach the root's MergeEditor context via the ancestor chain;
+        // editable, the root drops that context so the keys type instead.
+        // Structure's tree draws no editor, so the root takes focus there:
+        // focus left on an undrawn editor would swallow the keys.
+        let editor_drawn = self.mode() == MergeMode::Lines || self.editing;
+        match &self.result_editor {
+            Some(editor) if editor_drawn => {
+                let editor_focus = editor.read(cx).focus_handle();
+                if !editor_focus.is_focused(window) {
+                    editor_focus.focus(window);
+                }
             }
-        } else if self.loaded.is_some() && !self.focus_handle.is_focused(window) {
-            self.focus_handle.focus(window);
+            _ => {
+                if self.loaded.is_some() && !self.focus_handle.is_focused(window) {
+                    self.focus_handle.focus(window);
+                }
+            }
+        }
+        if let Some(loaded) = &mut self.loaded {
+            loaded.replan();
         }
         div()
             .track_focus(&self.focus_handle)
@@ -3441,7 +3521,7 @@ fn strip_block(
                 .h_full()
                 .w_full()
                 .child(ui::decision_strip(
-                    theme, region, state, None, None, None, on_pick, on_edit, on_revisit,
+                    theme, region, state, on_pick, on_edit, on_revisit,
                 ))
                 .into_any_element()
         }),

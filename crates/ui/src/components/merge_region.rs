@@ -8,10 +8,9 @@
 
 use std::collections::HashMap;
 
-use gpui::{App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*, px};
+use gpui::{App, ClickEvent, Div, ElementId, Rgba, SharedString, Window, div, prelude::*};
 
 use crate::components::button::{ButtonSize, ButtonVariant, button};
-use crate::components::icon::lock;
 use crate::components::mono::{line_gutter, line_text, mono_line};
 use crate::components::tooltip::text_tooltip;
 use crate::theme::Theme;
@@ -125,39 +124,13 @@ pub enum StripState {
         /// most files have no origin version, and most regions of the ones
         /// that do match it.
         origin: Option<SharedString>,
-        /// Whether the Both button is offered. Line regions always can; a
-        /// structured array entry has no meaningful "both".
+        /// Whether the Both button is offered.
         both: bool,
     },
     /// A decision exists; collapsed affordance names it and offers revisit.
     /// `focused`: the region cursor sits here (Next ↓ walks decided regions
     /// too once every conflict is resolved).
     Decided { choice: ChoiceKind, focused: bool },
-    /// Follows source; no buttons. `reason` is the hover text (the template
-    /// line that owns the entry).
-    Locked { reason: SharedString, focused: bool },
-}
-
-/// Widest a strip's leading path label grows before it ellipsizes.
-const LABEL_MAX_W: f32 = 170.;
-
-/// The leading path label (e.g. `editor.fontSize`). `line_clamp(1)` inside a
-/// bounded width: `.truncate()` hard-clips mid-glyph in gpui 0.2.2.
-fn path_label(theme: Theme, label: SharedString) -> Div {
-    div()
-        .max_w(px(LABEL_MAX_W))
-        .min_w_0()
-        .line_clamp(1)
-        .text_ellipsis()
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.text)
-        .child(label)
-}
-
-/// The words after the label: the caller's `detail` when given, else the
-/// engine-state wording the line editor has always shown.
-fn state_words(detail: Option<SharedString>, fallback: &'static str) -> SharedString {
-    detail.unwrap_or_else(|| fallback.into())
 }
 
 /// Decision strip rendered above a changed region, styled after Zed's
@@ -169,20 +142,10 @@ fn state_words(detail: Option<SharedString>, fallback: &'static str) -> SharedSt
 ///
 /// All behavior arrives via `on_pick` / `on_edit` / `on_revisit` so the
 /// builder stays pure.
-///
-/// `selector_prefix` gives tests a handle on the strip (a no-op outside
-/// test-support builds): with `Some("p")` the strip root carries the debug
-/// selector `p:<region_ix>`, each pick button `p-pick:<region_ix>:<pick>`
-/// (`disk`, `source`, `origin`, `last-written`, `both`), the edit button
-/// `p-edit:<region_ix>` and the revisit button `p-revisit:<region_ix>`.
-#[allow(clippy::too_many_arguments)]
 pub fn decision_strip(
     theme: Theme,
     region_ix: usize,
     state: StripState,
-    label: Option<SharedString>,
-    detail: Option<SharedString>,
-    selector_prefix: Option<SharedString>,
     on_pick: impl Fn(Pick, &ClickEvent, &mut Window, &mut App) + Clone + 'static,
     on_edit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_revisit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -199,27 +162,19 @@ pub fn decision_strip(
             *focused,
         ),
         StripState::Decided { choice, focused } => (choice.tint(theme), *focused),
-        StripState::Locked { focused, .. } => (theme.text_muted, *focused),
     };
     // Zed's header: `border_focused` when the header owns the cursor,
     // plain `border` otherwise.
     let border = if focused { accent } else { theme.border };
-    // The leading cell takes the free width (it replaces the old spacer) and
-    // may shrink below its content, so a long path label ellipsizes instead
-    // of pushing the buttons out of the card.
-    let lead = |words: Option<(SharedString, Rgba)>| {
+    // The leading cell takes the free width (it replaces the old spacer),
+    // pushing the actions to the trailing edge.
+    let lead = |words: SharedString, color: Rgba| {
         div()
             .flex_1()
             .min_w_0()
             .flex()
             .items_center()
-            .gap_1p5()
-            .when_some(label.clone(), |el, label| {
-                el.child(path_label(theme, label))
-            })
-            .when_some(words, |el, (words, color)| {
-                el.child(div().flex_none().text_color(color).child(words))
-            })
+            .child(div().flex_none().text_color(color).child(words))
     };
     let card = div()
         .w_full()
@@ -250,7 +205,6 @@ pub fn decision_strip(
             let pick_button = |id: &'static str, pick: Pick, label: &'static str, tint: Rgba| {
                 let on_pick = on_pick.clone();
                 let selected = current == Some(pick.kind());
-                let selector = pick_selector(&pick);
                 button(
                     theme,
                     ElementId::named_usize(id, region_ix),
@@ -260,24 +214,17 @@ pub fn decision_strip(
                     move |ev, window, cx| on_pick(pick.clone(), ev, window, cx),
                 )
                 .when(selected, |el| el.bg(Theme::wash(tint, 0.2)))
-                .when_some(selector_prefix.clone(), |el, prefix| {
-                    el.debug_selector(|| format!("{prefix}-pick:{region_ix}:{selector}"))
-                })
             };
-            let edit_selector = selector_prefix.clone();
-            card.child(lead(Some((
-                state_words(
-                    detail,
-                    if current.is_none() {
-                        "conflict"
-                    } else {
-                        // "merged" describes the whole-file operation; ONE
-                        // region that needed no human decision was resolved.
-                        "auto-resolved"
-                    },
-                ),
+            card.child(lead(
+                if current.is_none() {
+                    "conflict".into()
+                } else {
+                    // "merged" describes the whole-file operation; ONE
+                    // region that needed no human decision was resolved.
+                    "auto-resolved".into()
+                },
                 if focused { accent } else { theme.text_muted },
-            ))))
+            ))
             .child(pick_button("pick-ours", Pick::Ours, "disk", theme.drift))
             .child(pick_button(
                 "pick-theirs",
@@ -307,66 +254,37 @@ pub fn decision_strip(
                 el.child(pick_button("pick-both", Pick::Both, "both", theme.ok))
             })
             .child(divider(theme))
-            .child(
-                button(
-                    theme,
-                    ElementId::named_usize("edit-region", region_ix),
-                    "edit".into(),
-                    ButtonVariant::Ghost,
-                    ButtonSize::Micro,
-                    on_edit,
-                )
-                .when_some(edit_selector, |el, prefix| {
-                    el.debug_selector(|| format!("{prefix}-edit:{region_ix}"))
-                }),
-            )
+            .child(button(
+                theme,
+                ElementId::named_usize("edit-region", region_ix),
+                "edit".into(),
+                ButtonVariant::Ghost,
+                ButtonSize::Micro,
+                on_edit,
+            ))
         }
         StripState::Decided { choice, .. } => card
-            .child(lead(Some((
-                SharedString::from(format!("resolved · {}", choice.label())),
+            .child(lead(
+                format!("resolved · {}", choice.label()).into(),
                 theme.text_muted,
-            ))))
-            .child(
-                button(
-                    theme,
-                    ElementId::named_usize("revisit-region", region_ix),
-                    "revisit".into(),
-                    ButtonVariant::Ring(theme.text_muted),
-                    ButtonSize::Micro,
-                    on_revisit,
-                )
-                .when_some(selector_prefix.clone(), |el, prefix| {
-                    el.debug_selector(|| format!("{prefix}-revisit:{region_ix}"))
-                }),
-            )
+            ))
+            .child(button(
+                theme,
+                ElementId::named_usize("revisit-region", region_ix),
+                "revisit".into(),
+                ButtonVariant::Ring(theme.text_muted),
+                ButtonSize::Micro,
+                on_revisit,
+            ))
             .child(divider(theme))
-            .child(
-                button(
-                    theme,
-                    ElementId::named_usize("edit-region", region_ix),
-                    "edit".into(),
-                    ButtonVariant::Ghost,
-                    ButtonSize::Micro,
-                    on_edit,
-                )
-                .when_some(selector_prefix.clone(), |el, prefix| {
-                    el.debug_selector(|| format!("{prefix}-edit:{region_ix}"))
-                }),
-            ),
-        StripState::Locked { reason, .. } => card
-            .child(lead(detail.map(|d| (d, theme.text_muted))))
-            // The hover text names the template line that owns the entry.
-            .child(
-                div()
-                    .id(ElementId::named_usize("locked-region", region_ix))
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(theme.text_muted)
-                    .child(lock(theme))
-                    .child("templated · follows source")
-                    .tooltip(text_tooltip(reason)),
-            ),
+            .child(button(
+                theme,
+                ElementId::named_usize("edit-region", region_ix),
+                "edit".into(),
+                ButtonVariant::Ghost,
+                ButtonSize::Micro,
+                on_edit,
+            )),
     };
 
     // The 4px inset (Zed's BUFFER_HEADER_PADDING) is what makes the strip
@@ -377,21 +295,7 @@ pub fn decision_strip(
         .px_1()
         .flex()
         .items_center()
-        .when_some(selector_prefix, |el, prefix| {
-            el.debug_selector(|| format!("{prefix}:{region_ix}"))
-        })
         .child(body)
-}
-
-/// The suffix a pick button's debug selector ends in.
-fn pick_selector(pick: &Pick) -> &'static str {
-    match pick {
-        Pick::Ours => "disk",
-        Pick::Theirs => "source",
-        Pick::Origin(_) => "origin",
-        Pick::Base => "last-written",
-        Pick::Both => "both",
-    }
 }
 
 /// Hairline vertical rule separating action groups inside a strip.
