@@ -25,6 +25,10 @@ pub const COMPONENTS: &[(&str, &str)] = &[
     ),
     ("folder-row", "expanded, collapsed, partial-checked, n of m"),
     ("icon-button", "folder-tree toggle: off and on"),
+    (
+        "structure-row",
+        "tree rows: same, open conflict, picked, locked, folded",
+    ),
 ];
 
 fn noop(_: &ClickEvent, _: &mut Window, _: &mut App) {}
@@ -509,6 +513,111 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                 .into_any_element(),
             ))
             .into_any_element(),
+        "structure-row" => {
+            let key = |text: &'static str| div().flex_none().child(text);
+            let long: gpui::SharedString = "x".repeat(120).into();
+            let row = |ix: usize, depth: usize, tone: RowTone| {
+                tree_row(theme, ("prev-sr", ix), depth, tone, false, noop)
+            };
+            let chip = |ix: usize,
+                        tint: gpui::Rgba,
+                        label: &'static str,
+                        text: gpui::SharedString,
+                        picked: bool,
+                        prefix: Option<&'static str>| {
+                value_chip(
+                    theme,
+                    ("prev-sr-chip", ix),
+                    tint,
+                    label,
+                    text,
+                    picked,
+                    prefix,
+                    noop,
+                )
+            };
+            list_pane(theme, None)
+                .w(gpui::px(520.))
+                .py_1()
+                .child(row(0, 1, RowTone::Same).child(key("\"editor.formatOnSave\": true,")))
+                .child(
+                    row(1, 1, RowTone::Open)
+                        .child(key("\"theme\":"))
+                        .child(chip(
+                            0,
+                            theme.accent,
+                            "source",
+                            "One Dark".into(),
+                            false,
+                            None,
+                        ))
+                        .child(chip(1, theme.drift, "disk", "Ayu Dark".into(), false, None))
+                        .child(chip(
+                            2,
+                            theme.text_muted,
+                            "last written",
+                            "Solarized".into(),
+                            false,
+                            None,
+                        )),
+                )
+                .child(
+                    row(2, 1, RowTone::Changed)
+                        .child(key("\"font_size\":"))
+                        .child(chip(3, theme.accent, "source", "13".into(), false, None))
+                        .child(chip(4, theme.drift, "disk", "14".into(), true, None)),
+                )
+                .child(
+                    row(3, 1, RowTone::Changed)
+                        .child(key("\"tab_size\":"))
+                        .child(chip(5, theme.ok, "source · disk", "4".into(), true, None)),
+                )
+                .child(
+                    row(4, 1, RowTone::Changed)
+                        .child(key("\"account\":"))
+                        .child(chip(
+                            6,
+                            theme.accent,
+                            "source",
+                            "{{ .onepassword.account }}".into(),
+                            true,
+                            None,
+                        ))
+                        .child(lock_mark(
+                            theme,
+                            "a template renders this value; it follows source".into(),
+                        )),
+                )
+                .child(row(5, 1, RowTone::Fold).child("▸ 4 identical keys"))
+                .child(row(6, 1, RowTone::Comment).child("// editor"))
+                .child(
+                    row(7, 1, RowTone::Changed)
+                        .child(key("\"permissions\":"))
+                        .child(chip(
+                            7,
+                            theme.accent,
+                            "source",
+                            "absent".into(),
+                            false,
+                            None,
+                        ))
+                        .child(chip(
+                            8,
+                            theme.drift,
+                            "disk",
+                            "{ 3 keys }".into(),
+                            true,
+                            Some("▾"),
+                        )),
+                )
+                .child(row(8, 2, RowTone::Same).child(key("\"allow\": [\"Bash\"],")))
+                .child(
+                    row(9, 1, RowTone::Changed)
+                        .child(key("\"banner\":"))
+                        .child(chip(10, theme.drift, "disk", long, false, None)),
+                )
+                .into_any_element()
+        }
         _ => return None,
     };
     Some(el)
