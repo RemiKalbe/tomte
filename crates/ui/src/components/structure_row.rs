@@ -171,15 +171,17 @@ pub fn value_chip(
 }
 
 /// The lock on a row whose value a template renders: it follows source.
-/// `⚿`, the line editor's protected marker, so both editors share one
-/// mark; a text glyph, unlike an emoji, takes the muted colour. Returns
-/// `Stateful` because a tooltip needs an element id.
+/// `{}` in the drift tint, the marker the line editor puts in the gutter
+/// of a protected (template-rendered) line, so both editors mark a
+/// template's output the same way. It takes the row's Menlo text_xs, as
+/// the gutter takes its line's. Returns `Stateful` because a tooltip needs
+/// an element id.
 pub fn lock_mark(theme: Theme, reason: SharedString) -> Stateful<Div> {
     div()
         .id("lock-mark")
         .flex_none()
-        .text_color(theme.text_muted)
-        .child("⚿")
+        .text_color(theme.drift)
+        .child("{}")
         .tooltip(text_tooltip(reason))
 }
 

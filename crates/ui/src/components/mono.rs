@@ -22,7 +22,7 @@ pub fn mono_line(theme: Theme) -> Div {
         .whitespace_nowrap()
 }
 
-/// Fixed marker cell (diff `+`/`−`, protected `⚿`, …): w_4, non-shrinking.
+/// Fixed marker cell (diff `+`/`−`, protected `{}`, …): w_4, non-shrinking.
 pub fn line_gutter(tint: Rgba, glyph: impl Into<SharedString>) -> Div {
     div()
         .w_4()
