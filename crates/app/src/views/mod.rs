@@ -6568,34 +6568,35 @@ mod render_smoke {
 
     /// A file whose disk text equals its source (only origin differs)
     /// opens in Lines with the "disk matches source" note, still offering
-    /// Structure; in Structure the note stands in for the progress words
-    /// and Save is enabled at once (nothing is open).
+    /// Structure; in Structure the note stands in for the progress words,
+    /// points to Lines, and Save is enabled at once (nothing is open).
+    /// What the chip drew is read from `take_same_notes_drawn`, because
+    /// `debug_bounds` keeps the Lines frame's entry after the switch.
     ///
     /// MUTATION: `with_structured` keeps Structure as the default → mode is Structure.
     /// MUTATION: the note is built from `ours == base` → no note (origin case).
     /// The fixture's base equals its source, so that second mutation is
     /// killed by the assertion on inputs whose base differs, below.
+    /// MUTATION: `header_controls` draws nothing in its note branch → no
+    /// note is drawn after the switch to Structure.
+    /// MUTATION: Lines mode draws the see-Lines wording → the Lines header
+    /// drew "… · see Lines".
     #[gpui::test]
     fn disk_equal_to_source_opens_in_lines_with_the_note(cx: &mut TestAppContext) {
         use tomte_app::structured_tree::TreeRow;
-        const ORIGIN_NOTE: &str = "disk matches source · origin differs · see Lines";
+        const LINES_NOTE: &str = "disk matches source · origin differs";
+        const STRUCTURE_NOTE: &str = "disk matches source · origin differs · see Lines";
+        merge_structured::take_same_notes_drawn();
         let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_same_inputs());
-        let (mode, note, has_structure) = vis.update(|_w, cx| {
-            let view = merge.read(cx);
-            let loaded = view.loaded.as_ref().expect("loaded");
-            (
-                loaded.mode,
-                view.same_text_note(),
-                loaded.structured.is_some(),
-            )
+        let (mode, has_structure) = vis.update(|_w, cx| {
+            let loaded = merge.read(cx).loaded.as_ref().expect("loaded");
+            (loaded.mode, loaded.structured.is_some())
         });
         assert_eq!(mode, merge::MergeMode::Lines);
         assert!(has_structure, "Structure stays on offer");
-        assert_eq!(note, Some(ORIGIN_NOTE));
-        assert!(
-            vis.debug_bounds("merge-same-note").is_some(),
-            "the note renders"
-        );
+        let drawn = merge_structured::take_same_notes_drawn();
+        assert!(!drawn.is_empty(), "the Lines header draws the note");
+        assert!(drawn.iter().all(|n| *n == LINES_NOTE), "{drawn:?}");
         let structure = vis
             .debug_bounds("merge-mode-structure")
             .expect("the mode toggle offers Structure");
@@ -6605,8 +6606,8 @@ mod render_smoke {
             ..fixtures::json_same_inputs()
         };
         assert_eq!(
-            merge_structured::same_text_note(&base_differs),
-            Some(ORIGIN_NOTE)
+            merge_structured::same_text_note(&base_differs, merge::MergeMode::Lines),
+            Some(LINES_NOTE)
         );
 
         vis.simulate_click(structure.center(), gpui::Modifiers::default());
@@ -6622,7 +6623,10 @@ mod render_smoke {
                 .any(|row| matches!(row, TreeRow::Decision { open: true, .. })),
             "nothing is open"
         );
-        assert!(vis.debug_bounds("merge-same-note").is_some());
+        // The mouse-down redraws the Lines header before the switch; the
+        // frame after it is Structure's.
+        let drawn = merge_structured::take_same_notes_drawn();
+        assert_eq!(drawn.last(), Some(&STRUCTURE_NOTE), "{drawn:?}");
         // The progress words never rendered in this window: the note
         // stands in for them in Structure, and Lines has its own.
         assert!(vis.debug_bounds("merge-progress").is_none());

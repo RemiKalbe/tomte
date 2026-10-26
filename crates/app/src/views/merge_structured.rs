@@ -395,18 +395,33 @@ pub(super) fn next_target(state: &mut StructuredState) -> Option<usize> {
 }
 
 /// The header's note for a file whose disk text equals its source text
-/// byte for byte: nothing is left to merge between them, so the merge
-/// editor opens in Lines (where origin shows) and says why. `None` when
-/// the texts differ.
-pub(super) fn same_text_note(inputs: &MergeInputs) -> Option<&'static str> {
+/// byte for byte, in `mode`'s header: nothing is left to merge between
+/// them, so the merge editor opens in Lines (where origin shows) and says
+/// why. Only Structure points the reader to Lines. `None` when the texts
+/// differ.
+pub(super) fn same_text_note(inputs: &MergeInputs, mode: MergeMode) -> Option<&'static str> {
     if inputs.ours != inputs.theirs {
         return None;
     }
-    Some(if inputs.origin.is_some() {
-        "disk matches source · origin differs · see Lines"
-    } else {
-        "disk matches source"
+    Some(match (inputs.origin.is_some(), mode) {
+        (false, _) => "disk matches source",
+        (true, MergeMode::Lines) => "disk matches source · origin differs",
+        (true, MergeMode::Structure) => "disk matches source · origin differs · see Lines",
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the notes [`same_text_chip`] drew on this thread.
+    static SAME_NOTES_DRAWN: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The notes `merge-same-note` drew on this test's thread since the last
+/// call, oldest first; the call empties the record.
+#[cfg(test)]
+pub(super) fn take_same_notes_drawn() -> Vec<&'static str> {
+    SAME_NOTES_DRAWN.with(|v| v.take())
 }
 
 /// The header's progress words over the structured state: "4 of 5 picked
@@ -670,6 +685,8 @@ fn matching_close(rows: &[TreeRow], open: usize) -> Option<usize> {
 /// The "disk matches source" chip (`merge-same-note`), drawn by both
 /// modes' headers.
 pub(super) fn same_text_chip(theme: Theme, note: &'static str) -> Stateful<Div> {
+    #[cfg(test)]
+    SAME_NOTES_DRAWN.with(|v| v.borrow_mut().push(note));
     div()
         .id("merge-same-note")
         .debug_selector(|| "merge-same-note".into())

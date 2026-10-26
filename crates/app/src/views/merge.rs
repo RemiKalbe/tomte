@@ -949,7 +949,7 @@ impl LoadedMerge {
         };
         // Disk equal to source leaves nothing to merge between them: open
         // in Lines, where origin shows, and keep Structure on offer.
-        let mode = if merge_structured::same_text_note(&inputs).is_some() {
+        let mode = if merge_structured::same_text_note(&inputs, MergeMode::Lines).is_some() {
             MergeMode::Lines
         } else if structured.is_some() {
             MergeMode::Structure
@@ -2808,11 +2808,12 @@ impl MergeView {
         }
     }
 
-    /// The header's "disk matches source" note, in either mode (see
+    /// The header's "disk matches source" note in the current mode (see
     /// [`merge_structured::same_text_note`]). The header renders exactly
     /// this text as `merge-same-note`.
     pub(super) fn same_text_note(&self) -> Option<&'static str> {
-        merge_structured::same_text_note(&self.loaded.as_ref()?.inputs)
+        let loaded = self.loaded.as_ref()?;
+        merge_structured::same_text_note(&loaded.inputs, loaded.mode)
     }
 
     /// The line editor's note for a JSON-looking file that does not merge
