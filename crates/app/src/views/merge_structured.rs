@@ -1410,6 +1410,35 @@ mod tests {
         assert_eq!(kept_top(&old, &new, 3), Some(3));
     }
 
+    /// Folding on with the lone identical row of a run of one at the top:
+    /// that run does not fold, so the row keeps its place; a row of the
+    /// later run of two goes to its fold.
+    ///
+    /// MUTATION: `anchor_row` does not stop at a `Decision` → the lone row
+    /// goes to the later fold, Some(4).
+    #[test]
+    fn kept_top_keeps_the_row_of_a_run_of_one() {
+        let old = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            same_row(1),
+            decision_row(1, 1),
+            same_row(1),
+            same_row(1),
+            close_row(0),
+        ];
+        let new = vec![
+            open_row(0, 0),
+            decision_row(1, 0),
+            same_row(1),
+            decision_row(1, 1),
+            fold_row(1, 3),
+            close_row(0),
+        ];
+        assert_eq!(kept_top(&old, &new, 2), Some(2));
+        assert_eq!(kept_top(&old, &new, 5), Some(4));
+    }
+
     // MUTATION: return the error's byte offset (or a 0-based line) instead
     // of its 1-based line → the "line 3" asserts fail.
     // MUTATION: `Some` on a valid text → the JSONC-with-comments case fails.

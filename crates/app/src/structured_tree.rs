@@ -395,7 +395,9 @@ fn container_value(doc: &Document, id: NodeId) -> Option<SideValue> {
 
 /// The run of identical children being planned inside one container: a
 /// child with no decision of its own or below it. When the run ends it
-/// collapses to one `Fold` row unless the user expanded it.
+/// collapses to one `Fold` row unless the user expanded it or it holds a
+/// single child: a fold that replaces one row with one row would hide the
+/// value and save nothing.
 struct Runs<'v> {
     view: &'v TreeView,
     container: NodeKey,
@@ -433,7 +435,7 @@ impl<'v> Runs<'v> {
             container: self.container,
             first,
         };
-        if self.view.fold_identical && !self.view.expanded_folds.contains(&key) {
+        if count >= 2 && self.view.fold_identical && !self.view.expanded_folds.contains(&key) {
             rows.truncate(start);
             rows.push(TreeRow::Fold {
                 depth: self.depth,
@@ -2042,6 +2044,40 @@ mod tests {
                     locked: false,
                 },
                 fold(&st, 126, 125),
+                root_close(),
+            ]
+        );
+    }
+
+    /// A run of one identical key stays its own row: a fold would replace
+    /// one row with one row and hide the value. A run of two still folds.
+    /// MUTATION: a run of one folds → a Fold{count:1} row appears.
+    #[test]
+    fn fold_identical_leaves_a_run_of_one_unfolded() {
+        let base = "{\n  \"a\": 1,\n  \"b\": 1,\n  \"c\": 1,\n  \"d\": 1\n}\n";
+        let ours = base.replace("\"b\": 1", "\"b\": 2");
+        let st = state(Some(base), &ours, base);
+        let view = TreeView {
+            fold_identical: true,
+            ..TreeView::default()
+        };
+        assert_eq!(
+            plan(&st, &view),
+            vec![
+                root_open(&st, "4 keys", false),
+                same(1, "\"a\": 1,"),
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 0,
+                    key: key("\"b\""),
+                    chips: vec![
+                        chip(ChipSide::Source, "1", false),
+                        chip(ChipSide::Disk, "2", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                fold(&st, 2, 2),
                 root_close(),
             ]
         );
