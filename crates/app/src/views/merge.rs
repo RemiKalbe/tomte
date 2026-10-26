@@ -2375,13 +2375,14 @@ impl MergeView {
             ),
             None => ("merge editor".into(), "".into()),
         };
-        // Every control goes in ONE trailing box on one row, at its full
-        // width: the title column takes what is left, and its name and path
-        // end in an ellipsis when that is too narrow (`detail_header`).
+        // Every control goes in ONE trailing box. The title column takes
+        // what the controls leave, down to its minimum width, and its name
+        // and path end in an ellipsis (`detail_header`); past that minimum
+        // the controls wrap onto a second row rather than run off the
+        // window.
         let mut bar = div()
             .flex()
-            .flex_shrink_0()
-            .flex_nowrap()
+            .flex_wrap()
             .items_center()
             .justify_end()
             .gap_2();

@@ -47,9 +47,11 @@ pub enum RowTone {
     Fold,
 }
 
-/// One clickable tree row: [`inert_tree_row`] plus the pointer, the
-/// `list_row` hover wash, and `on_click`. `cursor` takes the list-row
-/// selected wash.
+/// One clickable tree row: [`inert_tree_row`] plus the pointer, a hover
+/// wash that reads over the changed rows' own wash, and `on_click`.
+/// `cursor` marks the row the pick keys act on with an accent wash, which
+/// neither the changed wash nor the open row's red edge uses, so an open
+/// row under the cursor keeps its edge and gains the wash.
 pub fn tree_row(
     theme: Theme,
     id: impl Into<ElementId>,
@@ -59,11 +61,28 @@ pub fn tree_row(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let row = inert_tree_row(theme, id, depth, tone);
-    row.when(cursor, |el| el.bg(Theme::wash(theme.text, 0.08)))
+    let hover = if cursor {
+        Theme::wash(theme.accent, 0.20)
+    } else {
+        Theme::wash(theme.text, 0.10)
+    };
+    row.when(cursor, |el| el.bg(Theme::wash(theme.accent, 0.14)))
         .cursor_pointer()
-        .hover(|el| el.bg(Theme::wash(theme.text, 0.06)))
+        .hover(move |el| el.bg(hover))
         .on_click(on_click)
 }
+
+/// A container chip's `▸` / `▾` glyph: its own click target, which unfolds
+/// or folds the chip's preview rows while a click on the rest of the chip
+/// picks that side. `selector` names the glyph for tests' `debug_bounds`.
+pub struct ChipPrefix {
+    pub glyph: &'static str,
+    pub selector: String,
+    pub on_click: ClickHandler,
+}
+
+/// A boxed click handler, as [`ChipPrefix`] carries one.
+pub type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// One tree row that nothing happens on (identical rows, comments,
 /// previews, closing brackets): Menlo text_xs, [`TREE_ROW_H`] tall,
@@ -106,9 +125,11 @@ pub fn inert_tree_row(
 
 /// One side's value on a changed row: `label` (`"source"`, `"disk"`,
 /// `"last written"`, `"both"`, `"source · disk"`) in muted text, then the
-/// value clamped to one line. `prefix` (`"▸"` / `"▾"`) marks a container
-/// chip. A picked chip is filled with the tint and leads with `●`; an
-/// unpicked one has only the tinted border and fills lightly on hover.
+/// value clamped to one line. A container chip carries a [`ChipPrefix`]
+/// (`"▸"` / `"▾"`) before its value: the glyph unfolds, the rest of the
+/// chip runs `on_click`. A picked chip is filled with the tint and leads
+/// its value with `●`; an unpicked one has only the tinted border and
+/// fills lightly on hover.
 #[allow(clippy::too_many_arguments)]
 pub fn value_chip(
     theme: Theme,
@@ -117,19 +138,30 @@ pub fn value_chip(
     label: &'static str,
     text: SharedString,
     picked: bool,
-    prefix: Option<&'static str>,
+    prefix: Option<ChipPrefix>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let long = text.chars().count() > CHIP_TOOLTIP_CHARS;
-    let mut shown = String::new();
-    if picked {
-        shown.push_str("● ");
-    }
-    if let Some(prefix) = prefix {
-        shown.push_str(prefix);
-        shown.push(' ');
-    }
-    shown.push_str(&text);
+    let glyph = prefix.map(|prefix| {
+        let ChipPrefix {
+            glyph,
+            selector,
+            on_click,
+        } = prefix;
+        div()
+            .id("chip-unfold")
+            .flex_none()
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .hover(|el| el.text_color(theme.text))
+            .debug_selector(move || selector)
+            .child(glyph)
+            .on_click(move |event, window, cx| {
+                // The chip's own click picks; the glyph only unfolds.
+                cx.stop_propagation();
+                on_click(event, window, cx);
+            })
+    });
     div()
         .id(id)
         // A fixed height under the row's, so chips on consecutive rows keep
@@ -155,6 +187,10 @@ pub fn value_chip(
                 .text_color(theme.text_muted)
                 .child(label),
         )
+        .when(picked, |el| {
+            el.child(div().flex_none().text_color(theme.text).child("●"))
+        })
+        .children(glyph)
         .child(
             // The row sets nowrap; a clamped line needs normal wrapping to
             // measure against the chip's width and ellipsize.
@@ -164,7 +200,7 @@ pub fn value_chip(
                 .line_clamp(1)
                 .text_ellipsis()
                 .text_color(theme.text)
-                .child(shown),
+                .child(text.clone()),
         )
         .when(long, |el| el.tooltip(text_tooltip(text)))
         .on_click(on_click)

@@ -16,6 +16,9 @@ pub fn shorten_home(path: &str) -> String {
 const NAME_LINE_H: f32 = 23.;
 /// Path line height: text_xs at gpui's default 1.618 line height.
 const PATH_LINE_H: f32 = 19.;
+/// Narrowest the title column gets: a few characters and the ellipsis,
+/// never a bare ellipsis. Past it the trailing actions wrap instead.
+const TITLE_MIN_W: f32 = 120.;
 
 /// One line of the title column that ends in an ellipsis when it does not
 /// fit. gpui 0.2.2 ellipsizes only text measured against a definite width
@@ -42,7 +45,8 @@ fn ellipsized_line(text: SharedString, line_h: f32) -> Div {
 
 /// `p_3 border_b` header row: name (semibold) over path (muted), then the
 /// trailing actions. The title column takes the width the actions leave,
-/// and each of its lines ends in an ellipsis when it does not fit
+/// down to [`TITLE_MIN_W`], and each of its lines ends in an ellipsis when
+/// it does not fit
 /// ([`ellipsized_line`]). Callers still ~-shorten paths via
 /// [`shorten_home`].
 pub fn detail_header(
@@ -61,7 +65,7 @@ pub fn detail_header(
         .child(
             div()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(TITLE_MIN_W))
                 .flex()
                 .flex_col()
                 .child(

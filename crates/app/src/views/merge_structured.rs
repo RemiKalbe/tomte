@@ -15,7 +15,9 @@ use gpui::{
 };
 use tomte_app::merge_inputs::MergeInputs;
 use tomte_app::structured_state::{Stage, StructuredState};
-use tomte_app::structured_tree::{Bracket, Chip, ChipSide, FoldKey, FoldWhat, NodeKey, TreeRow};
+use tomte_app::structured_tree::{
+    Bracket, Chip, ChipSide, FoldKey, FoldWhat, NodeKey, TreeRow, offered_sides,
+};
 use tomte_app::theme::Theme;
 use tomte_core::structured::jsonc;
 use tomte_core::structured::{Decision, NotStructured, Pick, looked_like_json};
@@ -175,32 +177,36 @@ fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
                 ui::RowTone::Plain
             };
             let node = *node;
-            let view = frame.view.clone();
-            ui::tree_row(
-                theme,
-                ("tree-line", ix),
-                *depth,
-                tone,
-                false,
-                move |_, _, cx| {
-                    view.update(cx, |merge, cx| merge.toggle_container(node, cx))
-                        .ok();
-                },
-            )
-            .w_full()
-            .debug_selector(move || format!("tree-line:{ix}"))
-            .child(text)
-            .when_some(tail, |el, (summary, close)| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .gap_2()
-                        .child(div().text_color(theme.text_muted).child(summary))
-                        .child(close),
+            let row = if open_row_toggles(row) {
+                let view = frame.view.clone();
+                ui::tree_row(
+                    theme,
+                    ("tree-line", ix),
+                    *depth,
+                    tone,
+                    false,
+                    move |_, _, cx| {
+                        view.update(cx, |merge, cx| merge.toggle_container(node, cx))
+                            .ok();
+                    },
                 )
-            })
-            .into_any_element()
+            } else {
+                ui::inert_tree_row(theme, ("tree-line", ix), *depth, tone)
+            };
+            row.w_full()
+                .debug_selector(move || format!("tree-line:{ix}"))
+                .child(text)
+                .when_some(tail, |el, (summary, close)| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .gap_2()
+                            .child(div().text_color(theme.text_muted).child(summary))
+                            .child(close),
+                    )
+                })
+                .into_any_element()
         }
         TreeRow::Close {
             depth,
@@ -259,8 +265,17 @@ fn tree_row(row: &TreeRow, ix: usize, frame: &TreeFrame) -> AnyElement {
     }
 }
 
-/// One side's chip on decision `id`'s row. A container chip unfolds or
-/// folds its preview; every other chip picks its side.
+/// Whether a click on an `Open` row folds or unfolds it: every container
+/// but the root, which the planner always draws open (its rows are the
+/// whole file), so the root row takes no pointer and no handler.
+pub(super) fn open_row_toggles(row: &TreeRow) -> bool {
+    matches!(row, TreeRow::Open { key, depth, .. } if key.is_some() || *depth > 0)
+}
+
+/// One side's chip on decision `id`'s row. A click on the chip picks its
+/// side; a container chip's `▸` / `▾` glyph (`chip-unfold:<id>:<side>`)
+/// unfolds or folds its preview instead, so a row whose chips are all
+/// containers can still be picked with the mouse.
 fn value_chip(chip: &Chip, id: usize, frame: &TreeFrame) -> Stateful<Div> {
     let side = chip.side;
     let label = if chip.agreed {
@@ -268,14 +283,24 @@ fn value_chip(chip: &Chip, id: usize, frame: &TreeFrame) -> Stateful<Div> {
     } else {
         side.label()
     };
-    let prefix = if chip.unfolded {
+    let glyph = if chip.unfolded {
         Some("▾")
     } else if chip.container {
         Some("▸")
     } else {
         None
     };
-    let container = chip.container;
+    let prefix = glyph.map(|glyph| {
+        let view = frame.view.clone();
+        ui::ChipPrefix {
+            glyph,
+            selector: format!("chip-unfold:{id}:{}", side.selector()),
+            on_click: Box::new(move |_, _, cx| {
+                view.update(cx, |merge, cx| merge.toggle_chip(id, side, cx))
+                    .ok();
+            }),
+        }
+    });
     let view = frame.view.clone();
     ui::value_chip(
         frame.theme,
@@ -290,14 +315,10 @@ fn value_chip(chip: &Chip, id: usize, frame: &TreeFrame) -> Stateful<Div> {
             // below moves the cursor on, and the row would pull it back.
             cx.stop_propagation();
             view.update(cx, |merge, cx| {
-                if container {
-                    merge.toggle_chip(id, side, cx);
-                } else {
-                    // A pick lands where the cursor is, as a pick key does:
-                    // the cursor comes to this row, then advances from it.
-                    merge.select_decision(id, cx);
-                    merge.apply_pick(id, side.pick(), cx);
-                }
+                // A pick lands where the cursor is, as a pick key does:
+                // the cursor comes to this row, then advances from it.
+                merge.select_decision(id, cx);
+                merge.apply_pick(id, side.pick(), cx);
             })
             .ok();
         },
@@ -359,20 +380,14 @@ pub(super) fn lock_reason(
 }
 
 /// Whether `pick` may land on decision `id`: never on a locked decision,
-/// last written only where the base had the entry, both only on an array
-/// conflict run.
+/// and otherwise only on a side the row shows a chip for
+/// ([`offered_sides`], the planner's own rule), so a key never picks a
+/// side the reader cannot see filled.
 pub(super) fn pick_allowed(state: &StructuredState, id: usize, pick: Pick) -> bool {
     let Some(d) = state.doc.decisions.get(id) else {
         return false;
     };
-    if d.locked.is_some() {
-        return false;
-    }
-    match pick {
-        Pick::LastWritten => state.doc.has_base(id),
-        Pick::Both => d.both_allowed,
-        Pick::Disk | Pick::Source => true,
-    }
+    d.locked.is_none() && offered_sides(&state.doc, id).contains(&ChipSide::from(pick))
 }
 
 /// Whether the user has made any structure pick (what a mode switch would
@@ -944,7 +959,7 @@ mod tests {
 
     use super::{
         Anchor, anchor_row, fold_anchor, has_picks, invalid_json_line, kept_top,
-        not_structured_note, pick_allowed, progress_text,
+        not_structured_note, open_row_toggles, pick_allowed, progress_text,
     };
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
@@ -966,6 +981,41 @@ mod tests {
             "no base in two-way"
         );
         assert!(!pick_allowed(&two, 7, Pick::Disk), "unknown id");
+    }
+
+    /// The root's bracket row is always open, so it takes no click; every
+    /// nested container's row folds and unfolds.
+    ///
+    /// MUTATION: `open_row_toggles` returns true for every `Open` row → the
+    /// root row toggles.
+    #[test]
+    fn only_a_nested_container_row_toggles() {
+        use tomte_app::merge_inputs::MergeInputs;
+        use tomte_app::structured_tree::{TreeView, plan};
+        let inputs: MergeInputs = super::super::fixtures::json_tree_inputs();
+        let s = StructuredState::new(
+            StructuredDocument::compute(inputs.base.as_deref(), &inputs.ours, &inputs.theirs, None)
+                .expect("json"),
+        );
+        let rows = plan(&s, &TreeView::default());
+        let opens: Vec<&TreeRow> = rows
+            .iter()
+            .filter(|r| matches!(r, TreeRow::Open { .. }))
+            .collect();
+        assert!(opens.len() > 1, "the root and a nested container");
+        assert!(
+            matches!(
+                opens[0],
+                TreeRow::Open {
+                    key: None,
+                    depth: 0,
+                    ..
+                }
+            ),
+            "the root comes first"
+        );
+        assert!(!open_row_toggles(opens[0]), "the root is inert");
+        assert!(opens[1..].iter().all(|r| open_row_toggles(r)));
     }
 
     /// MUTATION: m counts conflicts only → "0 of 1 picked" on json_inputs.

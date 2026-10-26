@@ -7026,6 +7026,165 @@ mod render_smoke {
         );
     }
 
+    /// Decision `id` of the keyed row `name` in `rows`.
+    fn keyed_decision(rows: &[tomte_app::structured_tree::TreeRow], name: &str) -> usize {
+        use tomte_app::structured_tree::TreeRow;
+        rows.iter()
+            .find_map(|row| match row {
+                TreeRow::Decision {
+                    id, key: Some(k), ..
+                } if k == name => Some(*id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} has a decision row"))
+    }
+
+    /// Decision `id`'s explicit pick, if any.
+    fn structured_pick(
+        merge: &Entity<merge::MergeView>,
+        vis: &mut VisualTestContext,
+        id: usize,
+    ) -> Option<tomte_core::structured::Pick> {
+        vis.update(|_w, cx| {
+            merge
+                .read(cx)
+                .loaded
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap()
+                .resolution
+                .get(id)
+        })
+    }
+
+    /// A pick key for a side the row shows no chip for does nothing (spec
+    /// §3.5): 3 on "font_size", changed on disk only, whose row offers no
+    /// last written; 1 on the agreed "editor.formatOnSave", whose one chip
+    /// reads `source · disk`.
+    ///
+    /// MUTATION: `pick_allowed` allows last written wherever the base has
+    /// the entry (the old `has_base`-only rule) → 3 on "font_size" picks
+    /// last written.
+    /// MUTATION: `pick_allowed` allows disk and source on every unlocked
+    /// row → 1 on "editor.formatOnSave" picks disk.
+    #[gpui::test]
+    fn a_pick_key_for_a_chip_the_row_lacks_does_nothing(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::ChipSide;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_tree_inputs());
+        let rows = tree_rows(&merge, vis);
+        let font = keyed_decision(&rows, "\"font_size\"");
+        let agreed = keyed_decision(&rows, "\"editor.formatOnSave\"");
+        for (id, key, side) in [
+            (font, "3", ChipSide::LastWritten),
+            (agreed, "1", ChipSide::Disk),
+        ] {
+            let (chips, _) = decision_row(&tree_rows(&merge, vis), id);
+            assert!(
+                chips.iter().all(|c| c.side != side),
+                "row {id} shows no {side:?} chip: {chips:?}"
+            );
+            merge.update(vis, |m, cx| m.select_decision(id, cx));
+            vis.run_until_parked();
+            assert_eq!(structured_cursor(&merge, vis), Some(id));
+            let before = structured_pick(&merge, vis, id);
+            vis.simulate_keystrokes(key);
+            vis.run_until_parked();
+            assert_eq!(
+                structured_pick(&merge, vis, id),
+                before,
+                "{key} on row {id} picked nothing"
+            );
+            assert_eq!(decision_row(&tree_rows(&merge, vis), id).0, chips);
+        }
+    }
+
+    /// A container chip has two targets: its body picks that side, its
+    /// `▸` glyph unfolds the preview. The gallery's appended hooks object
+    /// is an open conflict whose chips are both containers, so the body
+    /// is the mouse's only way to pick it.
+    ///
+    /// MUTATION: the glyph's handler also picks (`apply_pick` beside
+    /// `toggle_chip`) → the source glyph click picks source.
+    /// MUTATION: the body's handler unfolds instead of picking (the old
+    /// container branch) → no pick, and preview rows appear.
+    /// MUTATION: `ui::value_chip`'s glyph handler drops its
+    /// `stop_propagation` → the click bubbles to the body and picks source.
+    #[gpui::test]
+    fn a_container_chip_click_picks_and_its_glyph_unfolds(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::TreeRow;
+        use tomte_core::structured::Pick;
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_tree_inputs());
+        let previews = |rows: &[TreeRow]| {
+            rows.iter()
+                .filter(|r| matches!(r, TreeRow::Preview { .. }))
+                .count()
+        };
+        let rows = tree_rows(&merge, vis);
+        let hooks = rows
+            .iter()
+            .find_map(|row| match row {
+                TreeRow::Decision {
+                    id,
+                    key: None,
+                    chips,
+                    open: true,
+                    ..
+                } if chips.iter().filter(|c| c.container).count() == 2 => Some(*id),
+                _ => None,
+            })
+            .expect("the hooks conflict has two container chips");
+        assert_eq!(previews(&rows), 0, "every chip starts folded");
+        assert_eq!(structured_pick(&merge, vis, hooks), None);
+        merge.update(vis, |m, cx| {
+            m.scroll_to_decision(hooks);
+            cx.notify();
+        });
+        vis.run_until_parked();
+
+        // The source glyph unfolds and picks nothing.
+        let glyph = vis
+            .debug_bounds(leak(format!("chip-unfold:{hooks}:source")))
+            .expect("the source chip has a glyph");
+        vis.simulate_click(glyph.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(
+            structured_pick(&merge, vis, hooks),
+            None,
+            "the glyph does not pick"
+        );
+        let rows = tree_rows(&merge, vis);
+        assert!(previews(&rows) > 0, "the glyph unfolded the preview");
+        let (chips, _) = decision_row(&rows, hooks);
+        assert!(chips.iter().any(|c| c.unfolded));
+        // Fold it again so the body click below starts from no previews.
+        let glyph = vis
+            .debug_bounds(leak(format!("chip-unfold:{hooks}:source")))
+            .expect("the unfolded chip keeps its glyph");
+        vis.simulate_click(glyph.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(previews(&tree_rows(&merge, vis)), 0, "a second click folds");
+
+        // The disk chip's body picks disk and unfolds nothing.
+        let body = vis
+            .debug_bounds(leak(format!("chip:{hooks}:disk")))
+            .expect("the disk chip renders");
+        let glyph = vis
+            .debug_bounds(leak(format!("chip-unfold:{hooks}:disk")))
+            .expect("the disk chip has a glyph");
+        // Click the body to the right of the glyph, clear of it.
+        let point = gpui::point((glyph.right() + body.right()) / 2., body.center().y);
+        vis.simulate_click(point, gpui::Modifiers::default());
+        vis.run_until_parked();
+        assert_eq!(structured_pick(&merge, vis, hooks), Some(Pick::Disk));
+        assert_eq!(
+            previews(&tree_rows(&merge, vis)),
+            0,
+            "the body does not unfold"
+        );
+    }
+
     /// A pick that moves the cursor to an off-screen conflict scrolls the
     /// tree to that conflict, where the next pick key lands.
     ///

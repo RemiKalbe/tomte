@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use tomte_core::merge::RegionKind;
 use tomte_core::structured::jsonc::{Document, Element, NodeId, NodeKind};
-use tomte_core::structured::{Change, Decision, Pick, Side, SideText};
+use tomte_core::structured::{Change, Decision, Pick, Side, SideText, StructuredDocument};
 
 use crate::structured_state::StructuredState;
 
@@ -60,6 +60,47 @@ impl ChipSide {
             ChipSide::Both => None,
         }
     }
+}
+
+impl From<Pick> for ChipSide {
+    /// The chip whose click makes `pick`.
+    fn from(pick: Pick) -> Self {
+        match pick {
+            Pick::Disk => ChipSide::Disk,
+            Pick::Source => ChipSide::Source,
+            Pick::LastWritten => ChipSide::LastWritten,
+            Pick::Both => ChipSide::Both,
+        }
+    }
+}
+
+/// The chips decision `id`'s row shows, in order (spec §3.2). A locked row
+/// and an agreed row (both sides made the same change) show one source chip;
+/// last written shows only on a conflict or an agreed row whose base had the
+/// entry; both only where the decision allows it. The pick keys use the same
+/// rule (spec §3.5): a key for a chip the row does not show does nothing.
+/// Empty for an unknown id.
+pub fn offered_sides(doc: &StructuredDocument, id: usize) -> Vec<ChipSide> {
+    let Some(d) = doc.decisions.get(id) else {
+        return Vec::new();
+    };
+    if d.locked.is_some() {
+        return vec![ChipSide::Source];
+    }
+    let agreed = d.kind == RegionKind::BothSame && d.duplicated.is_none();
+    let mut sides = if agreed {
+        vec![ChipSide::Source]
+    } else {
+        vec![ChipSide::Source, ChipSide::Disk]
+    };
+    let base_offered = matches!(d.kind, RegionKind::Conflict | RegionKind::BothSame);
+    if base_offered && doc.has_base(id) {
+        sides.push(ChipSide::LastWritten);
+    }
+    if d.both_allowed {
+        sides.push(ChipSide::Both);
+    }
+    sides
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -855,19 +896,7 @@ impl<'a> Planner<'a> {
             )];
         }
         let agreed = d.kind == RegionKind::BothSame && d.duplicated.is_none();
-        let mut sides = if agreed {
-            vec![ChipSide::Source]
-        } else {
-            vec![ChipSide::Source, ChipSide::Disk]
-        };
-        let base_offered = matches!(d.kind, RegionKind::Conflict | RegionKind::BothSame);
-        if base_offered && self.state.doc.has_base(d.id) {
-            sides.push(ChipSide::LastWritten);
-        }
-        if d.both_allowed {
-            sides.push(ChipSide::Both);
-        }
-        sides
+        offered_sides(&self.state.doc, d.id)
             .into_iter()
             .map(|side| {
                 let (chip, previews) = self.chip(d, side, effective);
@@ -1381,6 +1410,42 @@ mod tests {
                 },
                 root_close(),
             ]
+        );
+    }
+
+    /// A decision on an entry source has takes its comments from source,
+    /// even when disk carries its own comment above the same key.
+    ///
+    /// MUTATION: the owner lookup tries `[Ours, Theirs, Base]` → the
+    /// conflict row is preceded by "// d".
+    #[test]
+    fn a_conflict_row_takes_its_comments_from_source() {
+        let base = "{\n  \"a\": 1\n}\n";
+        let theirs = "{\n  // s\n  \"a\": 2\n}\n";
+        let ours = "{\n  // d\n  \"a\": 3\n}\n";
+        let st = state(Some(base), ours, theirs);
+        let rows = plan(&st, &TreeView::default());
+        let at = rows
+            .iter()
+            .position(|r| matches!(r, TreeRow::Decision { id: 0, .. }))
+            .expect("the conflict has a row");
+        assert!(
+            matches!(&rows[at], TreeRow::Decision { open: true, .. }),
+            "a conflict: {:?}",
+            rows[at]
+        );
+        assert_eq!(
+            rows[at - 1],
+            TreeRow::Comment {
+                depth: 1,
+                text: "// s".to_string()
+            }
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, TreeRow::Comment { text, .. } if text == "// d")),
+            "disk's comment is not drawn: {rows:?}"
         );
     }
 

@@ -510,7 +510,11 @@ pub fn render_component(name: &str, theme: Theme) -> Option<AnyElement> {
                     label,
                     text,
                     picked,
-                    prefix,
+                    prefix.map(|glyph| ChipPrefix {
+                        glyph,
+                        selector: format!("prev-sr-unfold:{ix}"),
+                        on_click: Box::new(noop),
+                    }),
                     noop,
                 )
             };
