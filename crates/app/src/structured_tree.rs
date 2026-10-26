@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use tomte_core::merge::RegionKind;
 use tomte_core::structured::jsonc::{Document, Element, NodeId, NodeKind};
-use tomte_core::structured::{Decision, Pick, Side, SideText};
+use tomte_core::structured::{Change, Decision, Pick, Side, SideText};
 
 use crate::structured_state::StructuredState;
 
@@ -332,6 +332,28 @@ struct SideValue {
     text: String,
     container: bool,
     previews: Vec<String>,
+}
+
+/// A container node's chip value: its count, unfolding into one row per
+/// entry or element as written. `None` for a scalar.
+fn container_value(doc: &Document, id: NodeId) -> Option<SideValue> {
+    let (bracket, count) = summary(doc, id)?;
+    let previews = match &doc.node(id).kind {
+        NodeKind::Object { entries } => entries
+            .iter()
+            .map(|e| one_line(doc.slice(&e.range)))
+            .collect(),
+        NodeKind::Array { elements } => elements
+            .iter()
+            .map(|e| one_line(doc.slice(&e.range)))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(SideValue {
+        text: counted(bracket, &count),
+        container: true,
+        previews,
+    })
 }
 
 /// One child of a container in the walk: an object entry or an array element.
@@ -781,6 +803,14 @@ impl<'a> Planner<'a> {
         let index = self.index(side);
         let doc = index.doc;
         if let Some(run) = index.run_at(&st.value) {
+            // A single added or removed element is a value, not a run: a
+            // container one unfolds into its own entries.
+            if d.what != Change::Elements
+                && let [element] = run
+                && let Some(value) = container_value(doc, element.value)
+            {
+                return value;
+            }
             let texts: Vec<String> = run
                 .iter()
                 .map(|e| match summary(doc, e.value) {
@@ -795,28 +825,13 @@ impl<'a> Planner<'a> {
             };
         }
         let node = index.node_at(&st.value);
-        let mut value = match node.and_then(|id| summary(doc, id).map(|s| (id, s))) {
-            Some((id, (bracket, count))) => SideValue {
-                text: counted(bracket, &count),
-                container: true,
-                previews: match &doc.node(id).kind {
-                    NodeKind::Object { entries } => entries
-                        .iter()
-                        .map(|e| one_line(doc.slice(&e.range)))
-                        .collect(),
-                    NodeKind::Array { elements } => elements
-                        .iter()
-                        .map(|e| one_line(doc.slice(&e.range)))
-                        .collect(),
-                    _ => Vec::new(),
-                },
-            },
-            None => SideValue {
+        let mut value = node
+            .and_then(|id| container_value(doc, id))
+            .unwrap_or_else(|| SideValue {
                 text: one_line(doc.slice(&st.value)),
                 container: false,
                 previews: Vec::new(),
-            },
-        };
+            });
         if d.duplicated == Some(side)
             && let Some(copies) = self.copies(index, &st.value)
         {
@@ -1477,6 +1492,17 @@ mod tests {
         "  ]\n",
         "}\n",
     );
+    const A_ONE_OBJ: &str = concat!(
+        "{\n",
+        "  \"p\": [\n",
+        "    \"a\",\n",
+        "    {\n",
+        "      \"u\": 1,\n",
+        "      \"v\": 2\n",
+        "    }\n",
+        "  ]\n",
+        "}\n",
+    );
     const ROOT_12: &str = "[\n  1,\n  2\n]\n";
     const ROOT_13: &str = "[\n  1,\n  3\n]\n";
 
@@ -1782,6 +1808,45 @@ mod tests {
                     open: false,
                     locked: false,
                 },
+                array_close(1),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: previews built per run element → the added object unfolds
+    /// into one line `{ "u": 1, "v": 2 }` instead of its two entries.
+    #[test]
+    fn an_added_object_element_unfolds_into_its_entries() {
+        let st = state(Some(A), A_ONE_OBJ, A);
+        let view = TreeView {
+            unfolded_chips: [(0, ChipSide::Disk)].into_iter().collect(),
+            ..TreeView::default()
+        };
+        let rows = plan(&st, &view);
+        assert_eq!(
+            rows,
+            vec![
+                root_open(&st, "1 key", false),
+                array_open(&st, "p", "1 element"),
+                same(2, "\"a\""),
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "absent", false),
+                        Chip {
+                            container: true,
+                            unfolded: true,
+                            ..chip(ChipSide::Disk, "{ 2 keys }", true)
+                        },
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                preview(3, "\"u\": 1,"),
+                preview(3, "\"v\": 2"),
                 array_close(1),
                 root_close(),
             ]
