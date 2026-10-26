@@ -16,8 +16,8 @@ version without one.
   you pick. Identical rows stay dimmed in place, and Fold identical
   collapses runs of them. Keys a template renders stay locked to source.
   Edit opens the assembled file as text so you can refine it before you
-  save. A file whose disk already matches its source opens in the line view
-  with a note saying so.
+  save. A file whose disk already matches its source opens in Lines with a
+  note saying so.
 
 ### Fixed
 

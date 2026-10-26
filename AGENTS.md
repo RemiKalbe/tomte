@@ -424,9 +424,9 @@ one-liners in place, and a Fold identical toggle collapses runs of them.
 Keys a template renders are locked to source and carry the `{}` mark. Save
 splices the picks into the source text so comments and layout survive, and
 Edit opens a Text stage on the assembled file. A file whose disk text equals
-its source opens in Lines with a note saying so; Structure still shows the
-same note. A JSON-looking file that does not parse opens in the line editor
-with a note saying why. Deliberate limits: TOML comes later, origin is shown
+its source opens in Lines with a note saying so; Structure offers the
+same note with `· see Lines` added when origin differs. A JSON-looking
+file that does not parse opens in the line editor with a note saying why. Deliberate limits: TOML comes later, origin is shown
 only in Lines ("origin differs · see Lines"), and objects inside array
 elements are not merged key by key.
 
