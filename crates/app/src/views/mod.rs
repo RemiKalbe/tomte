@@ -6519,8 +6519,10 @@ mod render_smoke {
     /// A JSON file opens in Structure mode as one tree of rows: a row per
     /// decision, no input panes and no result pane.
     ///
-    /// MUTATION: `body` still renders the pane row in Structure mode → a
-    /// `merge-pane-divider` bound exists.
+    /// MUTATION: `body` draws the panes beside the tree in Structure mode
+    /// (the tree rows still render) → a `merge-pane-divider` bound exists.
+    /// A body that draws the panes INSTEAD of the tree fails earlier, on
+    /// the missing `tree-row:<id>`.
     /// MUTATION: `LoadedMerge::new` never runs `detect` (the structured load
     /// returns an error) → mode stays Lines and no `tree-row:<id>` renders.
     #[gpui::test]
@@ -7134,6 +7136,8 @@ mod render_smoke {
     ///
     /// MUTATION: `render_tree` drops the `lock_mark` on a locked row → no
     /// `lock:<id>` bound.
+    /// MUTATION: `render_tree` words the lock reasons itself (calls
+    /// `lock_reasons` per render) → the count grows across two frames.
     #[gpui::test]
     fn a_locked_row_offers_only_source_and_a_lock(cx: &mut TestAppContext) {
         use tomte_app::structured_tree::ChipSide;
@@ -7180,6 +7184,17 @@ mod render_smoke {
         assert!(
             vis.debug_bounds(leak(format!("lock:{locked}"))).is_some(),
             "the lock renders"
+        );
+        // The hover is worded once per load, not once per frame.
+        let worded = merge_structured::lock_reasons_worded();
+        for _ in 0..2 {
+            vis.update(|_w, cx| merge.update(cx, |_, cx| cx.notify()));
+            vis.run_until_parked();
+        }
+        assert_eq!(
+            merge_structured::lock_reasons_worded(),
+            worded,
+            "two more frames word no lock reason"
         );
     }
 

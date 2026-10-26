@@ -844,6 +844,9 @@ pub(super) struct LoadedMerge {
     pub(super) tree_rows: Rc<Vec<TreeRow>>,
     /// A change since the last plan: the next [`Self::replan`] plans.
     pub(super) tree_dirty: bool,
+    /// Each locked decision's hover text, worded once per load
+    /// ([`merge_structured::lock_reasons`]); empty in Lines-only loads.
+    pub(super) lock_reasons: Rc<HashMap<usize, SharedString>>,
     /// Test seam: how many times the tree was planned.
     #[cfg(test)]
     pub(super) plan_runs: usize,
@@ -950,6 +953,12 @@ impl LoadedMerge {
             MergeMode::Lines
         };
         let state = MergeState::new(&inputs);
+        let lock_reasons = Rc::new(
+            structured
+                .as_ref()
+                .map(|s| merge_structured::lock_reasons(s, &inputs))
+                .unwrap_or_default(),
+        );
         let protected = inputs
             .span_map
             .as_ref()
@@ -1013,6 +1022,7 @@ impl LoadedMerge {
             tree: TreeView::default(),
             tree_rows: Rc::new(Vec::new()),
             tree_dirty: true,
+            lock_reasons,
             #[cfg(test)]
             plan_runs: 0,
         }

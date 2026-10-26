@@ -41,7 +41,7 @@ struct TreeFrame {
     /// The structured cursor, drawn with the selected wash.
     cursor: Option<usize>,
     /// Each locked decision's hover text ([`lock_reason`]).
-    locks: HashMap<usize, SharedString>,
+    locks: std::rc::Rc<HashMap<usize, SharedString>>,
     view: WeakEntity<MergeView>,
     #[cfg(test)]
     drawn: std::rc::Rc<std::cell::Cell<usize>>,
@@ -58,29 +58,10 @@ pub(super) fn render_tree(
 ) -> AnyElement {
     let rows = loaded.tree_rows.clone();
     let state = loaded.structured.as_ref();
-    // A lock's hover lexes the template, so it is worded once per frame
-    // here rather than once per drawn row.
-    let locks = state
-        .map(|s| {
-            s.doc
-                .decisions
-                .iter()
-                .filter(|d| d.locked.is_some())
-                .map(|d| {
-                    let reason = lock_reason(
-                        d,
-                        loaded.inputs.template.as_deref(),
-                        loaded.inputs.span_map.as_ref(),
-                    );
-                    (d.id, reason)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     let frame = TreeFrame {
         theme,
         cursor: state.and_then(|s| s.cursor),
-        locks,
+        locks: loaded.lock_reasons.clone(),
         view: cx.weak_entity(),
         #[cfg(test)]
         drawn: view.tree_rows_drawn.clone(),
@@ -322,6 +303,36 @@ fn value_chip(chip: &Chip, id: usize, frame: &TreeFrame) -> Stateful<Div> {
     .debug_selector(move || format!("chip:{id}:{}", side.selector()))
 }
 
+/// Every locked decision's hover text ([`lock_reason`]), by decision id.
+/// Each one lexes the template, so the view words them once per load.
+pub(super) fn lock_reasons(
+    state: &StructuredState,
+    inputs: &MergeInputs,
+) -> HashMap<usize, SharedString> {
+    state
+        .doc
+        .decisions
+        .iter()
+        .filter(|d| d.locked.is_some())
+        .map(|d| {
+            let reason = lock_reason(d, inputs.template.as_deref(), inputs.span_map.as_ref());
+            (d.id, reason)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: how many lock reasons this thread has worded.
+    static LOCK_REASONS_WORDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many lock reasons this test's thread has worded so far.
+#[cfg(test)]
+pub(super) fn lock_reasons_worded() -> usize {
+    LOCK_REASONS_WORDED.with(|n| n.get())
+}
+
 /// A locked row's hover text: the template line behind the span that
 /// pins the decision, in the same words the source pane's `{}` gutter uses.
 pub(super) fn lock_reason(
@@ -329,6 +340,8 @@ pub(super) fn lock_reason(
     template: Option<&str>,
     span_map: Option<&SpanMap>,
 ) -> SharedString {
+    #[cfg(test)]
+    LOCK_REASONS_WORDED.with(|n| n.set(n.get() + 1));
     let span = d
         .locked
         .zip(span_map)
