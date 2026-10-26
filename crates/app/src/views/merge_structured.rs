@@ -394,6 +394,21 @@ pub(super) fn next_target(state: &mut StructuredState) -> Option<usize> {
     }
 }
 
+/// The header's note for a file whose disk text equals its source text
+/// byte for byte: nothing is left to merge between them, so the merge
+/// editor opens in Lines (where origin shows) and says why. `None` when
+/// the texts differ.
+pub(super) fn same_text_note(inputs: &MergeInputs) -> Option<&'static str> {
+    if inputs.ours != inputs.theirs {
+        return None;
+    }
+    Some(if inputs.origin.is_some() {
+        "disk matches source · origin differs · see Lines"
+    } else {
+        "disk matches source"
+    })
+}
+
 /// The header's progress words over the structured state: "4 of 5 picked
 /// · 1 to decide", counting every unlocked decision (a row whose effective
 /// pick is automatic counts as picked), and "5 of 5 picked" once nothing is
@@ -652,16 +667,34 @@ fn matching_close(rows: &[TreeRow], open: usize) -> Option<usize> {
         .map(|(ix, _)| ix)
 }
 
+/// The "disk matches source" chip (`merge-same-note`), drawn by both
+/// modes' headers.
+pub(super) fn same_text_chip(theme: Theme, note: &'static str) -> Stateful<Div> {
+    div()
+        .id("merge-same-note")
+        .debug_selector(|| "merge-same-note".into())
+        .child(ui::chip(
+            theme,
+            note,
+            ui::ChipVariant::Wash(theme.text_muted),
+        ))
+}
+
 /// Structure mode's header controls: progress over the decisions, the
-/// origin chip, Fold identical, Next ↓, and Edit. In the Text stage (`text` is `Some`):
+/// origin chip, Fold identical, Next ↓, and Edit. With `note` (disk equals
+/// source, [`same_text_note`]) the note stands in for the progress words
+/// and the origin chip: it already says both, and "formatting differs"
+/// would be false. In the Text stage (`text` is `Some`):
 /// the invalid-JSON chip when the text does not parse, and Back to
 /// structure (reading "Discard edits" once armed) — no Apply (the line
 /// editor's Apply maps regions and has no meaning here) and no Discard
 /// edit (Back to structure is the way out). Save sits after Cancel, drawn
 /// by the view.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn header_controls(
     mut bar: Div,
     state: &StructuredState,
+    note: Option<&'static str>,
     has_origin: bool,
     fold_identical: bool,
     text: Option<TextStage>,
@@ -669,14 +702,19 @@ pub(super) fn header_controls(
     cx: &mut Context<MergeView>,
 ) -> Div {
     let open = state.unresolved().len();
-    bar = bar.child(
-        div()
-            .text_xs()
-            .whitespace_nowrap()
-            .text_color(if open == 0 { theme.ok } else { theme.conflict })
-            .child(progress_text(state)),
-    );
-    if has_origin {
+    if let Some(note) = note {
+        bar = bar.child(same_text_chip(theme, note));
+    } else {
+        bar = bar.child(
+            div()
+                .debug_selector(|| "merge-progress".into())
+                .text_xs()
+                .whitespace_nowrap()
+                .text_color(if open == 0 { theme.ok } else { theme.conflict })
+                .child(progress_text(state)),
+        );
+    }
+    if has_origin && note.is_none() {
         bar = bar.child(ui::chip(
             theme,
             "origin differs · see Lines",

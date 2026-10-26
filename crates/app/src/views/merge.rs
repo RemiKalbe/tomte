@@ -947,7 +947,11 @@ impl LoadedMerge {
             Ok(doc) => (Some(StructuredState::new(doc)), None),
             Err(why) => (None, Some(why)),
         };
-        let mode = if structured.is_some() {
+        // Disk equal to source leaves nothing to merge between them: open
+        // in Lines, where origin shows, and keep Structure on offer.
+        let mode = if merge_structured::same_text_note(&inputs).is_some() {
+            MergeMode::Lines
+        } else if structured.is_some() {
             MergeMode::Structure
         } else {
             MergeMode::Lines
@@ -2399,6 +2403,7 @@ impl MergeView {
             bar = merge_structured::header_controls(
                 bar,
                 state,
+                self.same_text_note(),
                 loaded.inputs.origin.is_some(),
                 loaded.tree.fold_identical,
                 text,
@@ -2406,6 +2411,9 @@ impl MergeView {
                 cx,
             );
         } else if let Some(loaded) = &self.loaded {
+            if let Some(note) = self.same_text_note() {
+                bar = bar.child(merge_structured::same_text_chip(theme, note));
+            }
             let (decided, total) = loaded.state.progress();
             let open = total - decided;
             bar = bar.child(
@@ -2798,6 +2806,13 @@ impl MergeView {
         if let Some(editor) = &self.result_editor {
             editor.update(cx, |area, _| area.set_content(text));
         }
+    }
+
+    /// The header's "disk matches source" note, in either mode (see
+    /// [`merge_structured::same_text_note`]). The header renders exactly
+    /// this text as `merge-same-note`.
+    pub(super) fn same_text_note(&self) -> Option<&'static str> {
+        merge_structured::same_text_note(&self.loaded.as_ref()?.inputs)
     }
 
     /// The line editor's note for a JSON-looking file that does not merge

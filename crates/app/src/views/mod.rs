@@ -6566,6 +6566,70 @@ mod render_smoke {
         assert_eq!(first_key, Some(Some("\"theme\"".to_string())));
     }
 
+    /// A file whose disk text equals its source (only origin differs)
+    /// opens in Lines with the "disk matches source" note, still offering
+    /// Structure; in Structure the note stands in for the progress words
+    /// and Save is enabled at once (nothing is open).
+    ///
+    /// MUTATION: `with_structured` keeps Structure as the default → mode is Structure.
+    /// MUTATION: the note is built from `ours == base` → no note (origin case).
+    /// The fixture's base equals its source, so that second mutation is
+    /// killed by the assertion on inputs whose base differs, below.
+    #[gpui::test]
+    fn disk_equal_to_source_opens_in_lines_with_the_note(cx: &mut TestAppContext) {
+        use tomte_app::structured_tree::TreeRow;
+        const ORIGIN_NOTE: &str = "disk matches source · origin differs · see Lines";
+        let (_shell, merge, vis) = structured_merge_window(cx, fixtures::json_same_inputs());
+        let (mode, note, has_structure) = vis.update(|_w, cx| {
+            let view = merge.read(cx);
+            let loaded = view.loaded.as_ref().expect("loaded");
+            (
+                loaded.mode,
+                view.same_text_note(),
+                loaded.structured.is_some(),
+            )
+        });
+        assert_eq!(mode, merge::MergeMode::Lines);
+        assert!(has_structure, "Structure stays on offer");
+        assert_eq!(note, Some(ORIGIN_NOTE));
+        assert!(
+            vis.debug_bounds("merge-same-note").is_some(),
+            "the note renders"
+        );
+        let structure = vis
+            .debug_bounds("merge-mode-structure")
+            .expect("the mode toggle offers Structure");
+        // The note reads the two texts, not the base.
+        let base_differs = tomte_app::merge_inputs::MergeInputs {
+            base: fixtures::json_inputs().base,
+            ..fixtures::json_same_inputs()
+        };
+        assert_eq!(
+            merge_structured::same_text_note(&base_differs),
+            Some(ORIGIN_NOTE)
+        );
+
+        vis.simulate_click(structure.center(), gpui::Modifiers::default());
+        vis.run_until_parked();
+        let (mode, gate) = vis.update(|_w, cx| {
+            let view = merge.read(cx);
+            (view.loaded.as_ref().expect("loaded").mode, view.save_gate())
+        });
+        assert_eq!(mode, merge::MergeMode::Structure);
+        assert!(
+            !tree_rows(&merge, vis)
+                .iter()
+                .any(|row| matches!(row, TreeRow::Decision { open: true, .. })),
+            "nothing is open"
+        );
+        assert!(vis.debug_bounds("merge-same-note").is_some());
+        // The progress words never rendered in this window: the note
+        // stands in for them in Structure, and Lines has its own.
+        assert!(vis.debug_bounds("merge-progress").is_none());
+        assert_eq!(gate, Some(merge::SaveGate::Enabled));
+        assert!(vis.debug_bounds("merge-save").is_some());
+    }
+
     /// A real click on a chip picks that side: the assembled text changes,
     /// the row's chip reads picked and its edge goes, and ⌘Z through the
     /// merge editor's binding puts it back.

@@ -488,6 +488,21 @@ pub(super) fn json_inputs() -> MergeInputs {
     }
 }
 
+/// [`json_inputs`] after the user re-added: disk equals source byte for
+/// byte, and only git origin differs ("font_size" is 16 there). The
+/// merge editor opens it in Lines with the "disk matches source" note.
+// Only the Shell tests use it until a gallery pose does.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn json_same_inputs() -> MergeInputs {
+    let mut inputs = json_inputs();
+    inputs.ours = inputs.theirs.clone();
+    inputs.base = Some(inputs.theirs.clone());
+    let needle = "\"font_size\": 14";
+    debug_assert_eq!(inputs.theirs.matches(needle).count(), 1, "one font_size");
+    inputs.origin = Some(inputs.theirs.replace(needle, "\"font_size\": 16"));
+    inputs
+}
+
 /// A templated JSON source with a real span map (lex + anchor, as
 /// [`templated_inputs`] does): "email" renders from a template action, so
 /// its decision (disk changed it) is locked to source; "font_size" changed
