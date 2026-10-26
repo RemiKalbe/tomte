@@ -139,7 +139,7 @@ pub enum TreeRow {
     },
     /// One entry or element of an unfolded container chip, read-only.
     Preview { depth: usize, text: String },
-    /// A run of identical rows behind the fold toggle. Task 4 plans them.
+    /// A run of `count` identical entries or elements behind "Fold identical".
     Fold {
         depth: usize,
         count: usize,
@@ -151,14 +151,14 @@ pub enum TreeRow {
 /// The view's fold and unfold choices, kept for the editor session.
 #[derive(Debug, Clone, Default)]
 pub struct TreeView {
-    /// "Fold identical" (Task 4).
+    /// "Fold identical": runs of identical children collapse to `Fold` rows.
     pub fold_identical: bool,
     /// A container the user folded (`true`) or opened (`false`), overriding
     /// its default.
     pub folded_overrides: HashMap<NodeKey, bool>,
     /// Container chips the user unfolded.
     pub unfolded_chips: HashSet<(usize, ChipSide)>,
-    /// Fold runs the user expanded (Task 4).
+    /// Fold runs the user expanded; ignored while `fold_identical` is off.
     pub expanded_folds: HashSet<FoldKey>,
 }
 
@@ -174,6 +174,38 @@ pub fn plan(state: &StructuredState, view: &TreeView) -> Vec<TreeRow> {
     let mut rows = Vec::new();
     planner.root(&mut rows);
     rows
+}
+
+/// The index of decision `id`'s row in `rows`, `None` while it is hidden.
+pub fn scroll_target(rows: &[TreeRow], id: usize) -> Option<usize> {
+    rows.iter()
+        .position(|row| matches!(row, TreeRow::Decision { id: d, .. } if *d == id))
+}
+
+/// Opens every source container on the path to decision `id`, so its row
+/// is in the plan. Fold runs need no change: a decision never folds.
+pub fn reveal(view: &mut TreeView, state: &StructuredState, id: usize) {
+    let source = state.doc.side_doc(Side::Theirs);
+    let Some(d) = state.doc.decisions.get(id) else {
+        return;
+    };
+    // The container the planner places the decision in (`place_decisions`).
+    let mut node = d
+        .site
+        .container
+        .filter(|&c| c < source.nodes.len() && is_container(source, c))
+        .or(source.root);
+    let parent = SideIndex::new(source).parent;
+    while let Some(c) = node {
+        view.folded_overrides.insert(
+            NodeKey {
+                side: Side::Theirs,
+                node: c,
+            },
+            false,
+        );
+        node = parent.get(&c).copied();
+    }
 }
 
 /// Lookups over one side's document, built once per plan.
@@ -354,6 +386,58 @@ fn container_value(doc: &Document, id: NodeId) -> Option<SideValue> {
         container: true,
         previews,
     })
+}
+
+/// The run of identical children being planned inside one container: a
+/// child with no decision of its own or below it. When the run ends it
+/// collapses to one `Fold` row unless the user expanded it.
+struct Runs<'v> {
+    view: &'v TreeView,
+    container: NodeKey,
+    depth: usize,
+    what: FoldWhat,
+    /// The run's first child, its child count and its first row.
+    run: Option<(usize, usize, usize)>,
+}
+
+impl<'v> Runs<'v> {
+    fn new(view: &'v TreeView, container: NodeKey, depth: usize, what: FoldWhat) -> Self {
+        Self {
+            view,
+            container,
+            depth,
+            what,
+            run: None,
+        }
+    }
+
+    /// Child `index`, whose rows start at `rows.len()`, joins the run.
+    fn identical(&mut self, rows: &[TreeRow], index: usize) {
+        match &mut self.run {
+            Some((_, count, _)) => *count += 1,
+            None => self.run = Some((index, 1, rows.len())),
+        }
+    }
+
+    /// Ends the run before rows that never fold, or at the container's end.
+    fn end(&mut self, rows: &mut Vec<TreeRow>) {
+        let Some((first, count, start)) = self.run.take() else {
+            return;
+        };
+        let key = FoldKey {
+            container: self.container,
+            first,
+        };
+        if self.view.fold_identical && !self.view.expanded_folds.contains(&key) {
+            rows.truncate(start);
+            rows.push(TreeRow::Fold {
+                depth: self.depth,
+                count,
+                what: self.what,
+                key,
+            });
+        }
+    }
 }
 
 /// One child of a container in the walk: an object entry or an array element.
@@ -540,8 +624,13 @@ impl<'a> Planner<'a> {
     /// The rows inside source container `c`, at `depth`.
     fn children(&self, rows: &mut Vec<TreeRow>, c: NodeId, depth: usize) {
         let source = self.source();
+        let container = NodeKey {
+            side: Side::Theirs,
+            node: c,
+        };
         match &source.node(c).kind {
             NodeKind::Object { entries } => {
+                let mut runs = Runs::new(self.view, container, depth, FoldWhat::Keys);
                 let earlier_copies: HashSet<usize> = source
                     .duplicates
                     .iter()
@@ -551,10 +640,15 @@ impl<'a> Planner<'a> {
                     .collect();
                 for (i, entry) in entries.iter().enumerate() {
                     match self.at_entry.get(&(c, i)) {
-                        Some(ids) => self.decisions(rows, ids, depth),
+                        Some(ids) => {
+                            runs.end(rows);
+                            self.decisions(rows, ids, depth);
+                        }
                         // The last copy of a repeated key stands for all of them.
                         None if earlier_copies.contains(&i) => {}
                         None => self.item(
+                            &mut runs,
+                            i,
                             rows,
                             Item {
                                 key: Some(&entry.key_range),
@@ -568,21 +662,26 @@ impl<'a> Planner<'a> {
                         ),
                     }
                     if let Some(ids) = self.after_entry.get(&(c, Some(i))) {
+                        runs.end(rows);
                         self.decisions(rows, ids, depth);
                     }
                 }
+                runs.end(rows);
                 if let Some(ids) = self.after_entry.get(&(c, None)) {
                     self.decisions(rows, ids, depth);
                 }
             }
             NodeKind::Array { elements } => {
+                let mut runs = Runs::new(self.view, container, depth, FoldWhat::Elements);
                 // The first element not yet covered by a decision's run.
                 let mut next = 0;
                 for (k, element) in elements.iter().enumerate() {
                     if let Some(ids) = self.before_element.get(&(c, k)) {
+                        runs.end(rows);
                         self.decisions(rows, ids, depth);
                     }
                     if let Some((end, ids)) = self.at_element.get(&(c, k)) {
+                        runs.end(rows);
                         self.decisions(rows, ids, depth);
                         next = next.max(*end);
                     }
@@ -590,6 +689,8 @@ impl<'a> Planner<'a> {
                         continue;
                     }
                     self.item(
+                        &mut runs,
+                        k,
                         rows,
                         Item {
                             key: None,
@@ -602,6 +703,7 @@ impl<'a> Planner<'a> {
                         depth,
                     );
                 }
+                runs.end(rows);
                 if let Some(ids) = self.before_element.get(&(c, elements.len())) {
                     self.decisions(rows, ids, depth);
                 }
@@ -615,7 +717,21 @@ impl<'a> Planner<'a> {
 
     /// A source entry or element no decision replaces: its comments, then
     /// one `Same` row, or an `Open`/children/`Close` group for a container.
-    fn item(&self, rows: &mut Vec<TreeRow>, item: Item<'_>, depth: usize) {
+    /// It joins the run of identical children `runs` tracks, or ends it
+    /// when it holds a decision.
+    fn item(
+        &self,
+        runs: &mut Runs<'_>,
+        index: usize,
+        rows: &mut Vec<TreeRow>,
+        item: Item<'_>,
+        depth: usize,
+    ) {
+        if self.holding.contains(&item.value) {
+            runs.end(rows);
+        } else {
+            runs.identical(rows, index);
+        }
         let source = self.source();
         push_comments(rows, source, item.leading, depth);
         let Some((bracket, summary)) = summary(source, item.value) else {
@@ -876,11 +992,17 @@ fn side_text(d: &Decision, side: Side) -> Option<&SideText> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use tomte_core::structured::{Pick, Side, StructuredDocument};
+
+    use tomte_core::structured::jsonc::{Document, NodeId, NodeKind, parse};
     use tomte_core::template::anchor::anchor;
     use tomte_core::template::lexer::lex;
 
-    use super::{Bracket, Chip, ChipSide, NodeKey, Planner, TreeRow, TreeView, plan};
+    use super::{
+        Bracket, Chip, ChipSide, FoldKey, FoldWhat, NodeKey, Planner, TreeRow, TreeView, one_line,
+        plan, reveal, scroll_target,
+    };
     use crate::structured_state::StructuredState;
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
@@ -1851,5 +1973,355 @@ mod tests {
                 root_close(),
             ]
         );
+    }
+
+    /// An object of `n` keys `"k000": 0, …`, with key `changed` set to 1000.
+    fn wide(n: usize, changed: Option<usize>) -> String {
+        let entries: Vec<String> = (0..n)
+            .map(|i| {
+                let value = if changed == Some(i) { 1000 } else { i };
+                format!("  \"k{i:03}\": {value}")
+            })
+            .collect();
+        format!("{{\n{}\n}}\n", entries.join(",\n"))
+    }
+
+    fn fold(st: &StructuredState, first: usize, count: usize) -> TreeRow {
+        let source = st.doc.side_doc(Side::Theirs);
+        TreeRow::Fold {
+            depth: 1,
+            count,
+            what: FoldWhat::Keys,
+            key: FoldKey {
+                container: NodeKey {
+                    side: Side::Theirs,
+                    node: source.root.expect("source root"),
+                },
+                first,
+            },
+        }
+    }
+
+    /// MUTATION: a fold crosses a Decision → count too high, decision row gone.
+    /// (Applied as: the run is not ended before a decision's rows.)
+    #[test]
+    fn fold_identical_collapses_runs_but_never_a_decision() {
+        let base = wide(251, None);
+        let ours = wide(251, Some(125));
+        let st = state(Some(&base), &ours, &base);
+        let view = TreeView {
+            fold_identical: true,
+            ..TreeView::default()
+        };
+        assert_eq!(
+            plan(&st, &view),
+            vec![
+                root_open(&st, "251 keys", false),
+                fold(&st, 0, 125),
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 0,
+                    key: key("\"k125\""),
+                    chips: vec![
+                        chip(ChipSide::Source, "125", false),
+                        chip(ChipSide::Disk, "1000", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                fold(&st, 126, 125),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: expanding one fold expands all → the other Fold disappears.
+    /// (Applied as: any non-empty `expanded_folds` expands every run.)
+    #[test]
+    fn an_expanded_fold_opens_only_its_run() {
+        let base = concat!(
+            "{\n",
+            "  \"o\": { \"p\": 1 },\n",
+            "  // note\n",
+            "  \"b\": 1,\n",
+            "  \"c\": 1,\n",
+            "  \"d\": 1,\n",
+            "  \"e\": 1\n",
+            "}\n",
+        );
+        let ours = base.replace("\"c\": 1", "\"c\": 2");
+        let st = state(Some(base), &ours, base);
+        let root = st.doc.side_doc(Side::Theirs).root.expect("root");
+        let view = TreeView {
+            fold_identical: true,
+            expanded_folds: [FoldKey {
+                container: NodeKey {
+                    side: Side::Theirs,
+                    node: root,
+                },
+                first: 0,
+            }]
+            .into_iter()
+            .collect(),
+            ..TreeView::default()
+        };
+        assert_eq!(
+            plan(&st, &view),
+            vec![
+                root_open(&st, "5 keys", false),
+                TreeRow::Open {
+                    depth: 1,
+                    key: key("\"o\""),
+                    bracket: Bracket::Object,
+                    folded: true,
+                    summary: "1 key".to_string(),
+                    same: true,
+                    node: NodeKey {
+                        side: Side::Theirs,
+                        node: source_value(&st, "o"),
+                    },
+                },
+                TreeRow::Close {
+                    depth: 1,
+                    bracket: Bracket::Object,
+                    comma: true,
+                },
+                TreeRow::Comment {
+                    depth: 1,
+                    text: "// note".to_string(),
+                },
+                same(1, "\"b\": 1,"),
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 0,
+                    key: key("\"c\""),
+                    chips: vec![
+                        chip(ChipSide::Source, "1", false),
+                        chip(ChipSide::Disk, "2", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                fold(&st, 3, 2),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: `scroll_target` returns the first Decision for every id.
+    #[test]
+    fn scroll_target_finds_every_decisions_row() {
+        let base = "{\n  \"a\": 1,\n  \"b\": 1,\n  \"c\": 1\n}\n";
+        let ours = "{\n  \"a\": 2,\n  \"b\": 1,\n  \"c\": 2\n}\n";
+        let rows = rows(base, ours, base);
+        assert_eq!(scroll_target(&rows, 0), Some(1));
+        assert_eq!(scroll_target(&rows, 1), Some(3));
+        assert_eq!(scroll_target(&rows, 2), None);
+    }
+
+    /// MUTATION: `reveal` leaves the override → the row stays hidden.
+    #[test]
+    fn reveal_opens_a_container_the_user_folded() {
+        let base = "{\n  \"o\": {\n    \"p\": 1,\n    \"q\": 2\n  }\n}\n";
+        let ours = "{\n  \"o\": {\n    \"p\": 1,\n    \"q\": 3\n  }\n}\n";
+        let st = state(Some(base), ours, base);
+        let o = NodeKey {
+            side: Side::Theirs,
+            node: source_value(&st, "o"),
+        };
+        let root = NodeKey {
+            side: Side::Theirs,
+            node: st.doc.side_doc(Side::Theirs).root.expect("root"),
+        };
+        let mut view = TreeView {
+            folded_overrides: [(o, true)].into_iter().collect(),
+            ..TreeView::default()
+        };
+        assert_eq!(scroll_target(&plan(&st, &view), 0), None);
+        reveal(&mut view, &st, 0);
+        assert_eq!(
+            view.folded_overrides,
+            [(o, false), (root, false)].into_iter().collect()
+        );
+        assert!(view.expanded_folds.is_empty());
+        assert_eq!(scroll_target(&plan(&st, &view), 0), Some(3));
+    }
+
+    const CORPUS: [&str; 5] = [
+        "claude-settings.json",
+        "opencode.jsonc",
+        "skill-lock.json",
+        "vscode-settings.jsonc",
+        "zed-settings.jsonc",
+    ];
+
+    /// The first scalar in document order, depth first.
+    fn first_scalar(doc: &Document, id: NodeId) -> Option<NodeId> {
+        match &doc.node(id).kind {
+            NodeKind::Object { entries } => entries.iter().find_map(|e| first_scalar(doc, e.value)),
+            NodeKind::Array { elements } => {
+                elements.iter().find_map(|e| first_scalar(doc, e.value))
+            }
+            _ => Some(id),
+        }
+    }
+
+    /// `text` with its first scalar value changed to another of its kind.
+    fn first_scalar_changed(name: &str, text: &str) -> String {
+        let doc = parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let id = doc
+            .root
+            .and_then(|root| first_scalar(&doc, root))
+            .unwrap_or_else(|| panic!("{name}: no scalar"));
+        let range = doc.node(id).range.clone();
+        let literal = doc.slice(&range);
+        let changed = match &doc.node(id).kind {
+            NodeKind::String(_) => format!("{}x\"", &literal[..literal.len() - 1]),
+            NodeKind::Number(_) => format!("{literal}1"),
+            NodeKind::Bool(b) => (!b).to_string(),
+            NodeKind::Null => "0".to_string(),
+            _ => unreachable!("first_scalar returns scalars"),
+        };
+        format!("{}{changed}{}", &text[..range.start], &text[range.end..])
+    }
+
+    /// Checks the rows of source container `c`, whose `Open` row is
+    /// `rows[open]`, against its entries or elements, then recurses into
+    /// every child container's group.
+    ///
+    /// Method: the rows one level below the `Open` (up to its `Close`) are
+    /// walked against the source's children in order, earlier copies of a
+    /// repeated key removed. A `Same` row consumes one child (an object's
+    /// row text must start with that child's key), an `Open` row consumes
+    /// one child (its key and node must be that child's) and recurses, a
+    /// `Decision` consumes the source children its site replaces (an object
+    /// entry: the child at `site.entry`; an array run: `site.elements`) and
+    /// an inserted decision consumes none. Every child must be consumed
+    /// exactly once, in order.
+    fn check_group(name: &str, st: &StructuredState, rows: &[TreeRow], open: usize, c: NodeId) {
+        let source = st.doc.side_doc(Side::Theirs);
+        let TreeRow::Open { depth, .. } = rows[open] else {
+            panic!("{name}: row {open} is not an Open")
+        };
+        let close = open
+            + rows[open..]
+                .iter()
+                .position(|row| matches!(row, TreeRow::Close { depth: d, .. } if *d == depth))
+                .unwrap_or_else(|| panic!("{name}: Open {open} has no Close"));
+        // (source index, key as written, value node) per expected child.
+        let expected: Vec<(usize, Option<String>, NodeId)> = match &source.node(c).kind {
+            NodeKind::Object { entries } => {
+                let earlier: HashSet<usize> = source
+                    .duplicates
+                    .iter()
+                    .filter(|dup| dup.object == c)
+                    .flat_map(|dup| dup.entries[..dup.entries.len() - 1].to_vec())
+                    .collect();
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !earlier.contains(i))
+                    .map(|(i, e)| (i, Some(one_line(source.slice(&e.key_range))), e.value))
+                    .collect()
+            }
+            NodeKind::Array { elements } => elements
+                .iter()
+                .enumerate()
+                .map(|(k, e)| (k, None, e.value))
+                .collect(),
+            _ => panic!("{name}: node {c} is not a container"),
+        };
+        let mut next = 0;
+        for (at, row) in rows.iter().enumerate().take(close).skip(open + 1) {
+            match row {
+                TreeRow::Same { depth: d, text } if *d == depth + 1 => {
+                    let (_, key, _) = &expected[next];
+                    if let Some(key) = key {
+                        assert!(
+                            text.starts_with(key.as_str()),
+                            "{name}: {text} is not {key}"
+                        );
+                    }
+                    next += 1;
+                }
+                TreeRow::Open {
+                    depth: d,
+                    key,
+                    node,
+                    ..
+                } if *d == depth + 1 => {
+                    let (_, want, value) = &expected[next];
+                    assert_eq!(key.as_deref().map(one_line), *want, "{name}: Open key");
+                    assert_eq!(node.node, *value, "{name}: Open node");
+                    check_group(name, st, rows, at, *value);
+                    next += 1;
+                }
+                TreeRow::Decision { depth: d, id, .. } if *d == depth + 1 => {
+                    let site = &st.doc.decisions[*id].site;
+                    let covered = match &source.node(c).kind {
+                        NodeKind::Object { .. } => site.entry.map(|i| i..i + 1),
+                        _ => Some(site.elements.clone()).filter(|run| !run.is_empty()),
+                    };
+                    if let Some(run) = covered {
+                        assert_eq!(
+                            expected[next].0, run.start,
+                            "{name}: decision {id} out of order"
+                        );
+                        next += run.len();
+                    }
+                }
+                TreeRow::Fold { .. } => panic!("{name}: a Fold row with fold_identical off"),
+                _ => {}
+            }
+        }
+        assert_eq!(next, expected.len(), "{name}: container {c} lost children");
+    }
+
+    /// MUTATION: planner skips a container's last entry → an entry is missing.
+    #[test]
+    fn every_decision_and_every_source_entry_has_exactly_one_row() {
+        for name in CORPUS {
+            let path = format!(
+                "{}/../core/tests/fixtures/jsonc/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let theirs = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let ours = first_scalar_changed(name, &theirs);
+            let doc = StructuredDocument::compute(Some(&theirs), &ours, &theirs, None)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let st = StructuredState::new(doc);
+            assert!(!st.doc.decisions.is_empty(), "{name}: no decision");
+            let source = st.doc.side_doc(Side::Theirs);
+            let view = TreeView {
+                folded_overrides: (0..source.nodes.len())
+                    .filter(|&id| {
+                        matches!(
+                            source.node(id).kind,
+                            NodeKind::Object { .. } | NodeKind::Array { .. }
+                        )
+                    })
+                    .map(|node| {
+                        (
+                            NodeKey {
+                                side: Side::Theirs,
+                                node,
+                            },
+                            false,
+                        )
+                    })
+                    .collect(),
+                ..TreeView::default()
+            };
+            let rows = plan(&st, &view);
+            for d in &st.doc.decisions {
+                let count = rows
+                    .iter()
+                    .filter(|row| matches!(row, TreeRow::Decision { id, .. } if *id == d.id))
+                    .count();
+                assert_eq!(count, 1, "{name}: decision {} has {count} rows", d.id);
+            }
+            assert!(matches!(rows[0], TreeRow::Open { depth: 0, .. }), "{name}");
+            check_group(name, &st, &rows, 0, source.root.expect("source root"));
+        }
     }
 }
