@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use tomte_core::merge::RegionKind;
-use tomte_core::structured::jsonc::{Document, NodeId, NodeKind};
+use tomte_core::structured::jsonc::{Document, Element, NodeId, NodeKind};
 use tomte_core::structured::{Decision, Pick, Side, SideText};
 
 use crate::structured_state::StructuredState;
@@ -137,7 +137,7 @@ pub enum TreeRow {
         open: bool,
         locked: bool,
     },
-    /// An unfolded container chip's read-only rows. Task 3 plans them.
+    /// One entry or element of an unfolded container chip, read-only.
     Preview { depth: usize, text: String },
     /// A run of identical rows behind the fold toggle. Task 4 plans them.
     Fold {
@@ -156,7 +156,7 @@ pub struct TreeView {
     /// A container the user folded (`true`) or opened (`false`), overriding
     /// its default.
     pub folded_overrides: HashMap<NodeKey, bool>,
-    /// Container chips the user unfolded (Task 3).
+    /// Container chips the user unfolded.
     pub unfolded_chips: HashSet<(usize, ChipSide)>,
     /// Fold runs the user expanded (Task 4).
     pub expanded_folds: HashSet<FoldKey>,
@@ -183,6 +183,8 @@ struct SideIndex<'a> {
     by_start: HashMap<usize, NodeId>,
     /// An object entry's value node → (object, entry index).
     entry_of: HashMap<NodeId, (NodeId, usize)>,
+    /// An array element's value node → (array, element index).
+    element_of: HashMap<NodeId, (NodeId, usize)>,
     /// A container node → the container holding it.
     parent: HashMap<NodeId, NodeId>,
 }
@@ -191,6 +193,7 @@ impl<'a> SideIndex<'a> {
     fn new(doc: &'a Document) -> Self {
         let mut by_start = HashMap::new();
         let mut entry_of = HashMap::new();
+        let mut element_of = HashMap::new();
         let mut parent = HashMap::new();
         for (id, node) in doc.nodes.iter().enumerate() {
             by_start.insert(node.range.start, id);
@@ -201,7 +204,12 @@ impl<'a> SideIndex<'a> {
                     }
                     entries.iter().map(|e| e.value).collect()
                 }
-                NodeKind::Array { elements } => elements.iter().map(|e| e.value).collect(),
+                NodeKind::Array { elements } => {
+                    for (i, element) in elements.iter().enumerate() {
+                        element_of.insert(element.value, (id, i));
+                    }
+                    elements.iter().map(|e| e.value).collect()
+                }
                 _ => continue,
             };
             for child in children {
@@ -214,6 +222,7 @@ impl<'a> SideIndex<'a> {
             doc,
             by_start,
             entry_of,
+            element_of,
             parent,
         }
     }
@@ -230,6 +239,25 @@ impl<'a> SideIndex<'a> {
     fn entry_at(&self, value: &Range<usize>) -> Option<(NodeId, usize)> {
         self.node_at(value)
             .and_then(|id| self.entry_of.get(&id).copied())
+    }
+
+    /// The run of array elements whose ranges, first start to last end,
+    /// are exactly `value`: an element row's text on this side.
+    fn run_at(&self, value: &Range<usize>) -> Option<&'a [Element]> {
+        let first = self.by_start.get(&value.start)?;
+        let &(array, k) = self.element_of.get(first)?;
+        let NodeKind::Array { elements } = &self.doc.node(array).kind else {
+            unreachable!("element_of maps only into arrays")
+        };
+        let elements: &'a [Element] = elements;
+        if elements[k].range.start != value.start {
+            return None;
+        }
+        let len = elements[k..]
+            .iter()
+            .position(|e| e.range.end >= value.end)
+            .filter(|&i| elements[k + i].range.end == value.end)?;
+        Some(&elements[k..=k + len])
     }
 }
 
@@ -281,6 +309,31 @@ fn push_comments(rows: &mut Vec<TreeRow>, doc: &Document, leading: &Range<usize>
     }
 }
 
+/// A container's chip text: `{ 2 keys }` / `[ 3 elements ]`.
+fn counted(bracket: Bracket, count: &str) -> String {
+    match bracket {
+        Bracket::Object => format!("{{ {count} }}"),
+        Bracket::Array => format!("[ {count} ]"),
+    }
+}
+
+/// An element's text without its comma, on one line.
+fn element_text(doc: &Document, element: &Element) -> String {
+    let end = element
+        .comma
+        .as_ref()
+        .map_or(element.range.end, |c| c.start);
+    one_line(doc.slice(&(element.range.start..end)))
+}
+
+/// One side's value on a chip: its text, whether it is (or holds) a
+/// container, and the rows it unfolds into.
+struct SideValue {
+    text: String,
+    container: bool,
+    previews: Vec<String>,
+}
+
 /// One child of a container in the walk: an object entry or an array element.
 struct Item<'d> {
     key: Option<&'d Range<usize>>,
@@ -302,6 +355,15 @@ struct Planner<'a> {
     /// Decisions inserted after source entry `(object, Some(index))`, or at
     /// the end of the object (`None`), in id order.
     after_entry: HashMap<(NodeId, Option<usize>), Vec<usize>>,
+    /// Decisions covering source elements `(array, k)..` and the end of the
+    /// run they cover; the covered elements get no rows of their own.
+    at_element: HashMap<(NodeId, usize), (usize, Vec<usize>)>,
+    /// Decisions inserted before source element `(array, k)`, `k == len`
+    /// after the last, in id order.
+    before_element: HashMap<(NodeId, usize), Vec<usize>>,
+    /// The decision for the whole root array, when a side has no root: the
+    /// single row inside the source's root.
+    whole_root: Option<usize>,
     /// Decisions the walk cannot place, appended at the end of a container.
     unplaced: HashMap<NodeId, Vec<usize>>,
     /// Containers holding a decision, themselves or in a descendant.
@@ -319,6 +381,9 @@ impl<'a> Planner<'a> {
             theirs: SideIndex::new(doc.side_doc(Side::Theirs)),
             at_entry: HashMap::new(),
             after_entry: HashMap::new(),
+            at_element: HashMap::new(),
+            before_element: HashMap::new(),
+            whole_root: None,
             unplaced: HashMap::new(),
             holding: HashSet::new(),
         };
@@ -350,14 +415,22 @@ impl<'a> Planner<'a> {
                 .site
                 .container
                 .filter(|&c| c < source.nodes.len() && is_container(source, c));
+            let elements = &d.site.elements;
             let slot = match container.map(|c| (c, &source.node(c).kind)) {
+                Some((c, _)) if d.path.is_empty() && c == root => Some((c, Slot::WholeRoot)),
                 Some((c, NodeKind::Object { entries })) => match (d.site.entry, d.site.after) {
                     (Some(i), _) if i < entries.len() => Some((c, Slot::At(i))),
                     (None, None) => Some((c, Slot::After(None))),
                     (None, Some(a)) if a < entries.len() => Some((c, Slot::After(Some(a)))),
                     _ => None,
                 },
-                // Element sites are Task 3's; until then they land at the end.
+                Some((c, NodeKind::Array { elements: items })) if elements.end <= items.len() => {
+                    if elements.is_empty() {
+                        Some((c, Slot::Before(elements.start)))
+                    } else {
+                        Some((c, Slot::Elements(elements.clone())))
+                    }
+                }
                 _ => None,
             };
             let holder = match slot {
@@ -367,6 +440,20 @@ impl<'a> Planner<'a> {
                 }
                 Some((c, Slot::After(a))) => {
                     self.after_entry.entry((c, a)).or_default().push(d.id);
+                    c
+                }
+                Some((c, Slot::Elements(run))) => {
+                    let (end, ids) = self.at_element.entry((c, run.start)).or_default();
+                    *end = (*end).max(run.end);
+                    ids.push(d.id);
+                    c
+                }
+                Some((c, Slot::Before(k))) => {
+                    self.before_element.entry((c, k)).or_default().push(d.id);
+                    c
+                }
+                Some((c, Slot::WholeRoot)) => {
+                    self.whole_root = Some(d.id);
                     c
                 }
                 None => {
@@ -412,12 +499,14 @@ impl<'a> Planner<'a> {
             same: side == Side::Theirs && !self.holding.contains(&root),
             node: NodeKey { side, node: root },
         });
-        if side == Side::Theirs {
-            self.children(rows, root, 1);
-        } else {
+        if side == Side::Ours {
             for d in &self.state.doc.decisions {
                 self.decision(rows, d, 1);
             }
+        } else if let Some(id) = self.whole_root {
+            self.decisions(rows, &[id], 1);
+        } else {
+            self.children(rows, root, 1);
         }
         rows.push(TreeRow::Close {
             depth: 0,
@@ -465,7 +554,19 @@ impl<'a> Planner<'a> {
                 }
             }
             NodeKind::Array { elements } => {
-                for element in elements {
+                // The first element not yet covered by a decision's run.
+                let mut next = 0;
+                for (k, element) in elements.iter().enumerate() {
+                    if let Some(ids) = self.before_element.get(&(c, k)) {
+                        self.decisions(rows, ids, depth);
+                    }
+                    if let Some((end, ids)) = self.at_element.get(&(c, k)) {
+                        self.decisions(rows, ids, depth);
+                        next = next.max(*end);
+                    }
+                    if k < next {
+                        continue;
+                    }
                     self.item(
                         rows,
                         Item {
@@ -478,6 +579,9 @@ impl<'a> Planner<'a> {
                         },
                         depth,
                     );
+                }
+                if let Some(ids) = self.before_element.get(&(c, elements.len())) {
+                    self.decisions(rows, ids, depth);
                 }
             }
             _ => {}
@@ -533,27 +637,30 @@ impl<'a> Planner<'a> {
         }
     }
 
-    /// A decision's comments (from the side whose text the result carries)
-    /// and its row.
+    /// A decision's comments (from the side whose text the result carries),
+    /// its row, and the `Preview` rows of its unfolded chips.
     fn decision(&self, rows: &mut Vec<TreeRow>, d: &Decision, depth: usize) {
+        // The entry or the run's first element that carries the decision on
+        // the first side that has one: its key and its leading comments.
         let owner = [Side::Theirs, Side::Ours, Side::Base]
             .into_iter()
             .find_map(|side| {
                 let st = side_text(d, side)?;
-                let (object, i) = self.index(side).entry_at(&st.value)?;
-                Some((side, object, i))
+                let index = self.index(side);
+                if let Some((object, i)) = index.entry_at(&st.value) {
+                    let NodeKind::Object { entries } = &index.doc.node(object).kind else {
+                        unreachable!("entry_of maps only into objects")
+                    };
+                    let entry = &entries[i];
+                    return Some((side, Some(&entry.key_range), &entry.leading));
+                }
+                let run = index.run_at(&st.value)?;
+                Some((side, None, &run[0].leading))
             });
-        let entry = owner.map(|(side, object, i)| {
-            let doc = self.index(side).doc;
-            let NodeKind::Object { entries } = &doc.node(object).kind else {
-                unreachable!("entry_of maps only into objects")
-            };
-            (side, doc, &entries[i])
-        });
-        if let Some((side, doc, entry)) = entry
+        if let Some((side, _, leading)) = owner
             && side != Side::Base
         {
-            push_comments(rows, doc, &entry.leading, depth);
+            push_comments(rows, self.index(side).doc, leading, depth);
         }
         let locked = d.locked.is_some();
         let effective = self
@@ -561,22 +668,42 @@ impl<'a> Planner<'a> {
             .resolution
             .get(d.id)
             .or(self.state.doc.auto_pick(d.id));
+        let (chips, previews): (Vec<Chip>, Vec<Vec<String>>) =
+            self.chips(d, effective).into_iter().unzip();
+        let unfolded: Vec<TreeRow> = chips
+            .iter()
+            .zip(previews)
+            .filter(|(chip, _)| chip.unfolded)
+            .flat_map(|(_, previews)| previews)
+            .map(|text| TreeRow::Preview {
+                depth: depth + 1,
+                text,
+            })
+            .collect();
         rows.push(TreeRow::Decision {
             depth,
             id: d.id,
-            key: entry.map(|(_, doc, entry)| doc.slice(&entry.key_range).to_string()),
-            chips: self.chips(d, effective),
+            key: owner.and_then(|(side, key, _)| {
+                key.map(|range| self.index(side).doc.slice(range).to_string())
+            }),
+            chips,
             open: !locked && d.kind == RegionKind::Conflict && effective.is_none(),
             locked,
         });
+        rows.extend(unfolded);
     }
 
-    fn chips(&self, d: &Decision, effective: Option<Pick>) -> Vec<Chip> {
+    /// The row's chips, each with the rows it unfolds into.
+    fn chips(&self, d: &Decision, effective: Option<Pick>) -> Vec<(Chip, Vec<String>)> {
         if d.locked.is_some() {
-            return vec![Chip {
-                picked: true,
-                ..self.chip(d, ChipSide::Source, None)
-            }];
+            let (chip, previews) = self.chip(d, ChipSide::Source, None);
+            return vec![(
+                Chip {
+                    picked: true,
+                    ..chip
+                },
+                previews,
+            )];
         }
         let agreed = d.kind == RegionKind::BothSame && d.duplicated.is_none();
         let mut sides = if agreed {
@@ -593,55 +720,109 @@ impl<'a> Planner<'a> {
         }
         sides
             .into_iter()
-            .map(|side| Chip {
-                agreed: agreed && side == ChipSide::Source,
-                ..self.chip(d, side, effective)
+            .map(|side| {
+                let (chip, previews) = self.chip(d, side, effective);
+                (
+                    Chip {
+                        agreed: agreed && side == ChipSide::Source,
+                        ..chip
+                    },
+                    previews,
+                )
             })
             .collect()
     }
 
-    fn chip(&self, d: &Decision, side: ChipSide, effective: Option<Pick>) -> Chip {
-        let (text, container) = match side.side() {
+    fn chip(&self, d: &Decision, side: ChipSide, effective: Option<Pick>) -> (Chip, Vec<String>) {
+        let value = match side.side() {
             Some(doc_side) => self.side_value(d, doc_side),
             None => {
-                let disk = self.side_value(d, Side::Ours).0;
-                let source = self.side_value(d, Side::Theirs).0;
-                (format!("{disk}, {source}"), false)
+                // Disk's run then source's, skipping a side with none.
+                let text = [Side::Ours, Side::Theirs]
+                    .into_iter()
+                    .filter(|&s| side_text(d, s).is_some())
+                    .map(|s| self.side_value(d, s).text)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                SideValue {
+                    text,
+                    container: false,
+                    previews: Vec::new(),
+                }
             }
         };
-        Chip {
+        let chip = Chip {
             side,
-            text,
+            text: value.text,
             picked: effective == Some(side.pick()),
             agreed: false,
-            container,
-            unfolded: false,
-        }
+            container: value.container,
+            unfolded: value.container && self.view.unfolded_chips.contains(&(d.id, side)),
+        };
+        (chip, value.previews)
     }
 
-    /// One side's chip text and whether the value is a container.
-    fn side_value(&self, d: &Decision, side: Side) -> (String, bool) {
+    /// One side's chip value. An element row's run reads element by
+    /// element, a container element as its count; a container value reads
+    /// as its count and unfolds into its entries or elements.
+    fn side_value(&self, d: &Decision, side: Side) -> SideValue {
         let Some(st) = side_text(d, side) else {
             let missing = if d.base.is_some() {
                 "removed"
             } else {
                 "absent"
             };
-            return (missing.to_string(), false);
+            return SideValue {
+                text: missing.to_string(),
+                container: false,
+                previews: Vec::new(),
+            };
         };
         let index = self.index(side);
+        let doc = index.doc;
+        if let Some(run) = index.run_at(&st.value) {
+            let texts: Vec<String> = run
+                .iter()
+                .map(|e| match summary(doc, e.value) {
+                    Some((bracket, count)) => counted(bracket, &count),
+                    None => element_text(doc, e),
+                })
+                .collect();
+            return SideValue {
+                text: texts.join(", "),
+                container: run.iter().any(|e| is_container(doc, e.value)),
+                previews: run.iter().map(|e| element_text(doc, e)).collect(),
+            };
+        }
         let node = index.node_at(&st.value);
-        let (mut text, container) = match node.and_then(|id| summary(index.doc, id)) {
-            Some((Bracket::Object, count)) => (format!("{{ {count} }}"), true),
-            Some((Bracket::Array, count)) => (format!("[ {count} ]"), true),
-            None => (one_line(index.doc.slice(&st.value)), false),
+        let mut value = match node.and_then(|id| summary(doc, id).map(|s| (id, s))) {
+            Some((id, (bracket, count))) => SideValue {
+                text: counted(bracket, &count),
+                container: true,
+                previews: match &doc.node(id).kind {
+                    NodeKind::Object { entries } => entries
+                        .iter()
+                        .map(|e| one_line(doc.slice(&e.range)))
+                        .collect(),
+                    NodeKind::Array { elements } => elements
+                        .iter()
+                        .map(|e| one_line(doc.slice(&e.range)))
+                        .collect(),
+                    _ => Vec::new(),
+                },
+            },
+            None => SideValue {
+                text: one_line(doc.slice(&st.value)),
+                container: false,
+                previews: Vec::new(),
+            },
         };
         if d.duplicated == Some(side)
             && let Some(copies) = self.copies(index, &st.value)
         {
-            text.push_str(&format!(" ×{copies}"));
+            value.text.push_str(&format!(" ×{copies}"));
         }
-        (text, container)
+        value
     }
 
     /// How many times the key whose value is `value` appears in its object.
@@ -656,10 +837,18 @@ impl<'a> Planner<'a> {
     }
 }
 
-/// Where a decision goes inside a source object.
+/// Where a decision goes inside a source container.
 enum Slot {
+    /// Replaces object entry `i`.
     At(usize),
+    /// After object entry `i`, or at the object's end.
     After(Option<usize>),
+    /// Replaces the array elements of the run.
+    Elements(Range<usize>),
+    /// Before array element `k`; `k == len` is after the last.
+    Before(usize),
+    /// The whole root array.
+    WholeRoot,
 }
 
 fn side_text(d: &Decision, side: Side) -> Option<&SideText> {
@@ -676,7 +865,7 @@ mod tests {
     use tomte_core::template::anchor::anchor;
     use tomte_core::template::lexer::lex;
 
-    use super::{Bracket, Chip, ChipSide, NodeKey, TreeRow, TreeView, plan};
+    use super::{Bracket, Chip, ChipSide, NodeKey, Planner, TreeRow, TreeView, plan};
     use crate::structured_state::StructuredState;
 
     fn state(base: Option<&str>, ours: &str, theirs: &str) -> StructuredState {
@@ -1233,6 +1422,367 @@ mod tests {
                     comma: true,
                 },
                 same(1, "\"a\": 1"),
+                root_close(),
+            ]
+        );
+    }
+
+    /// The `Open` row of source key `name`, an array holding a decision.
+    fn array_open(st: &StructuredState, name: &str, summary: &str) -> TreeRow {
+        TreeRow::Open {
+            depth: 1,
+            key: key(&format!("\"{name}\"")),
+            bracket: Bracket::Array,
+            folded: false,
+            summary: summary.to_string(),
+            same: false,
+            node: NodeKey {
+                side: Side::Theirs,
+                node: source_value(st, name),
+            },
+        }
+    }
+
+    fn array_close(depth: usize) -> TreeRow {
+        TreeRow::Close {
+            depth,
+            bracket: Bracket::Array,
+            comma: false,
+        }
+    }
+
+    fn preview(depth: usize, text: &str) -> TreeRow {
+        TreeRow::Preview {
+            depth,
+            text: text.to_string(),
+        }
+    }
+
+    const ABC: &str = "{\n  \"p\": [\n    \"a\",\n    \"b\",\n    \"c\"\n  ]\n}\n";
+    const ACD: &str = "{\n  \"p\": [\n    \"a\",\n    \"c\",\n    \"d\"\n  ]\n}\n";
+    const AZ: &str = "{\n  \"p\": [\n    \"a\",\n    \"z\"\n  ]\n}\n";
+    const ABZ: &str = "{\n  \"p\": [\n    \"a\",\n    \"b\",\n    \"z\"\n  ]\n}\n";
+    const ACZ: &str = "{\n  \"p\": [\n    \"a\",\n    \"c\",\n    \"z\"\n  ]\n}\n";
+    const A: &str = "{\n  \"p\": [\n    \"a\"\n  ]\n}\n";
+    const A_OBJ: &str = "{\n  \"p\": [\n    \"a\",\n    { \"x\": 1, \"y\": 2 }\n  ]\n}\n";
+    const A_TWO_OBJS: &str = concat!(
+        "{\n",
+        "  \"p\": [\n",
+        "    \"a\",\n",
+        "    {\n",
+        "      \"u\": 1,\n",
+        "      \"v\": 2\n",
+        "    },\n",
+        "    { \"w\": 3 }\n",
+        "  ]\n",
+        "}\n",
+    );
+    const ROOT_12: &str = "[\n  1,\n  2\n]\n";
+    const ROOT_13: &str = "[\n  1,\n  3\n]\n";
+
+    /// MUTATION: removed elements emitted after added ones → order flips.
+    /// (Applied as: the insertions after the last element are emitted
+    /// before the element loop.)
+    #[test]
+    fn removed_and_added_elements_are_rows_at_their_source_positions() {
+        let st = state(Some(ABC), ACD, ABC);
+        let rows = plan(&st, &TreeView::default());
+        assert_eq!(
+            rows,
+            vec![
+                root_open(&st, "1 key", false),
+                array_open(&st, "p", "3 elements"),
+                same(2, "\"a\","),
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "\"b\"", false),
+                        chip(ChipSide::Disk, "removed", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                same(2, "\"c\""),
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 1,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "absent", false),
+                        chip(ChipSide::Disk, "\"d\"", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                array_close(1),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: both chip joins source first → text order flips.
+    #[test]
+    fn a_conflicting_run_has_source_disk_and_both_chips() {
+        let st = state(Some(AZ), ACZ, ABZ);
+        let rows = plan(&st, &TreeView::default());
+        assert_eq!(
+            rows,
+            vec![
+                root_open(&st, "1 key", false),
+                array_open(&st, "p", "3 elements"),
+                same(2, "\"a\","),
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "\"b\"", false),
+                        chip(ChipSide::Disk, "\"c\"", false),
+                        chip(ChipSide::Both, "\"c\", \"b\"", false),
+                    ],
+                    open: true,
+                    locked: false,
+                },
+                same(2, "\"z\""),
+                array_close(1),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: container elements in a run read raw → "{ 2 keys }" missing.
+    #[test]
+    fn a_run_of_object_elements_reads_as_counts_and_unfolds_per_element() {
+        let st = state(Some(A), A_TWO_OBJS, A_OBJ);
+        let view = TreeView {
+            unfolded_chips: [(0, ChipSide::Disk)].into_iter().collect(),
+            ..TreeView::default()
+        };
+        let rows = plan(&st, &view);
+        assert_eq!(
+            rows,
+            vec![
+                root_open(&st, "1 key", false),
+                array_open(&st, "p", "2 elements"),
+                same(2, "\"a\","),
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        Chip {
+                            container: true,
+                            ..chip(ChipSide::Source, "{ 2 keys }", false)
+                        },
+                        Chip {
+                            container: true,
+                            unfolded: true,
+                            ..chip(ChipSide::Disk, "{ 2 keys }, { 1 key }", false)
+                        },
+                        chip(ChipSide::Both, "{ 2 keys }, { 1 key }, { 2 keys }", false),
+                    ],
+                    open: true,
+                    locked: false,
+                },
+                preview(3, "{ \"u\": 1, \"v\": 2 }"),
+                preview(3, "{ \"w\": 3 }"),
+                array_close(1),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: `unfolded` ignored → no Preview rows.
+    #[test]
+    fn an_object_chip_unfolds_into_preview_rows_under_its_row() {
+        let base = "{\n  \"x\": 1\n}\n";
+        let ours = "{\n  \"x\": {\n    \"a\": 1,\n    \"b\": 2\n  }\n}\n";
+        let st = state(Some(base), ours, base);
+        let view = TreeView {
+            unfolded_chips: [(0, ChipSide::Disk)].into_iter().collect(),
+            ..TreeView::default()
+        };
+        let rows = plan(&st, &view);
+        assert_eq!(
+            rows,
+            vec![
+                root_open(&st, "1 key", false),
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 0,
+                    key: key("\"x\""),
+                    chips: vec![
+                        chip(ChipSide::Source, "1", false),
+                        Chip {
+                            container: true,
+                            unfolded: true,
+                            ..chip(ChipSide::Disk, "{ 2 keys }", true)
+                        },
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                preview(2, "\"a\": 1,"),
+                preview(2, "\"b\": 2"),
+                root_close(),
+            ]
+        );
+    }
+
+    /// MUTATION: root arrays walk as objects → panics/empty. (Applied as:
+    /// the Array arm of `children` lists nothing.)
+    #[test]
+    fn a_root_array_lists_its_elements() {
+        let st = state(Some(ROOT_12), ROOT_13, ROOT_12);
+        let rows = plan(&st, &TreeView::default());
+        let source = st.doc.side_doc(Side::Theirs);
+        assert_eq!(
+            rows,
+            vec![
+                TreeRow::Open {
+                    depth: 0,
+                    key: None,
+                    bracket: Bracket::Array,
+                    folded: false,
+                    summary: "2 elements".to_string(),
+                    same: false,
+                    node: NodeKey {
+                        side: Side::Theirs,
+                        node: source.root.expect("root"),
+                    },
+                },
+                same(1, "1,"),
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "2", false),
+                        chip(ChipSide::Disk, "removed", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 1,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "absent", false),
+                        chip(ChipSide::Disk, "3", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                array_close(0),
+            ]
+        );
+    }
+
+    /// MUTATION: the whole-root decision falls into the array's insertion
+    /// slots → the source's elements are listed beside it.
+    #[test]
+    fn a_whole_root_array_decision_is_the_single_row_inside_the_root() {
+        let st = state(None, "", ROOT_12);
+        let rows = plan(&st, &TreeView::default());
+        let source = st.doc.side_doc(Side::Theirs);
+        assert_eq!(
+            rows,
+            vec![
+                TreeRow::Open {
+                    depth: 0,
+                    key: None,
+                    bracket: Bracket::Array,
+                    folded: false,
+                    summary: "2 elements".to_string(),
+                    same: false,
+                    node: NodeKey {
+                        side: Side::Theirs,
+                        node: source.root.expect("root"),
+                    },
+                },
+                TreeRow::Decision {
+                    depth: 1,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        Chip {
+                            container: true,
+                            ..chip(ChipSide::Source, "[ 2 elements ]", false)
+                        },
+                        chip(ChipSide::Disk, "removed", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                array_close(0),
+            ]
+        );
+    }
+
+    /// MUTATION: restore Task 2's unplaced arm for arrays (`_ => None`) →
+    /// every array decision lands in `unplaced`.
+    #[test]
+    fn an_ordinary_array_decision_never_takes_the_unplaced_path() {
+        let view = TreeView::default();
+        for (base, ours, theirs) in [
+            (Some(ABC), ACD, ABC),
+            (Some(AZ), ACZ, ABZ),
+            (Some(A), A_TWO_OBJS, A_OBJ),
+            (Some(ROOT_12), ROOT_13, ROOT_12),
+            (None, "", ROOT_12),
+        ] {
+            let st = state(base, ours, theirs);
+            assert!(!st.doc.decisions.is_empty(), "{ours:?} has decisions");
+            let planner = Planner::new(&st, &view);
+            assert!(
+                planner.unplaced.is_empty(),
+                "{ours:?}: unplaced {:?}",
+                planner.unplaced
+            );
+        }
+    }
+
+    /// MUTATION: the array arm accepts any `elements` range → the decision
+    /// is keyed past the last element and never emitted.
+    #[test]
+    fn an_element_site_past_the_array_lands_at_its_end() {
+        let mut st = state(Some(ABC), ACD, ABC);
+        st.doc.decisions[0].site.elements = 7..8;
+        let rows = plan(&st, &TreeView::default());
+        assert_eq!(
+            rows,
+            vec![
+                root_open(&st, "1 key", false),
+                array_open(&st, "p", "3 elements"),
+                same(2, "\"a\","),
+                same(2, "\"b\","),
+                same(2, "\"c\""),
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 1,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "absent", false),
+                        chip(ChipSide::Disk, "\"d\"", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                TreeRow::Decision {
+                    depth: 2,
+                    id: 0,
+                    key: None,
+                    chips: vec![
+                        chip(ChipSide::Source, "\"b\"", false),
+                        chip(ChipSide::Disk, "removed", true),
+                    ],
+                    open: false,
+                    locked: false,
+                },
+                array_close(1),
                 root_close(),
             ]
         );
