@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+The Structure stage's view was replaced by 2026-10-25-structured-tree-view.md (plan) per 2026-10-25-structured-tree-view-design.md (spec); the engine tasks here still stand.
+
 **Goal:** JSON/JSONC settings files merge per key and per array element in the merge editor, with commas, indents and comments handled by the engine, templated entries locked to source, and a Text stage to refine the assembled result before saving.
 
 **Architecture:** A new `tomte_core::structured` module: a lossless, iterative JSONC parser (`jsonc.rs`), a differ that walks base/disk/source trees into a flat list of decisions and reuses the line engine's clustering for arrays (`merge.rs`), and a splicer that rebuilds only the containers that changed, byte-identical elsewhere (`splice.rs`). The app gains a pure `structured_state.rs` beside `merge_state.rs` and a `views/merge_structured.rs` that renders the Structure stage inside the existing result editor; Save enqueues the same `Decision::Merged` as today.

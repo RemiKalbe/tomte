@@ -6,6 +6,8 @@ section and approved. Recorded here so they can be overruled before or
 during implementation.
 **Implemented by:** `.agents/artifacts/plans/2026-10-21-structured-merge.md`
 
+§6 "Structure stage" and §7 "Nothing to decide" are superseded by 2026-10-25-structured-tree-view-design.md.
+
 > "files that are not code, but structured settings like json, toml and
 > everything else, should have an alternative path where the merge would
 > understand when keys are duplicated, when and where to put commas when

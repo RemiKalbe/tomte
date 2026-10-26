@@ -46,10 +46,11 @@ crates/ui       tomte-ui       Theme tokens, embedded SVG assets, every reusable
                                component previews for the gallery.
 crates/app      tomte-app      lib: ipc, model (pure), resolve (ResolveEngine),
                                action_queue, merge_inputs/merge_state (pure),
-                               structured_state (pure, Structure mode's picks), update.
+                               structured_state (pure, Structure mode's picks),
+                               structured_tree (pure, the rows Structure mode draws), update.
                                bin: main.rs (boot, reconnect loop, CLI flags),
                                views/ (mod.rs = Shell, dashboard, review, merge,
-                               merge_structured = Structure mode's strips and header,
+                               merge_structured = Structure mode's tree and header,
                                settings, changelog, fixtures = gallery poses,
                                review_selection/review_tree = pure Review
                                multi-select + folder-tree projections),
@@ -153,12 +154,17 @@ Then READ the PNG. `shoot.sh` deletes a stale PNG when a capture fails, so
 an "OK" line means this run wrote the file. `screencapture` fails inside a
 sandboxed shell; run it unsandboxed. Every new view sub-state gets a pose in
 `crates/app/src/views/fixtures.rs` (`STATES`); the render-smoke test builds
-all of them. `merge-structured`, `merge-structured-locked`, and
-`merge-structured-text` pose Structure mode on a JSON settings file (a
-conflict, keys added and removed on disk, array rows), a templated source
-with a locked row, and the Text stage with its not-valid-JSON chip;
-`merge-not-structured` poses a JSON-looking file that does not parse (the
-line editor with its "line merge" note).
+all of them. Six merge poses cover Structure mode: `merge-structured`
+poses every row kind on a `~/.claude/settings.json`-like file (a same-change
+row, a conflict, changed, added and removed keys, a type change, array rows
+and runs, a comment row, a folded identical object);
+`merge-structured-folded` is the same with Fold identical on;
+`merge-structured-locked` a templated source with a locked row;
+`merge-structured-same` a file whose disk equals its source (Lines with the
+note, origin differs); `merge-structured-text` the Text stage with its
+not-valid-JSON chip; `merge-not-structured` a JSON-looking file that does
+not parse (the line editor with its "line merge" note). `comp:structure-row`
+previews the row kinds.
 `review-multiselect`, `review-multiselect-closed`,
 `review-tree`, and `review-tree-selected` pose the sidebar's multi-select
 and folder-tree states (checkboxes ticked, ticked with no file open, a
@@ -407,14 +413,22 @@ the watcher, a queued decision that can be ✕'d, and the app replacing a
 daemon from another build at launch.
 
 On top of that, this branch adds Structure mode to the merge editor for
-JSON and JSONC settings files (`2026-10-21-structured-merge-design.md`).
-Each changed key or array element is one decision with its own pick; keys
-a template renders are locked and follow source; Save splices the picks
-into the source text so comments and layout survive, and Edit opens a
-Text stage on the assembled file. A JSON-looking file that does not parse opens in
-the line editor with a note saying why. Deliberate limits: TOML comes
-later, origin is shown only in Lines ("origin differs · see Lines"), and
-objects inside array elements are not merged key by key.
+JSON and JSONC settings files (`2026-10-21-structured-merge-design.md`; its
+view, a tree of the whole file, is `2026-10-25-structured-tree-view-design.md`,
+which supersedes the earlier spec's §6 and §7). The file shows in order, one
+row per key or array element. A changed row carries a chip per side (source,
+disk, last written on a conflict, both on a conflicting array run) and each
+row is one decision. Rows the engine can settle are pre-picked; a row that
+still needs the user has a red left edge until picked. Identical rows are dim
+one-liners in place, and a Fold identical toggle collapses runs of them.
+Keys a template renders are locked to source and carry the `{}` mark. Save
+splices the picks into the source text so comments and layout survive, and
+Edit opens a Text stage on the assembled file. A file whose disk text equals
+its source opens in Lines with a note saying so; Structure still shows the
+same note. A JSON-looking file that does not parse opens in the line editor
+with a note saying why. Deliberate limits: TOML comes later, origin is shown
+only in Lines ("origin differs · see Lines"), and objects inside array
+elements are not merged key by key.
 
 Open, deliberately (design calls, not bugs):
 
@@ -432,9 +446,12 @@ Open, deliberately (design calls, not bugs):
 - The per-event path (`rescan_source_side`) and `handle_fetch`'s per-file
   probes still run under the lock — bounded by changed-file counts; give
   them the begin/apply split if one ever shows in a banner.
-- `merge.rs` grew by about 600 lines with Structure mode. Its
-  Structure-mode branches, beside `merge_structured.rs`, are the next
-  split after the Review planner.
+- `structured_tree.rs` is about 1,000 lines before its tests; its chip
+  logic would split into a `chips` sibling. `merge.rs` still holds the
+  Structure-mode state beside `merge_structured.rs`.
+- A chip holding an object or array unfolds on click and never picks; the
+  row is picked with the keys. A second click target on the ▸ glyph would
+  let the mouse pick it.
 - Free-text region editing in the merge editor (`tomte_ui::text_area`
   exists; integration remains), keyboard hints, tabular figures (gpui has no
   font-features hook), journal pruning, SMAppService instead of launchctl.

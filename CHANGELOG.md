@@ -9,10 +9,15 @@ version without one.
 ### Added
 
 - **Settings files merge per key.** A JSON or JSONC settings file opens
-  in Structure mode: one row per changed key or array entry, with a disk
-  or source pick for each, and last written where the journal has it.
-  Keys a template renders stay locked and follow source. Edit opens the
-  assembled file as text so you can refine it before you save.
+  as a tree in file order. Every changed key or array entry shows a chip
+  for each side, and you pick one per row: disk, source, last written where
+  the journal has it, or both for a run of array entries. Rows the merge
+  can settle are already picked; a row that needs you has a red edge until
+  you pick. Identical rows stay dimmed in place, and Fold identical
+  collapses runs of them. Keys a template renders stay locked to source.
+  Edit opens the assembled file as text so you can refine it before you
+  save. A file whose disk already matches its source opens in the line view
+  with a note saying so.
 
 ### Fixed
 
