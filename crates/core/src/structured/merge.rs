@@ -24,7 +24,7 @@ pub enum Format {
 }
 
 /// Which text a decision, a parse error or a duplicate refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Base,
     Ours,
