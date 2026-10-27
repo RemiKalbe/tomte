@@ -601,8 +601,7 @@ impl ChezmoiClient {
                     .into(),
             ));
         }
-        let mut args = vec!["apply".to_string(), "--force".to_string()];
-        args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+        let args = targeted_apply_args(targets);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.run_ok(&refs, None)?;
         Ok(())
@@ -615,7 +614,11 @@ impl ChezmoiClient {
     /// explicit user decision, so overwriting is exactly the contract.
     pub fn apply(&self, target: Option<&Path>) -> Result<(), ChezmoiError> {
         match target {
-            Some(t) => self.run_ok(&["apply", "--force", &t.to_string_lossy()], None)?,
+            Some(t) => {
+                let args = targeted_apply_args(&[t.to_path_buf()]);
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                self.run_ok(&refs, None)?
+            }
             None => self.run_ok(&["apply", "--force"], None)?,
         };
         Ok(())
@@ -656,6 +659,34 @@ impl ChezmoiClient {
         self.run_ok_with_timeout(&["update"], None, Duration::from_secs(120))?;
         Ok(())
     }
+}
+
+/// `apply --force <targets>`, with every missing ancestor directory of a
+/// target listed first. chezmoi refuses to apply a file whose parent
+/// directory is missing (`stat <dir>: no such file or directory`) and fails
+/// the whole invocation, so a deleted folder made Keep source fail for every
+/// file in the batch. The ancestors are managed directories (a target's
+/// parent exists in the source state), and `--recursive=false` makes chezmoi
+/// create each one without applying the rest of its contents. Targets whose
+/// parents all exist get the plain argument list.
+fn targeted_apply_args(targets: &[PathBuf]) -> Vec<String> {
+    let mut missing = std::collections::BTreeSet::new();
+    for target in targets {
+        for dir in target.ancestors().skip(1) {
+            if dir.as_os_str().is_empty() || dir.exists() {
+                break;
+            }
+            missing.insert(dir.to_path_buf());
+        }
+    }
+    let mut args = vec!["apply".to_string(), "--force".to_string()];
+    if !missing.is_empty() {
+        args.push("--recursive=false".to_string());
+    }
+    // BTreeSet order puts a parent before its children.
+    args.extend(missing.iter().map(|d| d.to_string_lossy().into_owned()));
+    args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+    args
 }
 
 #[cfg(test)]
@@ -824,19 +855,12 @@ mod tests {
         fake.push_ok(0, "", "");
         fake.push_ok(0, "", "");
         let c = client(fake.clone());
-        c.apply(Some(std::path::Path::new("/Users/x/.zshrc")))
-            .unwrap();
+        c.apply(Some(std::path::Path::new("/.zshrc"))).unwrap();
         c.apply(None).unwrap();
         let calls = fake.calls();
         assert_eq!(
             calls[0].args,
-            vec![
-                "--no-tty",
-                "--no-pager",
-                "apply",
-                "--force",
-                "/Users/x/.zshrc"
-            ]
+            vec!["--no-tty", "--no-pager", "apply", "--force", "/.zshrc"]
         );
         assert_eq!(
             calls[1].args,
@@ -917,24 +941,51 @@ mod tests {
         );
     }
 
+    /// MUTATION: skip the `dir.exists()` check → the existing parent is
+    /// listed too and the assertion on the exact args fails; drop the
+    /// ancestor walk → `--recursive=false` and both directories vanish.
+    #[test]
+    fn apply_many_lists_missing_parent_directories_first() {
+        let home = tempfile::tempdir().unwrap();
+        let gone = home.path().join(".d");
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "", "");
+        client(fake.clone())
+            .apply_many(&[
+                gone.join("sub/deep"),
+                gone.join("top"),
+                home.path().join(".a"),
+            ])
+            .unwrap();
+        let s = |p: PathBuf| p.to_string_lossy().into_owned();
+        assert_eq!(
+            fake.calls()[0].args,
+            vec![
+                "--no-tty".to_string(),
+                "--no-pager".into(),
+                "apply".into(),
+                "--force".into(),
+                "--recursive=false".into(),
+                s(gone.clone()),
+                s(gone.join("sub")),
+                s(gone.join("sub/deep")),
+                s(gone.join("top")),
+                s(home.path().join(".a")),
+            ]
+        );
+    }
+
     #[test]
     fn apply_many_sends_every_target_in_a_single_invocation() {
         let fake = Arc::new(FakeRunner::new());
         fake.push_ok(0, "", "");
         client(fake.clone())
-            .apply_many(&[PathBuf::from("/Users/x/.a"), PathBuf::from("/Users/x/.b")])
+            .apply_many(&[PathBuf::from("/.a"), PathBuf::from("/.b")])
             .unwrap();
         assert_eq!(fake.calls().len(), 1);
         assert_eq!(
             fake.calls()[0].args,
-            vec![
-                "--no-tty",
-                "--no-pager",
-                "apply",
-                "--force",
-                "/Users/x/.a",
-                "/Users/x/.b"
-            ]
+            vec!["--no-tty", "--no-pager", "apply", "--force", "/.a", "/.b"]
         );
     }
 

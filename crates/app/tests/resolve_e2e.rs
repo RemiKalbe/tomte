@@ -614,6 +614,53 @@ fn story_q_a_mixed_batch_commits_the_keep_disk_half_only() {
     );
 }
 
+/// Keep source on files whose whole directory was deleted from disk. chezmoi
+/// refuses to apply a file whose parent directory is missing (`stat …: no
+/// such file or directory`) and fails the WHOLE invocation with it, so one
+/// deleted skill folder failed every file in the batch (2026-10-26, a
+/// `~/.agents/skills/<skill>/` removed by hand).
+///
+/// MUTATION: drop the missing-ancestor targets from `ChezmoiClient::apply_many`
+/// and `apply` → both applies fail with chezmoi's stat error.
+#[test]
+fn keep_source_recreates_a_deleted_directory() {
+    let lab = DriftLab::new();
+    let dir = lab.s.source.join("dot_d/sub");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(lab.s.source.join("dot_d/top"), MANAGED_BASE).unwrap();
+    std::fs::write(dir.join("deep"), MANAGED_BASE).unwrap();
+    std::fs::create_dir_all(lab.s.source.join("dot_e")).unwrap();
+    std::fs::write(lab.s.source.join("dot_e/one"), MANAGED_BASE).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "directories"]);
+    git(&lab.s.source, &["push"]);
+    lab.s.chezmoi().apply(None).unwrap();
+    std::fs::remove_dir_all(lab.s.home.join(".d")).unwrap();
+    std::fs::remove_dir_all(lab.s.home.join(".e")).unwrap();
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".d/top", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".d/sub/deep", BatchDecision::KeepSourceLocal),
+    ]);
+    done(&outcome, 0);
+    done(&outcome, 1);
+    for name in [".d/top", ".d/sub/deep"] {
+        assert_eq!(
+            std::fs::read(lab.s.home.join(name)).unwrap(),
+            MANAGED_BASE,
+            "{name} must be back on disk"
+        );
+    }
+
+    lab.engine
+        .keep_source(&lab.s.home.join(".e/one"))
+        .expect("single-file keep source must recreate its directory too");
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".e/one")).unwrap(),
+        MANAGED_BASE
+    );
+}
+
 /// A keep-source-only batch must not commit or push AT ALL.
 ///
 /// `apply` never touches the source repo, and the commit phase counts a clean
