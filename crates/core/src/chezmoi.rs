@@ -653,6 +653,22 @@ impl ChezmoiClient {
         Ok(())
     }
 
+    /// Remove the listed targets from the source state, in ONE invocation:
+    /// chezmoi deletes their source files (and, with autoCommit, commits the
+    /// removal). `--force` skips chezmoi's confirmation prompt, which under
+    /// `--no-tty` would die with `EOF`. An empty slice is REFUSED: there is
+    /// no "every file" meaning to fall back on, only a caller bug.
+    pub fn forget(&self, targets: &[PathBuf]) -> Result<(), ChezmoiError> {
+        if targets.is_empty() {
+            return Err(ChezmoiError::Failed("forget called with no targets".into()));
+        }
+        let mut args = vec!["forget".to_string(), "--force".to_string()];
+        args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_ok(&refs, None)?;
+        Ok(())
+    }
+
     /// Pull changes from the source repo and apply them. Network op: 120s
     /// timeout like git fetch, overriding the configured default.
     pub fn update(&self) -> Result<(), ChezmoiError> {
@@ -986,6 +1002,23 @@ mod tests {
         assert_eq!(
             fake.calls()[0].args,
             vec!["--no-tty", "--no-pager", "apply", "--force", "/.a", "/.b"]
+        );
+    }
+
+    /// MUTATION: drop `--force` → the args differ (and in the field chezmoi
+    /// would prompt and die on EOF); drop the empty check → no error.
+    #[test]
+    fn forget_forces_and_refuses_an_empty_list() {
+        let fake = Arc::new(FakeRunner::new());
+        assert!(client(fake.clone()).forget(&[]).is_err());
+        assert!(fake.calls().is_empty());
+        fake.push_ok(0, "", "");
+        client(fake.clone())
+            .forget(&[PathBuf::from("/.a")])
+            .unwrap();
+        assert_eq!(
+            fake.calls()[0].args,
+            vec!["--no-tty", "--no-pager", "forget", "--force", "/.a"]
         );
     }
 

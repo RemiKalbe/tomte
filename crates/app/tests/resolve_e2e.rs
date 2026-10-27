@@ -661,6 +661,55 @@ fn keep_source_recreates_a_deleted_directory() {
     );
 }
 
+/// Keep disk on a file deleted from disk removes it from the source. Before,
+/// the undo snapshot found no disk file and every such row failed with
+/// "snapshot returned 1 blobs for 2 paths" (2026-10-26, a skill's WARP.md
+/// the upstream had dropped).
+///
+/// MUTATION: route a deleted target through `re-add` like any other keep
+/// disk → the snapshot error comes back and the source files survive.
+#[test]
+fn keep_disk_on_a_deleted_file_removes_it_from_the_source() {
+    let lab = DriftLab::new();
+    more_managed_files(&lab, &["gone1", "gone2", "edited"]);
+    std::fs::remove_file(lab.s.home.join(".gone1")).unwrap();
+    std::fs::remove_file(lab.s.home.join(".gone2")).unwrap();
+    std::fs::write(lab.s.home.join(".edited"), b"edited=disk\n").unwrap();
+    let commits_before = commit_count(&lab.s.bare);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".gone1", BatchDecision::KeepDisk),
+        batch_item(&lab, ".edited", BatchDecision::KeepDisk),
+    ]);
+    let (_, committed, pushed, _) = done(&outcome, 0);
+    assert!(committed && pushed, "the removal must reach origin");
+    done(&outcome, 1);
+    assert!(
+        !lab.s.source.join("dot_gone1").exists(),
+        "the deleted file must be gone from the source"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_edited")).unwrap(),
+        b"edited=disk\n",
+        "and the batch's ordinary keep disk still re-added"
+    );
+    assert_eq!(
+        commit_count(&lab.s.bare) - commits_before,
+        1,
+        "one commit for the batch"
+    );
+
+    match lab.engine.keep_disk(&lab.s.home.join(".gone2")) {
+        Ok(ResolveOutcome::Done { committed, .. }) => assert!(committed),
+        other => panic!("single keep disk on a deleted file: {other:?}"),
+    }
+    assert!(!lab.s.source.join("dot_gone2").exists());
+    assert!(
+        !lab.s.home.join(".gone2").exists(),
+        "and nothing was recreated on disk"
+    );
+}
+
 /// A keep-source-only batch must not commit or push AT ALL.
 ///
 /// `apply` never touches the source repo, and the commit phase counts a clean

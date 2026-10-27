@@ -123,6 +123,11 @@ struct Candidate {
     /// (chezmoi ignores templates there); its source is written by the
     /// template write-back instead, and it still shares the batch's commit.
     templated: bool,
+    /// The target is gone from disk. Keep disk then means "remove it from the
+    /// source": it rides `chezmoi forget`, not `re-add`, and journals no disk
+    /// blob. Always `templated: false` alongside, since forget removes a
+    /// template as readily as a plain file.
+    deleted: bool,
     /// Index of this item's entry in [`BatchOutcome::per_target`], carried so
     /// its result lands in INPUT order however many siblings were refused.
     slot: usize,
@@ -166,6 +171,9 @@ impl ResolveEngine {
     pub fn keep_disk(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "keep_disk {}", target.display());
         let source = self.chezmoi.source_path(target)?;
+        if is_absent(target) {
+            return self.keep_deletion(target, &source);
+        }
         if is_templated(&source) {
             // Checked here as well as inside `resolve_merged_as`: a source
             // full of conflict markers may not even render, and that raw
@@ -209,6 +217,38 @@ impl ResolveEngine {
         } else {
             self.chezmoi
                 .re_add(std::slice::from_ref(&target.to_path_buf()))?;
+            self.commit_phase("keep_disk", target)
+        };
+        self.session_end(session, &format!("keep_disk {}", display_name(target)))?;
+        self.rescan()?;
+        Ok(ResolveOutcome::Done {
+            session,
+            committed,
+            pushed,
+            note,
+        })
+    }
+
+    /// Keep disk for a target that is gone from disk: remove it from the
+    /// source. The journal records the source blob and no disk blob, so Undo
+    /// leaves the target absent, as it found it. Mid-merge the source file is
+    /// deleted and staged by hand, for the reason `keep_disk` copies instead
+    /// of re-adding there: forget's own commit would sweep up every other
+    /// file the merge left conflicted.
+    fn keep_deletion(&self, target: &Path, source: &Path) -> Result<ResolveOutcome, ResolveError> {
+        let session = self.session_start()?;
+        let source_blob = self.snapshot_source(source)?;
+        let decision = build_decision("keep_disk", target, None, Some(&source_blob));
+        self.session_decision(session, decision)?;
+        self.expect_changes(vec![target.to_path_buf(), source.to_path_buf()])?;
+        let merging = self.ensure_merge_started()?;
+        let (committed, pushed, note) = if merging {
+            std::fs::remove_file(source)?;
+            self.stage_resolution(source)?;
+            self.conclude_merge()
+        } else {
+            self.chezmoi
+                .forget(std::slice::from_ref(&target.to_path_buf()))?;
             self.commit_phase("keep_disk", target)
         };
         self.session_end(session, &format!("keep_disk {}", display_name(target)))?;
@@ -313,12 +353,14 @@ impl ResolveEngine {
                             "internal: the batch never reported this file".into(),
                         )),
                     ));
-                    let templated = is_templated(&source);
+                    let deleted = is_absent(&item.target);
+                    let templated = !deleted && is_templated(&source);
                     candidates.push(Candidate {
                         target: item.target,
                         source,
                         decision: item.decision,
                         templated,
+                        deleted,
                         slot,
                     });
                 }
@@ -467,13 +509,23 @@ impl ResolveEngine {
 
         let readds: Vec<PathBuf> = prepared
             .iter()
-            .filter(|p| p.candidate.decision == BatchDecision::KeepDisk && !p.candidate.templated)
+            .filter(|p| {
+                p.candidate.decision == BatchDecision::KeepDisk
+                    && !p.candidate.templated
+                    && !p.candidate.deleted
+            })
+            .map(|p| p.candidate.target.clone())
+            .collect();
+        let forgets: Vec<PathBuf> = prepared
+            .iter()
+            .filter(|p| p.candidate.decision == BatchDecision::KeepDisk && p.candidate.deleted)
             .map(|p| p.candidate.target.clone())
             .collect();
         // Guarded, never called empty: an empty target list keeps chezmoi's
         // own meaning — EVERY modified file — and both `re_add` and
         // `apply_many` refuse one outright rather than let that happen.
         let readd = (!readds.is_empty()).then(|| self.chezmoi.re_add(&readds));
+        let forgot = (!forgets.is_empty()).then(|| self.chezmoi.forget(&forgets));
         let applies = self.batch_targets(&prepared, BatchDecision::KeepSourceLocal);
         let applied = (!applies.is_empty()).then(|| self.chezmoi.apply_many(&applies));
         // A verified template write leaves the destination already saying
@@ -497,6 +549,7 @@ impl ResolveEngine {
         // exactly as single-file `keep_source` does — rather than counting a
         // clean repo as "committed" and pushing a no-op.
         let plain_landed = matches!(readd, Some(Ok(())));
+        let forgot_landed = matches!(forgot, Some(Ok(())));
         let landed_disk: Vec<usize> = prepared
             .iter()
             .enumerate()
@@ -504,6 +557,8 @@ impl ResolveEngine {
                 p.candidate.decision == BatchDecision::KeepDisk
                     && if p.candidate.templated {
                         written.contains(ix)
+                    } else if p.candidate.deleted {
+                        forgot_landed
                     } else {
                         plain_landed
                     }
@@ -539,6 +594,10 @@ impl ResolveEngine {
                         _ => Ok(commit.clone()),
                     }
                 }
+                BatchDecision::KeepDisk if p.candidate.deleted => match &forgot {
+                    Some(Err(e)) => Err(format!("the batch forget failed: {e}")),
+                    _ => Ok(commit.clone()),
+                },
                 BatchDecision::KeepDisk => match &readd {
                     Some(Err(e)) => Err(format!("the batch re-add failed: {e}")),
                     _ => Ok(commit.clone()),
@@ -600,6 +659,9 @@ impl ResolveEngine {
     fn open_batch_session(&self, c: &Candidate) -> Result<i64, ResolveError> {
         let session = self.session_start()?;
         let (action, dest_blob, source_blob) = match c.decision {
+            BatchDecision::KeepDisk if c.deleted => {
+                ("keep_disk", None, Some(self.snapshot_source(&c.source)?))
+            }
             BatchDecision::KeepDisk => {
                 let hashes = self.snapshot_blobs(vec![c.target.clone(), c.source.clone()])?;
                 let [dest, source] = hashes.as_slice() else {
@@ -630,6 +692,18 @@ impl ResolveEngine {
     /// HERE, on the same filesystem, before asking the daemon: `SnapshotBlobs`
     /// omits a path it cannot read without saying which, so a blob-count
     /// mismatch for a target that DOES exist stays the error it always was.
+    fn snapshot_source(&self, source: &Path) -> Result<String, ResolveError> {
+        let hashes = self.snapshot_blobs(vec![source.to_path_buf()])?;
+        match hashes.as_slice() {
+            [one] => Ok(one.clone()),
+            _ => Err(ResolveError::Failed(format!(
+                "snapshot of the source {} returned {} blobs",
+                source.display(),
+                hashes.len()
+            ))),
+        }
+    }
+
     fn snapshot_dest(&self, target: &Path) -> Result<Option<String>, ResolveError> {
         match std::fs::metadata(target) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1649,6 +1723,12 @@ fn write_back_verified(
 /// write-back instead of `re-add`.
 pub fn is_templated(source_path: &Path) -> bool {
     source_path.extension().is_some_and(|ext| ext == "tmpl")
+}
+
+/// The target is gone from disk. `symlink_metadata`, so a dangling symlink
+/// still counts as present: that is a link to re-add, not a deletion.
+fn is_absent(target: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(target), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Message for the engine's fallback source-repo commit:
