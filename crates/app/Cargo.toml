@@ -30,5 +30,6 @@ toml.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+rusqlite.workspace = true
 tomte-daemon = { path = "../daemon" }
 tomte-core = { path = "../core", features = ["test-support"] }

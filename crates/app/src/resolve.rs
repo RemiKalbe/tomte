@@ -9,7 +9,7 @@
 //! commit still leaves the resolution DONE locally, reported honestly via
 //! `ResolveOutcome::Done { committed: false, note, .. }` (spec §10).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,7 +23,7 @@ use tomte_core::template::writeback::write_back;
 use tomte_core::type_change::{
     EntryKind, FolderComparison, TypeChange, compare_folder, disk_kind, type_change,
 };
-use tomte_journal::{Journal, JournalError};
+use tomte_journal::{BLOB_CAP, Journal, JournalError};
 use tomte_proto::{Request, Response};
 
 use crate::ipc::{IpcClient, IpcError};
@@ -588,6 +588,9 @@ impl ResolveEngine {
         tomte_core::log_info!("resolve", "keep_source {}", target.display());
         let source = self.chezmoi.source_path(target)?;
         let change = self.type_change_at(target, &source)?;
+        if let Some(change) = &change {
+            refuse_unrestorable(target, change)?;
+        }
         // Catch up first, exactly as `keep_disk` does. This one never FAILED
         // while behind — `chezmoi apply` does not dirty the source, so there
         // was nothing to push and `commit_phase`'s rebase-and-retry recovery
@@ -681,6 +684,10 @@ impl ResolveEngine {
                 .and_then(|source| {
                     let change = self.type_change_at(&item.target, &source)?;
                     refuse_stray_copies(item.decision, change.as_ref(), &item.copies)?;
+                    if let (BatchDecision::KeepSourceLocal, Some(change)) = (item.decision, &change)
+                    {
+                        refuse_unrestorable(&item.target, change)?;
+                    }
                     Ok((source, change))
                 });
             match preflight {
@@ -1456,14 +1463,38 @@ impl ResolveEngine {
         for step in steps.iter().filter(|step| step.replace) {
             refuse_foreign_folder(step)?;
         }
-        let blob = |hash: &str, path: &Path| -> Result<Vec<u8>, ResolveError> {
-            journal.get_blob(hash)?.ok_or_else(|| {
-                ResolveError::Failed(format!(
-                    "undo: blob {hash} for {} is missing from the journal",
-                    path.display()
-                ))
-            })
-        };
+        // Every blob is read BEFORE anything at a target is removed: a
+        // missing one (a file over the journal's cap) refuses the whole undo
+        // with the disk untouched, never half restored.
+        let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
+        for step in &steps {
+            let needed: Vec<(&str, PathBuf)> = match &step.restore {
+                UndoRestore::Content(hash) => vec![(hash.as_str(), step.target.clone())],
+                UndoRestore::Folder(entries) => entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        FolderEntry::File { blob, .. } => {
+                            Some((blob.as_str(), step.target.join(entry.path())))
+                        }
+                        FolderEntry::Link { .. } => None,
+                    })
+                    .collect(),
+                UndoRestore::Absent | UndoRestore::Link(_) => Vec::new(),
+            };
+            for (hash, path) in needed {
+                if blobs.contains_key(hash) {
+                    continue;
+                }
+                let bytes = journal.get_blob(hash)?.ok_or_else(|| {
+                    ResolveError::Failed(format!(
+                        "undo: blob {hash} for {} is missing from the journal",
+                        path.display()
+                    ))
+                })?;
+                blobs.insert(hash.to_owned(), bytes);
+            }
+        }
+        let blob = |hash: &str| -> &[u8] { blobs.get(hash).map(Vec::as_slice).unwrap_or_default() };
         let (mut restored, mut removed) = (0usize, 0usize);
         for step in &steps {
             let target = &step.target;
@@ -1477,7 +1508,7 @@ impl ResolveEngine {
             }
             match &step.restore {
                 UndoRestore::Content(dest_blob) => {
-                    write_creating_parents(target, &blob(dest_blob, target)?)?;
+                    write_creating_parents(target, blob(dest_blob))?;
                     restored += 1;
                 }
                 // The file was not on disk before the decision: back to that.
@@ -1499,7 +1530,7 @@ impl ResolveEngine {
                         let path = target.join(entry.path());
                         match entry {
                             FolderEntry::File { blob: hash, .. } => {
-                                write_creating_parents(&path, &blob(hash, &path)?)?;
+                                write_creating_parents(&path, blob(hash))?;
                             }
                             FolderEntry::Link { text, .. } => link_creating_parents(text, &path)?,
                         }
@@ -2260,6 +2291,37 @@ fn conflict_refusal(rel: &Path) -> ResolveError {
          resolve the origin difference in the merge editor first",
         rel.display()
     ))
+}
+
+/// Keep source on a type change deletes whatever the disk holds at
+/// `target`, and Undo can only bring back what the journal stored. A file
+/// over [`BLOB_CAP`] is journaled by hash alone, so a decision that would
+/// delete one refuses before anything is journaled or touched, naming the
+/// file and its size.
+fn refuse_unrestorable(target: &Path, change: &TypeChange) -> Result<(), ResolveError> {
+    let files: Vec<PathBuf> = match change.disk {
+        EntryKind::File => vec![target.to_path_buf()],
+        EntryKind::Folder => walk_folder(target)?
+            .into_iter()
+            .filter(|(_, kind)| *kind == Walked::File)
+            .map(|(rel, _)| target.join(rel))
+            .collect(),
+        EntryKind::Absent | EntryKind::Link(_) => Vec::new(),
+    };
+    for file in files {
+        let size = std::fs::symlink_metadata(&file)?.len();
+        if size > BLOB_CAP as u64 {
+            return Err(ResolveError::Failed(format!(
+                "{} is {:.1} MB, over the {} MB Undo can bring back — restoring would delete \
+                 it for good; move it out of {} first",
+                file.display(),
+                size as f64 / (1024.0 * 1024.0),
+                BLOB_CAP / (1024 * 1024),
+                display_name(target)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn copy_picks_refused() -> ResolveError {

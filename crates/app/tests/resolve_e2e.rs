@@ -3377,6 +3377,111 @@ fn undo_restore_folder_refuses_when_the_folder_gained_a_file() {
     assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
 }
 
+/// `~/.l` (a managed link) replaced by a folder holding `small` and `big`,
+/// a 5 MB file: over the journal's blob cap, so Undo could not bring it back.
+fn link_replaced_by_a_folder_with_a_big_file(lab: &DriftLab) -> PathBuf {
+    managed_link(lab);
+    let target = lab.s.home.join(".l");
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("small"), b"small\n").unwrap();
+    std::fs::File::create(target.join("big"))
+        .unwrap()
+        .set_len(5 * 1024 * 1024)
+        .unwrap();
+    target
+}
+
+fn too_large_refusal(target: &std::path::Path) -> String {
+    format!(
+        "{}/big is 5.0 MB, over the 4 MB Undo can bring back — restoring would delete \
+         it for good; move it out of .l first",
+        target.display()
+    )
+}
+
+/// Restore the link refuses up front when the folder it would delete holds
+/// a file over the journal's cap (ruling R11): nothing is journaled, the
+/// folder stays.
+///
+/// MUTATION: drop the `refuse_unrestorable` call in `keep_source` → apply
+/// deletes the folder and `big` is gone for good.
+#[test]
+fn restore_link_refuses_when_the_folder_holds_a_file_over_the_cap() {
+    let lab = DriftLab::new();
+    let target = link_replaced_by_a_folder_with_a_big_file(&lab);
+
+    let err = lab.engine.keep_source(&target).unwrap_err().to_string();
+    assert_eq!(err, too_large_refusal(&target));
+    assert_eq!(
+        std::fs::metadata(target.join("big")).unwrap().len(),
+        5 * 1024 * 1024
+    );
+    assert!(
+        lab.journal().last_finished_session().unwrap().is_none(),
+        "nothing is journaled"
+    );
+}
+
+/// The batch path refuses the same way, before the batch touches the repo,
+/// and only for that file: the drifted file beside it still lands.
+///
+/// MUTATION: drop the `refuse_unrestorable` call in `resolve_batch`'s
+/// pre-flight → the batch apply deletes the folder with `big` in it.
+#[test]
+fn batch_restore_link_refuses_when_the_folder_holds_a_file_over_the_cap() {
+    let lab = DriftLab::new();
+    let target = link_replaced_by_a_folder_with_a_big_file(&lab);
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".l", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".testrc", BatchDecision::KeepSourceLocal),
+    ]);
+
+    let err = outcome.per_target[0].1.as_ref().unwrap_err().to_string();
+    assert_eq!(err, too_large_refusal(&target));
+    assert!(target.join("big").exists(), "the folder stays");
+    done(&outcome, 1);
+    assert_eq!(std::fs::read(&lab.target).unwrap(), RENDERED);
+}
+
+/// Undo reads every blob it needs BEFORE removing anything: a restored
+/// link whose folder lost a blob from the journal refuses with the link in
+/// place, never a half-restored folder.
+///
+/// MUTATION: read each blob lazily inside the restore loop in `undo_last`
+/// (drop the pre-read) → the link is removed, `a` written, then the undo
+/// fails on `sub/b` with the folder half restored.
+#[test]
+fn undo_refuses_intact_when_a_folder_blob_is_missing() {
+    let lab = DriftLab::new();
+    managed_link(&lab);
+    let target = lab.s.home.join(".l");
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir_all(target.join("sub")).unwrap();
+    std::fs::write(target.join("a"), b"a\n").unwrap();
+    std::fs::write(target.join("sub/b"), b"b-only\n").unwrap();
+    lab.engine.keep_source(&target).unwrap();
+    assert_eq!(link_text(&target), ".real");
+    let missing = ContentHash::of(b"b-only\n").to_hex();
+    let db = rusqlite::Connection::open(&lab.journal_path).unwrap();
+    let gone = db
+        .execute("DELETE FROM blobs WHERE hash = ?1", [&missing])
+        .unwrap();
+    assert_eq!(gone, 1, "sanity: the fixture removed the blob of sub/b");
+
+    let err = lab.engine.undo_last().unwrap_err().to_string();
+    assert_eq!(
+        err,
+        format!(
+            "undo: blob {missing} for {}/sub/b is missing from the journal",
+            target.display()
+        )
+    );
+    assert_eq!(link_text(&target), ".real", "the link stays in place");
+}
+
 /// Mid-merge, Keep the link swaps the entry by hand and stages only it: the
 /// other conflicted file stays conflicted, markers uncommitted, and the
 /// merge stays open.

@@ -11,10 +11,8 @@ use tomte_core::drift::{ContentHash, DriftClass};
 use tomte_core::git::{GitClient, GitError, MergeStart, MergeTreeOutcome};
 use tomte_core::scanner::{DriftScanner, FileDrift, ScanError, ScanReport};
 use tomte_core::type_change::{EntryKind, TypeChange};
-use tomte_journal::{EventKind, Journal, JournalError, NewEvent};
+use tomte_journal::{BLOB_CAP, EventKind, Journal, JournalError, NewEvent};
 use tomte_proto::{DriftSummary, Event, WireEntryKind, WireTypeChange};
-
-const BLOB_CAP: usize = 4 * 1024 * 1024;
 
 /// How long the unattended auto-join may wait for the commit signer to prove
 /// it is awake. Long enough for a signer that is merely slow, far short of

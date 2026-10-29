@@ -13,6 +13,12 @@ pub enum JournalError {
     Corrupt(String),
 }
 
+/// The largest file the journal stores as a blob. A bigger one is recorded
+/// by hash only, so nothing can restore it: a decision that would delete
+/// one refuses first (`ResolveEngine`), and the daemon marks its events
+/// `skipped_too_large`.
+pub const BLOB_CAP: usize = 4 * 1024 * 1024;
+
 pub struct Journal {
     pub(crate) conn: Connection,
     machine: String,
