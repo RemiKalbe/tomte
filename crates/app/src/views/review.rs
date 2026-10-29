@@ -307,6 +307,7 @@ fn load_type_change_blocking(
     let mut detail = TypeChangeDetail {
         comparison: None,
         deletes: Vec::new(),
+        source: Vec::new(),
         failure: None,
     };
     let mut preview = PreviewState::Empty;
@@ -314,7 +315,10 @@ fn load_type_change_blocking(
         TypeChangeBody::Comparison => {
             let client = crate::app_chezmoi_client();
             match tomte_app::resolve::folder_comparison(&client, target) {
-                Ok(cmp) => detail.comparison = Some(cmp),
+                Ok((cmp, files)) => {
+                    detail.comparison = Some(cmp);
+                    detail.source = source_marks(files);
+                }
                 Err(e) => {
                     tomte_core::log_error!(
                         "review",
@@ -326,16 +330,48 @@ fn load_type_change_blocking(
             }
         }
         TypeChangeBody::LineDiff => preview = load_link_diff_blocking(target, change),
-        TypeChangeBody::Deletes => match restore_deletes(target, change) {
-            Ok(names) => detail.deletes = names,
-            Err(e) => {
-                tomte_core::log_error!("review", "read {}: {e}", target.display());
-                detail.failure = Some(format!("read {}: {e}", target.display()));
+        TypeChangeBody::Deletes => {
+            match restore_deletes(target, change) {
+                Ok(names) => detail.deletes = names,
+                Err(e) => {
+                    tomte_core::log_error!("review", "read {}: {e}", target.display());
+                    detail.failure = Some(format!("read {}: {e}", target.display()));
+                }
             }
-        },
+            // A folder replaced by a file: Keep the file removes the
+            // source's folder, so its files are named too.
+            if matches!(change.source, WireEntryKind::Folder) && detail.failure.is_none() {
+                let client = crate::app_chezmoi_client();
+                match tomte_app::resolve::source_files(&client, target) {
+                    Ok(files) => detail.source = source_marks(files),
+                    Err(e) => {
+                        tomte_core::log_error!(
+                            "review",
+                            "source files under {} failed: {e}",
+                            target.display()
+                        );
+                        detail.failure = Some(e.to_string());
+                    }
+                }
+            }
+        }
         TypeChangeBody::Nothing => {}
     }
     (preview, detail)
+}
+
+/// The source files under a type change's folder, with their marks.
+fn source_marks(files: Vec<tomte_app::resolve::SourceFile>) -> Vec<(PathBuf, ui::NameMarks)> {
+    files
+        .into_iter()
+        .map(|file| {
+            let marks = ui::NameMarks {
+                template: file.template,
+                encrypted: file.encrypted,
+            };
+            (file.rel, marks)
+        })
+        .collect()
 }
 
 /// What Restore deletes on disk, by name: the top level of a folder there
@@ -360,26 +396,34 @@ fn restore_deletes(target: &Path, change: &WireTypeChange) -> std::io::Result<Ve
 
 /// A file against a link: the source side as chezmoi would write it, the
 /// disk side as it reads now. A link side is what it resolves to, or its
-/// text when it dangles.
+/// text when it dangles (its target is not found); any other read error is
+/// the pane's error.
 fn load_link_diff_blocking(target: &Path, change: &WireTypeChange) -> PreviewState {
-    let side =
-        |kind: &WireEntryKind, read: &dyn Fn() -> Result<Vec<u8>, String>| match (kind, read()) {
-            (_, Ok(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-            (WireEntryKind::Link { text }, Err(_)) => Ok(text.clone()),
-            (_, Err(e)) => Err(e),
-        };
+    let side = |kind: &WireEntryKind, read: &dyn Fn() -> Result<Vec<u8>, SideError>| match (
+        kind,
+        read(),
+    ) {
+        (_, Ok(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        (WireEntryKind::Link { text }, Err(SideError::NotFound(_))) => Ok(text.clone()),
+        (_, Err(SideError::NotFound(e) | SideError::Other(e))) => Err(e),
+    };
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|e| {
+            let why = format!("read {}: {e}", path.display());
+            if e.kind() == std::io::ErrorKind::NotFound {
+                SideError::NotFound(why)
+            } else {
+                SideError::Other(why)
+            }
+        })
+    };
     let rendered = side(&change.source, &|| match &change.source {
-        WireEntryKind::Link { text } => {
-            let at = target.parent().unwrap_or(Path::new("/")).join(text);
-            std::fs::read(&at).map_err(|e| format!("read {}: {e}", at.display()))
-        }
+        WireEntryKind::Link { text } => read(&target.parent().unwrap_or(Path::new("/")).join(text)),
         _ => crate::app_chezmoi_client()
             .cat(target)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| SideError::Other(e.to_string())),
     });
-    let destination = side(&change.disk, &|| {
-        std::fs::read(target).map_err(|e| format!("read {}: {e}", target.display()))
-    });
+    let destination = side(&change.disk, &|| read(target));
     match (rendered, destination) {
         (Ok(rendered), Ok(destination)) => PreviewState::Ready(MergeDocument::compute(
             &rendered,
@@ -387,8 +431,18 @@ fn load_link_diff_blocking(target: &Path, change: &WireTypeChange) -> PreviewSta
             &rendered,
             MergeOptions::default(),
         )),
-        (Err(e), _) | (_, Err(e)) => PreviewState::Error(e),
+        (Err(e), _) | (_, Err(e)) => {
+            tomte_core::log_error!("review", "link diff for {} failed: {e}", target.display());
+            PreviewState::Error(e)
+        }
     }
+}
+
+/// Why one side of a link diff could not be read: only a missing file lets
+/// a link side fall back to its text.
+enum SideError {
+    NotFound(String),
+    Other(String),
 }
 
 /// One Differs file of a folder replaced by a link: what the source would
@@ -402,11 +456,17 @@ fn load_compare_diff_blocking(target: &Path, rel: &Path) -> PreviewState {
         .and_then(|source| tomte_app::resolve::source_version(&client, &source, &file))
     {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => return PreviewState::Error(e.to_string()),
+        Err(e) => {
+            tomte_core::log_error!("review", "source of {}: {e}", file.display());
+            return PreviewState::Error(e.to_string());
+        }
     };
     let destination = match std::fs::read(&file) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => return PreviewState::Error(format!("read {}: {e}", file.display())),
+        Err(e) => {
+            tomte_core::log_error!("review", "read {}: {e}", file.display());
+            return PreviewState::Error(format!("read {}: {e}", file.display()));
+        }
     };
     PreviewState::Ready(MergeDocument::compute(
         &rendered,
@@ -625,6 +685,9 @@ pub(super) struct TypeChangeDetail {
     /// [`TypeChangeBody::Deletes`]: what Restore deletes on disk, top-level
     /// names, folders with a trailing `/`.
     pub deletes: Vec<String>,
+    /// The source's files under a folder Keep disk removes (a folder
+    /// replaced by a link or a file), relative, with their marks.
+    pub source: Vec<(PathBuf, ui::NameMarks)>,
     /// Why the comparison or the list could not be loaded.
     pub failure: Option<String>,
 }
@@ -647,17 +710,19 @@ pub(super) enum CompareItem {
         picked: bool,
         opens_diff: bool,
         open: bool,
+        marks: ui::NameMarks,
     },
-    /// Up to [`NAMES_PER_ITEM`] names that need no decision, wrapped.
-    Names(Vec<PathBuf>),
-    /// What Restore does to disk.
-    Footer,
+    /// Up to [`NAMES_PER_ITEM`] names that need no decision, wrapped, each
+    /// with its marks.
+    Names(Vec<(PathBuf, ui::NameMarks)>),
 }
 
 /// The items under a type-change header, in order: each group's label and
 /// its rows (files that carry a pick or a diff one per row, the rest as
-/// wrapped name runs), then the footer. Empty when the pane draws no list:
-/// a line diff, a load in flight, or a load that failed.
+/// wrapped name runs). A source file carries its template / encrypted
+/// marks. Empty when the pane draws no list: a line diff, a link retargeted
+/// or removed, a load in flight, or a load that failed. The footer is not
+/// an item: the pane pins it under the list.
 pub(super) fn compare_items(
     change: &WireTypeChange,
     detail: Option<&TypeChangeDetail>,
@@ -665,13 +730,19 @@ pub(super) fn compare_items(
     open: Option<&Path>,
 ) -> Vec<CompareItem> {
     let kind = type_change_body(change);
-    if kind == TypeChangeBody::Nothing {
-        return vec![CompareItem::Footer];
-    }
     let Some(detail) = detail.filter(|d| d.failure.is_none()) else {
         return Vec::new();
     };
-    let names = |items: &mut Vec<CompareItem>, names: Vec<PathBuf>| {
+    let marks: BTreeMap<&Path, ui::NameMarks> = detail
+        .source
+        .iter()
+        .map(|(rel, marks)| (rel.as_path(), *marks))
+        .collect();
+    let marked = |rel: PathBuf| {
+        let marks = marks.get(rel.as_path()).copied().unwrap_or_default();
+        (rel, marks)
+    };
+    let names = |items: &mut Vec<CompareItem>, names: Vec<(PathBuf, ui::NameMarks)>| {
         items.extend(
             names
                 .chunks(NAMES_PER_ITEM)
@@ -689,29 +760,46 @@ pub(super) fn compare_items(
                 if rows.iter().any(|r| r.pickable || r.opens_diff) {
                     items.extend(rows.into_iter().map(|row| CompareItem::File {
                         open: row.opens_diff && open == Some(row.rel.as_path()),
+                        marks: marks.get(row.rel.as_path()).copied().unwrap_or_default(),
                         rel: row.rel,
                         pickable: row.pickable,
                         picked: row.picked,
                         opens_diff: row.opens_diff,
                     }));
                 } else {
-                    names(&mut items, rows.into_iter().map(|r| r.rel).collect());
+                    names(
+                        &mut items,
+                        rows.into_iter().map(|r| marked(r.rel)).collect(),
+                    );
                 }
             }
         }
         TypeChangeBody::Deletes => {
-            let (_, restore) = type_change_buttons(change);
+            let (keep, restore) = type_change_buttons(change);
             items.push(CompareItem::Label(
                 format!("On disk · deleted if you {}", restore.to_lowercase()).into(),
             ));
             names(
                 &mut items,
-                detail.deletes.iter().map(PathBuf::from).collect(),
+                detail
+                    .deletes
+                    .iter()
+                    .map(|name| (PathBuf::from(name), ui::NameMarks::default()))
+                    .collect(),
             );
+            if !detail.source.is_empty() {
+                items.push(CompareItem::Label(
+                    format!(
+                        "In source · removed from source if you {}",
+                        keep.to_lowercase()
+                    )
+                    .into(),
+                ));
+                names(&mut items, detail.source.clone());
+            }
         }
         TypeChangeBody::LineDiff | TypeChangeBody::Nothing => return Vec::new(),
     }
-    items.push(CompareItem::Footer);
     items
 }
 
@@ -1578,15 +1666,15 @@ pub(super) struct SidebarInputs<'a> {
     pub home: &'a Path,
 }
 
-/// Plan the sidebar: the PROCESSING group first (spec §2.1 — the row MOVES
-/// there), then NEEDS A DECISION flat, then SAFE TO RESOLVE flat or as a
-/// tree (spec §2.5 of the multi-select design). Only the safe group's rows
-/// are selectable, and the header's checkbox stands for all of them.
 /// A type-change row's second line: the class wording.
 fn sub_line(entry: &DriftSummary) -> Option<&'static str> {
     entry.type_change.as_ref().map(type_change_label)
 }
 
+/// Plan the sidebar: the PROCESSING group first (spec §2.1 — the row MOVES
+/// there), then NEEDS A DECISION flat, then SAFE TO RESOLVE flat or as a
+/// tree (spec §2.5 of the multi-select design). Only the safe group's rows
+/// are selectable, and the header's checkbox stands for all of them.
 pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
     let SidebarInputs {
         drifted,
@@ -3606,11 +3694,13 @@ impl ReviewView {
                 .child(footer_text(change, target))
         };
         let kind = type_change_body(change);
-        // No list to draw: the line diff, or the load's own state, then the
-        // footer.
+        // No list to draw: the line diff, nothing (a link retargeted or
+        // removed), or the load's own state, then the footer.
         if self.compare_keys.is_empty() {
             let body = if kind == TypeChangeBody::LineDiff {
                 self.preview_body(theme)
+            } else if kind == TypeChangeBody::Nothing {
+                div().into_any_element()
             } else if let Some(why) = self.type_change.as_ref().and_then(|d| d.failure.clone()) {
                 message_box(theme, "could not compare", why, None)
             } else {
@@ -3627,7 +3717,6 @@ impl ReviewView {
         }
         let items = self.compare_keys.clone();
         let weak = cx.weak_entity();
-        let footer_line: SharedString = footer_text(change, target).into();
         // Same shape as the sidebar's list: the item closure runs in the
         // list's prepaint, after this render released the view, so the
         // update below is a fresh one that gives each row its listeners.
@@ -3636,9 +3725,7 @@ impl ReviewView {
             let Some(view) = weak.upgrade() else {
                 return div().into_any_element();
             };
-            let item = view.update(cx, |view, cx| {
-                view.compare_item_el(ix, &items, footer_line.clone(), theme, cx)
-            });
+            let item = view.update(cx, |view, cx| view.compare_item_el(ix, &items, theme, cx));
             div()
                 .w_full()
                 .px_3()
@@ -3690,6 +3777,16 @@ impl ReviewView {
                         .child(self.preview_body(theme)),
                 )
             })
+            // Pinned under the list and the diff, never scrolled out of
+            // view: it says what Restore does to disk.
+            .child(
+                div()
+                    .debug_selector(|| "type-change-footer".into())
+                    .flex_none()
+                    .px_3()
+                    .py_2()
+                    .child(footer()),
+            )
             .into_any_element()
     }
 
@@ -3698,7 +3795,6 @@ impl ReviewView {
         &self,
         ix: usize,
         items: &[CompareItem],
-        footer: SharedString,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3717,6 +3813,7 @@ impl ReviewView {
                 picked,
                 opens_diff,
                 open,
+                marks,
             } => {
                 let pick_rel = rel.clone();
                 let open_rel = rel.clone();
@@ -3728,6 +3825,7 @@ impl ReviewView {
                         pick: pickable.then_some((*picked, COPY_PICK_LABEL)),
                         opens: *opens_diff,
                         open: *open,
+                        marks: *marks,
                     },
                     cx.listener(move |view, _ev, _w, cx| view.toggle_copy_pick(&pick_rel, cx)),
                     cx.listener(move |view, _ev, _w, cx| {
@@ -3740,17 +3838,11 @@ impl ReviewView {
                 theme,
                 names
                     .iter()
-                    .map(|n| n.display().to_string().into())
+                    .map(|(n, marks)| (n.display().to_string().into(), *marks))
                     .collect(),
             )
             .pb_0p5()
             .into_any_element(),
-            CompareItem::Footer => div()
-                .pt_3()
-                .text_xs()
-                .text_color(theme.text_muted)
-                .child(footer)
-                .into_any_element(),
         }
     }
 
@@ -4371,6 +4463,7 @@ mod tests {
         TypeChangeDetail {
             comparison: Some(cmp),
             deletes: Vec::new(),
+            source: Vec::new(),
             failure: None,
         }
     }
@@ -4382,17 +4475,35 @@ mod tests {
             picked,
             opens_diff,
             open,
+            marks: tomte_ui::components::NameMarks::default(),
         }
     }
 
+    /// Names with no marks, as a `Names` item holds them.
+    fn plain(names: &[&str]) -> Vec<(PathBuf, tomte_ui::components::NameMarks)> {
+        names
+            .iter()
+            .map(|n| (p(n), tomte_ui::components::NameMarks::default()))
+            .collect()
+    }
+
+    const TEMPLATE: tomte_ui::components::NameMarks = tomte_ui::components::NameMarks {
+        template: true,
+        encrypted: false,
+    };
+    const ENCRYPTED: tomte_ui::components::NameMarks = tomte_ui::components::NameMarks {
+        template: false,
+        encrypted: true,
+    };
+
     /// The list's items in the spec's order: a group's label, then its files
-    /// one per row when they carry a pick or a diff, else as a name run;
-    /// the footer last.
+    /// one per row when they carry a pick or a diff, else as a name run.
+    /// No footer item: the pane pins it under the list.
     /// MUTATION: always take the name-run branch in `compare_items` (drop
     /// the `rows.iter().any(..)` test) → WARP.md becomes part of a `Names`
     /// item and loses its pick.
     #[test]
-    fn compare_items_lay_out_the_groups_then_the_footer() {
+    fn compare_items_lay_out_the_groups() {
         let change = tc("folder", "../../.agents/skills/humanizer");
         let detail = detail_with(humanizer_cmp(false));
         let picks = BTreeSet::from([p("WARP.md")]);
@@ -4404,10 +4515,69 @@ mod tests {
                 ),
                 file("WARP.md", true, true, false, false),
                 CompareItem::Label("Only in the link target · not managed".into()),
-                CompareItem::Names(vec![p("agents/"), p("LICENSE")]),
+                CompareItem::Names(plain(&["agents/", "LICENSE"])),
                 CompareItem::Label("Same on both sides".into()),
-                CompareItem::Names(vec![p("README.md")]),
-                CompareItem::Footer,
+                CompareItem::Names(plain(&["README.md"])),
+            ]
+        );
+    }
+
+    /// A source file Keep the link removes carries its template / encrypted
+    /// mark, on a file row and in a name run alike; a name only in the link
+    /// target carries none.
+    /// MUTATION: `marks: tomte_ui::components::NameMarks::default()` in `compare_items`' file
+    /// rows → WARP.md loses its template mark.
+    #[test]
+    fn compare_items_mark_templates_and_encrypted_files() {
+        let change = tc("folder", "../../.agents/skills/humanizer");
+        let mut detail = detail_with(humanizer_cmp(false));
+        detail.source = vec![(p("WARP.md"), TEMPLATE), (p("README.md"), ENCRYPTED)];
+        let items = compare_items(&change, Some(&detail), &BTreeSet::new(), None);
+        assert_eq!(
+            items[1],
+            CompareItem::File {
+                rel: p("WARP.md"),
+                pickable: true,
+                picked: false,
+                opens_diff: false,
+                open: false,
+                marks: TEMPLATE,
+            }
+        );
+        assert_eq!(items[3], CompareItem::Names(plain(&["agents/", "LICENSE"])));
+        assert_eq!(
+            items[5],
+            CompareItem::Names(vec![(p("README.md"), ENCRYPTED)])
+        );
+    }
+
+    /// A folder replaced by a file: the file Restore deletes, then the
+    /// source files Keep the file removes, marked (spec §Resolving, "Source
+    /// content lost by Keep disk").
+    /// MUTATION: drop the `if !detail.source.is_empty()` block in
+    /// `compare_items` → the source files are not named.
+    #[test]
+    fn compare_items_name_the_source_files_keep_the_file_removes() {
+        let change = tc("folder", "file");
+        let detail = TypeChangeDetail {
+            comparison: None,
+            deletes: vec!["fish".into()],
+            source: vec![
+                (p("config.fish"), TEMPLATE),
+                (p("conf.d/abbr.fish"), Default::default()),
+            ],
+            failure: None,
+        };
+        assert_eq!(
+            compare_items(&change, Some(&detail), &BTreeSet::new(), None),
+            vec![
+                CompareItem::Label("On disk · deleted if you restore the folder".into()),
+                CompareItem::Names(plain(&["fish"])),
+                CompareItem::Label("In source · removed from source if you keep the file".into()),
+                CompareItem::Names(vec![
+                    (p("config.fish"), TEMPLATE),
+                    (p("conf.d/abbr.fish"), Default::default()),
+                ]),
             ]
         );
     }
@@ -4443,6 +4613,7 @@ mod tests {
         let detail = TypeChangeDetail {
             comparison: None,
             deletes: (0..30).map(|i| format!("f{i:02}")).collect(),
+            source: Vec::new(),
             failure: None,
         };
         let items = compare_items(&change, Some(&detail), &BTreeSet::new(), None);
@@ -4458,13 +4629,13 @@ mod tests {
             items[0],
             CompareItem::Label("On disk · deleted if you restore the link".into())
         );
-        assert_eq!(items.last(), Some(&CompareItem::Footer));
     }
 
-    /// No list while loading or after a failure (the pane says which); a
-    /// retargeted link has only its footer.
+    /// No list while loading or after a failure (the pane says which), nor
+    /// for a retargeted link (the pane draws its pinned footer alone).
     /// MUTATION: drop `.filter(|d| d.failure.is_none())` in `compare_items`
-    /// → a failed load lists a footer under its error.
+    /// → a failed load of what Restore deletes lists its label under the
+    /// error.
     #[test]
     fn compare_items_draw_no_list_while_loading_or_failed() {
         let change = tc("folder", "../h");
@@ -4472,15 +4643,14 @@ mod tests {
         let failed = TypeChangeDetail {
             comparison: None,
             deletes: Vec::new(),
+            source: Vec::new(),
             failure: Some("chezmoi exited 1".into()),
         };
         for change in [change.clone(), tc(".real", "folder")] {
             assert!(compare_items(&change, Some(&failed), &BTreeSet::new(), None).is_empty());
         }
-        assert_eq!(
-            compare_items(&tc(".a", ".b"), None, &BTreeSet::new(), None),
-            [CompareItem::Footer]
-        );
+        let loaded = detail_with(humanizer_cmp(false));
+        assert!(compare_items(&tc(".a", ".b"), Some(&loaded), &BTreeSet::new(), None).is_empty());
     }
 
     /// Each pair draws the body the spec gives it.

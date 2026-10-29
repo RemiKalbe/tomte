@@ -3155,6 +3155,33 @@ fn link_text(path: &std::path::Path) -> String {
         .into_owned()
 }
 
+/// The source files Keep disk would remove come back with their marks: a
+/// `.tmpl` is marked a template, a plain file is not.
+///
+/// MUTATION: `template: false` in `source_files` → `t` loses its mark.
+#[test]
+fn source_files_mark_a_template() {
+    let lab = DriftLab::new();
+    managed_folder(&lab);
+    std::fs::write(lab.s.source.join("dot_d/t.tmpl"), b"t={{ 1 }}\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "a template in the folder"]);
+    let target = lab.s.home.join(".d");
+    let files = tomte_app::resolve::source_files(&lab.engine.chezmoi, &target).unwrap();
+    let marks: Vec<(PathBuf, bool, bool)> = files
+        .into_iter()
+        .map(|f| (f.rel, f.template, f.encrypted))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            (PathBuf::from("gone"), false, false),
+            (PathBuf::from("one"), false, false),
+            (PathBuf::from("t"), true, false),
+        ]
+    );
+}
+
 /// The humanizer case (2026-10-26): a managed folder replaced on disk by a
 /// link. Keep the link swaps the source's folder for a `symlink_` entry in
 /// one commit, and the next scan is clean.
@@ -3200,7 +3227,8 @@ fn keep_link_with_copies_writes_them_first_and_undo_removes_them() {
     managed_folder(&lab);
     replace_with_link(&lab, ".d", ".real");
     let target = lab.s.home.join(".d");
-    let comparison = tomte_app::resolve::folder_comparison(&lab.engine.chezmoi, &target).unwrap();
+    let (comparison, _) =
+        tomte_app::resolve::folder_comparison(&lab.engine.chezmoi, &target).unwrap();
     assert_eq!(
         comparison.entries,
         vec![

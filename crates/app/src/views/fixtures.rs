@@ -112,6 +112,11 @@ pub const STATES: &[(&str, &str)] = &[
         "a link replaced by a folder: what Restore the link deletes, by name",
     ),
     (
+        "review-type-folder-file",
+        "a folder replaced by a file: what Restore deletes, and the source files \
+         Keep the file removes, templates and encrypted files marked",
+    ),
+    (
         "review-type-sidebar",
         "a type-change row among files: name with /, its wording on a second line",
     ),
@@ -413,6 +418,11 @@ fn type_changes() -> Vec<(PathBuf, WireTypeChange, u64)> {
             home(".config/zsh"),
             change(link("../.dotfiles/zsh"), WireEntryKind::Folder),
             70_000,
+        ),
+        (
+            home(".config/fish"),
+            change(WireEntryKind::Folder, WireEntryKind::File),
+            90_000,
         ),
     ]
 }
@@ -1221,6 +1231,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
         | "review-type-link-retargeted"
         | "review-type-file-link"
         | "review-type-link-folder"
+        | "review-type-folder-file"
         | "review-type-sidebar" => {
             let mut s = shell(Route::Review, type_change_model());
             let review = posed_review(cx, s.state.clone(), None, true);
@@ -1235,6 +1246,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                 "review-type-link-retargeted" => Some(pick(".config/nvim")),
                 "review-type-file-link" => Some(pick(".gitignore_global")),
                 "review-type-link-folder" => Some(pick(".config/zsh")),
+                "review-type-folder-file" => Some(pick(".config/fish")),
                 _ => Some(pick(".claude/skills/humanizer")),
             };
             if let Some((target, change, age)) = posed {
@@ -1246,6 +1258,7 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                     view.type_change = Some(TypeChangeDetail {
                         comparison: None,
                         deletes: Vec::new(),
+                        source: Vec::new(),
                         failure: None,
                     });
                     match name {
@@ -1274,6 +1287,23 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                                 GITIGNORE_FILE,
                                 MergeOptions::default(),
                             ));
+                        }
+                        "review-type-folder-file" => {
+                            let detail = view.type_change.as_mut().expect("set above");
+                            detail.deletes = vec!["fish".to_owned()];
+                            let mark = |template, encrypted| tomte_ui::components::NameMarks {
+                                template,
+                                encrypted,
+                            };
+                            detail.source = vec![
+                                (PathBuf::from("conf.d/abbr.fish"), mark(false, false)),
+                                (PathBuf::from("conf.d/secrets.fish"), mark(false, true)),
+                                (PathBuf::from("config.fish"), mark(true, false)),
+                                (
+                                    PathBuf::from("functions/fish_prompt.fish"),
+                                    mark(false, false),
+                                ),
+                            ];
                         }
                         "review-type-link-folder" => {
                             view.type_change.as_mut().expect("set above").deletes = [

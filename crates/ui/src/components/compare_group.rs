@@ -29,6 +29,38 @@ pub fn compare_label(theme: Theme, label: impl Into<SharedString>) -> Div {
         .child(label.into())
 }
 
+/// What a source file is beyond its bytes, marked after its name: Keep
+/// disk removes it from the source, and these are the ones a user cannot
+/// simply copy back from the disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NameMarks {
+    /// A template: `{}` in the drift tint, the line editor's template mark.
+    pub template: bool,
+    /// Stored encrypted: the word, muted.
+    pub encrypted: bool,
+}
+
+/// The marks after a name, or nothing.
+fn name_marks(theme: Theme, marks: NameMarks) -> Option<Div> {
+    if marks == NameMarks::default() {
+        return None;
+    }
+    Some(
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .when(marks.template, |el| {
+                el.child(div().text_color(theme.drift).child("{}"))
+            })
+            .when(marks.encrypted, |el| {
+                el.child(div().text_color(theme.text_muted).child("encrypted"))
+            }),
+    )
+}
+
 /// What a [`compare_row`] carries besides its name.
 pub struct CompareRowSpec {
     /// The pick and its words ("copy into the link target"), when the row
@@ -37,6 +69,7 @@ pub struct CompareRowSpec {
     /// The name opens something (its line diff); `open` marks the one open.
     pub opens: bool,
     pub open: bool,
+    pub marks: NameMarks,
 }
 
 /// One file row: checkbox (or its empty slot), name, then the pick's words.
@@ -94,6 +127,7 @@ pub fn compare_row(
         .text_sm()
         .child(slot)
         .child(name_el)
+        .children(name_marks(theme, spec.marks))
         .children(spec.pick.map(|(_, words)| {
             div()
                 .flex_1()
@@ -105,8 +139,9 @@ pub fn compare_row(
         }))
 }
 
-/// Names that carry no decision, wrapped inline in the rows' name column.
-pub fn compare_names(theme: Theme, names: Vec<SharedString>) -> Div {
+/// Names that carry no decision, wrapped inline in the rows' name column,
+/// each followed by its marks.
+pub fn compare_names(theme: Theme, names: Vec<(SharedString, NameMarks)>) -> Div {
     div()
         .pl(px(NAME_INDENT))
         .flex()
@@ -115,5 +150,13 @@ pub fn compare_names(theme: Theme, names: Vec<SharedString>) -> Div {
         .gap_y_0p5()
         .text_sm()
         .text_color(theme.text)
-        .children(names.into_iter().map(|name| div().px_1().child(name)))
+        .children(names.into_iter().map(|(name, marks)| {
+            div()
+                .px_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(name)
+                .children(name_marks(theme, marks))
+        }))
 }

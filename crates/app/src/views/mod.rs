@@ -3884,11 +3884,32 @@ mod render_smoke {
             .expect("the fixture poses a review view");
         vis.update(|_window, cx| {
             let view = review.read(cx);
-            // Three labels, WARP.md, two name runs, the footer.
-            assert_eq!(view.compare_keys.len(), 7);
-            assert_eq!(view.compare_list.item_count(), 7);
-            assert_eq!(view.compare_keys.last(), Some(&review::CompareItem::Footer));
+            // Three labels, WARP.md, two name runs.
+            assert_eq!(view.compare_keys.len(), 6);
+            assert_eq!(view.compare_list.item_count(), 6);
         });
+    }
+
+    /// The footer (what Restore does to disk) is pinned under the list, not
+    /// its last item: with a diff open it still draws, below the list, on
+    /// the first frame.
+    ///
+    /// MUTATION: drop the pinned footer child from `type_change_pane` →
+    /// no `type-change-footer` bounds.
+    #[gpui::test]
+    fn the_type_change_footer_is_pinned_under_the_list(cx: &mut TestAppContext) {
+        let (_shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-type-folder-link-diff", smoke_paths(), cx)
+                .expect("type-change fixture")
+        });
+        vis.run_until_parked();
+        let list = vis
+            .debug_bounds("type-change-list")
+            .expect("the list draws");
+        let footer = vis
+            .debug_bounds("type-change-footer")
+            .expect("the footer draws");
+        assert!(footer.top() >= list.bottom(), "{footer:?} under {list:?}");
     }
 
     /// A press on a type-change row queues under the words on its button,

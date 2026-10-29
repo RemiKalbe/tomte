@@ -2207,6 +2207,58 @@ pub fn is_templated(source_path: &Path) -> bool {
     source_path.extension().is_some_and(|ext| ext == "tmpl")
 }
 
+/// Whether a source file is stored encrypted (`encrypted_`). chezmoi's file
+/// prefixes come in a fixed order: `create_` or `modify_` first, then
+/// `encrypted_`.
+pub fn is_encrypted(source_path: &Path) -> bool {
+    let name = source_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.strip_prefix("create_")
+        .unwrap_or(&name)
+        .starts_with("encrypted_")
+}
+
+/// One managed file under a folder the source holds, as Keep disk would
+/// remove it from the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFile {
+    /// Relative to the folder's target.
+    pub rel: PathBuf,
+    pub source: PathBuf,
+    /// A `.tmpl`: what lands on disk is rendered, so the file on disk is
+    /// not the source.
+    pub template: bool,
+    /// Stored encrypted in the source.
+    pub encrypted: bool,
+}
+
+/// Every managed file the source holds under the folder at `target`, with
+/// its source path and its template / encrypted marks.
+pub fn source_files(
+    chezmoi: &ChezmoiClient,
+    target: &Path,
+) -> Result<Vec<SourceFile>, ResolveError> {
+    let files = chezmoi.managed_under(target, Some("files"))?;
+    let sources = chezmoi.source_paths(&files)?;
+    files
+        .iter()
+        .zip(sources)
+        .map(|(file, source)| {
+            let source = source.ok_or_else(|| {
+                ResolveError::Failed(format!("{} has no source path", file.display()))
+            })?;
+            Ok(SourceFile {
+                rel: file.strip_prefix(target).unwrap_or(file).to_path_buf(),
+                template: is_templated(&source),
+                encrypted: is_encrypted(&source),
+                source,
+            })
+        })
+        .collect()
+}
+
 /// The source's version of one managed file, as `chezmoi apply` would write
 /// it: the raw source bytes, or `chezmoi cat` when those bytes are not what
 /// lands on disk (a template, an encrypted file, a `modify_` script).
@@ -2215,17 +2267,10 @@ pub fn source_version(
     source_file: &Path,
     target_file: &Path,
 ) -> Result<Vec<u8>, ResolveError> {
-    let name = source_file
+    let modify = source_file
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    // chezmoi's file prefixes come in a fixed order: `create_` or `modify_`
-    // first, then `encrypted_`.
-    let after_create = name.strip_prefix("create_").unwrap_or(&name);
-    if is_templated(source_file)
-        || name.starts_with("modify_")
-        || after_create.starts_with("encrypted_")
-    {
+        .is_some_and(|name| name.to_string_lossy().starts_with("modify_"));
+    if is_templated(source_file) || modify || is_encrypted(source_file) {
         return Ok(chezmoi.cat(target_file)?);
     }
     Ok(std::fs::read(source_file)?)
@@ -2233,25 +2278,19 @@ pub fn source_version(
 
 /// How the folder the source holds at `target` compares with what the disk
 /// holds there now (followed through a link): every managed file under it,
-/// hashed from [`source_version`], against the disk.
+/// hashed from [`source_version`], against the disk. The source files come
+/// back with it, for their marks.
 pub fn folder_comparison(
     chezmoi: &ChezmoiClient,
     target: &Path,
-) -> Result<FolderComparison, ResolveError> {
-    let files = chezmoi.managed_under(target, Some("files"))?;
-    let sources = chezmoi.source_paths(&files)?;
+) -> Result<(FolderComparison, Vec<SourceFile>), ResolveError> {
+    let files = source_files(chezmoi, target)?;
     let mut hashed = Vec::with_capacity(files.len());
-    for (file, source) in files.iter().zip(sources) {
-        let source = source.ok_or_else(|| {
-            ResolveError::Failed(format!("{} has no source path", file.display()))
-        })?;
-        let rel = file.strip_prefix(target).unwrap_or(file).to_path_buf();
-        hashed.push((
-            rel,
-            ContentHash::of(&source_version(chezmoi, &source, file)?),
-        ));
+    for file in &files {
+        let bytes = source_version(chezmoi, &file.source, &target.join(&file.rel))?;
+        hashed.push((file.rel.clone(), ContentHash::of(&bytes)));
     }
-    Ok(compare_folder(&hashed, target)?)
+    Ok((compare_folder(&hashed, target)?, files))
 }
 
 /// What the source says `target` is, read from its source path: a
@@ -2783,6 +2822,16 @@ mod tests {
         fake.push_ok(1, "", "boom");
         let err = write_back_verified(&chezmoi, TMPL, &span_map(), RENDERED, resolved).unwrap_err();
         assert!(matches!(err, ResolveError::Chezmoi(_)), "got {err:?}");
+    }
+
+    /// MUTATION: `name.starts_with("encrypted_")` without stripping
+    /// `create_` in `is_encrypted` → `create_encrypted_dot_x` reads as plain.
+    #[test]
+    fn is_encrypted_reads_the_prefix_after_create() {
+        assert!(is_encrypted(Path::new("/src/encrypted_dot_netrc.age")));
+        assert!(is_encrypted(Path::new("/src/create_encrypted_dot_x")));
+        assert!(!is_encrypted(Path::new("/src/private_dot_netrc")));
+        assert!(!is_encrypted(Path::new("/src/dot_d/encrypted")));
     }
 
     #[test]

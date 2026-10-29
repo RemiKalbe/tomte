@@ -25,9 +25,13 @@ version without one.
   Choose to keep what is on disk or restore what the source has. For a
   folder replaced by a link, Review lists the files in both places; files
   that exist only in the source can be ticked to copy into the link target
-  before the folder is dropped. Type changes work in batches, with Undo, and
+  before the folder is dropped. Keeping what is on disk names the source
+  files it removes, with templates and encrypted files marked. Restoring
+  refuses when it would delete a file over 4 MB, which Undo could not bring
+  back, and names the file. Type changes work in batches, with Undo, and
   make one commit and one push even when chezmoi commits and pushes by
-  itself.
+  itself. The dashboard offers no quick buttons on these rows; they open
+  Review.
 
 ### Fixed
 

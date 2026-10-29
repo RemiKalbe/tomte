@@ -172,14 +172,16 @@ previews the row kinds.
 `review-tree`, and `review-tree-selected` pose the sidebar's multi-select
 and folder-tree states (checkboxes ticked, ticked with no file open, a
 folder collapsed, a whole folder selected). `review-many` is the 500-file
-perf pose. Seven `review-type-*` poses cover type changes:
+perf pose. Eight `review-type-*` poses cover type changes:
 `review-type-folder-link` (a folder replaced by a link, WARP.md only in
 source), `-folder-link-picked` (WARP.md picked to copy into the link target),
 `-folder-link-diff` (a Differs file open with its line diff),
 `-link-retargeted` (a link that points elsewhere), `-file-link` (a file
 replaced by a link), `-link-folder` (a link replaced by a folder, listing
-what Restore the link deletes), and `-sidebar` (a type-change row among
-files).
+what Restore the link deletes), `-folder-file` (a folder replaced by a
+file: the file Restore deletes and the source files Keep the file removes,
+a template and an encrypted file marked), and `-sidebar` (a type-change row
+among files).
 
 ## The gate
 
