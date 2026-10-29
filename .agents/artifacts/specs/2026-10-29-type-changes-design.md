@@ -243,3 +243,18 @@ app e2e (`resolve_e2e.rs`):
 
 gallery: a pose per wording, plus the humanizer folder comparison with picks;
 the render smoke test builds them.
+
+## Refinements (2026-10-29, from planning)
+
+- "was" is what the source says, taken from `chezmoi managed --include
+  dirs|symlinks` and, for link text, `chezmoi cat`. The state dump is used only
+  to tell which side moved: when the state's kind equals the disk's kind, the
+  source moved. Comparing state to disk alone misses a type change made in the
+  source on another machine and has no link text for links.
+- Scoped status passes every managed target outside the type-changed folders,
+  with `--recursive=false`, instead of a minimal cover. It is simpler, and the
+  argument list for about 1,000 targets is about 60 KB.
+- The source side of a folder comparison is the raw source file, or
+  `chezmoi cat` for a `.tmpl` or `encrypted_` file.
+- A deleted folder (a folder in the source, nothing on disk) is not a type
+  change. It keeps today's per-file deleted rows, like a deleted file.

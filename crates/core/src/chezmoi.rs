@@ -1,6 +1,6 @@
 //! ChezmoiClient + parsers + error classification.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +64,37 @@ pub struct StatusEntry {
     pub last_written_vs_actual: ChangeCode,
     pub actual_vs_target: ChangeCode,
     pub path: PathBuf,
+}
+
+/// The managed folders and links, from `managed --include dirs|symlinks`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedKinds {
+    pub folders: BTreeSet<PathBuf>,
+    pub links: BTreeSet<PathBuf>,
+}
+
+fn parse_status(text: &str) -> Result<Vec<StatusEntry>, ChezmoiError> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let mut chars = line.chars();
+        let c1 = chars.next().and_then(ChangeCode::from_char);
+        let c2 = chars.next().and_then(ChangeCode::from_char);
+        let (Some(c1), Some(c2)) = (c1, c2) else {
+            return Err(ChezmoiError::Parse {
+                context: "status",
+                detail: line.to_string(),
+            });
+        };
+        entries.push(StatusEntry {
+            last_written_vs_actual: c1,
+            actual_vs_target: c2,
+            path: PathBuf::from(&line[3..]),
+        });
+    }
+    Ok(entries)
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,27 +460,50 @@ impl ChezmoiClient {
 
     pub fn status(&self) -> Result<Vec<StatusEntry>, ChezmoiError> {
         let text = self.run_utf8(&["status", "--path-style=absolute"])?;
-        let mut entries = Vec::new();
-        for line in text.lines() {
-            if line.len() < 4 {
-                continue;
-            }
-            let mut chars = line.chars();
-            let c1 = chars.next().and_then(ChangeCode::from_char);
-            let c2 = chars.next().and_then(ChangeCode::from_char);
-            let (Some(c1), Some(c2)) = (c1, c2) else {
-                return Err(ChezmoiError::Parse {
-                    context: "status",
-                    detail: line.to_string(),
-                });
-            };
-            entries.push(StatusEntry {
-                last_written_vs_actual: c1,
-                actual_vs_target: c2,
-                path: PathBuf::from(&line[3..]),
-            });
+        parse_status(&text)
+    }
+
+    /// `status` for the listed targets only, without descending into a
+    /// listed directory. An empty slice is REFUSED: with no targets chezmoi
+    /// reports every file, which a scoped caller never means.
+    pub fn status_of(&self, targets: &[PathBuf]) -> Result<Vec<StatusEntry>, ChezmoiError> {
+        if targets.is_empty() {
+            return Err(ChezmoiError::Failed(
+                "status_of called with no targets".into(),
+            ));
         }
-        Ok(entries)
+        let mut args = vec![
+            "status".to_string(),
+            "--path-style=absolute".to_string(),
+            "--recursive=false".to_string(),
+        ];
+        args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        parse_status(&String::from_utf8_lossy(&self.run_ok(&refs, None)?))
+    }
+
+    /// The managed folders and links, as the source says (not the disk).
+    pub fn managed_kinds(&self) -> Result<ManagedKinds, ChezmoiError> {
+        let list = |kind: &str| -> Result<BTreeSet<PathBuf>, ChezmoiError> {
+            Ok(self
+                .run_utf8(&["managed", "--path-style=absolute", "--include", kind])?
+                .lines()
+                .map(PathBuf::from)
+                .collect())
+        };
+        Ok(ManagedKinds {
+            folders: list("dirs")?,
+            links: list("symlinks")?,
+        })
+    }
+
+    /// What the source says the link at `target` points to: `cat` output with
+    /// the one trailing newline chezmoi adds removed. A templated link that
+    /// fails to render keeps its `Eval` error.
+    pub fn link_text(&self, target: &Path) -> Result<String, ChezmoiError> {
+        let bytes = self.run_ok(&["cat", &target.to_string_lossy()], None)?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(text.strip_suffix('\n').map(str::to_string).unwrap_or(text))
     }
 
     pub fn cat(&self, target: &Path) -> Result<Vec<u8>, ChezmoiError> {
@@ -647,6 +701,21 @@ impl ChezmoiClient {
             ));
         }
         let mut args = vec!["re-add".to_string()];
+        args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_ok(&refs, None)?;
+        Ok(())
+    }
+
+    /// Record the listed targets as they are on disk, in ONE invocation.
+    /// Unlike `re_add` this takes a target whose type changed (a folder that
+    /// became a link). `--force` skips the confirmation prompt. An empty
+    /// slice is REFUSED, like `forget`.
+    pub fn add(&self, targets: &[PathBuf]) -> Result<(), ChezmoiError> {
+        if targets.is_empty() {
+            return Err(ChezmoiError::Failed("add called with no targets".into()));
+        }
+        let mut args = vec!["add".to_string(), "--force".to_string()];
         args.extend(targets.iter().map(|t| t.to_string_lossy().into_owned()));
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.run_ok(&refs, None)?;
@@ -1020,6 +1089,92 @@ mod tests {
             fake.calls()[0].args,
             vec!["--no-tty", "--no-pager", "forget", "--force", "/.a"]
         );
+    }
+
+    /// MUTATION: drop `--force` → the args differ (chezmoi would prompt and
+    /// die on EOF); drop the empty check → no error.
+    #[test]
+    fn add_forces_and_refuses_an_empty_list() {
+        let fake = Arc::new(FakeRunner::new());
+        assert!(client(fake.clone()).add(&[]).is_err());
+        assert!(fake.calls().is_empty());
+        fake.push_ok(0, "", "");
+        client(fake.clone())
+            .add(&[PathBuf::from("/.a"), PathBuf::from("/.b")])
+            .unwrap();
+        assert_eq!(
+            fake.calls()[0].args,
+            vec!["--no-tty", "--no-pager", "add", "--force", "/.a", "/.b"]
+        );
+    }
+
+    /// MUTATION: drop `--recursive=false` from `status_of` → the args differ
+    /// (and chezmoi would list every file under a listed folder); drop the
+    /// empty check → no error.
+    #[test]
+    fn status_of_is_not_recursive() {
+        let fake = Arc::new(FakeRunner::new());
+        assert!(client(fake.clone()).status_of(&[]).is_err());
+        assert!(fake.calls().is_empty());
+        fake.push_ok(0, " M /h/.a\n", "");
+        let got = client(fake.clone())
+            .status_of(&[PathBuf::from("/h/.a")])
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, PathBuf::from("/h/.a"));
+        assert_eq!(
+            fake.calls()[0].args,
+            vec![
+                "--no-tty",
+                "--no-pager",
+                "status",
+                "--path-style=absolute",
+                "--recursive=false",
+                "/h/.a"
+            ]
+        );
+    }
+
+    /// MUTATION: `trim()` the whole reply instead of stripping one `\n` → the
+    /// link text `target  ` (trailing spaces are part of it) loses them.
+    #[test]
+    fn link_text_strips_one_newline() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "../x y  \n\n", "");
+        let text = client(fake.clone()).link_text(Path::new("/h/.l")).unwrap();
+        assert_eq!(text, "../x y  \n");
+        assert_eq!(
+            fake.calls()[0].args,
+            vec!["--no-tty", "--no-pager", "cat", "/h/.l"]
+        );
+    }
+
+    /// MUTATION: swap the two `--include` values in `managed_kinds` → folders
+    /// and links trade places.
+    #[test]
+    fn managed_kinds_reads_dirs_and_symlinks() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "/h/.d\n/h/.e\n", "");
+        fake.push_ok(0, "/h/.l\n", "");
+        let kinds = client(fake.clone()).managed_kinds().unwrap();
+        assert_eq!(
+            kinds.folders,
+            BTreeSet::from([PathBuf::from("/h/.d"), PathBuf::from("/h/.e")])
+        );
+        assert_eq!(kinds.links, BTreeSet::from([PathBuf::from("/h/.l")]));
+        let calls = fake.calls();
+        assert_eq!(
+            calls[0].args,
+            vec![
+                "--no-tty",
+                "--no-pager",
+                "managed",
+                "--path-style=absolute",
+                "--include",
+                "dirs"
+            ]
+        );
+        assert_eq!(calls[1].args[5], "symlinks");
     }
 
     #[test]

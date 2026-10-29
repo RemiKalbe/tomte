@@ -7,6 +7,7 @@ pub mod merge;
 pub mod scanner;
 pub mod structured;
 pub mod template;
+pub mod type_change;
 
 #[cfg(feature = "test-support")]
 pub mod testsupport;
