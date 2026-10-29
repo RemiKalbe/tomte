@@ -1581,13 +1581,9 @@ fn run_batch_inner(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<Deci
         let labels: Vec<&'static str> = batch.iter().map(|a| a.decision.label()).collect();
         let items: Vec<BatchItem> = batch
             .into_iter()
-            .map(|a| BatchItem {
-                target: a.target,
-                decision: a
-                    .decision
-                    .as_batch()
-                    .expect("`batchable` just said every decision here has a batch form"),
-                copies: Vec::new(),
+            .map(|a| {
+                a.into_batch_item()
+                    .expect("`batchable` just said every decision here has a batch form")
             })
             .collect();
         return engine
@@ -1610,6 +1606,9 @@ fn run_batch_inner(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<Deci
         let label = decision.label();
         let result = match decision {
             Decision::KeepDisk => engine.keep_disk(&target).map(BatchResult::Resolved),
+            Decision::KeepLink { copies } => engine
+                .keep_disk_with(&target, &copies)
+                .map(BatchResult::Resolved),
             Decision::KeepSourceLocal => engine.keep_source(&target).map(BatchResult::Resolved),
             Decision::KeepSourceOrigin { seen } => engine
                 .keep_source_origin(&target, &seen)
@@ -2111,10 +2110,11 @@ mod render_smoke {
         // Reaching any of these reaches `ensure_merge_started`: `keep_disk`
         // and `keep_source_origin` are the one-click writes, `resolve_merged`
         // is the merge editor's and "Keep both"'s.
-        const STARTS_A_MERGE: [&str; 4] = [
+        const STARTS_A_MERGE: [&str; 5] = [
             "action.run(",
             ".resolve_merged(",
             ".keep_disk(",
+            ".keep_disk_with(",
             ".keep_source_origin(",
         ];
         const PROBE: &str = "refresh_pending_merge";

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use gpui::SharedString;
 
 use crate::merge_inputs::MergeInputs;
-use crate::resolve::BatchDecision;
+use crate::resolve::{BatchDecision, BatchItem};
 
 /// What the user chose for one target, carrying exactly what that choice
 /// needs to run later — nothing more.
@@ -45,6 +45,10 @@ use crate::resolve::BatchDecision;
 pub enum Decision {
     /// Keep the on-disk version: re-add it into the source state.
     KeepDisk,
+    /// Keep a link that replaced a folder, after copying the files the user
+    /// picked (relative to the target) from the source into the link target.
+    /// Queued only with picks; with none the press is [`Self::KeepDisk`].
+    KeepLink { copies: Arc<[PathBuf]> },
     /// Restore chezmoi's (local source's) version: apply the target.
     KeepSourceLocal,
     /// Keep origin's version of the source, as the view showed it —
@@ -80,6 +84,7 @@ impl Decision {
     pub fn label(&self) -> &'static str {
         match self {
             Decision::KeepDisk => "Keep disk",
+            Decision::KeepLink { .. } => "Keep the link",
             Decision::KeepSourceLocal => "Keep source · this machine",
             Decision::KeepSourceOrigin { .. } => "Keep source · origin",
             Decision::KeepBoth { .. } => "Keep both",
@@ -99,6 +104,7 @@ impl Decision {
     pub fn verb(&self) -> &'static str {
         match self {
             Decision::KeepDisk => "Kept disk version",
+            Decision::KeepLink { .. } => "Kept the link",
             Decision::KeepSourceLocal => "Restored chezmoi's version",
             Decision::KeepSourceOrigin { .. } => "Restored origin's version",
             Decision::Merged { .. } | Decision::KeepBoth { .. } => "Merged",
@@ -133,12 +139,21 @@ impl Decision {
     /// decision that has to run alone.
     pub fn as_batch(&self) -> Option<BatchDecision> {
         match self {
-            Decision::KeepDisk => Some(BatchDecision::KeepDisk),
+            Decision::KeepDisk | Decision::KeepLink { .. } => Some(BatchDecision::KeepDisk),
             Decision::KeepSourceLocal => Some(BatchDecision::KeepSourceLocal),
             Decision::KeepSourceOrigin { .. }
             | Decision::Merged { .. }
             | Decision::KeepBoth { .. }
             | Decision::RepoConflict { .. } => None,
+        }
+    }
+
+    /// The files to copy into the link target before Keep disk; empty for
+    /// every decision but [`Self::KeepLink`].
+    pub fn copies(&self) -> &[PathBuf] {
+        match self {
+            Decision::KeepLink { copies } => copies,
+            _ => &[],
         }
     }
 }
@@ -159,6 +174,20 @@ pub struct QueuedAction {
     /// screen to say it, so they set FALSE and a second, redundant
     /// notification per file never fires.
     pub notify_on_done: bool,
+}
+
+impl QueuedAction {
+    /// This action as the item [`crate::resolve::ResolveEngine::resolve_batch`]
+    /// takes, or `None` for a decision that has to run alone. The copy picks
+    /// travel on the item, not on [`BatchDecision`].
+    pub fn into_batch_item(self) -> Option<BatchItem> {
+        let decision = self.decision.as_batch()?;
+        Some(BatchItem {
+            copies: self.decision.copies().to_vec(),
+            target: self.target,
+            decision,
+        })
+    }
 }
 
 /// Pending and running decisions, plus the failures that have not been
@@ -416,6 +445,38 @@ mod tests {
             span_map: None,
             origin: None,
         })
+    }
+
+    /// A Keep the link with copy picks joins a run of one-click decisions and
+    /// reaches the batch as Keep disk carrying its picks.
+    /// MUTATION: build the item with `copies: Vec::new()` in
+    /// `QueuedAction::into_batch_item` → the picks never reach the engine.
+    #[test]
+    fn keep_link_with_picks_is_batched_with_copies() {
+        let picks: Arc<[PathBuf]> = vec![PathBuf::from("WARP.md")].into();
+        let mut q = ActionQueue::default();
+        q.push(action(
+            "/skills/humanizer",
+            Decision::KeepLink { copies: picks },
+        ));
+        q.push(action("/b", Decision::KeepDisk));
+        let batch = q.take_batch();
+        assert_eq!(
+            targets(&batch),
+            [Path::new("/skills/humanizer"), Path::new("/b")]
+        );
+        assert_eq!(
+            q.decision_label(Path::new("/skills/humanizer")),
+            Some("Keep the link")
+        );
+        let items: Vec<BatchItem> = batch
+            .into_iter()
+            .map(|a| a.into_batch_item().expect("both are batchable"))
+            .collect();
+        assert_eq!(items[0].decision, BatchDecision::KeepDisk);
+        assert_eq!(items[0].copies, [PathBuf::from("WARP.md")]);
+        assert_eq!(items[1].decision, BatchDecision::KeepDisk);
+        assert!(items[1].copies.is_empty());
     }
 
     /// The point of the whole thing: a second decision is accepted while the

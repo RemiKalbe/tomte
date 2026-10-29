@@ -469,6 +469,21 @@ pub fn type_change_label(tc: &WireTypeChange) -> &'static str {
     tc.label()
 }
 
+/// The class chip on a timeline row: the row's own wording first, then, for
+/// a `type_changed` row without one, the wording of the target's live type
+/// change, and only then the generic class label.
+pub fn chip_label(class: &str, label: Option<&str>, current: Option<&DriftSummary>) -> String {
+    if let Some(label) = label {
+        return label.to_owned();
+    }
+    if class == "type_changed"
+        && let Some(tc) = current.and_then(|d| d.type_change.as_ref())
+    {
+        return type_change_label(tc).to_owned();
+    }
+    class_label(class).to_owned()
+}
+
 /// Human label for a drift class — raw enum names ("destination_drift")
 /// never reach the UI.
 pub fn class_label(class: &str) -> &'static str {
@@ -1147,6 +1162,39 @@ mod tests {
             "folder" => Folder,
             _ => Link { text: "x".into() },
         }
+    }
+
+    /// A `type_changed` timeline row with no wording of its own (a journal
+    /// row from before labels) takes the live drift's wording, not the
+    /// generic fallback; a row of another class keeps its own label.
+    /// MUTATION: return `class_label(class)` without consulting `current`
+    /// in `chip_label` → the first assertion reads "type changed".
+    #[test]
+    fn chip_label_prefers_the_live_type_change() {
+        let live = DriftSummary {
+            target: "/h/.claude/skills/humanizer".into(),
+            class: "type_changed".into(),
+            since_ts: None,
+            origin_differs: false,
+            type_change: Some(WireTypeChange {
+                source: wk("folder"),
+                disk: wk("link"),
+                disk_moved: true,
+            }),
+        };
+        assert_eq!(
+            chip_label("type_changed", None, Some(&live)),
+            "replaced by a link"
+        );
+        assert_eq!(chip_label("type_changed", None, None), "type changed");
+        assert_eq!(
+            chip_label("destination_drift", None, Some(&live)),
+            "modified on disk"
+        );
+        assert_eq!(
+            chip_label("type_changed", Some("link removed"), Some(&live)),
+            "link removed"
+        );
     }
 
     /// MUTATION: swap two arms of `WireTypeChange::label` (say the

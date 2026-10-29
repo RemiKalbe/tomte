@@ -16,12 +16,13 @@ use gpui::{
 };
 use tomte_app::action_queue::{Decision, QueuedAction};
 use tomte_app::model::{
-    SyncModel, TimelineItem, TimelineRow, class_label, group_timeline, kind_glyph, kind_label,
+    SyncModel, TimelineItem, TimelineRow, chip_label, group_timeline, kind_glyph, kind_label,
     time_ago,
 };
 use tomte_app::resolve::{ResolveEngine, ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
 use tomte_core::cmd::SystemRunner;
+use tomte_proto::DriftSummary;
 use tomte_ui::components as ui;
 
 use super::review::ResolveAction;
@@ -86,7 +87,8 @@ enum Line {
 }
 
 impl Line {
-    fn event(row: &TimelineRow, now: u64, indented: bool, drifted: bool) -> Self {
+    /// `drift` is the target's current drift, `Some` when it is drifted.
+    fn event(row: &TimelineRow, now: u64, indented: bool, drift: Option<&DriftSummary>) -> Self {
         let (name, dir): (SharedString, Option<SharedString>) = match &row.target {
             Some(target) => (
                 super::review::display_name(target),
@@ -101,24 +103,23 @@ impl Line {
             glyph: kind_glyph(&row.kind),
             name,
             dir,
-            chip: row.class.as_ref().map(|class| match &row.label {
-                Some(label) => SharedString::from(label.clone()),
-                None => SharedString::from(class_label(class)),
-            }),
+            chip: row
+                .class
+                .as_ref()
+                .map(|class| chip_label(class, row.label.as_deref(), drift).into()),
             class: row.class.clone().map(SharedString::from),
             target: row.target.clone(),
             indented,
-            drifted,
+            drifted: drift.is_some(),
         }
     }
 }
 
-/// Whether a timeline row's target is currently drifted — those rows carry
-/// the inline quick actions (plan 6 Task 3).
-fn is_drifted(model: &SyncModel, row: &TimelineRow) -> bool {
-    row.target
-        .as_ref()
-        .is_some_and(|t| model.drifted.iter().any(|d| &d.target == t))
+/// The current drift of a timeline row's target, if it is drifted — those
+/// rows carry the inline quick actions (plan 6 Task 3).
+fn current_drift<'a>(model: &'a SyncModel, row: &TimelineRow) -> Option<&'a DriftSummary> {
+    let target = row.target.as_ref()?;
+    model.drifted.iter().find(|d| &d.target == target)
 }
 
 /// Flatten grouped timeline items into display lines, honoring expansion.
@@ -127,7 +128,7 @@ fn build_lines(model: &SyncModel, now: u64, expanded: &HashSet<u64>) -> Vec<Line
     for item in group_timeline(&model.timeline) {
         match item {
             TimelineItem::Row(row) => {
-                lines.push(Line::event(&row, now, false, is_drifted(model, &row)))
+                lines.push(Line::event(&row, now, false, current_drift(model, &row)))
             }
             TimelineItem::ScanGroup {
                 count,
@@ -143,7 +144,7 @@ fn build_lines(model: &SyncModel, now: u64, expanded: &HashSet<u64>) -> Vec<Line
                 });
                 if is_open {
                     for row in &rows {
-                        lines.push(Line::event(row, now, true, is_drifted(model, row)));
+                        lines.push(Line::event(row, now, true, current_drift(model, row)));
                     }
                 }
             }

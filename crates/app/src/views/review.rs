@@ -31,14 +31,17 @@ use gpui::{
     px,
 };
 use tomte_app::action_queue::{Decision, QueuedAction};
-use tomte_app::model::{SyncModel, class_label, kind_glyph, kind_label, time_ago};
+use tomte_app::model::{
+    SyncModel, class_label, kind_glyph, kind_label, time_ago, type_change_label,
+};
 use tomte_app::resolve::{ResolveError, ResolveOutcome};
 use tomte_app::theme::Theme;
 use tomte_core::chezmoi::ChezmoiError;
 use tomte_core::cmd::{CommandRequest, CommandRunner, SystemRunner};
 use tomte_core::merge::{MergeDocument, MergeOptions, RegionKind, worddiff::word_diff};
+use tomte_core::type_change::{CompareGroup, FolderComparison};
 use tomte_journal::{EventRow, Journal};
-use tomte_proto::DriftSummary;
+use tomte_proto::{DriftSummary, WireEntryKind, WireTypeChange};
 use tomte_ui::components as ui;
 use tomte_ui::components::{CheckState, TREE_INDENT};
 
@@ -359,6 +362,121 @@ pub(super) fn bulk_decision(action: ResolveAction) -> Decision {
         // Structural: `bulk_actions` never yields it. Falling back to the
         // local source would silently do something the user did not press.
         ResolveAction::KeepSourceOrigin => unreachable!("origin is never a bulk action"),
+    }
+}
+
+/// The header's two buttons on a type-change row, (keep disk, keep source),
+/// named from what is on each side, never "Keep disk"/"Keep source" alone.
+#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the header"))]
+pub(super) fn type_change_buttons(tc: &WireTypeChange) -> (&'static str, &'static str) {
+    use WireEntryKind::*;
+    let keep = match (&tc.disk, &tc.source) {
+        (Link { .. }, Link { .. }) => "Keep the new link",
+        (Link { .. }, _) => "Keep the link",
+        (Folder, _) => "Keep the folder",
+        (File, _) => "Keep the file",
+        (Absent, _) => "Remove from source",
+    };
+    let restore = match &tc.source {
+        Link { .. } => "Restore the link",
+        Folder => "Restore the folder",
+        File => "Restore the file",
+        // Not produced by the scanner (a target with no source is not
+        // managed); the generic words are still true.
+        Absent => "Keep source",
+    };
+    (keep, restore)
+}
+
+/// What a Keep disk press queues: with copy picks, Keep the link carrying
+/// them; with none, the ordinary Keep disk.
+pub(super) fn keep_disk_decision(picks: &BTreeSet<PathBuf>) -> Decision {
+    if picks.is_empty() {
+        Decision::KeepDisk
+    } else {
+        Decision::KeepLink {
+            copies: picks.iter().cloned().collect(),
+        }
+    }
+}
+
+/// The folder comparison under a type-change header, as the rows it draws.
+#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the comparison"))]
+pub(super) struct ComparisonPlan {
+    pub groups: Vec<(&'static str, Vec<ComparisonRow>)>,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the comparison"))]
+pub(super) struct ComparisonRow {
+    pub rel: PathBuf,
+    /// Carries the "copy into the link target" pick.
+    pub pickable: bool,
+    pub picked: bool,
+    /// A click opens its line diff below the list.
+    pub opens_diff: bool,
+}
+
+/// Group the comparison in the spec's order (only in source, differs, only
+/// in the link target, same), dropping empty groups.
+#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the comparison"))]
+pub(super) fn comparison_plan(cmp: &FolderComparison, picks: &BTreeSet<PathBuf>) -> ComparisonPlan {
+    const GROUPS: [(CompareGroup, &str); 4] = [
+        (
+            CompareGroup::OnlyInSource,
+            "Only in source · removed from source if you keep the link",
+        ),
+        (CompareGroup::Differs, "Differs"),
+        (
+            CompareGroup::OnlyOnDisk,
+            "Only in the link target · not managed",
+        ),
+        (CompareGroup::Same, "Same on both sides"),
+    ];
+    let groups = GROUPS
+        .iter()
+        .map(|&(group, label)| {
+            let pickable = matches!(group, CompareGroup::OnlyInSource | CompareGroup::Differs);
+            let rows: Vec<ComparisonRow> = cmp
+                .entries
+                .iter()
+                .filter(|(_, g)| *g == group)
+                .map(|(rel, _)| ComparisonRow {
+                    rel: rel.clone(),
+                    pickable,
+                    picked: pickable && picks.contains(rel),
+                    opens_diff: group == CompareGroup::Differs,
+                })
+                .collect();
+            (label, rows)
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect();
+    ComparisonPlan { groups }
+}
+
+/// The footer under a type-change row: what Restore does to disk. Link texts
+/// are shown as written, never resolved.
+#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the footer"))]
+pub(super) fn footer_text(tc: &WireTypeChange, target: &Path) -> String {
+    use WireEntryKind::*;
+    let kind = |k: &WireEntryKind| match k {
+        Absent => "entry",
+        File => "file",
+        Folder => "folder",
+        Link { .. } => "link",
+    };
+    let restore = kind(&tc.source);
+    let name = display_name(target);
+    match (&tc.source, &tc.disk) {
+        (Folder, Link { text }) => {
+            format!("Restore the folder replaces the link. Files in {text} stay where they are.")
+        }
+        (Link { text }, Link { .. }) => format!("Restore the link points it back at {text}."),
+        (_, Absent) => format!("Restore the {restore} recreates it."),
+        (_, Link { .. }) => format!("Restore the {restore} replaces the link."),
+        (Link { .. }, File) => "Restore the link replaces the file.".to_string(),
+        (_, Folder) => format!("Restore the {restore} deletes the folder on disk: {name}/."),
+        (_, File) => format!("Restore the {restore} deletes the file on disk: {name}."),
     }
 }
 
@@ -1045,6 +1163,9 @@ pub(super) enum SidebarRow {
         /// A safe row: carries a checkbox, answers ⌘/⇧-clicks.
         selectable: bool,
         checked: bool,
+        /// The dim second line of a type-change row ("replaced by a link").
+        /// A field like `locked`: derived once here, read verbatim by the row.
+        sub_line: Option<&'static str>,
     },
 }
 
@@ -1071,6 +1192,7 @@ pub(super) enum RowKey {
         path: PathBuf,
         queued: Option<QueuedStatus>,
         failed: bool,
+        sub_line: Option<&'static str>,
     },
 }
 
@@ -1080,10 +1202,16 @@ pub(super) fn row_keys(plan: &SidebarPlan, queue: &QueueSnapshot) -> Vec<RowKey>
         .map(|row| match row {
             SidebarRow::Group { label, .. } => RowKey::Group(label),
             SidebarRow::Folder { node, .. } => RowKey::Folder(node.path.clone()),
-            SidebarRow::Target { entry, queued, .. } => RowKey::Target {
+            SidebarRow::Target {
+                entry,
+                queued,
+                sub_line,
+                ..
+            } => RowKey::Target {
                 path: entry.target.clone(),
                 queued: queued.map(|q| q.status),
                 failed: queue.failure(&entry.target).is_some(),
+                sub_line: *sub_line,
             },
         })
         .collect()
@@ -1143,6 +1271,11 @@ pub(super) struct SidebarInputs<'a> {
 /// there), then NEEDS A DECISION flat, then SAFE TO RESOLVE flat or as a
 /// tree (spec §2.5 of the multi-select design). Only the safe group's rows
 /// are selectable, and the header's checkbox stands for all of them.
+/// A type-change row's second line: the class wording.
+fn sub_line(entry: &DriftSummary) -> Option<&'static str> {
+    entry.type_change.as_ref().map(type_change_label)
+}
+
 pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
     let SidebarInputs {
         drifted,
@@ -1171,6 +1304,7 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
                     origin_differs: false,
                 });
             rows.push(SidebarRow::Target {
+                sub_line: sub_line(&entry),
                 entry,
                 queued: Some(*queued),
                 locked: queued.locks_row(),
@@ -1203,6 +1337,7 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
             depth: 0,
             selectable: false,
             checked: false,
+            sub_line: sub_line(entry),
         }));
     }
     let mut safe_order: Vec<PathBuf> = Vec::new();
@@ -1225,6 +1360,7 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
             depth,
             selectable: true,
             checked: selection.contains(&entry.target),
+            sub_line: sub_line(entry),
         };
         match mode {
             ReviewMode::Flat => {
@@ -1330,6 +1466,10 @@ pub struct ReviewView {
     /// Outcome of the last resolve/undo action, rendered as a banner above
     /// the diff. `pub(super)` for the render-smoke tests.
     pub(super) last_outcome: Option<OutcomeBanner>,
+    /// Files of a folder replaced by a link that Keep disk copies into the
+    /// link target first (relative to the selected target). Cleared when the
+    /// selection moves to another target.
+    pub(super) copy_picks: BTreeSet<PathBuf>,
     /// The diff is a read-only [`ui::TextArea`] (2026-08-23 feedback: "diffs
     /// should be selectable"): same editor as the merge result, minus the
     /// decision strips — so a diff can be selected and copied like text.
@@ -1424,6 +1564,7 @@ impl ReviewView {
             provenance: Vec::new(),
             auto_merge: None,
             last_outcome: None,
+            copy_picks: BTreeSet::new(),
             preview_editor: None,
             preview_dirty: true,
             preview_appearance: None,
@@ -1453,6 +1594,7 @@ impl ReviewView {
         // must not carry a stale "committed & pushed" (or its Undo) along.
         if self.selected.as_deref() != Some(target.as_path()) {
             self.last_outcome = None;
+            self.copy_picks.clear();
         }
         self.selected = Some(target.clone());
         self.preview = PreviewState::Loading;
@@ -1531,7 +1673,7 @@ impl ReviewView {
         // travels WITH the decision — by the time the queue runs it, the
         // selection may well be three files further on.
         let decision = match action {
-            ResolveAction::KeepDisk => Decision::KeepDisk,
+            ResolveAction::KeepDisk => keep_disk_decision(&self.copy_picks),
             ResolveAction::KeepSourceLocal => Decision::KeepSourceLocal,
             ResolveAction::KeepSourceOrigin => {
                 let Some(seen) = self.origin_diffs.as_ref().map(|d| d.seen.clone()) else {
@@ -2425,6 +2567,7 @@ impl ReviewView {
                 depth,
                 selectable,
                 checked,
+                sub_line,
             }) => self
                 .target_row(
                     ix,
@@ -2436,6 +2579,7 @@ impl ReviewView {
                     *depth,
                     *selectable,
                     *checked,
+                    *sub_line,
                     selection_active,
                     queue.failure(&entry.target),
                     theme,
@@ -2542,6 +2686,7 @@ impl ReviewView {
         depth: usize,
         selectable: bool,
         checked: bool,
+        sub_line: Option<&'static str>,
         selection_active: bool,
         failure: Option<&SharedString>,
         theme: Theme,
@@ -2676,6 +2821,17 @@ impl ReviewView {
                     .children(origin_hint(ix, entry, theme))
                     .child(trailing),
             )
+            // A type change's wording, dim, on its own line: the name alone
+            // cannot say a folder became a link.
+            .children(sub_line.map(|text| {
+                div()
+                    .pl(px(ROW_SUBLINE_INDENT))
+                    .w_full()
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .line_clamp(1)
+                    .child(text)
+            }))
             // What this row is waiting on, in the words of the button that
             // was pressed. `line_clamp(1)` over a definite width, never
             // `truncate()`: gpui's truncate does not ellipsize (it just
@@ -3396,9 +3552,11 @@ mod tests {
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
         QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, RowKey, Selection, SidebarInputs,
         SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
-        display_name, flatten_document, next_after, origin_diffs, origin_hint, per_line_ranges,
-        preview_decors, queued_outcome_banner, re_anchor_index, refused_banner, row_keys,
-        severity_groups, sidebar_rows, source_actions, splice_window, undo_affordance, undo_banner,
+        comparison_plan, display_name, flatten_document, footer_text, keep_disk_decision,
+        next_after, origin_diffs, origin_hint, per_line_ranges, preview_decors,
+        queued_outcome_banner, re_anchor_index, refused_banner, row_keys, severity_groups,
+        sidebar_rows, source_actions, splice_window, type_change_buttons, undo_affordance,
+        undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -3414,6 +3572,215 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    fn wk(kind: &str) -> tomte_proto::WireEntryKind {
+        use tomte_proto::WireEntryKind::*;
+        match kind {
+            "absent" => Absent,
+            "file" => File,
+            "folder" => Folder,
+            text => Link { text: text.into() },
+        }
+    }
+
+    /// A type change; any kind other than absent/file/folder is a link with
+    /// that text.
+    fn tc(source: &str, disk: &str) -> tomte_proto::WireTypeChange {
+        tomte_proto::WireTypeChange {
+            source: wk(source),
+            disk: wk(disk),
+            disk_moved: true,
+        }
+    }
+
+    /// Every row of the button table, keep-disk side by the disk kind and
+    /// keep-source side by the source kind.
+    /// MUTATION: swap the "Keep the new link" and "Keep the link" arms in
+    /// `type_change_buttons` → the link→link and folder→link rows fail.
+    #[test]
+    fn buttons_table() {
+        let rows = [
+            (
+                tc("folder", ".real"),
+                ("Keep the link", "Restore the folder"),
+            ),
+            (tc("file", ".real"), ("Keep the link", "Restore the file")),
+            (
+                tc(".real", ".other"),
+                ("Keep the new link", "Restore the link"),
+            ),
+            (
+                tc(".real", "folder"),
+                ("Keep the folder", "Restore the link"),
+            ),
+            (
+                tc("file", "folder"),
+                ("Keep the folder", "Restore the file"),
+            ),
+            (tc(".real", "file"), ("Keep the file", "Restore the link")),
+            (
+                tc("folder", "file"),
+                ("Keep the file", "Restore the folder"),
+            ),
+            (
+                tc(".real", "absent"),
+                ("Remove from source", "Restore the link"),
+            ),
+        ];
+        for (change, want) in rows {
+            assert_eq!(type_change_buttons(&change), want, "{change:?}");
+        }
+    }
+
+    /// MUTATION: `keep_disk_decision` returns `Decision::KeepDisk` whatever
+    /// the picks → the picked press is not a `KeepLink` carrying them.
+    #[test]
+    fn keep_disk_with_picks_queues_keep_the_link() {
+        assert!(matches!(
+            keep_disk_decision(&BTreeSet::new()),
+            Decision::KeepDisk
+        ));
+        let picks = BTreeSet::from([p("WARP.md"), p("a/b.md")]);
+        match keep_disk_decision(&picks) {
+            Decision::KeepLink { copies } => {
+                assert_eq!(&*copies, [p("WARP.md"), p("a/b.md")])
+            }
+            other => panic!("expected KeepLink, got {}", other.label()),
+        }
+    }
+
+    /// The comparison in the spec's order with empty groups gone; picks show
+    /// only on rows that can carry one, and only Differs opens a diff.
+    /// MUTATION: drop the `!rows.is_empty()` filter in `comparison_plan` →
+    /// an empty "Differs" group appears.
+    #[test]
+    fn comparison_plan_drops_empty_groups_and_marks_picks() {
+        use tomte_core::type_change::{CompareGroup, FolderComparison};
+        let cmp = FolderComparison {
+            entries: vec![
+                (p("WARP.md"), CompareGroup::OnlyInSource),
+                (p("x.md"), CompareGroup::OnlyInSource),
+                (p("agents/"), CompareGroup::OnlyOnDisk),
+                (p("README.md"), CompareGroup::Same),
+            ],
+        };
+        let picks = BTreeSet::from([p("WARP.md"), p("README.md")]);
+        let plan = comparison_plan(&cmp, &picks);
+        let shown: Vec<(&str, Vec<String>)> = plan
+            .groups
+            .iter()
+            .map(|(label, rows)| {
+                let rows = rows
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{} pickable={} picked={} diff={}",
+                            r.rel.display(),
+                            r.pickable,
+                            r.picked,
+                            r.opens_diff
+                        )
+                    })
+                    .collect();
+                (*label, rows)
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (
+                    "Only in source · removed from source if you keep the link",
+                    vec![
+                        "WARP.md pickable=true picked=true diff=false".to_string(),
+                        "x.md pickable=true picked=false diff=false".to_string(),
+                    ]
+                ),
+                (
+                    "Only in the link target · not managed",
+                    vec!["agents/ pickable=false picked=false diff=false".to_string()]
+                ),
+                (
+                    "Same on both sides",
+                    vec!["README.md pickable=false picked=false diff=false".to_string()]
+                ),
+            ]
+        );
+        let differs = FolderComparison {
+            entries: vec![(p("SKILL.md"), CompareGroup::Differs)],
+        };
+        let plan = comparison_plan(&differs, &BTreeSet::from([p("SKILL.md")]));
+        let (label, rows) = &plan.groups[0];
+        assert_eq!(*label, "Differs");
+        assert!(rows[0].pickable && rows[0].picked && rows[0].opens_diff);
+    }
+
+    /// One row per pair. The link text is shown as written.
+    /// MUTATION: resolve the link text against the target's parent in
+    /// `footer_text`'s folder→link arm → the first row names an absolute path.
+    #[test]
+    fn footer_names_the_link_target() {
+        let target = Path::new("/Users/x/.claude/skills/humanizer");
+        let rows = [
+            (
+                tc("folder", "../../.agents/skills/humanizer"),
+                "Restore the folder replaces the link. Files in \
+                 ../../.agents/skills/humanizer stay where they are.",
+            ),
+            (
+                tc(".real", ".other"),
+                "Restore the link points it back at .real.",
+            ),
+            (tc("file", ".real"), "Restore the file replaces the link."),
+            (tc(".real", "file"), "Restore the link replaces the file."),
+            (
+                tc("folder", "file"),
+                "Restore the folder deletes the file on disk: humanizer.",
+            ),
+            (
+                tc(".real", "folder"),
+                "Restore the link deletes the folder on disk: humanizer/.",
+            ),
+            (tc(".real", "absent"), "Restore the link recreates it."),
+        ];
+        for (change, want) in rows {
+            assert_eq!(footer_text(&change, target), want, "{change:?}");
+        }
+    }
+
+    /// The class wording rides on the plan row and its key (a second line
+    /// changes the row's height).
+    /// MUTATION: `sub_line: None` in `sidebar_rows`' safe-row closure (the
+    /// render computing it instead) → the row's `sub_line` is `None`.
+    #[test]
+    fn sidebar_type_change_row_has_its_sub_line() {
+        let mut changed = s("/Users/x/.claude/skills/humanizer", "type_changed");
+        changed.type_change = Some(tc("folder", "../../.agents/skills/humanizer"));
+        let drifted = vec![changed, s("/Users/x/.zshrc", "destination_drift")];
+        let queue = QueueSnapshot::default();
+        let plan = plan_of(&drifted, &queue);
+        let subs: Vec<(String, Option<&str>)> = plan
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                SidebarRow::Target {
+                    entry, sub_line, ..
+                } => Some((entry.target.display().to_string(), *sub_line)),
+                _ => None,
+            })
+            .collect();
+        assert!(subs.contains(&(
+            "/Users/x/.claude/skills/humanizer".to_string(),
+            Some("replaced by a link")
+        )));
+        assert!(subs.contains(&("/Users/x/.zshrc".to_string(), None)));
+        assert!(row_keys(&plan, &queue).iter().any(|k| matches!(
+            k,
+            RowKey::Target {
+                sub_line: Some("replaced by a link"),
+                ..
+            }
+        )));
     }
 
     fn plan_of(drifted: &[DriftSummary], queue: &QueueSnapshot) -> SidebarPlan {
@@ -3434,6 +3801,7 @@ mod tests {
                 path: PathBuf::from(n),
                 queued: None,
                 failed: false,
+                sub_line: None,
             })
             .collect()
     }
@@ -3490,6 +3858,7 @@ mod tests {
                 path: PathBuf::from("c"),
                 queued: Some(QueuedStatus::Waiting),
                 failed: false,
+                sub_line: None,
             },
         );
         assert_eq!(
@@ -3533,6 +3902,7 @@ mod tests {
             path: PathBuf::from("b"),
             queued: Some(QueuedStatus::Waiting),
             failed: false,
+            sub_line: None,
         };
         assert_eq!(splice_window(&before, &after), Some((1..2, 1)));
         let mut failed = before.clone();
@@ -3540,6 +3910,7 @@ mod tests {
             path: PathBuf::from("c"),
             queued: None,
             failed: true,
+            sub_line: None,
         };
         assert_eq!(splice_window(&before, &failed), Some((2..3, 1)));
     }
@@ -3573,6 +3944,7 @@ mod tests {
             path: PathBuf::from(p),
             queued,
             failed,
+            sub_line: None,
         };
         assert!(matches!(ks[0], RowKey::Group(_)), "PROCESSING leads");
         assert_eq!(ks[1], target("/c", Some(QueuedStatus::Waiting), false));
