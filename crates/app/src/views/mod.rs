@@ -1587,6 +1587,7 @@ fn run_batch_inner(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<Deci
                     .decision
                     .as_batch()
                     .expect("`batchable` just said every decision here has a batch form"),
+                copies: Vec::new(),
             })
             .collect();
         return engine

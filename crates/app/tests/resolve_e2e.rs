@@ -17,7 +17,8 @@ use tomte_app::merge_state::MergeState;
 use tomte_app::resolve::{
     BatchDecision, BatchItem, BatchOutcome, MergeConclusion, ResolveEngine, ResolveOutcome,
 };
-use tomte_core::cmd::SystemRunner;
+use tomte_core::chezmoi::{ChezmoiClient, ChezmoiOptions};
+use tomte_core::cmd::{CommandRunner, SystemRunner};
 use tomte_core::drift::{ContentHash, DriftClass};
 use tomte_core::git::GitClient;
 use tomte_core::merge::{Choice, RegionKind};
@@ -333,14 +334,17 @@ fn story_m_a_batch_of_keep_disk_shares_one_commit_and_one_push() {
         BatchItem {
             target: lab.s.home.join(".a"),
             decision: BatchDecision::KeepDisk,
+            copies: Vec::new(),
         },
         BatchItem {
             target: lab.s.home.join(".b"),
             decision: BatchDecision::KeepDisk,
+            copies: Vec::new(),
         },
         BatchItem {
             target: lab.s.home.join(".c"),
             decision: BatchDecision::KeepDisk,
+            copies: Vec::new(),
         },
     ]);
 
@@ -423,6 +427,7 @@ fn story_n_a_batch_while_mid_merge_falls_back_to_single_file_paths() {
     let outcome = lab.engine.resolve_batch(vec![BatchItem {
         target: lab.target.clone(),
         decision: BatchDecision::KeepDisk,
+        copies: Vec::new(),
     }]);
     let (_, r) = &outcome.per_target[0];
     assert!(matches!(r, Ok(ResolveOutcome::Done { .. })), "got {r:?}");
@@ -468,6 +473,7 @@ fn story_o_a_mid_merge_batch_never_commits_a_conflict_it_did_not_answer() {
     let outcome = lab.engine.resolve_batch(vec![BatchItem {
         target: lab.target.clone(),
         decision: BatchDecision::KeepDisk,
+        copies: Vec::new(),
     }]);
     let (_, r) = &outcome.per_target[0];
     let Ok(ResolveOutcome::Done {
@@ -790,6 +796,7 @@ fn story_s_a_templated_keep_disk_shares_the_batch_commit_with_its_sibling() {
         BatchItem {
             target: lab.target.clone(),
             decision: BatchDecision::KeepDisk,
+            copies: Vec::new(),
         },
         batch_item(&lab, ".a", BatchDecision::KeepDisk),
     ]);
@@ -844,6 +851,7 @@ fn story_s3_an_all_templated_batch_commits_and_pushes_its_write_backs() {
     let outcome = lab.engine.resolve_batch(vec![BatchItem {
         target: lab.target.clone(),
         decision: BatchDecision::KeepDisk,
+        copies: Vec::new(),
     }]);
 
     let (_, committed, pushed, note) = done(&outcome, 0);
@@ -881,6 +889,7 @@ fn story_s4_undo_after_a_batch_skips_the_rejected_last_item_and_reverts_the_land
         BatchItem {
             target: lab.target.clone(),
             decision: BatchDecision::KeepDisk,
+            copies: Vec::new(),
         },
     ]);
     let (plain_session, committed, _, _) = done(&outcome, 0);
@@ -930,6 +939,7 @@ fn story_s2_a_rejected_templated_keep_disk_keeps_its_slot_and_its_sibling_still_
         BatchItem {
             target: lab.target.clone(),
             decision: BatchDecision::KeepDisk,
+            copies: Vec::new(),
         },
         batch_item(&lab, ".a", BatchDecision::KeepDisk),
     ]);
@@ -1001,6 +1011,7 @@ fn story_t_an_all_templated_batch_catches_up_and_reports_a_conflicted_template_h
     let outcome = lab.engine.resolve_batch(vec![BatchItem {
         target: lab.target.clone(),
         decision: BatchDecision::KeepDisk,
+        copies: Vec::new(),
     }]);
 
     let err = outcome.per_target[0]
@@ -1110,6 +1121,7 @@ fn batch_item(lab: &DriftLab, name: &str, decision: BatchDecision) -> BatchItem 
     BatchItem {
         target: lab.s.home.join(name),
         decision,
+        copies: Vec::new(),
     }
 }
 
@@ -1654,6 +1666,7 @@ fn story_w3_a_stuck_daemon_costs_a_batch_one_budget_not_one_per_file() {
         BatchItem {
             target: lab.target.clone(),
             decision: BatchDecision::KeepDisk,
+            copies: Vec::new(),
         },
         batch_item(&lab, ".a", BatchDecision::KeepDisk),
     ]);
@@ -3454,4 +3467,205 @@ fn keep_link_mid_merge_refuses_a_copy_of_a_conflicted_file() {
         "the source is untouched"
     );
     assert_eq!(link_text(&lab.s.home.join(".d")), ".real");
+}
+
+/// Every chezmoi argv a client ran, in order.
+type ArgLog = Arc<Mutex<Vec<Vec<String>>>>;
+
+/// A `SystemRunner` that logs each argv first, so a story can count
+/// invocations: one `apply` and three cost the same at the end state, and
+/// only the log tells them apart.
+struct RecordingRunner {
+    calls: ArgLog,
+}
+
+impl CommandRunner for RecordingRunner {
+    fn run(
+        &self,
+        req: tomte_core::cmd::CommandRequest,
+    ) -> Result<tomte_core::cmd::CommandOutput, tomte_core::cmd::CommandError> {
+        self.calls.lock().unwrap().push(req.args.clone());
+        SystemRunner.run(req)
+    }
+}
+
+/// Swap the engine's chezmoi client for one over a [`RecordingRunner`],
+/// pointed at the same scratch home as `Scratch::chezmoi`.
+fn record_engine_chezmoi(lab: &mut DriftLab) -> ArgLog {
+    let calls = ArgLog::default();
+    let opts = ChezmoiOptions {
+        base_args: vec![
+            "--source".into(),
+            lab.s.source.to_string_lossy().into_owned(),
+            "--destination".into(),
+            lab.s.home.to_string_lossy().into_owned(),
+            "--config".into(),
+            lab.s.config_path().to_string_lossy().into_owned(),
+            "--no-tty".into(),
+            "--no-pager".into(),
+        ],
+        ..ChezmoiOptions::default()
+    };
+    let runner = RecordingRunner {
+        calls: calls.clone(),
+    };
+    lab.engine.chezmoi = ChezmoiClient::new(Arc::new(runner), opts);
+    calls
+}
+
+/// A kept link over a folder (with a copy), an edited file and a deleted
+/// file in ONE batch: each lands through its own call (`add`, `re-add`,
+/// `forget`) and the three share one commit.
+///
+/// MUTATION: commit the `adds` separately in `resolve_batch` (a
+/// `commit_batch` right after `chezmoi.add`) → origin gains two commits.
+#[test]
+fn batch_mixes_a_type_change_a_file_and_a_deletion_in_one_commit() {
+    let lab = DriftLab::new();
+    managed_folder(&lab);
+    more_managed_files(&lab, &["a", "g"]);
+    replace_with_link(&lab, ".d", ".real");
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    std::fs::remove_file(lab.s.home.join(".g")).unwrap();
+    let commits_before = commit_count(&lab.s.bare);
+
+    let mut keep_link = batch_item(&lab, ".d", BatchDecision::KeepDisk);
+    keep_link.copies = vec![PathBuf::from("gone")];
+    let outcome = lab.engine.resolve_batch(vec![
+        keep_link,
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+        batch_item(&lab, ".g", BatchDecision::KeepDisk),
+    ]);
+
+    for ix in 0..3 {
+        let (_, committed, pushed, note) = done(&outcome, ix);
+        assert!(committed && pushed, "item {ix} must reach origin: {note:?}");
+    }
+    assert_eq!(
+        commit_count(&lab.s.bare) - commits_before,
+        1,
+        "one commit for the whole batch"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("symlink_dot_d")).unwrap(),
+        b".real\n"
+    );
+    assert!(!lab.s.source.join("dot_d").exists(), "the folder is gone");
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".real/gone")).unwrap(),
+        GONE,
+        "the copy was written before the swap"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_a")).unwrap(),
+        b"a=disk\n"
+    );
+    assert!(!lab.s.source.join("dot_g").exists(), "the deletion is kept");
+    assert!(
+        lab.rescan_and_settle().is_empty(),
+        "nothing is left to resolve"
+    );
+}
+
+/// Restore a folder over a link, restore a link over a folder and restore a
+/// plain file, batched: ONE `chezmoi apply` serves all three, and each keeps
+/// its own journaled disk entry, so Undo of the last brings its link back.
+///
+/// MUTATION: apply the type changes one by one in `resolve_batch` (a
+/// `chezmoi.apply(Some(target))` per type-change keep source, the rest in
+/// `apply_many`) → the log shows three applies.
+#[test]
+fn batch_restore_folder_rides_the_one_apply() {
+    let mut lab = DriftLab::new();
+    managed_folder(&lab);
+    managed_link(&lab);
+    replace_with_link(&lab, ".d", ".real");
+    let l = lab.s.home.join(".l");
+    std::fs::remove_file(&l).unwrap();
+    std::fs::create_dir_all(&l).unwrap();
+    std::fs::write(l.join("a"), b"a\n").unwrap();
+    std::fs::write(&lab.target, DRIFTED).unwrap();
+    let calls = record_engine_chezmoi(&mut lab);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".testrc", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".l", BatchDecision::KeepSourceLocal),
+        batch_item(&lab, ".d", BatchDecision::KeepSourceLocal),
+    ]);
+
+    for ix in 0..3 {
+        done(&outcome, ix);
+    }
+    let applies = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|args| args.iter().any(|a| a == "apply"))
+        .count();
+    assert_eq!(applies, 1, "one apply for the whole batch");
+    assert_eq!(std::fs::read(&lab.target).unwrap(), RENDERED);
+    assert_eq!(link_text(&l), ".real");
+    let d = lab.s.home.join(".d");
+    assert!(std::fs::symlink_metadata(&d).unwrap().is_dir());
+    assert_eq!(std::fs::read(d.join("gone")).unwrap(), GONE);
+
+    let (session_d, ..) = done(&outcome, 2);
+    assert_eq!(lab.engine.undo_last().unwrap(), Some(session_d));
+    assert_eq!(link_text(&d), ".real", "undo restores the journaled link");
+}
+
+/// Puts a file's mode back when the story ends, pass or fail.
+struct RestoreMode(PathBuf);
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+/// A folder replaced by an unreadable file fails the batch's `add`; that
+/// failure is the type change's alone. The edited file beside it rides
+/// `re-add`, lands, and is committed.
+///
+/// MUTATION: report `added` errors on re-add rows too (match `&added` in the
+/// plain keep-disk arm of Phase 3) → `.a` fails with "the batch add failed".
+#[test]
+fn batch_add_failure_is_charged_to_type_changes_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = DriftLab::new();
+    managed_folder(&lab);
+    more_managed_files(&lab, &["a"]);
+    let d = lab.s.home.join(".d");
+    std::fs::remove_dir_all(&d).unwrap();
+    std::fs::write(&d, b"now a file\n").unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = RestoreMode(d.clone());
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    let commits_before = commit_count(&lab.s.bare);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".d", BatchDecision::KeepDisk),
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+    ]);
+
+    let (_, result) = &outcome.per_target[0];
+    let Err(e) = result else {
+        panic!("an unreadable file cannot be added, got {result:?}");
+    };
+    assert!(
+        e.to_string().starts_with("the batch add failed: "),
+        "must name the call that failed, got {e}"
+    );
+    let (_, committed, pushed, note) = done(&outcome, 1);
+    assert!(committed && pushed, "the plain file lands: {note:?}");
+    assert_eq!(
+        std::fs::read(lab.s.source.join("dot_a")).unwrap(),
+        b"a=disk\n"
+    );
+    assert_eq!(commit_count(&lab.s.bare) - commits_before, 1);
+    assert!(
+        lab.s.source.join("dot_d/one").exists(),
+        "the folder stays in the source"
+    );
 }

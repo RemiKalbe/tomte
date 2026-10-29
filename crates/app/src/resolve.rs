@@ -109,6 +109,10 @@ pub enum BatchDecision {
 pub struct BatchItem {
     pub target: PathBuf,
     pub decision: BatchDecision,
+    /// Keep disk on a folder replaced by a link: files (relative to
+    /// `target`) whose source version is copied into the link target first,
+    /// as [`ResolveEngine::keep_disk_with`] takes them. Empty otherwise.
+    pub copies: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -133,9 +137,34 @@ struct Candidate {
     /// blob. Always `templated: false` alongside, since forget removes a
     /// template as readily as a plain file.
     deleted: bool,
+    /// The disk holds another kind of entry than the source (a folder that
+    /// became a link, …). `re-add` silently does nothing for one, so a
+    /// keep-disk rides `chezmoi add` instead (unless `deleted`, which is
+    /// still a forget), and both decisions journal the disk entry exactly as
+    /// the single-file paths do. Always `templated: false` alongside.
+    type_change: Option<TypeChange>,
+    /// The item's copies, relative to `target`; only ever non-empty for a
+    /// keep-disk of a folder replaced by a link (pre-flight refuses others).
+    copies: Vec<PathBuf>,
     /// Index of this item's entry in [`BatchOutcome::per_target`], carried so
     /// its result lands in INPUT order however many siblings were refused.
     slot: usize,
+}
+
+impl Candidate {
+    /// A keep disk that swaps the source entry for another kind via
+    /// `chezmoi add`.
+    fn swaps_entry(&self) -> bool {
+        self.decision == BatchDecision::KeepDisk && !self.deleted && self.type_change.is_some()
+    }
+
+    /// The copies as absolute paths inside the link target.
+    fn copy_paths(&self) -> Vec<PathBuf> {
+        self.copies
+            .iter()
+            .map(|rel| self.target.join(rel))
+            .collect()
+    }
 }
 
 /// A candidate whose own journal session is open and whose decision (with the
@@ -324,13 +353,7 @@ impl ResolveEngine {
         change: &TypeChange,
         copies: &[PathBuf],
     ) -> Result<ResolveOutcome, ResolveError> {
-        let link_over_folder = matches!(
-            (&change.source, &change.disk),
-            (EntryKind::Folder, EntryKind::Link(_))
-        );
-        if !copies.is_empty() && !link_over_folder {
-            return Err(copy_picks_refused());
-        }
+        refuse_stray_copies(BatchDecision::KeepDisk, Some(change), copies)?;
         if change.disk == EntryKind::Absent {
             return self.keep_deletion(target, source);
         }
@@ -349,32 +372,11 @@ impl ResolveEngine {
             }
         }
         let session = self.session_start()?;
-        for file in &copies {
-            let dest_blob = self.snapshot_dest(file)?;
-            let decision = build_decision("copy_into_link", file, dest_blob.as_deref(), None);
-            self.session_decision(session, decision)?;
-        }
-        self.session_decision(
-            session,
-            serde_json::json!({
-                "action": "keep_disk",
-                "target": target.to_string_lossy(),
-                "type_change": {
-                    "source": kind_word(&change.source),
-                    "disk": kind_word(&change.disk),
-                },
-            }),
-        )?;
+        self.journal_keep_disk_type_change(session, target, change, &copies)?;
         let mut expected = vec![target.to_path_buf(), source.to_path_buf()];
         expected.extend(copies.iter().cloned());
         self.expect_changes(expected)?;
-        for file in &copies {
-            let bytes = source_version(&self.chezmoi, &self.chezmoi.source_path(file)?, file)?;
-            if let Some(parent) = file.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(file, bytes)?;
-        }
+        self.write_copies(&copies)?;
         let (committed, pushed, note) = if merging {
             self.swap_source_entry(target, source)?;
             self.conclude_merge()
@@ -391,6 +393,48 @@ impl ResolveEngine {
             pushed,
             note,
         })
+    }
+
+    /// Journal a type-change keep disk into `session`: one `copy_into_link`
+    /// decision per copy (absolute paths) with what it will overwrite, then
+    /// the keep-disk decision, which names the change and records no disk
+    /// entry.
+    fn journal_keep_disk_type_change(
+        &self,
+        session: i64,
+        target: &Path,
+        change: &TypeChange,
+        copies: &[PathBuf],
+    ) -> Result<(), ResolveError> {
+        for file in copies {
+            let dest_blob = self.snapshot_dest(file)?;
+            let decision = build_decision("copy_into_link", file, dest_blob.as_deref(), None);
+            self.session_decision(session, decision)?;
+        }
+        self.session_decision(
+            session,
+            serde_json::json!({
+                "action": "keep_disk",
+                "target": target.to_string_lossy(),
+                "type_change": {
+                    "source": kind_word(&change.source),
+                    "disk": kind_word(&change.disk),
+                },
+            }),
+        )
+    }
+
+    /// Write the source's version of each copy (absolute paths) into the
+    /// link target. Runs before the swap: `add` removes those source files.
+    fn write_copies(&self, copies: &[PathBuf]) -> Result<(), ResolveError> {
+        for file in copies {
+            let bytes = source_version(&self.chezmoi, &self.chezmoi.source_path(file)?, file)?;
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(file, bytes)?;
+        }
+        Ok(())
     }
 
     /// The mid-merge half of a type-change keep disk. `chezmoi add` cannot
@@ -438,20 +482,8 @@ impl ResolveEngine {
         target: &Path,
         change: &TypeChange,
     ) -> Result<ResolveOutcome, ResolveError> {
-        let applied = match change.source {
-            EntryKind::Folder => Some(
-                self.chezmoi
-                    .managed_under(target, None)?
-                    .iter()
-                    .map(|path| path.strip_prefix(target).unwrap_or(path).to_path_buf())
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        };
         let session = self.session_start()?;
-        let dest_entry = self.snapshot_entry(target, &change.disk)?;
-        let decision = build_entry_decision("keep_source", target, dest_entry, applied.as_deref());
-        self.session_decision(session, decision)?;
+        self.journal_keep_source_type_change(session, target, change)?;
         self.expect_changes(vec![target.to_path_buf()])?;
         self.chezmoi.apply(Some(target))?;
         self.session_end(session, &format!("keep_source {}", display_name(target)))?;
@@ -462,6 +494,29 @@ impl ResolveEngine {
             pushed: false,
             note: None,
         })
+    }
+
+    /// Journal a type-change keep source into `session`: the disk entry and,
+    /// for a folder the source restores, the paths apply writes into it.
+    fn journal_keep_source_type_change(
+        &self,
+        session: i64,
+        target: &Path,
+        change: &TypeChange,
+    ) -> Result<(), ResolveError> {
+        let applied = match change.source {
+            EntryKind::Folder => Some(
+                self.chezmoi
+                    .managed_under(target, None)?
+                    .iter()
+                    .map(|path| path.strip_prefix(target).unwrap_or(path).to_path_buf())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        let dest_entry = self.snapshot_entry(target, &change.disk)?;
+        let decision = build_entry_decision("keep_source", target, dest_entry, applied.as_deref());
+        self.session_decision(session, decision)
     }
 
     /// What is at `target` now, as the journal's `dest_entry`, its file
@@ -587,7 +642,9 @@ impl ResolveEngine {
     /// Per file: its own journal session, snapshot and decision, exactly as
     /// [`Self::keep_disk`] / [`Self::keep_source`] do — so Undo is unchanged.
     /// Shared: one `expect_changes`, one `chezmoi re-add` for every keep-disk
-    /// target, one `chezmoi apply` for every keep-source target, one commit
+    /// target (one `chezmoi add` for the type changes among them, which
+    /// re-add silently skips), one `chezmoi apply` for every keep-source
+    /// target, type changes included, one commit
     /// and one push for the keep-disk group, one rescan. Those are the
     /// seconds (re-add ~2.5s, push ~1.5s, per INVOCATION, not per file); the
     /// sessions are milliseconds.
@@ -617,8 +674,17 @@ impl ResolveEngine {
         let mut candidates: Vec<Candidate> = Vec::new();
         for item in items {
             let slot = per_target.len();
-            match self.chezmoi.source_path(&item.target) {
-                Ok(source) => {
+            let preflight = self
+                .chezmoi
+                .source_path(&item.target)
+                .map_err(ResolveError::from)
+                .and_then(|source| {
+                    let change = self.type_change_at(&item.target, &source)?;
+                    refuse_stray_copies(item.decision, change.as_ref(), &item.copies)?;
+                    Ok((source, change))
+                });
+            match preflight {
+                Ok((source, type_change)) => {
                     // Overwritten below for EVERY candidate. An honest error
                     // so that if a future edit ever let one leak, the caller
                     // reads a failure instead of a bogus success.
@@ -629,17 +695,19 @@ impl ResolveEngine {
                         )),
                     ));
                     let deleted = is_absent(&item.target);
-                    let templated = !deleted && is_templated(&source);
+                    let templated = !deleted && type_change.is_none() && is_templated(&source);
                     candidates.push(Candidate {
                         target: item.target,
                         source,
                         decision: item.decision,
                         templated,
                         deleted,
+                        type_change,
+                        copies: item.copies,
                         slot,
                     });
                 }
-                Err(e) => per_target.push((item.target, Err(e.into()))),
+                Err(e) => per_target.push((item.target, Err(e))),
             }
         }
         if candidates.is_empty() {
@@ -652,7 +720,7 @@ impl ResolveEngine {
             Ok(true) => {
                 for c in candidates {
                     per_target[c.slot].1 = match c.decision {
-                        BatchDecision::KeepDisk => self.keep_disk(&c.target),
+                        BatchDecision::KeepDisk => self.keep_disk_with(&c.target, &c.copies),
                         BatchDecision::KeepSourceLocal => self.keep_source(&c.target),
                     };
                 }
@@ -725,6 +793,7 @@ impl ResolveEngine {
             if p.candidate.decision == BatchDecision::KeepDisk {
                 expect.push(p.candidate.source.clone());
             }
+            expect.extend(p.candidate.copy_paths());
         }
         if let Err(e) = self.expect_changes(expect) {
             // Pre-announcing is the first thing the tail does, so nothing has
@@ -782,14 +851,37 @@ impl ResolveEngine {
             };
         }
 
+        // Phase 2b — copies for a kept link that replaced a folder, written
+        // into the link target BEFORE the shared `add` removes their source
+        // files. A failed write fails that file alone: it drops out of the
+        // add, and its session stays open as a failed single-file keep disk
+        // leaves its own.
+        let mut copy_failed: Vec<usize> = Vec::new(); // indices into `prepared`
+        for (ix, p) in prepared.iter().enumerate() {
+            if !p.candidate.swaps_entry() || p.candidate.copies.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.write_copies(&p.candidate.copy_paths()) {
+                per_target[p.candidate.slot].1 = Err(e);
+                copy_failed.push(ix);
+            }
+        }
+
         let readds: Vec<PathBuf> = prepared
             .iter()
             .filter(|p| {
                 p.candidate.decision == BatchDecision::KeepDisk
                     && !p.candidate.templated
                     && !p.candidate.deleted
+                    && p.candidate.type_change.is_none()
             })
             .map(|p| p.candidate.target.clone())
+            .collect();
+        let adds: Vec<PathBuf> = prepared
+            .iter()
+            .enumerate()
+            .filter(|(ix, p)| p.candidate.swaps_entry() && !copy_failed.contains(ix))
+            .map(|(_, p)| p.candidate.target.clone())
             .collect();
         let forgets: Vec<PathBuf> = prepared
             .iter()
@@ -800,6 +892,7 @@ impl ResolveEngine {
         // own meaning — EVERY modified file — and both `re_add` and
         // `apply_many` refuse one outright rather than let that happen.
         let readd = (!readds.is_empty()).then(|| self.chezmoi.re_add(&readds));
+        let added = (!adds.is_empty()).then(|| self.chezmoi.add(&adds));
         let forgot = (!forgets.is_empty()).then(|| self.chezmoi.forget(&forgets));
         let applies = self.batch_targets(&prepared, BatchDecision::KeepSourceLocal);
         let applied = (!applies.is_empty()).then(|| self.chezmoi.apply_many(&applies));
@@ -825,6 +918,7 @@ impl ResolveEngine {
         // clean repo as "committed" and pushing a no-op.
         let plain_landed = matches!(readd, Some(Ok(())));
         let forgot_landed = matches!(forgot, Some(Ok(())));
+        let added_landed = matches!(added, Some(Ok(())));
         let landed_disk: Vec<usize> = prepared
             .iter()
             .enumerate()
@@ -834,6 +928,8 @@ impl ResolveEngine {
                         written.contains(ix)
                     } else if p.candidate.deleted {
                         forgot_landed
+                    } else if p.candidate.swaps_entry() {
+                        added_landed && !copy_failed.contains(ix)
                     } else {
                         plain_landed
                     }
@@ -873,6 +969,16 @@ impl ResolveEngine {
                     Some(Err(e)) => Err(format!("the batch forget failed: {e}")),
                     _ => Ok(commit.clone()),
                 },
+                BatchDecision::KeepDisk if p.candidate.swaps_entry() => {
+                    // A failed copy is already reported, its session open.
+                    if copy_failed.contains(&ix) {
+                        continue;
+                    }
+                    match &added {
+                        Some(Err(e)) => Err(format!("the batch add failed: {e}")),
+                        _ => Ok(commit.clone()),
+                    }
+                }
                 BatchDecision::KeepDisk => match &readd {
                     Some(Err(e)) => Err(format!("the batch re-add failed: {e}")),
                     _ => Ok(commit.clone()),
@@ -933,6 +1039,26 @@ impl ResolveEngine {
     /// disk from a snapshot that failed.
     fn open_batch_session(&self, c: &Candidate) -> Result<i64, ResolveError> {
         let session = self.session_start()?;
+        // A type change journals exactly what its single-file path does. A
+        // removed link (keep disk, `deleted`) is a deletion, as it is there.
+        if let Some(change) = &c.type_change {
+            match c.decision {
+                BatchDecision::KeepDisk if c.deleted => {}
+                BatchDecision::KeepDisk => {
+                    self.journal_keep_disk_type_change(
+                        session,
+                        &c.target,
+                        change,
+                        &c.copy_paths(),
+                    )?;
+                    return Ok(session);
+                }
+                BatchDecision::KeepSourceLocal => {
+                    self.journal_keep_source_type_change(session, &c.target, change)?;
+                    return Ok(session);
+                }
+            }
+        }
         let (action, dest_blob, source_blob) = match c.decision {
             BatchDecision::KeepDisk if c.deleted => {
                 ("keep_disk", None, Some(self.snapshot_source(&c.source)?))
@@ -2116,6 +2242,24 @@ fn conflict_refusal(rel: &Path) -> ResolveError {
 
 fn copy_picks_refused() -> ResolveError {
     ResolveError::Failed("copy picks apply only to a folder replaced by a link".into())
+}
+
+/// Copies are only for keeping a link that replaced a folder; any other
+/// decision or change carrying them is refused before anything happens.
+fn refuse_stray_copies(
+    decision: BatchDecision,
+    change: Option<&TypeChange>,
+    copies: &[PathBuf],
+) -> Result<(), ResolveError> {
+    let link_over_folder = matches!(
+        change.map(|c| (&c.source, &c.disk)),
+        Some((EntryKind::Folder, EntryKind::Link(_)))
+    );
+    if copies.is_empty() || (decision == BatchDecision::KeepDisk && link_over_folder) {
+        Ok(())
+    } else {
+        Err(copy_picks_refused())
+    }
 }
 
 /// One path found by [`walk_folder`].
