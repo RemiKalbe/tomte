@@ -497,7 +497,19 @@ pub(super) fn bulk_actions() -> [ResolveAction; 2] {
     [ResolveAction::KeepDisk, ResolveAction::KeepSourceLocal]
 }
 
-pub(super) fn bulk_decision(action: ResolveAction) -> Decision {
+/// What a bulk press queues for one member. A type-change member gets the
+/// same decision its header buttons queue, under their words ("Restore the
+/// folder", "Keep the link"), never a bare Keep disk/Keep source; it carries
+/// no copy picks.
+pub(super) fn bulk_decision(action: ResolveAction, tc: Option<&WireTypeChange>) -> Decision {
+    if let Some(tc) = tc {
+        let keep_disk = match action {
+            ResolveAction::KeepDisk => true,
+            ResolveAction::KeepSourceLocal => false,
+            ResolveAction::KeepSourceOrigin => unreachable!("origin is never a bulk action"),
+        };
+        return type_change_decision(tc, keep_disk, &BTreeSet::new());
+    }
     match action {
         ResolveAction::KeepDisk => Decision::KeepDisk,
         ResolveAction::KeepSourceLocal => Decision::KeepSourceLocal,
@@ -2433,13 +2445,19 @@ impl ReviewView {
             .find(|m| plan.visible_safe.contains(m))
             .cloned()
             .unwrap_or(last);
-        let decision = bulk_decision(action);
+        let drifted = self.state.read(cx).drifted.clone();
         let actions: Vec<QueuedAction> = members
             .iter()
-            .map(|target| QueuedAction {
-                target: target.clone(),
-                decision: decision.clone(),
-                notify_on_done: false,
+            .map(|target| {
+                let tc = drifted
+                    .iter()
+                    .find(|d| &d.target == target)
+                    .and_then(|d| d.type_change.as_ref());
+                QueuedAction {
+                    target: target.clone(),
+                    decision: bulk_decision(action, tc),
+                    notify_on_done: false,
+                }
             })
             .collect();
         let count = actions.len();
@@ -4828,13 +4846,40 @@ mod tests {
         // MUTATION: `bulk_decision(KeepSourceLocal)` returns
         // `Decision::KeepDisk` → these `matches!` assertions fail.
         assert!(matches!(
-            bulk_decision(ResolveAction::KeepDisk),
+            bulk_decision(ResolveAction::KeepDisk, None),
             Decision::KeepDisk
         ));
         assert!(matches!(
-            bulk_decision(ResolveAction::KeepSourceLocal),
+            bulk_decision(ResolveAction::KeepSourceLocal, None),
             Decision::KeepSourceLocal
         ));
+    }
+
+    /// A bulk press on a type-change member queues the header's decision
+    /// under the header's words: the processing row and any failure say
+    /// "Restore the link", not "Keep source".
+    ///
+    /// MUTATION: drop the `if let Some(tc)` branch in `bulk_decision` → a
+    /// plain `Decision::KeepSourceLocal` is queued and the `matches!` fails.
+    #[test]
+    fn a_bulk_press_on_a_type_change_queues_the_buttons_words() {
+        let folder_over_link = tc("link", "folder");
+        let Decision::TypeChange {
+            keep_disk, label, ..
+        } = bulk_decision(ResolveAction::KeepSourceLocal, Some(&folder_over_link))
+        else {
+            panic!("a type-change member queues a type-change decision");
+        };
+        assert!(!keep_disk);
+        assert_eq!(label, "Restore the link");
+        let Decision::TypeChange {
+            keep_disk, label, ..
+        } = bulk_decision(ResolveAction::KeepDisk, Some(&folder_over_link))
+        else {
+            panic!("a type-change member queues a type-change decision");
+        };
+        assert!(keep_disk);
+        assert_eq!(label, "Keep the folder");
     }
 
     /// The list row is the one place the scan flag decides anything, and it

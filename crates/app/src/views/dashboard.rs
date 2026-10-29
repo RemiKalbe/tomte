@@ -73,8 +73,8 @@ enum Line {
         target: Option<PathBuf>,
         /// Rendered indented under an expanded scan group.
         indented: bool,
-        /// The target is CURRENTLY drifted (in `model.drifted`) → the row
-        /// carries inline keep-disk / keep-source quick actions.
+        /// The row carries inline keep-disk / keep-source quick actions:
+        /// see [`offers_quick_actions`].
         drifted: bool,
     },
     /// Collapsed run of scans/fetches; click toggles expansion.
@@ -110,9 +110,18 @@ impl Line {
             class: row.class.clone().map(SharedString::from),
             target: row.target.clone(),
             indented,
-            drifted: drift.is_some(),
+            drifted: offers_quick_actions(drift),
         }
     }
+}
+
+/// Whether a timeline row offers the inline quick actions: only when its
+/// target is CURRENTLY drifted, and never on a type change. There Keep
+/// source deletes a folder or a file and Keep disk removes source files,
+/// and this surface has loaded nothing that could name them; the row's
+/// click opens Review, whose buttons do.
+fn offers_quick_actions(drift: Option<&DriftSummary>) -> bool {
+    drift.is_some_and(|d| d.type_change.is_none())
 }
 
 /// The current drift of a timeline row's target, if it is drifted — those
@@ -1189,8 +1198,8 @@ mod tests {
 
     use super::super::{BatchResult, RepoOpKind};
     use super::{
-        DegradedRemedy, QuickAction, degraded_remedy, finish_button_state, quick_action_blocked,
-        quick_action_body,
+        DegradedRemedy, QuickAction, degraded_remedy, finish_button_state, offers_quick_actions,
+        quick_action_blocked, quick_action_body,
     };
 
     fn done(note: Option<&str>) -> Result<BatchResult, ResolveError> {
@@ -1200,6 +1209,33 @@ mod tests {
             pushed: note.is_none(),
             note: note.map(str::to_owned),
         }))
+    }
+
+    /// A type-change row offers no quick actions: its buttons would delete
+    /// a folder or source files this surface cannot name. A plain drifted
+    /// row keeps them; a row that is not drifted has none.
+    ///
+    /// MUTATION: `offers_quick_actions` returns `drift.is_some()` → the
+    /// type-change row offers them and the second assertion fails.
+    #[test]
+    fn a_type_change_row_offers_no_quick_actions() {
+        let drift = |type_change| tomte_proto::DriftSummary {
+            target: "/h/.d".into(),
+            class: "destination_drift".into(),
+            since_ts: Some(1),
+            origin_differs: false,
+            type_change,
+        };
+        assert!(offers_quick_actions(Some(&drift(None))));
+        let replaced = drift(Some(tomte_proto::WireTypeChange {
+            source: tomte_proto::WireEntryKind::Folder,
+            disk: tomte_proto::WireEntryKind::Link {
+                text: ".real".into(),
+            },
+            disk_moved: true,
+        }));
+        assert!(!offers_quick_actions(Some(&replaced)));
+        assert!(!offers_quick_actions(None));
     }
 
     #[test]
