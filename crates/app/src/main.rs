@@ -1274,6 +1274,7 @@ mod tests {
 
     fn drift(target: &str, class: &str, ts: u64) -> Event {
         Event::Drift {
+            type_change: None,
             target: PathBuf::from(target),
             class: class.into(),
             ts,

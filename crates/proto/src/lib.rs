@@ -116,6 +116,55 @@ pub enum Request {
     },
 }
 
+/// What a managed target is, on the wire (mirrors core's `EntryKind`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireEntryKind {
+    Absent,
+    File,
+    Folder,
+    /// The link text as written, not resolved.
+    Link {
+        text: String,
+    },
+}
+
+/// A type change between source and disk, on the wire (mirrors core's
+/// `TypeChange`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireTypeChange {
+    pub source: WireEntryKind,
+    pub disk: WireEntryKind,
+    /// False means the source changed and the disk is what chezmoi last wrote.
+    pub disk_moved: bool,
+}
+
+impl WireTypeChange {
+    /// The one wording table for a type change, shared by the journal meta
+    /// (daemon) and the UI (app).
+    pub fn label(&self) -> &'static str {
+        use WireEntryKind::*;
+        if self.disk_moved {
+            match (&self.source, &self.disk) {
+                (Link { .. }, Link { .. }) => "link points elsewhere",
+                (Link { .. }, Absent) => "link removed",
+                (_, Link { .. }) => "replaced by a link",
+                (_, Folder) => "replaced by a folder",
+                (_, File) => "replaced by a file",
+                _ => "type changed",
+            }
+        } else {
+            match (&self.source, &self.disk) {
+                (Link { .. }, Link { .. }) => "source link points elsewhere",
+                (Link { .. }, _) => "source is now a link",
+                (Folder, _) => "source is now a folder",
+                (File, _) => "source is now a file",
+                _ => "type changed",
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriftSummary {
     pub target: PathBuf,
@@ -124,6 +173,9 @@ pub struct DriftSummary {
     /// Origin's version of this target's source differs from local's,
     /// regardless of which side moved (decision 6.4).
     pub origin_differs: bool,
+    /// Set iff `class` is `type_changed`.
+    #[serde(default)]
+    pub type_change: Option<WireTypeChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +235,8 @@ pub enum Event {
         target: PathBuf,
         class: String,
         ts: u64,
+        #[serde(default)]
+        type_change: Option<WireTypeChange>,
     },
     RemoteAdvanced {
         target: PathBuf,
@@ -308,6 +362,7 @@ mod tests {
                 target: PathBuf::from("/x"),
                 class: "conflict".into(),
                 ts: 42,
+                type_change: None,
             },
         };
         let r = serde_json::to_string(&reply).unwrap();
@@ -376,5 +431,42 @@ mod tests {
                 "variant changed through roundtrip: {s}"
             );
         }
+    }
+
+    /// MUTATION: replace `#[serde(default)]` on `DriftSummary.type_change` with
+    /// `#[serde(deserialize_with = "Option::deserialize")]` (required key; plain
+    /// removal is a no-op for an Option);
+    /// a line from an older daemon then fails to parse.
+    #[test]
+    fn drift_summary_without_type_change_still_parses() {
+        let old = r#"{"target":"/t","class":"conflict","since_ts":1,"origin_differs":false}"#;
+        let d: DriftSummary = serde_json::from_str(old).unwrap();
+        assert!(d.type_change.is_none());
+        let old_ev = r#"{"type":"drift","target":"/t","class":"conflict","ts":1}"#;
+        let e: Event = serde_json::from_str(old_ev).unwrap();
+        assert!(matches!(
+            e,
+            Event::Drift {
+                type_change: None,
+                ..
+            }
+        ));
+    }
+
+    /// MUTATION: rename the `text` field of `WireEntryKind::Link` (or drop
+    /// the `Link` arm's payload); the roundtrip no longer matches.
+    #[test]
+    fn type_change_roundtrips() {
+        let tc = WireTypeChange {
+            source: WireEntryKind::Folder,
+            disk: WireEntryKind::Link {
+                text: "/elsewhere".into(),
+            },
+            disk_moved: true,
+        };
+        let line = serde_json::to_string(&tc).unwrap();
+        assert!(line.contains("\"kind\":\"link\""), "{line}");
+        let back: WireTypeChange = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, tc);
     }
 }

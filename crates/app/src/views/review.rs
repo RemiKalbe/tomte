@@ -143,10 +143,13 @@ pub(super) struct ProvRow {
     pub(super) kind: String,
     pub(super) machine: String,
     pub(super) class: Option<String>,
+    /// `meta.label` of a `type_changed` row ("replaced by a link").
+    pub(super) label: Option<String>,
 }
 
 impl From<EventRow> for ProvRow {
     fn from(r: EventRow) -> Self {
+        let label = tomte_app::model::type_changed_label(&r);
         let class = r
             .meta
             .as_ref()
@@ -158,6 +161,7 @@ impl From<EventRow> for ProvRow {
             kind: r.kind,
             machine: r.machine,
             class,
+            label,
         }
     }
 }
@@ -1160,6 +1164,7 @@ pub(super) fn sidebar_rows(inputs: SidebarInputs<'_>) -> SidebarPlan {
                 .find(|d| d.target == *target)
                 .cloned()
                 .unwrap_or_else(|| DriftSummary {
+                    type_change: None,
                     target: target.clone(),
                     class: String::new(),
                     since_ts: None,
@@ -3291,13 +3296,14 @@ fn provenance_row(row: &ProvRow, now: u64, theme: Theme) -> Div {
     let chip = row
         .class
         .clone()
-        .filter(|class| class_label(class) != kind_label(&row.kind))
+        .filter(|class| row.label.is_some() || class_label(class) != kind_label(&row.kind))
         .map(|class| {
             let color = theme.class_color(&class);
-            (
-                SharedString::from(class_label(&class)),
-                ui::ChipVariant::Outline(color),
-            )
+            let text = match &row.label {
+                Some(label) => SharedString::from(label.clone()),
+                None => SharedString::from(class_label(&class)),
+            };
+            (text, ui::ChipVariant::Outline(color))
         });
     ui::inert_event_row(
         theme,
@@ -3398,6 +3404,7 @@ mod tests {
 
     fn s(target: &str, class: &str) -> DriftSummary {
         DriftSummary {
+            type_change: None,
             target: target.into(),
             class: class.into(),
             since_ts: Some(1),

@@ -191,24 +191,28 @@ fn rich_model() -> SyncModel {
     m.hydrate_status(
         vec![
             DriftSummary {
+                type_change: None,
                 target: home(".config/nushell/env.nu"),
                 class: "conflict".into(),
                 since_ts: Some(now() - 9_000),
                 origin_differs: false,
             },
             DriftSummary {
+                type_change: None,
                 target: home(".config/zed/settings.json"),
                 class: "destination_drift".into(),
                 since_ts: Some(now() - 11_000),
                 origin_differs: false,
             },
             DriftSummary {
+                type_change: None,
                 target: home(".gitconfig"),
                 class: "remote_ahead".into(),
                 since_ts: Some(now() - 90_000),
                 origin_differs: false,
             },
             DriftSummary {
+                type_change: None,
                 target: home(".config/secrets.yaml"),
                 class: "eval_failed".into(),
                 since_ts: Some(now() - 200),
@@ -222,6 +226,7 @@ fn rich_model() -> SyncModel {
     );
     m.last_fetch_ts = Some(now() - 240);
     let row = |ts: u64, kind: &str, target: Option<PathBuf>, class: Option<&str>| TimelineRow {
+        label: None,
         ts,
         kind: kind.into(),
         target,
@@ -281,18 +286,21 @@ fn multiselect_model() -> SyncModel {
     let mut drifted = m.drifted.clone();
     drifted.extend([
         DriftSummary {
+            type_change: None,
             target: home(".config/starship.toml"),
             class: "destination_drift".into(),
             since_ts: Some(now() - 40_000),
             origin_differs: false,
         },
         DriftSummary {
+            type_change: None,
             target: home(".zshrc"),
             class: "source_ahead".into(),
             since_ts: Some(now() - 60_000),
             origin_differs: false,
         },
         DriftSummary {
+            type_change: None,
             target: home(".config/nvim/init.lua"),
             class: "destination_drift".into(),
             since_ts: Some(now() - 80_000),
@@ -312,6 +320,7 @@ fn many_model() -> SyncModel {
     for skill in 0..40u64 {
         for file in 0..12u64 {
             drifted.push(DriftSummary {
+                type_change: None,
                 target: home(&format!(
                     ".agents/skills/skill-{skill:02}/reference/doc-{file:02}.md"
                 )),
@@ -328,6 +337,7 @@ fn many_model() -> SyncModel {
     }
     for tool in 0..20u64 {
         drifted.push(DriftSummary {
+            type_change: None,
             target: home(&format!(".config/tool-{tool:02}/config.toml")),
             class: "destination_drift".into(),
             since_ts: Some(now() - 5_000 * tool),
@@ -378,18 +388,21 @@ fn posed_review(
             view.preview = PreviewState::Ready(preview_document());
             view.provenance = vec![
                 ProvRow {
+                    label: None,
                     ts: now() - 11_000,
                     kind: "dest_changed".into(),
                     machine: "this mac".into(),
                     class: Some("destination_drift".into()),
                 },
                 ProvRow {
+                    label: None,
                     ts: now() - 95_000,
                     kind: "applied".into(),
                     machine: "this mac".into(),
                     class: None,
                 },
                 ProvRow {
+                    label: None,
                     ts: now() - 260_000,
                     kind: "remote_advanced".into(),
                     machine: "macbook-b".into(),

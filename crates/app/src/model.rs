@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use tomte_journal::EventRow;
-use tomte_proto::{DriftSummary, Event};
+use tomte_proto::{DriftSummary, Event, WireTypeChange};
 
 /// Rows the dashboard timeline renders; journal-hydrated rows and synthetic
 /// rows from live pushes share this shape. `kind` uses the journal's kind
@@ -17,6 +17,9 @@ pub struct TimelineRow {
     pub target: Option<PathBuf>,
     pub machine: String,
     pub class: Option<String>,
+    /// The specific wording of a `type_changed` row ("replaced by a link"),
+    /// which `class` alone cannot carry.
+    pub label: Option<String>,
 }
 
 /// Newest-first timeline length limit (hydrate and live prepends alike).
@@ -132,6 +135,7 @@ impl SyncModel {
             .into_iter()
             .take(TIMELINE_CAP)
             .map(|r| TimelineRow {
+                label: type_changed_label(&r),
                 ts: r.ts,
                 // Failed fetches journal as kind "fetch" with an error meta;
                 // rendering them as plain "fetch" after a restart hid every
@@ -157,13 +161,20 @@ impl SyncModel {
 
     pub fn apply_event(&mut self, ev: Event) {
         match ev {
-            Event::Drift { target, class, ts } => {
+            Event::Drift {
+                target,
+                class,
+                ts,
+                type_change,
+            } => {
                 if class == "in_sync" {
                     self.drifted.retain(|d| d.target != target);
                     return;
                 }
-                if self.upsert_drift(&target, &class, ts) {
+                let label = type_change.as_ref().map(|tc| tc.label().to_string());
+                if self.upsert_drift(&target, &class, ts, type_change) {
                     self.push_row(TimelineRow {
+                        label,
                         ts,
                         kind: kind_for_class(&class).into(),
                         target: Some(target),
@@ -178,11 +189,12 @@ impl SyncModel {
                 ts,
             } => {
                 let is_news = match &target {
-                    Some(t) => self.upsert_drift(t, "eval_failed", ts),
+                    Some(t) => self.upsert_drift(t, "eval_failed", ts, None),
                     None => true,
                 };
                 if is_news {
                     self.push_row(TimelineRow {
+                        label: None,
                         ts,
                         kind: "eval_failed".into(),
                         target,
@@ -194,6 +206,7 @@ impl SyncModel {
             Event::LeftManagement { target, ts } => {
                 self.drifted.retain(|d| d.target != target);
                 self.push_row(TimelineRow {
+                    label: None,
                     ts,
                     kind: "left_management".into(),
                     target: Some(target),
@@ -205,6 +218,7 @@ impl SyncModel {
                 self.fetch_started_ts = None;
                 self.fetch_failed = Some(error);
                 self.push_row(TimelineRow {
+                    label: None,
                     ts,
                     kind: "fetch_failed".into(),
                     target: None,
@@ -220,6 +234,7 @@ impl SyncModel {
                 self.fetch_failed = None;
                 self.last_fetch_ts = Some(ts);
                 self.push_row(TimelineRow {
+                    label: None,
                     ts,
                     kind: "fetch".into(),
                     target: None,
@@ -241,6 +256,7 @@ impl SyncModel {
             Event::RemoteAdvanced { target, ts } => {
                 // Informational: any drift consequence arrives as its own push.
                 self.push_row(TimelineRow {
+                    label: None,
                     ts,
                     kind: "remote_advanced".into(),
                     target: Some(target),
@@ -324,12 +340,21 @@ impl SyncModel {
     /// Insert or update the drift entry for `target`. Returns whether this
     /// was new information (new target, or the class changed) — repeat
     /// observations of a known state must not spam the timeline.
-    fn upsert_drift(&mut self, target: &std::path::Path, class: &str, ts: u64) -> bool {
+    fn upsert_drift(
+        &mut self,
+        target: &std::path::Path,
+        class: &str,
+        ts: u64,
+        type_change: Option<WireTypeChange>,
+    ) -> bool {
         match self.drifted.iter_mut().find(|d| d.target == target) {
-            Some(existing) if existing.class == class => false,
+            Some(existing) if existing.class == class && existing.type_change == type_change => {
+                false
+            }
             Some(existing) => {
                 existing.class = class.to_string();
                 existing.since_ts = Some(ts);
+                existing.type_change = type_change;
                 true
             }
             None => {
@@ -342,6 +367,7 @@ impl SyncModel {
                     // scan and every periodic fetch — not just a full
                     // scan); the next Status poll corrects this if wrong.
                     origin_differs: false,
+                    type_change,
                 });
                 true
             }
@@ -354,6 +380,18 @@ impl SyncModel {
     }
 }
 
+/// The journal's own wording for a `type_changed` event (`meta.label`).
+pub fn type_changed_label(r: &EventRow) -> Option<String> {
+    if r.kind != "type_changed" {
+        return None;
+    }
+    r.meta
+        .as_ref()
+        .and_then(|m| m.get("label"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
 /// Journal event kind a live Drift push would have been recorded under, so
 /// synthetic rows use the same vocabulary as hydrated ones.
 fn kind_for_class(class: &str) -> &'static str {
@@ -361,6 +399,7 @@ fn kind_for_class(class: &str) -> &'static str {
         "remote_ahead" => "remote_advanced",
         "source_ahead" | "local_source_diverged" => "source_changed",
         "eval_failed" => "eval_failed",
+        "type_changed" => "type_changed",
         _ => "dest_changed", // destination_drift, conflict, unknown future classes
     }
 }
@@ -424,6 +463,12 @@ pub fn group_timeline(rows: &[TimelineRow]) -> Vec<TimelineItem> {
     items
 }
 
+/// The wording for a type change ("replaced by a link"). One table, in
+/// `tomte-proto`, shared with the daemon's journal meta.
+pub fn type_change_label(tc: &WireTypeChange) -> &'static str {
+    tc.label()
+}
+
 /// Human label for a drift class — raw enum names ("destination_drift")
 /// never reach the UI.
 pub fn class_label(class: &str) -> &'static str {
@@ -434,6 +479,8 @@ pub fn class_label(class: &str) -> &'static str {
         "local_source_diverged" => "diverged from origin",
         "conflict" => "conflict",
         "eval_failed" => "can't evaluate",
+        // Fallback only: a row with a type change shows `type_change_label`.
+        "type_changed" => "type changed",
         "in_sync" => "in sync",
         _ => "changed",
     }
@@ -449,6 +496,7 @@ pub fn kind_label(kind: &str) -> &'static str {
         "readded" => "re-added",
         "resolved" => "resolved",
         "eval_failed" => "can't evaluate",
+        "type_changed" => "type changed",
         "fetch" => "scan",
         "fetch_failed" => "fetch failed",
         "left_management" => "left management",
@@ -479,6 +527,7 @@ mod tests {
 
     fn drift(target: &str, class: &str, ts: u64) -> Event {
         Event::Drift {
+            type_change: None,
             target: PathBuf::from(target),
             class: class.into(),
             ts,
@@ -487,6 +536,7 @@ mod tests {
 
     fn summary(target: &str, class: &str, since_ts: Option<u64>) -> DriftSummary {
         DriftSummary {
+            type_change: None,
             target: PathBuf::from(target),
             class: class.into(),
             since_ts,
@@ -1046,6 +1096,7 @@ mod tests {
     #[test]
     fn group_timeline_collapses_consecutive_info_rows() {
         let info = |ts| TimelineRow {
+            label: None,
             ts,
             kind: "fetch".into(),
             target: None,
@@ -1053,6 +1104,7 @@ mod tests {
             class: None,
         };
         let drift = |ts| TimelineRow {
+            label: None,
             ts,
             kind: "dest_changed".into(),
             target: Some(PathBuf::from("/f")),
@@ -1085,5 +1137,66 @@ mod tests {
         assert!(matches!(&items[2], TimelineItem::Row(r) if r.ts == 6));
         assert!(matches!(&items[3], TimelineItem::Row(r) if r.ts == 5));
         assert!(matches!(&items[4], TimelineItem::Row(r) if r.ts == 4));
+    }
+
+    fn wk(kind: &str) -> tomte_proto::WireEntryKind {
+        use tomte_proto::WireEntryKind::*;
+        match kind {
+            "absent" => Absent,
+            "file" => File,
+            "folder" => Folder,
+            _ => Link { text: "x".into() },
+        }
+    }
+
+    /// MUTATION: swap two arms of `WireTypeChange::label` (say the
+    /// `(_, Folder)` and `(_, File)` arms); that row's wording changes.
+    #[test]
+    fn type_change_label_table() {
+        let tc = |s: &str, d: &str, moved: bool| WireTypeChange {
+            source: wk(s),
+            disk: wk(d),
+            disk_moved: moved,
+        };
+        let table = [
+            (tc("folder", "link", true), "replaced by a link"),
+            (tc("file", "link", true), "replaced by a link"),
+            (tc("file", "folder", true), "replaced by a folder"),
+            (tc("folder", "file", true), "replaced by a file"),
+            (tc("link", "link", true), "link points elsewhere"),
+            (tc("link", "absent", true), "link removed"),
+            (tc("link", "file", false), "source is now a link"),
+            (tc("folder", "file", false), "source is now a folder"),
+            (tc("file", "link", false), "source is now a file"),
+            (tc("link", "link", false), "source link points elsewhere"),
+        ];
+        for (change, want) in table {
+            assert_eq!(type_change_label(&change), want, "{change:?}");
+        }
+    }
+
+    /// MUTATION: in `upsert_drift`, compare the class only (drop the
+    /// `existing.type_change == type_change` condition).
+    #[test]
+    fn upsert_drift_updates_a_changed_type_change() {
+        let mut m = SyncModel::default();
+        let ev = |disk: &str, ts| Event::Drift {
+            target: PathBuf::from("/d"),
+            class: "type_changed".into(),
+            ts,
+            type_change: Some(WireTypeChange {
+                source: wk("folder"),
+                disk: wk(disk),
+                disk_moved: true,
+            }),
+        };
+        m.apply_event(ev("link", 10));
+        m.apply_event(ev("link", 11));
+        assert_eq!(m.timeline.len(), 1, "a repeat is not new information");
+        assert_eq!(m.timeline[0].label.as_deref(), Some("replaced by a link"));
+        m.apply_event(ev("file", 12));
+        assert_eq!(m.timeline.len(), 2);
+        assert_eq!(m.timeline[0].label.as_deref(), Some("replaced by a file"));
+        assert_eq!(m.drifted[0].type_change.as_ref().unwrap().disk, wk("file"));
     }
 }

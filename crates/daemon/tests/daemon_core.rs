@@ -42,6 +42,7 @@ fn foreign_dest_change_journals_and_pushes() {
             target: t,
             class,
             ts,
+            ..
         } => {
             assert_eq!(t, target);
             assert_eq!(class, "destination_drift");
@@ -754,4 +755,58 @@ fn run_scan_releases_the_flag_when_the_scan_fails() {
     let mut c = core.lock().unwrap();
     assert!(!c.scan_in_progress(), "a failed scan releases the flag");
     assert!(c.begin_scan(101).is_some(), "and the next scan may start");
+}
+
+/// A managed folder replaced by a link journals ONE `type_changed` event over
+/// two scans, publishes it, and the snapshot carries the change.
+///
+/// MUTATION: delete the `type_change_recorded` guard in `journal_probe`
+/// (record on every scan) → two events, the count assertion fails.
+#[test]
+fn type_change_is_journaled_once_and_published() {
+    let s = Scratch::new();
+    std::fs::create_dir(s.source.join("dot_d")).unwrap();
+    std::fs::write(s.source.join("dot_d/one"), "1\n").unwrap();
+    git(&s.source, &["add", "-A"]);
+    git(&s.source, &["commit", "-m", "folder"]);
+    git(&s.source, &["push"]);
+    s.chezmoi().apply(None).unwrap();
+    std::fs::rename(s.home.join(".d"), s.home.join(".real")).unwrap();
+    std::os::unix::fs::symlink(".real", s.home.join(".d")).unwrap();
+
+    let mut core = core_for(&s);
+    let rx = core.subscribe();
+    core.full_rescan(100).unwrap();
+    core.full_rescan(200).unwrap();
+
+    let target = s.home.join(".d");
+    let events: Vec<_> = core
+        .journal()
+        .events_for(&target, 20)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "type_changed")
+        .collect();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let meta = events[0].meta.as_ref().unwrap();
+    assert_eq!(meta["label"], "replaced by a link");
+    assert_eq!(meta["class"], "type_changed");
+
+    let (list, _, _) = core.status_snapshot();
+    let d = list.iter().find(|d| d.target == target).expect("listed");
+    assert_eq!(d.class, "type_changed");
+    let tc = d.type_change.as_ref().expect("type change on the summary");
+    assert!(tc.disk_moved);
+    assert_eq!(
+        tc.disk,
+        tomte_proto::WireEntryKind::Link {
+            text: ".real".into()
+        }
+    );
+
+    let pushed = std::iter::from_fn(|| rx.try_recv().ok()).any(|e| {
+        matches!(e, Event::Drift { class, type_change: Some(_), target: t, .. }
+            if class == "type_changed" && t == target)
+    });
+    assert!(pushed, "a Drift event carried the type change");
 }

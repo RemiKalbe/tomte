@@ -101,10 +101,10 @@ impl Line {
             glyph: kind_glyph(&row.kind),
             name,
             dir,
-            chip: row
-                .class
-                .as_ref()
-                .map(|class| SharedString::from(class_label(class))),
+            chip: row.class.as_ref().map(|class| match &row.label {
+                Some(label) => SharedString::from(label.clone()),
+                None => SharedString::from(class_label(class)),
+            }),
             class: row.class.clone().map(SharedString::from),
             target: row.target.clone(),
             indented,

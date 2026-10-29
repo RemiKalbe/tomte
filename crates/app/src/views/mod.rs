@@ -1762,6 +1762,7 @@ mod render_smoke {
         };
         m.hydrate_status(
             vec![tomte_proto::DriftSummary {
+                type_change: None,
                 target: PathBuf::from("/tmp/smoke/.zshrc"),
                 class: "destination_drift".into(),
                 since_ts: Some(10),
@@ -1773,6 +1774,7 @@ mod render_smoke {
             None,
         );
         let info = |ts: u64| TimelineRow {
+            label: None,
             ts,
             kind: "fetch".into(),
             target: None,
@@ -1784,6 +1786,7 @@ mod render_smoke {
             info(29),
             info(28),
             TimelineRow {
+                label: None,
                 ts: 27,
                 kind: "dest_changed".into(),
                 target: Some(PathBuf::from("/tmp/smoke/.zshrc")),
@@ -2045,6 +2048,7 @@ mod render_smoke {
             };
             model.hydrate_status(
                 vec![tomte_proto::DriftSummary {
+                    type_change: None,
                     target: PathBuf::from("/tmp/smoke/.zshrc"),
                     class: "destination_drift".into(),
                     since_ts: Some(10),
@@ -4721,6 +4725,7 @@ mod render_smoke {
         use std::path::Path;
 
         let drift = |target: &str| tomte_proto::DriftSummary {
+            type_change: None,
             target: PathBuf::from(target),
             class: "destination_drift".into(),
             since_ts: Some(1),

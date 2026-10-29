@@ -10,8 +10,9 @@ use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
 use tomte_core::drift::{ContentHash, DriftClass};
 use tomte_core::git::{GitClient, GitError, MergeStart, MergeTreeOutcome};
 use tomte_core::scanner::{DriftScanner, FileDrift, ScanError, ScanReport};
+use tomte_core::type_change::{EntryKind, TypeChange};
 use tomte_journal::{EventKind, Journal, JournalError, NewEvent};
-use tomte_proto::{DriftSummary, Event};
+use tomte_proto::{DriftSummary, Event, WireEntryKind, WireTypeChange};
 
 const BLOB_CAP: usize = 4 * 1024 * 1024;
 
@@ -79,6 +80,23 @@ pub fn class_str(class: DriftClass) -> &'static str {
     }
 }
 
+fn wire_kind(kind: &EntryKind) -> WireEntryKind {
+    match kind {
+        EntryKind::Absent => WireEntryKind::Absent,
+        EntryKind::File => WireEntryKind::File,
+        EntryKind::Folder => WireEntryKind::Folder,
+        EntryKind::Link(text) => WireEntryKind::Link { text: text.clone() },
+    }
+}
+
+pub fn wire(tc: &TypeChange) -> WireTypeChange {
+    WireTypeChange {
+        source: wire_kind(&tc.source),
+        disk: wire_kind(&tc.disk),
+        disk_moved: tc.disk_moved,
+    }
+}
+
 /// What one watcher path means to the daemon (spec 2026-10-11 §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathChange {
@@ -135,7 +153,7 @@ pub struct DaemonCore {
     remote_ref: String,
     managed: BTreeSet<PathBuf>,
     expected: Vec<(PathBuf, u64)>,
-    drift_state: BTreeMap<PathBuf, (String, u64)>,
+    drift_state: BTreeMap<PathBuf, (String, u64, Option<WireTypeChange>)>,
     in_sync_count: u64,
     /// Managed TARGET paths whose origin source differs from local's, from
     /// the most recent full scan. Retained between scans exactly like
@@ -268,11 +286,17 @@ impl DaemonCore {
     /// the target while a scan is in progress, which is what lets the scan
     /// run with the lock released and still never overwrite something the
     /// daemon learned after the scan looked.
-    fn set_drift(&mut self, target: PathBuf, class: String, since: u64) {
+    fn set_drift(
+        &mut self,
+        target: PathBuf,
+        class: String,
+        since: u64,
+        type_change: Option<WireTypeChange>,
+    ) {
         if self.scan_in_progress {
             self.touched_during_scan.insert(target.clone());
         }
-        self.drift_state.insert(target, (class, since));
+        self.drift_state.insert(target, (class, since, type_change));
     }
 
     fn clear_drift(&mut self, target: &Path) {
@@ -300,6 +324,24 @@ impl DaemonCore {
                 .iter()
                 .find(|e| e.kind == kind)
                 .is_some_and(|e| e.to_hash.as_deref() == to_hash),
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the newest `type_changed` event of `target` already names
+    /// this `(source, disk)` pair, so rescans of the same change stay quiet.
+    fn type_change_recorded(
+        &self,
+        target: &Path,
+        source: &serde_json::Value,
+        disk: &serde_json::Value,
+    ) -> bool {
+        match self.journal.events_for(target, 10) {
+            Ok(events) => events
+                .iter()
+                .find(|e| e.kind == "type_changed")
+                .and_then(|e| e.meta.as_ref())
+                .is_some_and(|m| m.get("source") == Some(source) && m.get("disk") == Some(disk)),
             Err(_) => false,
         }
     }
@@ -348,6 +390,28 @@ impl DaemonCore {
                     hint,
                     ts: now_ts,
                 });
+            }
+        } else if class == DriftClass::TypeChanged {
+            if let Some(tc) = fd.type_change.as_ref().map(wire) {
+                let (source, disk) = (
+                    serde_json::to_value(&tc.source).unwrap_or_default(),
+                    serde_json::to_value(&tc.disk).unwrap_or_default(),
+                );
+                if !self.type_change_recorded(&target, &source, &disk) {
+                    self.journal.record_event(NewEvent {
+                        target: Some(&target),
+                        ts: now_ts,
+                        kind: EventKind::TypeChanged,
+                        from_hash: None,
+                        to_hash: None,
+                        meta: Some(serde_json::json!({
+                            "class": cs,
+                            "label": tc.label(),
+                            "source": source,
+                            "disk": disk,
+                        })),
+                    })?;
+                }
             }
         } else {
             // destination side
@@ -415,14 +479,16 @@ impl DaemonCore {
         let since = self
             .drift_state
             .get(&target)
-            .filter(|(c, _)| *c == cs)
-            .map(|(_, s)| *s)
+            .filter(|(c, _, _)| *c == cs)
+            .map(|(_, s, _)| *s)
             .unwrap_or(now_ts);
-        self.set_drift(target.clone(), cs.to_string(), since);
+        let type_change = fd.type_change.as_ref().map(wire);
+        self.set_drift(target.clone(), cs.to_string(), since, type_change.clone());
         self.emit(Event::Drift {
             target,
             class: cs.to_string(),
             ts: now_ts,
+            type_change,
         });
         Ok(())
     }
@@ -1019,11 +1085,12 @@ impl DaemonCore {
         let drifted = self
             .drift_state
             .iter()
-            .map(|(t, (class, since))| DriftSummary {
+            .map(|(t, (class, since, type_change))| DriftSummary {
                 target: t.clone(),
                 class: class.clone(),
                 since_ts: Some(*since),
                 origin_differs: self.origin_differs.contains(t),
+                type_change: type_change.clone(),
             })
             .collect();
         (drifted, self.in_sync_count, self.degraded.clone())
