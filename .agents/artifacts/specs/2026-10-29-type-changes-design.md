@@ -148,14 +148,59 @@ restores nothing, as for a file.
 
 ## The Review screen
 
-One row per type change in the sidebar, in the folder tree at the target's
-place, with the class wording and the link text where there is one. Opening
-it shows `was` and `now`, the folder comparison when there is one, the per-file
-copy picks, and what each button deletes. A file in the comparison opens a
-read-only line diff of its two versions.
+Layouts picked by the user on 2026-10-29 from mockups drawn on the humanizer
+case.
 
-Layout is not decided: mockups on the humanizer case first (house rule), then
-they go in this section.
+Sidebar: the row has the same checkbox, dot and age as a file row. The name
+is the entry's name, with a trailing `/` for a folder on either side. A
+second, dim line under it gives the class wording ("replaced by a link"),
+the same two-line shape as a Processing row. It sits in the folder tree at
+the target's place.
+
+Detail pane, folder replaced by a link (the picked layout, "file list"):
+
+```
+humanizer/                 [Keep the link] [Restore the folder]
+~/.claude/skills/humanizer
+folder → link  ../../.agents/skills/humanizer
+
+History
+  2d ago  Δ replaced by a link   this mac
+
+Only in source · removed from source if you keep the link
+  [ ] WARP.md          copy into the link target
+Only in the link target · not managed
+      .claude-plugin/  .cursor-plugin/  .github/  agents/
+      AGENTS.md  CHANGELOG.md  LICENSE  scripts/
+Differs
+      (none here; each would carry the same copy pick)
+Same on both sides
+      README.md  SKILL.md
+
+Restore the folder replaces the link. Files in
+.agents/skills/humanizer stay where they are.
+```
+
+- Header: name, target path, and a `was → now` line with the link text.
+  Buttons named from `was`/`now`.
+- Groups in this order: only in source, differs, only on disk, same. An empty
+  group is not drawn. "Only on disk" lists top-level names only, folders with
+  a trailing `/`, since nothing there is managed.
+- A file in "only in source" or "differs" carries the copy pick. Clicking a
+  file name in "differs" opens its read-only line diff below the list, in the
+  existing diff view (source would write / on disk now).
+- The footer says what the other button does to disk.
+
+The other cases reuse the header and the footer with no file list:
+
+- link retargeted: `link → link  .real  →  .other`; footer "Restore the link
+  points it back at .real".
+- file replaced by a link, link replaced by a file: the header line, then the
+  existing line diff of the file's text against what the link resolves to
+  (or the link text when it dangles).
+- folder replaced by a file, link replaced by a folder: the header line, then
+  the list of what Keep source deletes from disk, by name.
+- link removed: the header line and the footer, as for a deleted file.
 
 ## Not covered, and why
 
