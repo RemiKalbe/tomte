@@ -35,14 +35,17 @@ crates/core     tomte-core     chezmoi + git clients, drift classification, scan
                                structured 3-way merge, template span pipeline,
                                structured/ = JSONC parser, per-key decisions, splicer,
                                SystemRunner (every subprocess goes through it),
-                               rotating file logging. test-support feature = Scratch.
+                               rotating file logging. type_change.rs = entries whose
+                               type differs between source and disk (folder/file/link).
+                               test-support feature = Scratch.
 crates/daemon   tomte-daemon   tomted: DaemonCore state machine (no clocks, callers
                                drive it), ndjson socket server, fs debounce, Settings.
 crates/journal  tomte-journal  SQLite WAL journal + zstd blob store. Single writer =
                                the daemon; the app opens it read-only.
 crates/proto    tomte-proto    IPC wire types: Request / Response / Event (ndjson).
 crates/ui       tomte-ui       Theme tokens, embedded SVG assets, every reusable
-                               component (one file each under src/components/),
+                               component (one file each under src/components/;
+                               compare_group = the type-change file list),
                                component previews for the gallery.
 crates/app      tomte-app      lib: ipc, model (pure), resolve (ResolveEngine),
                                action_queue, merge_inputs/merge_state (pure),
@@ -169,7 +172,14 @@ previews the row kinds.
 `review-tree`, and `review-tree-selected` pose the sidebar's multi-select
 and folder-tree states (checkboxes ticked, ticked with no file open, a
 folder collapsed, a whole folder selected). `review-many` is the 500-file
-perf pose.
+perf pose. Seven `review-type-*` poses cover type changes:
+`review-type-folder-link` (a folder replaced by a link, WARP.md only in
+source), `-folder-link-picked` (WARP.md picked to copy into the link target),
+`-folder-link-diff` (a Differs file open with its line diff),
+`-link-retargeted` (a link that points elsewhere), `-file-link` (a file
+replaced by a link), `-link-folder` (a link replaced by a folder, listing
+what Restore the link deletes), and `-sidebar` (a type-change row among
+files).
 
 ## The gate
 
@@ -204,7 +214,10 @@ assume it passed.
   and publishes it as the app's `EngineSlot`, so a `#[gpui::test]` can drive
   `Shell::enqueue` for real under `cx.run_until_parked()`. Its engine git
   client runs over a recording runner, so tests can count push invocations.
-- `tomte_core::testsupport::Scratch` is the scratch chezmoi home; it writes a
+- `tomte_core::testsupport::Scratch` is the scratch chezmoi home. Its chezmoi
+  config lives in its own `config/` folder under the scratch root, because
+  chezmoi refuses to `add` anything under the config file's folder ("is
+  protected"). It writes a
   repo-local unsigned git identity because production `GitClient` runs plain
   `git`. `chezmoi_commits_and_pushes_for_itself` (in `resolve_e2e.rs`) turns
   on autoCommit/autoPush the way the user's machine has them — without it a
@@ -429,6 +442,16 @@ same note with `· see Lines` added when origin differs. A JSON-looking
 file that does not parse opens in the line editor with a note saying why. Deliberate limits: TOML comes later, origin is shown
 only in Lines ("origin differs · see Lines"), and objects inside array
 elements are not merged key by key.
+
+Type changes (`2026-10-29-type-changes-design.md`): a managed entry whose
+type differs between the chezmoi source and the disk (a folder replaced by a
+link, a link pointing elsewhere, a file replaced by a folder, and so on)
+shows as one Review row and resolves either way: keep the disk's type or
+restore the source's. They resolve in batches with one commit and one push
+even when chezmoi's autoCommit/autoPush are on, mid-merge, and with Undo. For
+a folder replaced by a link, Review lists the files in both places and lets
+you pick files that exist only in source to copy into the link target before
+the folder goes. Copying a conflicted file is refused.
 
 Open, deliberately (design calls, not bugs):
 

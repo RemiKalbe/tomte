@@ -19,6 +19,16 @@ version without one.
   save. A file whose disk already matches its source opens in Lines with a
   note saying so.
 
+- **Type changes resolve as one decision.** When something you manage
+  changes kind on disk, for example a skill folder replaced by a link to
+  another folder, Review shows one row for it instead of a row per file.
+  Choose to keep what is on disk or restore what the source has. For a
+  folder replaced by a link, Review lists the files in both places; files
+  that exist only in the source can be ticked to copy into the link target
+  before the folder is dropped. Type changes work in batches, with Undo, and
+  make one commit and one push even when chezmoi commits and pushes by
+  itself.
+
 ### Fixed
 
 - **Keep source works on a file that is not on disk yet.** A source file

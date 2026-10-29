@@ -1,6 +1,6 @@
 # Type changes: files, folders and links
 
-Status: draft, for review. Plan: not written yet.
+Status: implemented on feat/type-changes; plan .agents/artifacts/plans/2026-10-29-type-changes.md
 
 ## Why
 
@@ -178,7 +178,7 @@ Same on both sides
       README.md  SKILL.md
 
 Restore the folder replaces the link. Files in
-.agents/skills/humanizer stay where they are.
+../../.agents/skills/humanizer stay where they are.
 ```
 
 - Header: name, target path, and a `was → now` line with the link text.
