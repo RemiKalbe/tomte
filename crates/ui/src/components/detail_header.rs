@@ -55,10 +55,20 @@ pub fn detail_header(
     path: SharedString,
     trailing: Vec<AnyElement>,
 ) -> Div {
-    div()
-        .p_3()
-        .border_b_1()
-        .border_color(theme.border)
+    noted_detail_header(theme, name, path, None, trailing)
+}
+
+/// [`detail_header`] with a line under it across the header's full width:
+/// `note`, in Menlo (it quotes link texts as written), muted, ending in an
+/// ellipsis like the other two.
+pub fn noted_detail_header(
+    theme: Theme,
+    name: SharedString,
+    path: SharedString,
+    note: Option<SharedString>,
+    trailing: Vec<AnyElement>,
+) -> Div {
+    let row = div()
         .flex()
         .items_center()
         .gap_2()
@@ -79,5 +89,21 @@ pub fn detail_header(
                         .text_color(theme.text_muted),
                 ),
         )
-        .children(trailing)
+        .children(trailing);
+    div()
+        .p_3()
+        .border_b_1()
+        .border_color(theme.border)
+        .flex()
+        .flex_col()
+        .child(row)
+        // Under the whole row, not in the title column: the buttons would
+        // leave it the title's width, and a link text cut short says less
+        // than the line exists to say.
+        .children(note.map(|note| {
+            ellipsized_line(note, PATH_LINE_H)
+                .font_family("Menlo")
+                .text_xs()
+                .text_color(theme.text_muted)
+        }))
 }

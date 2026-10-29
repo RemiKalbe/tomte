@@ -45,10 +45,18 @@ use crate::resolve::{BatchDecision, BatchItem};
 pub enum Decision {
     /// Keep the on-disk version: re-add it into the source state.
     KeepDisk,
-    /// Keep a link that replaced a folder, after copying the files the user
-    /// picked (relative to the target) from the source into the link target.
-    /// Queued only with picks; with none the press is [`Self::KeepDisk`].
-    KeepLink { copies: Arc<[PathBuf]> },
+    /// A one-click decision on a type-change row (a folder that became a
+    /// link, …), carrying the words of the button pressed ("Keep the
+    /// folder", "Restore the link") so the PROCESSING line and any failure
+    /// name a button that is on screen. Keep disk runs as
+    /// [`Self::KeepDisk`] does after copying `copies` (relative to the
+    /// target, only ever picked on a folder replaced by a link) from the
+    /// source into the link target; keep source as [`Self::KeepSourceLocal`].
+    TypeChange {
+        keep_disk: bool,
+        label: &'static str,
+        copies: Arc<[PathBuf]>,
+    },
     /// Restore chezmoi's (local source's) version: apply the target.
     KeepSourceLocal,
     /// Keep origin's version of the source, as the view showed it —
@@ -84,7 +92,7 @@ impl Decision {
     pub fn label(&self) -> &'static str {
         match self {
             Decision::KeepDisk => "Keep disk",
-            Decision::KeepLink { .. } => "Keep the link",
+            Decision::TypeChange { label, .. } => label,
             Decision::KeepSourceLocal => "Keep source · this machine",
             Decision::KeepSourceOrigin { .. } => "Keep source · origin",
             Decision::KeepBoth { .. } => "Keep both",
@@ -104,7 +112,7 @@ impl Decision {
     pub fn verb(&self) -> &'static str {
         match self {
             Decision::KeepDisk => "Kept disk version",
-            Decision::KeepLink { .. } => "Kept the link",
+            Decision::TypeChange { label, .. } => type_change_verb(label),
             Decision::KeepSourceLocal => "Restored chezmoi's version",
             Decision::KeepSourceOrigin { .. } => "Restored origin's version",
             Decision::Merged { .. } | Decision::KeepBoth { .. } => "Merged",
@@ -139,8 +147,14 @@ impl Decision {
     /// decision that has to run alone.
     pub fn as_batch(&self) -> Option<BatchDecision> {
         match self {
-            Decision::KeepDisk | Decision::KeepLink { .. } => Some(BatchDecision::KeepDisk),
-            Decision::KeepSourceLocal => Some(BatchDecision::KeepSourceLocal),
+            Decision::KeepDisk
+            | Decision::TypeChange {
+                keep_disk: true, ..
+            } => Some(BatchDecision::KeepDisk),
+            Decision::KeepSourceLocal
+            | Decision::TypeChange {
+                keep_disk: false, ..
+            } => Some(BatchDecision::KeepSourceLocal),
             Decision::KeepSourceOrigin { .. }
             | Decision::Merged { .. }
             | Decision::KeepBoth { .. }
@@ -149,12 +163,28 @@ impl Decision {
     }
 
     /// The files to copy into the link target before Keep disk; empty for
-    /// every decision but [`Self::KeepLink`].
+    /// every decision but a [`Self::TypeChange`] keeping the disk.
     pub fn copies(&self) -> &[PathBuf] {
         match self {
-            Decision::KeepLink { copies } => copies,
+            Decision::TypeChange { copies, .. } => copies,
             _ => &[],
         }
+    }
+}
+
+/// The past tense of a type-change button, for the landed banner. A label
+/// this table does not know reads as the side it kept.
+fn type_change_verb(label: &str) -> &'static str {
+    match label {
+        "Keep the link" => "Kept the link",
+        "Keep the new link" => "Kept the new link",
+        "Keep the folder" => "Kept the folder",
+        "Keep the file" => "Kept the file",
+        "Remove from source" => "Removed from source",
+        "Restore the link" => "Restored the link",
+        "Restore the folder" => "Restored the folder",
+        "Restore the file" => "Restored the file",
+        _ => "Resolved",
     }
 }
 
@@ -457,7 +487,11 @@ mod tests {
         let mut q = ActionQueue::default();
         q.push(action(
             "/skills/humanizer",
-            Decision::KeepLink { copies: picks },
+            Decision::TypeChange {
+                keep_disk: true,
+                label: "Keep the link",
+                copies: picks,
+            },
         ));
         q.push(action("/b", Decision::KeepDisk));
         let batch = q.take_batch();
@@ -477,6 +511,32 @@ mod tests {
         assert_eq!(items[0].copies, [PathBuf::from("WARP.md")]);
         assert_eq!(items[1].decision, BatchDecision::KeepDisk);
         assert!(items[1].copies.is_empty());
+    }
+
+    /// A type-change press keeps the side it named, is labelled with the
+    /// button's own words while it waits, and reports itself in the past
+    /// tense of those words.
+    /// MUTATION: map `TypeChange { keep_disk: false, .. }` to
+    /// `BatchDecision::KeepDisk` in `Decision::as_batch` → a "Restore the
+    /// folder" press would keep the link.
+    #[test]
+    fn type_change_decision_keeps_its_side_and_its_words() {
+        let restore = Decision::TypeChange {
+            keep_disk: false,
+            label: "Restore the folder",
+            copies: Arc::from([]),
+        };
+        assert_eq!(restore.as_batch(), Some(BatchDecision::KeepSourceLocal));
+        assert_eq!(restore.label(), "Restore the folder");
+        assert_eq!(restore.verb(), "Restored the folder");
+        let keep = Decision::TypeChange {
+            keep_disk: true,
+            label: "Keep the folder",
+            copies: Arc::from([]),
+        };
+        assert_eq!(keep.as_batch(), Some(BatchDecision::KeepDisk));
+        assert_eq!(keep.label(), "Keep the folder");
+        assert_eq!(keep.verb(), "Kept the folder");
     }
 
     /// The point of the whole thing: a second decision is accepted while the

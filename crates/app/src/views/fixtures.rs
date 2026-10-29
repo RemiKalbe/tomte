@@ -14,13 +14,14 @@ use tomte_app::model::{SyncModel, TimelineRow};
 use tomte_core::merge::{Choice, MergeDocument, MergeOptions};
 use tomte_core::structured::Pick;
 use tomte_core::template::{anchor::anchor, lexer::lex};
-use tomte_proto::DriftSummary;
+use tomte_core::type_change::{CompareGroup, FolderComparison};
+use tomte_proto::{DriftSummary, WireEntryKind, WireTypeChange};
 
 use super::PendingRepoOp;
 use super::merge::{LoadedMerge, MergeView, Rollback};
 use super::review::{
     BannerTint, DiffPair, OutcomeBanner, PreviewState, ProvRow, QueueSnapshot, ReviewMode,
-    ReviewView, SidebarInputs, origin_diffs, sidebar_rows,
+    ReviewView, SidebarInputs, TypeChangeDetail, origin_diffs, sidebar_rows,
 };
 use super::review_selection::Selection;
 use super::review_tree::safe_descendants;
@@ -85,6 +86,34 @@ pub const STATES: &[(&str, &str)] = &[
     (
         "review-many",
         "500 safe files in Tree mode: queued, running, failed and ticked rows — the perf pose",
+    ),
+    (
+        "review-type-folder-link",
+        "a skill folder replaced by a link: the file list, WARP.md only in source",
+    ),
+    (
+        "review-type-folder-link-picked",
+        "the same with WARP.md picked to copy into the link target",
+    ),
+    (
+        "review-type-folder-link-diff",
+        "a folder replaced by a link with a Differs file open: its line diff under the list",
+    ),
+    (
+        "review-type-link-retargeted",
+        "a link that points elsewhere: header and footer, no list",
+    ),
+    (
+        "review-type-file-link",
+        "a file replaced by a link: the file against what the link resolves to",
+    ),
+    (
+        "review-type-link-folder",
+        "a link replaced by a folder: what Restore the link deletes, by name",
+    ),
+    (
+        "review-type-sidebar",
+        "a type-change row among files: name with /, its wording on a second line",
     ),
     ("merge", "three-pane editor with unresolved conflicts"),
     (
@@ -348,6 +377,104 @@ fn many_model() -> SyncModel {
     m
 }
 
+fn link(text: &str) -> WireEntryKind {
+    WireEntryKind::Link { text: text.into() }
+}
+
+/// The type changes the `review-type-*` poses show, by target.
+fn type_changes() -> Vec<(PathBuf, WireTypeChange, u64)> {
+    let change = |source, disk| WireTypeChange {
+        source,
+        disk,
+        disk_moved: true,
+    };
+    vec![
+        // The user's 2026-10-29 case: a skill folder moved under
+        // `.agents/skills` and linked back.
+        (
+            home(".claude/skills/humanizer"),
+            change(
+                WireEntryKind::Folder,
+                link("../../.agents/skills/humanizer"),
+            ),
+            170_000,
+        ),
+        (
+            home(".config/nvim"),
+            change(link("../src/nvim-config"), link("../src/nvim-lazy")),
+            30_000,
+        ),
+        (
+            home(".gitignore_global"),
+            change(WireEntryKind::File, link(".config/git/ignore")),
+            50_000,
+        ),
+        (
+            home(".config/zsh"),
+            change(link("../.dotfiles/zsh"), WireEntryKind::Folder),
+            70_000,
+        ),
+    ]
+}
+
+/// `rich_model()` plus the type-change rows, in the safe group with the
+/// files.
+fn type_change_model() -> SyncModel {
+    let mut m = rich_model();
+    let mut drifted = m.drifted.clone();
+    drifted.extend(
+        type_changes()
+            .into_iter()
+            .map(|(target, change, age)| DriftSummary {
+                target,
+                class: "type_changed".into(),
+                since_ts: Some(now() - age),
+                origin_differs: false,
+                type_change: Some(change),
+            }),
+    );
+    m.hydrate_status(drifted, m.in_sync, None, false, None);
+    m
+}
+
+/// The humanizer folder against its link target, as `folder_comparison`
+/// returns it. `differs` moves SKILL.md into Differs.
+fn humanizer_comparison(differs: bool) -> FolderComparison {
+    let mut entries = vec![(PathBuf::from("WARP.md"), CompareGroup::OnlyInSource)];
+    if differs {
+        entries.push((PathBuf::from("SKILL.md"), CompareGroup::Differs));
+    }
+    entries.extend(
+        [
+            ".claude-plugin/",
+            ".cursor-plugin/",
+            ".github/",
+            "AGENTS.md",
+            "CHANGELOG.md",
+            "LICENSE",
+            "agents/",
+            "scripts/",
+        ]
+        .map(|name| (PathBuf::from(name), CompareGroup::OnlyOnDisk)),
+    );
+    entries.push((PathBuf::from("README.md"), CompareGroup::Same));
+    if !differs {
+        entries.push((PathBuf::from("SKILL.md"), CompareGroup::Same));
+    }
+    FolderComparison { entries }
+}
+
+/// The History row a type change leaves.
+fn type_change_history(label: &str, age: u64) -> Vec<ProvRow> {
+    vec![ProvRow {
+        label: Some(label.into()),
+        ts: now() - age,
+        kind: "type_changed".into(),
+        machine: "this mac".into(),
+        class: Some("type_changed".into()),
+    }]
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -363,6 +490,14 @@ const PREVIEW_DISK: &str = "theme = \"catppuccin\"\nfont_size = 15\nkeymap = \"v
 /// Origin's rendered version: another machine pushed a different font size
 /// and a key this machine's source has never had.
 const PREVIEW_ORIGIN: &str = "theme = \"catppuccin\"\nfont_size = 13\nkeymap = \"vim\"\nsoft_wrap = \"editor_width\"\nformat_on_save = true\n";
+
+/// SKILL.md as the source holds it, and as the link target has it now.
+const HUMANIZER_SKILL_SOURCE: &str = "---\nname: humanizer\ndescription: Rewrite AI-sounding text\n---\n\n# Humanizer\n\nRead the draft once before editing.\n";
+const HUMANIZER_SKILL_DISK: &str = "---\nname: humanizer\ndescription: Rewrite AI-sounding text so it reads like the writer\n---\n\n# Humanizer\n\nRead the draft once before editing.\nKeep the writer's own words.\n";
+/// A global gitignore kept as a file in the source, and the file its new
+/// link points at.
+const GITIGNORE_FILE: &str = ".DS_Store\n*.swp\n.direnv/\n";
+const GITIGNORE_LINKED: &str = ".DS_Store\n*.swp\n.direnv/\n.envrc.local\nnode_modules/\n";
 
 /// Small believable config diff for the review preview.
 fn preview_document() -> MergeDocument {
@@ -1074,6 +1209,84 @@ pub fn build(name: &str, paths: SettingsPaths, cx: &mut Context<Shell>) -> Optio
                             )),
                             &plan.safe_order,
                         );
+                    }
+                });
+            }
+            s.review = Some(review);
+            s
+        }
+        "review-type-folder-link"
+        | "review-type-folder-link-picked"
+        | "review-type-folder-link-diff"
+        | "review-type-link-retargeted"
+        | "review-type-file-link"
+        | "review-type-link-folder"
+        | "review-type-sidebar" => {
+            let mut s = shell(Route::Review, type_change_model());
+            let review = posed_review(cx, s.state.clone(), None, true);
+            let pick = |target: &str| {
+                type_changes()
+                    .into_iter()
+                    .find(|(t, _, _)| *t == home(target))
+                    .expect("posed type change")
+            };
+            let posed = match name {
+                "review-type-sidebar" => None,
+                "review-type-link-retargeted" => Some(pick(".config/nvim")),
+                "review-type-file-link" => Some(pick(".gitignore_global")),
+                "review-type-link-folder" => Some(pick(".config/zsh")),
+                _ => Some(pick(".claude/skills/humanizer")),
+            };
+            if let Some((target, change, age)) = posed {
+                review.update(cx, |view, _| {
+                    view.selected = Some(target);
+                    view.provenance =
+                        type_change_history(tomte_app::model::type_change_label(&change), age);
+                    view.preview = PreviewState::Empty;
+                    view.type_change = Some(TypeChangeDetail {
+                        comparison: None,
+                        deletes: Vec::new(),
+                        failure: None,
+                    });
+                    match name {
+                        "review-type-folder-link" | "review-type-folder-link-picked" => {
+                            view.type_change.as_mut().expect("set above").comparison =
+                                Some(humanizer_comparison(false));
+                            if name == "review-type-folder-link-picked" {
+                                view.copy_picks.insert(PathBuf::from("WARP.md"));
+                            }
+                        }
+                        "review-type-folder-link-diff" => {
+                            view.type_change.as_mut().expect("set above").comparison =
+                                Some(humanizer_comparison(true));
+                            view.compare_open = Some(PathBuf::from("SKILL.md"));
+                            view.preview = PreviewState::Ready(MergeDocument::compute(
+                                HUMANIZER_SKILL_SOURCE,
+                                HUMANIZER_SKILL_DISK,
+                                HUMANIZER_SKILL_SOURCE,
+                                MergeOptions::default(),
+                            ));
+                        }
+                        "review-type-file-link" => {
+                            view.preview = PreviewState::Ready(MergeDocument::compute(
+                                GITIGNORE_FILE,
+                                GITIGNORE_LINKED,
+                                GITIGNORE_FILE,
+                                MergeOptions::default(),
+                            ));
+                        }
+                        "review-type-link-folder" => {
+                            view.type_change.as_mut().expect("set above").deletes = [
+                                ".zshrc",
+                                "aliases.zsh",
+                                "completions/",
+                                "functions/",
+                                "plugins.zsh",
+                            ]
+                            .map(str::to_owned)
+                            .to_vec();
+                        }
+                        _ => {}
                     }
                 });
             }

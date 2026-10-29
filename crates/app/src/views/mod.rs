@@ -1606,9 +1606,16 @@ fn run_batch_inner(engine: &ResolveEngine, batch: Vec<QueuedAction>) -> Vec<Deci
         let label = decision.label();
         let result = match decision {
             Decision::KeepDisk => engine.keep_disk(&target).map(BatchResult::Resolved),
-            Decision::KeepLink { copies } => engine
+            Decision::TypeChange {
+                keep_disk: true,
+                copies,
+                ..
+            } => engine
                 .keep_disk_with(&target, &copies)
                 .map(BatchResult::Resolved),
+            Decision::TypeChange {
+                keep_disk: false, ..
+            } => engine.keep_source(&target).map(BatchResult::Resolved),
             Decision::KeepSourceLocal => engine.keep_source(&target).map(BatchResult::Resolved),
             Decision::KeepSourceOrigin { seen } => engine
                 .keep_source_origin(&target, &seen)
@@ -3858,6 +3865,55 @@ mod render_smoke {
             "the banner says why the click did nothing: {}",
             banner.text
         );
+    }
+
+    /// A press on a type-change row queues under the words on its button,
+    /// carrying the picks, and the picks are gone from the view once the
+    /// decision has them. The model holds the one row, so the selection has
+    /// nowhere to advance to and stays on it.
+    ///
+    /// MUTATION: drop `self.copy_picks.clear()` from `run_action` → WARP.md
+    /// is still ticked after the press. MUTATION: pass `None` for the type
+    /// change in `run_action`'s match → the queue says "Keep disk".
+    #[gpui::test]
+    fn a_type_change_press_queues_its_button_words_and_clears_the_picks(cx: &mut TestAppContext) {
+        use review::ResolveAction;
+
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-type-folder-link-picked", smoke_paths(), cx)
+                .expect("type-change fixture")
+        });
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the fixture poses a review view");
+        let target = vis
+            .update(|_window, cx| review.read(cx).selected.clone())
+            .expect("the fixture selects the folder");
+        vis.update(|_window, cx| {
+            let state = shell.read(cx).state.clone();
+            state.update(cx, |m, _| {
+                let only: Vec<_> = m
+                    .drifted
+                    .iter()
+                    .filter(|d| d.target == target)
+                    .cloned()
+                    .collect();
+                m.hydrate_status(only, m.in_sync, None, false, None);
+            });
+            assert!(!review.read(cx).copy_picks.is_empty(), "posed with a pick");
+        });
+
+        vis.update(|_window, cx| {
+            review.update(cx, |view, cx| view.run_action(ResolveAction::KeepDisk, cx))
+        });
+
+        vis.update(|_window, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.queue.decision_label(&target), Some("Keep the link"));
+            let view = review.read(cx);
+            assert_eq!(view.selected.as_ref(), Some(&target));
+            assert!(view.copy_picks.is_empty(), "the decision took the picks");
+        });
     }
 
     /// The user's own acceptance bar, end to end: confirming a file records

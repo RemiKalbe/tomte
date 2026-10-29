@@ -52,6 +52,10 @@ use super::review_tree::{
     FolderNode, TreeRow, count_chip, safe_descendants, tree_order, tree_rows,
 };
 
+/// The words beside a "copy into the link target" checkbox.
+const COPY_PICK_LABEL: &str = "copy into the link target";
+/// How tall a folder comparison stays while a file's diff is open under it.
+const COMPARE_LIST_MAX_H: f32 = 200.;
 /// Fixed sidebar width per the approved mockup A (~260px).
 const SIDEBAR_WIDTH: f32 = 260.;
 /// The queue must stay wide enough to read a filename, and never swallow
@@ -203,6 +207,8 @@ struct LoadedDetail {
     pub(super) auto_merge: Option<(std::sync::Arc<tomte_app::merge_inputs::MergeInputs>, String)>,
     /// `Some` only when origin's content actually loaded for this file.
     pub(super) origin_diffs: Option<OriginDiffs>,
+    /// `Some` for a type-change row.
+    pub(super) type_change: Option<TypeChangeDetail>,
 }
 
 /// The merge inputs for one target — the source of BOTH optional affordances
@@ -248,7 +254,11 @@ fn auto_merge_from(
     Some((inputs.clone(), assembled))
 }
 
-fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
+fn load_detail_blocking(
+    target: &Path,
+    journal: &Path,
+    change: Option<WireTypeChange>,
+) -> LoadedDetail {
     // Provenance is best-effort context, never a blocker for the diff: a
     // missing journal (fresh install, daemon not yet scanned) or a query
     // error both degrade to an empty history strip.
@@ -256,8 +266,21 @@ fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
         .and_then(|j| j.events_for(target, PROVENANCE_LIMIT))
         .map(|rows| rows.into_iter().map(ProvRow::from).collect())
         .unwrap_or_default();
+    // A type change has no merge: no Keep both, no origin comparison, and
+    // `chezmoi cat` of a folder or a link is not the text to diff.
+    if let Some(change) = change {
+        let (preview, detail) = load_type_change_blocking(target, &change);
+        return LoadedDetail {
+            provenance,
+            preview,
+            auto_merge: None,
+            origin_diffs: None,
+            type_change: Some(detail),
+        };
+    }
     let inputs = merge_inputs_blocking(target, journal);
     LoadedDetail {
+        type_change: None,
         provenance,
         preview: load_preview_blocking(target),
         auto_merge: inputs.as_ref().and_then(auto_merge_from),
@@ -272,6 +295,125 @@ fn load_detail_blocking(target: &Path, journal: &Path) -> LoadedDetail {
                 .map(|origin| origin_diffs(origin, &i.ours, &i.theirs))
         }),
     }
+}
+
+/// The body of a type-change row: the line diff for a file against a link,
+/// the folder comparison, or what Restore deletes. Failures are carried to
+/// the pane, never dropped.
+fn load_type_change_blocking(
+    target: &Path,
+    change: &WireTypeChange,
+) -> (PreviewState, TypeChangeDetail) {
+    let mut detail = TypeChangeDetail {
+        comparison: None,
+        deletes: Vec::new(),
+        failure: None,
+    };
+    let mut preview = PreviewState::Empty;
+    match type_change_body(change) {
+        TypeChangeBody::Comparison => {
+            let client = crate::app_chezmoi_client();
+            match tomte_app::resolve::folder_comparison(&client, target) {
+                Ok(cmp) => detail.comparison = Some(cmp),
+                Err(e) => {
+                    tomte_core::log_error!(
+                        "review",
+                        "folder comparison for {} failed: {e}",
+                        target.display()
+                    );
+                    detail.failure = Some(e.to_string());
+                }
+            }
+        }
+        TypeChangeBody::LineDiff => preview = load_link_diff_blocking(target, change),
+        TypeChangeBody::Deletes => match restore_deletes(target, change) {
+            Ok(names) => detail.deletes = names,
+            Err(e) => {
+                tomte_core::log_error!("review", "read {}: {e}", target.display());
+                detail.failure = Some(format!("read {}: {e}", target.display()));
+            }
+        },
+        TypeChangeBody::Nothing => {}
+    }
+    (preview, detail)
+}
+
+/// What Restore deletes on disk, by name: the top level of a folder there
+/// (folders with a trailing `/`), or the file itself.
+fn restore_deletes(target: &Path, change: &WireTypeChange) -> std::io::Result<Vec<String>> {
+    if !matches!(change.disk, WireEntryKind::Folder) {
+        return Ok(vec![display_name(target).to_string()]);
+    }
+    let mut names = Vec::new();
+    for item in std::fs::read_dir(target)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if item.file_type()?.is_dir() {
+            names.push(format!("{name}/"));
+        } else {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// A file against a link: the source side as chezmoi would write it, the
+/// disk side as it reads now. A link side is what it resolves to, or its
+/// text when it dangles.
+fn load_link_diff_blocking(target: &Path, change: &WireTypeChange) -> PreviewState {
+    let side =
+        |kind: &WireEntryKind, read: &dyn Fn() -> Result<Vec<u8>, String>| match (kind, read()) {
+            (_, Ok(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            (WireEntryKind::Link { text }, Err(_)) => Ok(text.clone()),
+            (_, Err(e)) => Err(e),
+        };
+    let rendered = side(&change.source, &|| match &change.source {
+        WireEntryKind::Link { text } => {
+            let at = target.parent().unwrap_or(Path::new("/")).join(text);
+            std::fs::read(&at).map_err(|e| format!("read {}: {e}", at.display()))
+        }
+        _ => crate::app_chezmoi_client()
+            .cat(target)
+            .map_err(|e| e.to_string()),
+    });
+    let destination = side(&change.disk, &|| {
+        std::fs::read(target).map_err(|e| format!("read {}: {e}", target.display()))
+    });
+    match (rendered, destination) {
+        (Ok(rendered), Ok(destination)) => PreviewState::Ready(MergeDocument::compute(
+            &rendered,
+            &destination,
+            &rendered,
+            MergeOptions::default(),
+        )),
+        (Err(e), _) | (_, Err(e)) => PreviewState::Error(e),
+    }
+}
+
+/// One Differs file of a folder replaced by a link: what the source would
+/// write against the file in the link target.
+fn load_compare_diff_blocking(target: &Path, rel: &Path) -> PreviewState {
+    let client = crate::app_chezmoi_client();
+    let file = target.join(rel);
+    let rendered = match client
+        .source_path(&file)
+        .map_err(ResolveError::from)
+        .and_then(|source| tomte_app::resolve::source_version(&client, &source, &file))
+    {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => return PreviewState::Error(e.to_string()),
+    };
+    let destination = match std::fs::read(&file) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => return PreviewState::Error(format!("read {}: {e}", file.display())),
+    };
+    PreviewState::Ready(MergeDocument::compute(
+        &rendered,
+        &destination,
+        &rendered,
+        MergeOptions::default(),
+    ))
 }
 
 fn load_preview_blocking(target: &Path) -> PreviewState {
@@ -367,7 +509,6 @@ pub(super) fn bulk_decision(action: ResolveAction) -> Decision {
 
 /// The header's two buttons on a type-change row, (keep disk, keep source),
 /// named from what is on each side, never "Keep disk"/"Keep source" alone.
-#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the header"))]
 pub(super) fn type_change_buttons(tc: &WireTypeChange) -> (&'static str, &'static str) {
     use WireEntryKind::*;
     let keep = match (&tc.disk, &tc.source) {
@@ -388,25 +529,99 @@ pub(super) fn type_change_buttons(tc: &WireTypeChange) -> (&'static str, &'stati
     (keep, restore)
 }
 
-/// What a Keep disk press queues: with copy picks, Keep the link carrying
-/// them; with none, the ordinary Keep disk.
-pub(super) fn keep_disk_decision(picks: &BTreeSet<PathBuf>) -> Decision {
-    if picks.is_empty() {
-        Decision::KeepDisk
-    } else {
-        Decision::KeepLink {
-            copies: picks.iter().cloned().collect(),
-        }
+/// What a header press on a type-change row queues: the side it keeps,
+/// under the words of the button pressed, and on keep disk the copy picks.
+pub(super) fn type_change_decision(
+    tc: &WireTypeChange,
+    keep_disk: bool,
+    picks: &BTreeSet<PathBuf>,
+) -> Decision {
+    let (keep, restore) = type_change_buttons(tc);
+    Decision::TypeChange {
+        keep_disk,
+        label: if keep_disk { keep } else { restore },
+        copies: if keep_disk {
+            picks.iter().cloned().collect()
+        } else {
+            std::sync::Arc::from([])
+        },
     }
 }
 
+/// A row's name: the file name, with a trailing `/` when either side of a
+/// type change is a folder.
+pub(super) fn entry_name(target: &Path, tc: Option<&WireTypeChange>) -> SharedString {
+    let name = display_name(target);
+    let folder = tc.is_some_and(|tc| {
+        matches!(tc.source, WireEntryKind::Folder) || matches!(tc.disk, WireEntryKind::Folder)
+    });
+    if folder {
+        format!("{name}/").into()
+    } else {
+        name
+    }
+}
+
+/// The header's third line on a type-change row: `was → now`, then the
+/// link text as written ("folder → link  ../../.agents/skills/humanizer",
+/// "link → link  .real  →  .other").
+pub(super) fn type_change_line(tc: &WireTypeChange) -> String {
+    use WireEntryKind::*;
+    let kind = |k: &WireEntryKind| match k {
+        Absent => "removed",
+        File => "file",
+        Folder => "folder",
+        Link { .. } => "link",
+    };
+    let kinds = format!("{} → {}", kind(&tc.source), kind(&tc.disk));
+    match (&tc.source, &tc.disk) {
+        (Link { text: was }, Link { text: now }) => format!("{kinds}  {was}  →  {now}"),
+        (Link { text }, _) | (_, Link { text }) => format!("{kinds}  {text}"),
+        _ => kinds,
+    }
+}
+
+/// What the detail pane draws under a type-change header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TypeChangeBody {
+    /// A folder replaced by a link: the folder comparison.
+    Comparison,
+    /// A file against a link: the line diff of the file's text against what
+    /// the link resolves to (or its text when it dangles).
+    LineDiff,
+    /// Restore deletes what is on disk: the list of it, by name.
+    Deletes,
+    /// The header and the footer say it all (a link retargeted or removed).
+    Nothing,
+}
+
+pub(super) fn type_change_body(tc: &WireTypeChange) -> TypeChangeBody {
+    use WireEntryKind::*;
+    match (&tc.source, &tc.disk) {
+        (Folder, Link { .. }) => TypeChangeBody::Comparison,
+        (File, Link { .. }) | (Link { .. }, File) => TypeChangeBody::LineDiff,
+        (_, Folder) | (Folder, File) => TypeChangeBody::Deletes,
+        _ => TypeChangeBody::Nothing,
+    }
+}
+
+/// The part of a type-change row's detail that is not the line diff,
+/// loaded with the rest of the detail.
+pub(super) struct TypeChangeDetail {
+    /// [`TypeChangeBody::Comparison`]: the folder comparison.
+    pub comparison: Option<FolderComparison>,
+    /// [`TypeChangeBody::Deletes`]: what Restore deletes on disk, top-level
+    /// names, folders with a trailing `/`.
+    pub deletes: Vec<String>,
+    /// Why the comparison or the list could not be loaded.
+    pub failure: Option<String>,
+}
+
 /// The folder comparison under a type-change header, as the rows it draws.
-#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the comparison"))]
 pub(super) struct ComparisonPlan {
     pub groups: Vec<(&'static str, Vec<ComparisonRow>)>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the comparison"))]
 pub(super) struct ComparisonRow {
     pub rel: PathBuf,
     /// Carries the "copy into the link target" pick.
@@ -418,7 +633,6 @@ pub(super) struct ComparisonRow {
 
 /// Group the comparison in the spec's order (only in source, differs, only
 /// in the link target, same), dropping empty groups.
-#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the comparison"))]
 pub(super) fn comparison_plan(cmp: &FolderComparison, picks: &BTreeSet<PathBuf>) -> ComparisonPlan {
     const GROUPS: [(CompareGroup, &str); 4] = [
         (
@@ -456,7 +670,6 @@ pub(super) fn comparison_plan(cmp: &FolderComparison, picks: &BTreeSet<PathBuf>)
 
 /// The footer under a type-change row: what Restore does to disk. Link texts
 /// are shown as written, never resolved.
-#[cfg_attr(not(test), expect(dead_code, reason = "Task 7 renders the footer"))]
 pub(super) fn footer_text(tc: &WireTypeChange, target: &Path) -> String {
     use WireEntryKind::*;
     let kind = |k: &WireEntryKind| match k {
@@ -1470,6 +1683,13 @@ pub struct ReviewView {
     /// link target first (relative to the selected target). Cleared when the
     /// selection moves to another target.
     pub(super) copy_picks: BTreeSet<PathBuf>,
+    /// The selected type-change row's comparison or deletion list (its line
+    /// diff, when it has one, is [`Self::preview`]). `pub(super)` for the
+    /// gallery poses.
+    pub(super) type_change: Option<TypeChangeDetail>,
+    /// The Differs file of the comparison whose line diff is open below the
+    /// list (relative to the selected target).
+    pub(super) compare_open: Option<PathBuf>,
     /// The diff is a read-only [`ui::TextArea`] (2026-08-23 feedback: "diffs
     /// should be selectable"): same editor as the merge result, minus the
     /// decision strips — so a diff can be selected and copied like text.
@@ -1565,6 +1785,8 @@ impl ReviewView {
             auto_merge: None,
             last_outcome: None,
             copy_picks: BTreeSet::new(),
+            type_change: None,
+            compare_open: None,
             preview_editor: None,
             preview_dirty: true,
             preview_appearance: None,
@@ -1603,14 +1825,17 @@ impl ReviewView {
         self.preview_dirty = true;
         self.provenance.clear();
         self.auto_merge = None;
+        self.type_change = None;
+        self.compare_open = None;
         cx.notify();
 
         let journal = journal_path();
+        let change = self.type_change_of(&target, cx);
         cx.spawn(async move |this, cx| {
             let loaded = {
                 let target = target.clone();
                 cx.background_executor()
-                    .spawn(async move { load_detail_blocking(&target, &journal) })
+                    .spawn(async move { load_detail_blocking(&target, &journal, change) })
                     .await
             };
             this.update(cx, |view, cx| {
@@ -1619,7 +1844,65 @@ impl ReviewView {
                     view.provenance = loaded.provenance;
                     view.auto_merge = loaded.auto_merge;
                     view.origin_diffs = loaded.origin_diffs;
+                    view.type_change = loaded.type_change;
                     view.preview = loaded.preview;
+                    view.preview_dirty = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The live type change at `target`, from the model the sidebar draws:
+    /// the header's buttons and words follow it before the detail loads.
+    fn type_change_of(&self, target: &Path, cx: &App) -> Option<WireTypeChange> {
+        self.state
+            .read(cx)
+            .drifted
+            .iter()
+            .find(|d| d.target == target)
+            .and_then(|d| d.type_change.clone())
+    }
+
+    /// Tick or untick one "copy into the link target" pick.
+    pub(super) fn toggle_copy_pick(&mut self, rel: &Path, cx: &mut Context<Self>) {
+        if !self.copy_picks.remove(rel) {
+            self.copy_picks.insert(rel.to_path_buf());
+        }
+        cx.notify();
+    }
+
+    /// Open (or, clicked again, close) the line diff of one Differs file
+    /// below the comparison, loaded on the background executor.
+    fn open_compare_diff(&mut self, rel: PathBuf, cx: &mut Context<Self>) {
+        let Some(target) = self.selected.clone() else {
+            return;
+        };
+        self.preview_dirty = true;
+        if self.compare_open.as_deref() == Some(rel.as_path()) {
+            self.compare_open = None;
+            self.preview = PreviewState::Empty;
+            cx.notify();
+            return;
+        }
+        self.compare_open = Some(rel.clone());
+        self.preview = PreviewState::Loading;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let preview = {
+                let (target, rel) = (target.clone(), rel.clone());
+                cx.background_executor()
+                    .spawn(async move { load_compare_diff_blocking(&target, &rel) })
+                    .await
+            };
+            this.update(cx, |view, cx| {
+                // Stale guard: another file, or another row, since.
+                if view.selected.as_deref() == Some(target.as_path())
+                    && view.compare_open.as_deref() == Some(rel.as_path())
+                {
+                    view.preview = preview;
                     view.preview_dirty = true;
                     cx.notify();
                 }
@@ -1672,10 +1955,16 @@ impl ReviewView {
         // button the user pressed, so it is captured at click time and
         // travels WITH the decision — by the time the queue runs it, the
         // selection may well be three files further on.
-        let decision = match action {
-            ResolveAction::KeepDisk => keep_disk_decision(&self.copy_picks),
-            ResolveAction::KeepSourceLocal => Decision::KeepSourceLocal,
-            ResolveAction::KeepSourceOrigin => {
+        let change = self.type_change_of(&target, cx);
+        let decision = match (action, &change) {
+            // A type-change row's buttons say what they keep; the decision
+            // carries those words.
+            (ResolveAction::KeepDisk | ResolveAction::KeepSourceLocal, Some(change)) => {
+                type_change_decision(change, action == ResolveAction::KeepDisk, &self.copy_picks)
+            }
+            (ResolveAction::KeepDisk, None) => Decision::KeepDisk,
+            (ResolveAction::KeepSourceLocal, None) => Decision::KeepSourceLocal,
+            (ResolveAction::KeepSourceOrigin, _) => {
                 let Some(seen) = self.origin_diffs.as_ref().map(|d| d.seen.clone()) else {
                     // The button only exists when origin's content loaded,
                     // so this is structural — and still reported rather than
@@ -1693,6 +1982,9 @@ impl ReviewView {
         };
         self.last_outcome = None;
         self.enqueue(target.clone(), decision, cx);
+        // The picks went with the decision; a second press must not carry
+        // them again.
+        self.copy_picks.clear();
         self.advance_from(&target, cx);
     }
 
@@ -2232,12 +2524,11 @@ impl ReviewView {
     fn action_button(
         &self,
         action: ResolveAction,
-        split: bool,
+        label: &'static str,
         blocked: Option<SharedString>,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let label = action.button_label(split);
         let el = match blocked {
             None => ui::button(
                 theme,
@@ -2700,7 +2991,7 @@ impl ReviewView {
         } else {
             theme.class_color(&entry.class)
         };
-        let name = display_name(&entry.target);
+        let name = entry_name(&entry.target, entry.type_change.as_ref());
         // A processing row's trailing column goes BLANK while it RUNS and
         // carries the ✕ while it WAITS: how long the file has been drifted
         // stopped being the interesting fact about it the moment a decision
@@ -2873,7 +3164,8 @@ impl ReviewView {
         let Some(selected) = self.selected.as_deref() else {
             return centered_note(theme, "select a file to review".into(), theme.text_muted);
         };
-        let name = display_name(selected);
+        let change = self.type_change_of(selected, cx);
+        let name = entry_name(selected, change.as_ref());
         let path: SharedString =
             super::dashboard::shorten_home(&selected.display().to_string()).into();
 
@@ -2896,15 +3188,57 @@ impl ReviewView {
         // ticked set, and the row `selected` happens to still name is
         // often not among them (a ⌘/⇧-click never moves `selected`), so a
         // Keep disk here would be a second, ambiguous surface.
-        let title_trailing: Vec<AnyElement> = if self.selection.is_empty() {
+        let title_trailing: Vec<AnyElement> = if !self.selection.is_empty() {
+            Vec::new()
+        } else if let Some(change) = &change {
+            // The two buttons named from what is on each side, and nothing
+            // else: a type change has no merge and no origin comparison.
+            let (keep, restore) = type_change_buttons(change);
+            vec![
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .max_w_2_3()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.action_button(
+                        ResolveAction::KeepDisk,
+                        keep,
+                        blocked.clone(),
+                        theme,
+                        cx,
+                    ))
+                    .child(self.action_button(
+                        ResolveAction::KeepSourceLocal,
+                        restore,
+                        blocked.clone(),
+                        theme,
+                        cx,
+                    ))
+                    .into_any_element(),
+            ]
+        } else {
             let mut header_actions: Vec<AnyElement> = Vec::new();
             header_actions.push(
-                self.action_button(ResolveAction::KeepDisk, split, blocked.clone(), theme, cx)
-                    .into_any_element(),
+                self.action_button(
+                    ResolveAction::KeepDisk,
+                    ResolveAction::KeepDisk.button_label(split),
+                    blocked.clone(),
+                    theme,
+                    cx,
+                )
+                .into_any_element(),
             );
             header_actions.extend(self.header_source_actions().into_iter().map(|action| {
-                self.action_button(action, split, blocked.clone(), theme, cx)
-                    .into_any_element()
+                self.action_button(
+                    action,
+                    action.button_label(split),
+                    blocked.clone(),
+                    theme,
+                    cx,
+                )
+                .into_any_element()
             }));
             if self.auto_merge.is_some() {
                 header_actions.push(
@@ -2971,26 +3305,14 @@ impl ReviewView {
                     .children(header_actions)
                     .into_any_element(),
             ]
-        } else {
-            Vec::new()
         };
 
-        let body = if self.diff_pair != DiffPair::DiskVsLocal && self.origin_diffs.is_some() {
+        let body = if let Some(change) = &change {
+            self.type_change_pane(change, selected, theme, cx)
+        } else if self.diff_pair != DiffPair::DiskVsLocal && self.origin_diffs.is_some() {
             self.diff_preview(theme)
         } else {
-            match &self.preview {
-                PreviewState::Empty | PreviewState::Loading => {
-                    centered_note(theme, "loading preview…".into(), theme.text_muted)
-                }
-                PreviewState::EvalFailed(hint) => message_box(
-                    theme,
-                    "template/secret evaluation failed",
-                    hint.clone(),
-                    Some("Fix this, then re-select the file to reload the preview."),
-                ),
-                PreviewState::Error(msg) => message_box(theme, "preview failed", msg.clone(), None),
-                PreviewState::Ready(_) => self.diff_preview(theme),
-            }
+            self.preview_body(theme)
         };
 
         div()
@@ -2998,10 +3320,11 @@ impl ReviewView {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(ui::detail_header(
+            .child(ui::noted_detail_header(
                 theme,
                 name,
                 path,
+                change.as_ref().map(|c| type_change_line(c).into()),
                 // ONE trailing element, and it wraps: with the source action
                 // split there are four buttons here, and the detail pane is
                 // ~370px at the app's minimum window width. Squeezing them
@@ -3106,6 +3429,192 @@ impl ReviewView {
     /// The diff pane: the read-only editor over a thin legend footer. The
     /// diff IS the pane content — no bordered sub-container (2026-08-08
     /// feedback).
+    /// The preview's own states, then the diff: shared by an ordinary file
+    /// and a type change's line diffs.
+    fn preview_body(&self, theme: Theme) -> AnyElement {
+        match &self.preview {
+            PreviewState::Empty | PreviewState::Loading => {
+                centered_note(theme, "loading preview…".into(), theme.text_muted)
+            }
+            PreviewState::EvalFailed(hint) => message_box(
+                theme,
+                "template/secret evaluation failed",
+                hint.clone(),
+                Some("Fix this, then re-select the file to reload the preview."),
+            ),
+            PreviewState::Error(msg) => message_box(theme, "preview failed", msg.clone(), None),
+            PreviewState::Ready(_) => self.diff_preview(theme),
+        }
+    }
+
+    /// Under a type-change header: the comparison, the line diff or the
+    /// list of what Restore deletes, then the footer saying what Restore
+    /// does to disk (spec 2026-10-29 §The Review screen).
+    fn type_change_pane(
+        &self,
+        change: &WireTypeChange,
+        target: &Path,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let footer = div()
+            .text_xs()
+            .text_color(theme.text_muted)
+            .child(footer_text(change, target));
+        let kind = type_change_body(change);
+        if kind == TypeChangeBody::LineDiff {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.preview_body(theme)),
+                )
+                .child(div().flex_none().px_3().py_2().child(footer))
+                .into_any_element();
+        }
+        let loading = self.type_change.is_none() && kind != TypeChangeBody::Nothing;
+        let groups: Vec<AnyElement> = match &self.type_change {
+            _ if loading => vec![
+                div()
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child("loading…")
+                    .into_any_element(),
+            ],
+            Some(TypeChangeDetail {
+                failure: Some(why), ..
+            }) => vec![message_box(theme, "could not compare", why.clone(), None)],
+            Some(TypeChangeDetail {
+                comparison: Some(cmp),
+                ..
+            }) => self.comparison_groups(cmp, theme, cx),
+            Some(detail) if kind == TypeChangeBody::Deletes => {
+                let (_, restore) = type_change_buttons(change);
+                vec![
+                    ui::compare_group(
+                        theme,
+                        format!("On disk · deleted if you {}", restore.to_lowercase()),
+                        ui::compare_names(
+                            theme,
+                            detail.deletes.iter().map(|n| n.clone().into()).collect(),
+                        ),
+                    )
+                    .into_any_element(),
+                ]
+            }
+            _ => Vec::new(),
+        };
+        let diff_open = self.compare_open.is_some();
+        let list = div()
+            .id("type-change-list")
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .overflow_y_scroll()
+            // As tall as its groups, shrinking (and scrolling) when the pane
+            // is shorter, so the footer sits right under it; shorter still
+            // above an open file's diff.
+            .min_h_0()
+            .when(diff_open, |el| el.flex_none().max_h(px(COMPARE_LIST_MAX_H)))
+            .children(groups);
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(list)
+            // Outside the scroll: what Restore does stays on screen however
+            // long the list.
+            .child(div().flex_none().px_3().pb_2().child(footer))
+            .when_some(self.compare_open.clone(), |el, rel| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .line_clamp(1)
+                        // The legend under the diff names its two sides.
+                        .child(rel.display().to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.preview_body(theme)),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The folder comparison's groups as [`comparison_plan`] lays them out:
+    /// a picked or Differs file on its own row, the rest wrapped inline.
+    fn comparison_groups(
+        &self,
+        cmp: &FolderComparison,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let plan = comparison_plan(cmp, &self.copy_picks);
+        plan.groups
+            .into_iter()
+            .enumerate()
+            .map(|(g, (label, rows))| {
+                let body: AnyElement = if rows.iter().any(|r| r.pickable || r.opens_diff) {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                            let open = self.compare_open.as_deref() == Some(row.rel.as_path());
+                            let pick_rel = row.rel.clone();
+                            let open_rel = row.rel.clone();
+                            ui::compare_row(
+                                theme,
+                                ElementId::Name(format!("compare-{g}-{ix}").into()),
+                                row.rel.display().to_string().into(),
+                                ui::CompareRowSpec {
+                                    pick: row.pickable.then_some((row.picked, COPY_PICK_LABEL)),
+                                    opens: row.opens_diff,
+                                    open,
+                                },
+                                cx.listener(move |view, _ev, _w, cx| {
+                                    view.toggle_copy_pick(&pick_rel, cx)
+                                }),
+                                cx.listener(move |view, _ev, _w, cx| {
+                                    view.open_compare_diff(open_rel.clone(), cx)
+                                }),
+                            )
+                            .into_any_element()
+                        }))
+                        .into_any_element()
+                } else {
+                    ui::compare_names(
+                        theme,
+                        rows.iter()
+                            .map(|r| r.rel.display().to_string().into())
+                            .collect(),
+                    )
+                    .into_any_element()
+                };
+                ui::compare_group(theme, label, body).into_any_element()
+            })
+            .collect()
+    }
+
     fn diff_preview(&self, theme: Theme) -> AnyElement {
         let Some(editor) = &self.preview_editor else {
             return centered_note(theme, self.diff_pair.matches_note(), theme.ok);
@@ -3552,11 +4061,11 @@ mod tests {
         BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
         QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, RowKey, Selection, SidebarInputs,
         SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
-        comparison_plan, display_name, flatten_document, footer_text, keep_disk_decision,
-        next_after, origin_diffs, origin_hint, per_line_ranges, preview_decors,
-        queued_outcome_banner, re_anchor_index, refused_banner, row_keys, severity_groups,
-        sidebar_rows, source_actions, splice_window, type_change_buttons, undo_affordance,
-        undo_banner,
+        comparison_plan, display_name, entry_name, flatten_document, footer_text, next_after,
+        origin_diffs, origin_hint, per_line_ranges, preview_decors, queued_outcome_banner,
+        re_anchor_index, refused_banner, row_keys, severity_groups, sidebar_rows, source_actions,
+        splice_window, type_change_body, type_change_buttons, type_change_decision,
+        type_change_line, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -3633,20 +4142,95 @@ mod tests {
         }
     }
 
-    /// MUTATION: `keep_disk_decision` returns `Decision::KeepDisk` whatever
-    /// the picks → the picked press is not a `KeepLink` carrying them.
+    /// A type-change press queues the words on the button pressed, and only
+    /// a keep-disk press carries the copy picks.
+    /// MUTATION: `label: keep` for both sides in `type_change_decision` →
+    /// the Restore press reads "Keep the link".
     #[test]
-    fn keep_disk_with_picks_queues_keep_the_link() {
-        assert!(matches!(
-            keep_disk_decision(&BTreeSet::new()),
-            Decision::KeepDisk
-        ));
+    fn type_change_press_queues_the_button_words() {
         let picks = BTreeSet::from([p("WARP.md"), p("a/b.md")]);
-        match keep_disk_decision(&picks) {
-            Decision::KeepLink { copies } => {
-                assert_eq!(&*copies, [p("WARP.md"), p("a/b.md")])
-            }
-            other => panic!("expected KeepLink, got {}", other.label()),
+        let change = tc("folder", "../../.agents/skills/humanizer");
+        let keep = type_change_decision(&change, true, &picks);
+        assert_eq!(keep.label(), "Keep the link");
+        assert_eq!(keep.copies(), [p("WARP.md"), p("a/b.md")]);
+        let restore = type_change_decision(&change, false, &picks);
+        assert_eq!(restore.label(), "Restore the folder");
+        assert!(restore.copies().is_empty());
+        assert_eq!(
+            type_change_decision(&tc("file", "folder"), true, &BTreeSet::new()).label(),
+            "Keep the folder"
+        );
+    }
+
+    /// MUTATION: drop the `.copies` arm (always `Arc::from([])`) in
+    /// `type_change_decision` → the picks never reach the queue.
+    #[test]
+    fn keep_the_link_carries_its_picks() {
+        let picks = BTreeSet::from([p("WARP.md")]);
+        let keep = type_change_decision(&tc("folder", "../x"), true, &picks);
+        assert_eq!(keep.copies(), [p("WARP.md")]);
+    }
+
+    /// A folder on either side gets the trailing `/`; a plain file or a
+    /// file↔link change does not.
+    /// MUTATION: check only `tc.source` in `entry_name` → the link→folder
+    /// row loses its `/`.
+    #[test]
+    fn entry_name_marks_a_folder_on_either_side() {
+        let t = Path::new("/Users/x/.claude/skills/humanizer");
+        assert_eq!(
+            entry_name(t, Some(&tc("folder", "../h"))).as_ref(),
+            "humanizer/"
+        );
+        assert_eq!(
+            entry_name(t, Some(&tc("../h", "folder"))).as_ref(),
+            "humanizer/"
+        );
+        assert_eq!(
+            entry_name(t, Some(&tc("file", "../h"))).as_ref(),
+            "humanizer"
+        );
+        assert_eq!(entry_name(t, None).as_ref(), "humanizer");
+    }
+
+    /// MUTATION: format the both-links arm of `type_change_line` like the
+    /// one-link arm (`{kinds}  {now}`) → the old link text disappears.
+    #[test]
+    fn type_change_line_shows_link_texts_as_written() {
+        assert_eq!(
+            type_change_line(&tc("folder", "../../.agents/skills/humanizer")),
+            "folder → link  ../../.agents/skills/humanizer"
+        );
+        assert_eq!(
+            type_change_line(&tc(".real", ".other")),
+            "link → link  .real  →  .other"
+        );
+        assert_eq!(type_change_line(&tc(".real", "file")), "link → file  .real");
+        assert_eq!(type_change_line(&tc("file", "folder")), "file → folder");
+        assert_eq!(
+            type_change_line(&tc(".real", "absent")),
+            "link → removed  .real"
+        );
+    }
+
+    /// Each pair draws the body the spec gives it.
+    /// MUTATION: move `(Link, File)` from the `LineDiff` arm to `Deletes` in
+    /// `type_change_body` → the link→file row asks for a list.
+    #[test]
+    fn type_change_body_by_pair() {
+        use super::TypeChangeBody::*;
+        let rows = [
+            (tc("folder", "../h"), Comparison),
+            (tc("file", ".real"), LineDiff),
+            (tc(".real", "file"), LineDiff),
+            (tc("folder", "file"), Deletes),
+            (tc(".real", "folder"), Deletes),
+            (tc("file", "folder"), Deletes),
+            (tc(".real", ".other"), Nothing),
+            (tc(".real", "absent"), Nothing),
+        ];
+        for (change, want) in rows {
+            assert_eq!(type_change_body(&change), want, "{change:?}");
         }
     }
 
