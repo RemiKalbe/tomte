@@ -3539,6 +3539,46 @@ fn keep_link_mid_merge_concludes_without_sweeping_conflicts() {
     );
 }
 
+/// Mid-merge, Keep the link still lands when origin changed a file inside
+/// the folder: the merge took it cleanly, so it sits staged under the
+/// folder the swap removes (the humanizer case when another machine touched
+/// the skill and some other file conflicts).
+///
+/// MUTATION: drop `-f` from `GitClient::rm_path` → `git rm` refuses "the
+/// following file has changes staged in the index" and the decision fails.
+#[test]
+fn keep_link_mid_merge_removes_a_folder_origin_changed_cleanly() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    managed_folder(&lab);
+    std::fs::write(lab.s.source.join("dot_other"), b"b=1\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "a second managed file"]);
+    git(&lab.s.source, &["push"]);
+    // `dot_d/one` keeps its base locally, so only origin changed it.
+    diverge_with_conflicts(
+        &lab,
+        &[
+            ("dot_other", OTHER_ORIGIN, OTHER_LOCAL),
+            ("dot_d/one", b"x=origin\n", MANAGED_BASE),
+        ],
+    );
+    replace_with_link(&lab, ".d", ".real");
+
+    let outcome = lab.engine.keep_disk(&lab.s.home.join(".d")).unwrap();
+    assert!(
+        matches!(outcome, ResolveOutcome::Done { .. }),
+        "keep the link mid-merge: {outcome:?}"
+    );
+    let git_c = lab.source_git();
+    assert!(git_c.merge_in_progress(), "dot_other is still conflicted");
+    assert_eq!(
+        std::fs::read(lab.s.source.join("symlink_dot_d")).unwrap(),
+        b".real\n"
+    );
+    assert!(!lab.s.source.join("dot_d").exists());
+}
+
 /// Mid-merge, a copy pick whose source file the merge left conflicted is
 /// refused before anything is journaled or written: its raw bytes are
 /// conflict markers, and they would land in the link target.

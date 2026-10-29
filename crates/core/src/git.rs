@@ -421,10 +421,16 @@ impl GitClient {
 
     /// Remove a tracked path (a folder recursively) from the index and the
     /// working tree, staging the removal. Mid-merge this also answers a
-    /// conflict on any file under it, as deleted.
+    /// conflict on any file under it, as deleted. Forced: a file under it
+    /// that the merge took cleanly from origin is staged, and a plain
+    /// `git rm` refuses that; the caller is replacing the whole entry, and
+    /// origin's version stays in origin's commit.
     pub fn rm_path(&self, rel_path: &Path) -> Result<(), GitError> {
         let path = rel_path.display().to_string();
-        self.run(&["rm", "-r", "-q", "--", &path], Duration::from_secs(30))?;
+        self.run(
+            &["rm", "-r", "-f", "-q", "--", &path],
+            Duration::from_secs(30),
+        )?;
         Ok(())
     }
 
