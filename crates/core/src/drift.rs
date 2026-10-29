@@ -53,6 +53,10 @@ pub enum DriftClass {
     LocalSourceDiverged,
     Conflict,
     EvalFailed,
+    /// The target is a different kind of entry (file, folder, link) on disk
+    /// than in the source, or a link points elsewhere. Set by the scanner
+    /// from `type_change`; `classify` never returns it.
+    TypeChanged,
 }
 
 pub fn classify(probe: &StateProbe) -> DriftClass {

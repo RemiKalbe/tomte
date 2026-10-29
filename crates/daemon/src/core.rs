@@ -75,6 +75,7 @@ pub fn class_str(class: DriftClass) -> &'static str {
         DriftClass::LocalSourceDiverged => "local_source_diverged",
         DriftClass::Conflict => "conflict",
         DriftClass::EvalFailed => "eval_failed",
+        DriftClass::TypeChanged => "type_changed",
     }
 }
 
