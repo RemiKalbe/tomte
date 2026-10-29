@@ -891,9 +891,31 @@ impl ResolveEngine {
         // Guarded, never called empty: an empty target list keeps chezmoi's
         // own meaning — EVERY modified file — and both `re_add` and
         // `apply_many` refuse one outright rather than let that happen.
-        let readd = (!readds.is_empty()).then(|| self.chezmoi.re_add(&readds));
-        let added = (!adds.is_empty()).then(|| self.chezmoi.add(&adds));
-        let forgot = (!forgets.is_empty()).then(|| self.chezmoi.forget(&forgets));
+        //
+        // These three run with chezmoi's git automation OFF. With autoCommit
+        // and autoPush on (the user's setup) each of them would commit and
+        // push by itself, so a mixed batch made up to three commits and three
+        // pushes; off, they only change the source and `commit_batch` below
+        // makes the batch's one commit and one push.
+        // Derived on first use, so a batch with none of the three never asks.
+        let quiet = std::cell::OnceCell::new();
+        let quietly = |run: &dyn Fn(&ChezmoiClient) -> Result<(), ChezmoiError>| {
+            let client = quiet.get_or_init(|| {
+                self.chezmoi.without_git_automation().map_err(|e| {
+                    tomte_core::log_error!("resolve", "batch config without git automation: {e}");
+                    format!("could not turn off chezmoi's git automation for the batch: {e}")
+                })
+            });
+            match client {
+                Ok(client) => run(client),
+                Err(why) => Err(ChezmoiError::Failed(why.clone())),
+            }
+        };
+
+        let readd = (!readds.is_empty()).then(|| quietly(&|c| c.re_add(&readds)));
+        let added = (!adds.is_empty()).then(|| quietly(&|c| c.add(&adds)));
+        let forgot = (!forgets.is_empty()).then(|| quietly(&|c| c.forget(&forgets)));
+
         let applies = self.batch_targets(&prepared, BatchDecision::KeepSourceLocal);
         let applied = (!applies.is_empty()).then(|| self.chezmoi.apply_many(&applies));
         // A verified template write leaves the destination already saying

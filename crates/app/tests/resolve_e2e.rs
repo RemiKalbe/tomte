@@ -3669,3 +3669,79 @@ fn batch_add_failure_is_charged_to_type_changes_only() {
         "the folder stays in the source"
     );
 }
+
+/// Updates of `main` on the bare origin, from its reflog: one per push that
+/// moved it, whoever pushed — Tomte's own git or chezmoi's autoPush.
+fn origin_updates(lab: &DriftLab) -> usize {
+    let out = std::process::Command::new("git")
+        .args(["reflog", "show", "--format=%H", "main"])
+        .current_dir(&lab.s.bare)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).lines().count()
+}
+
+/// The mixed batch of `batch_mixes_…` on the user's setup, chezmoi's
+/// autoCommit and autoPush on: still one commit, and one push moves origin.
+/// chezmoi's own pushes run as its child processes, invisible to the
+/// engine's recorder, so origin's reflog is what counts them.
+///
+/// MUTATION: run re-add, add and forget through `self.chezmoi` (the normal
+/// client) in `resolve_batch` Phase 2 → three commits, three origin updates.
+/// MUTATION: skip the `persistentState` pin in `git_automation_off` →
+/// chezmoi records the batch in a throwaway state file and the rescan still
+/// reports drift.
+
+#[test]
+fn batch_with_autocommit_on_makes_one_commit_and_one_push() {
+    let mut lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    managed_folder(&lab);
+    more_managed_files(&lab, &["a", "g"]);
+    git(&lab.s.bare, &["config", "core.logAllRefUpdates", "true"]);
+    replace_with_link(&lab, ".d", ".real");
+    std::fs::write(lab.s.home.join(".a"), b"a=disk\n").unwrap();
+    std::fs::remove_file(lab.s.home.join(".g")).unwrap();
+    let git_calls = ArgLog::default();
+    lab.engine.git = GitClient::new(
+        Arc::new(RecordingRunner {
+            calls: git_calls.clone(),
+        }),
+        lab.s.source.clone(),
+    );
+    let commits_before = commit_count(&lab.s.bare);
+    let updates_before = origin_updates(&lab);
+
+    let outcome = lab.engine.resolve_batch(vec![
+        batch_item(&lab, ".d", BatchDecision::KeepDisk),
+        batch_item(&lab, ".a", BatchDecision::KeepDisk),
+        batch_item(&lab, ".g", BatchDecision::KeepDisk),
+    ]);
+
+    for ix in 0..3 {
+        let (_, committed, pushed, note) = done(&outcome, ix);
+        assert!(committed && pushed, "item {ix} must reach origin: {note:?}");
+    }
+    assert_eq!(commit_count(&lab.s.bare) - commits_before, 1, "one commit");
+    assert_eq!(
+        origin_updates(&lab) - updates_before,
+        1,
+        "one push moved origin"
+    );
+    let pushes = git_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|args| args.iter().any(|a| a == "push"))
+        .count();
+    assert_eq!(pushes, 1, "the engine pushed once");
+    assert!(
+        lab.rescan_and_settle().is_empty(),
+        "chezmoi's state saw the batch: nothing is left to resolve"
+    );
+}

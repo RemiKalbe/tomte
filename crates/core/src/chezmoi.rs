@@ -35,6 +35,10 @@ impl Default for ChezmoiOptions {
 pub struct ChezmoiClient {
     runner: Arc<dyn CommandRunner>,
     opts: ChezmoiOptions,
+    /// The folder holding a derived config this client reads
+    /// ([`ChezmoiClient::without_git_automation`]); removed when the last
+    /// clone drops.
+    _derived_config: Option<Arc<tempfile::TempDir>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +75,65 @@ pub struct StatusEntry {
 pub struct ManagedKinds {
     pub folders: BTreeSet<PathBuf>,
     pub links: BTreeSet<PathBuf>,
+}
+
+/// Turn chezmoi's git automation off in a `dump-config` JSON object, and pin
+/// its persistent state to `state` unless the config already names one.
+/// `dump-config` spells the git keys in lower case (`autocommit`) while the
+/// docs use camel case; chezmoi reads either, so an existing key is set in
+/// whatever case it has and a missing one is added.
+fn git_automation_off(config: &mut serde_json::Value, state: &Path) -> Result<(), ChezmoiError> {
+    let not_an_object = || ChezmoiError::Parse {
+        context: "dump-config",
+        detail: "expected a JSON object with a `git` object".into(),
+    };
+    let root = config.as_object_mut().ok_or_else(not_an_object)?;
+    let pinned = root
+        .get("persistentState")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|path| !path.is_empty());
+    if !pinned {
+        root.insert(
+            "persistentState".into(),
+            serde_json::Value::String(state.to_string_lossy().into_owned()),
+        );
+    }
+    let git = root
+        .entry("git")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(not_an_object)?;
+    for wanted in ["autoAdd", "autoCommit", "autoPush"] {
+        let key = git
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(wanted))
+            .cloned()
+            .unwrap_or_else(|| wanted.to_string());
+        git.insert(key, serde_json::Value::Bool(false));
+    }
+    Ok(())
+}
+
+/// `base_args` reading `config` (JSON) instead of any config file they named.
+fn with_config_file(base_args: &[String], config: &Path) -> Vec<String> {
+    let mut args = Vec::with_capacity(base_args.len() + 4);
+    let mut iter = base_args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" | "-c" | "--config-format" => {
+                iter.next();
+            }
+            _ if arg.starts_with("--config=") || arg.starts_with("--config-format=") => {}
+            _ => args.push(arg.clone()),
+        }
+    }
+    args.extend([
+        "--config".to_string(),
+        config.to_string_lossy().into_owned(),
+        "--config-format".to_string(),
+        "json".to_string(),
+    ]);
+    args
 }
 
 fn parse_status(text: &str) -> Result<Vec<StatusEntry>, ChezmoiError> {
@@ -275,7 +338,57 @@ pub fn classify_eval_stderr(stderr: &str) -> Option<EvalFailure> {
 
 impl ChezmoiClient {
     pub fn new(runner: Arc<dyn CommandRunner>, opts: ChezmoiOptions) -> Self {
-        Self { runner, opts }
+        Self {
+            runner,
+            opts,
+            _derived_config: None,
+        }
+    }
+
+    /// This client with chezmoi's git automation off: same runner, binary,
+    /// environment and flags, but reading a copy of this client's config
+    /// (`dump-config`) with `git.autoAdd`, `autoCommit` and `autoPush` set
+    /// to false, so `re-add`, `add` and `forget` change the source and leave
+    /// committing and pushing to the caller. chezmoi has no per-invocation
+    /// switch for this.
+    ///
+    /// The copy pins `persistentState` to the file the original config uses.
+    /// chezmoi otherwise keeps its state next to the config file it read,
+    /// and a `re-add` would record what it wrote in a throwaway database the
+    /// next `status` never reads.
+    pub fn without_git_automation(&self) -> Result<ChezmoiClient, ChezmoiError> {
+        let dumped = self.run_ok(&["dump-config", "--format", "json"], None)?;
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&dumped).map_err(|e| ChezmoiError::Parse {
+                context: "dump-config",
+                detail: e.to_string(),
+            })?;
+        let config_file = self.run_utf8(&["execute-template", "{{ .chezmoi.configFile }}"])?;
+        let state = Path::new(config_file.trim())
+            .parent()
+            .map(|dir| dir.join("chezmoistate.boltdb"))
+            .ok_or_else(|| {
+                ChezmoiError::Failed(format!(
+                    "chezmoi named no folder for its config file: {config_file:?}"
+                ))
+            })?;
+        git_automation_off(&mut config, &state)?;
+        let written = |e: std::io::Error| {
+            ChezmoiError::Failed(format!(
+                "could not write a config without git automation: {e}"
+            ))
+        };
+        let dir = tempfile::tempdir().map_err(written)?;
+        let path = dir.path().join("chezmoi.json");
+        let bytes = serde_json::to_vec(&config).map_err(|e| ChezmoiError::Failed(e.to_string()))?;
+        std::fs::write(&path, bytes).map_err(written)?;
+        let mut opts = self.opts.clone();
+        opts.base_args = with_config_file(&self.opts.base_args, &path);
+        Ok(ChezmoiClient {
+            runner: self.runner.clone(),
+            opts,
+            _derived_config: Some(Arc::new(dir)),
+        })
     }
 
     fn request(&self, args: &[&str]) -> CommandRequest {
@@ -1393,5 +1506,68 @@ mod tests {
             ]
         );
         assert_eq!(fake.calls().len(), 2, "one retry of the whole chunk");
+    }
+
+    /// `dump-config`'s lower-case git keys are switched off in place, a
+    /// missing one is added, and the state database is pinned only when the
+    /// config named none.
+    ///
+    /// MUTATION: match the git keys case-sensitively in `git_automation_off`
+    /// → a camel-case `autoCommit` is added beside `autocommit: true`.
+    #[test]
+    fn git_automation_off_switches_the_dumped_keys_and_pins_the_state() {
+        let mut config = serde_json::json!({
+            "persistentState": "",
+            "git": { "autocommit": true, "autopush": true, "command": "git" },
+        });
+        git_automation_off(&mut config, Path::new("/cfg/chezmoistate.boltdb")).unwrap();
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "persistentState": "/cfg/chezmoistate.boltdb",
+                "git": {
+                    "autocommit": false,
+                    "autopush": false,
+                    "autoAdd": false,
+                    "command": "git",
+                },
+            })
+        );
+
+        let mut own = serde_json::json!({ "persistentState": "/own.boltdb" });
+        git_automation_off(&mut own, Path::new("/cfg/chezmoistate.boltdb")).unwrap();
+        assert_eq!(own["persistentState"], "/own.boltdb");
+    }
+
+    /// The derived config replaces any config flag, in either spelling.
+    ///
+    /// MUTATION: keep `--config <path>` in `with_config_file` → chezmoi
+    /// gets two config files and the args differ.
+    #[test]
+    fn with_config_file_replaces_the_config_flags() {
+        let base: Vec<String> = [
+            "--source",
+            "/s",
+            "--config",
+            "/c.toml",
+            "--config-format=toml",
+            "--no-tty",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            with_config_file(&base, Path::new("/t/chezmoi.json")),
+            [
+                "--source",
+                "/s",
+                "--no-tty",
+                "--config",
+                "/t/chezmoi.json",
+                "--config-format",
+                "json",
+            ]
+            .map(String::from)
+            .to_vec()
+        );
     }
 }
