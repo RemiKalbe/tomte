@@ -335,6 +335,19 @@ impl ResolveEngine {
             return self.keep_deletion(target, source);
         }
         let copies: Vec<PathBuf> = copies.iter().map(|rel| target.join(rel)).collect();
+        // Joined before journaling, so a copy whose source file the merge
+        // left conflicted refuses before anything is recorded: its raw bytes
+        // are conflict markers, and they would land in the link target.
+        let merging = self.ensure_merge_started()?;
+        if merging && !copies.is_empty() {
+            let conflicted = self.git.conflicted_files()?;
+            for file in &copies {
+                let rel = self.repo_rel(&self.chezmoi.source_path(file)?)?;
+                if conflicted.contains(&rel) {
+                    return Err(conflict_refusal(&rel));
+                }
+            }
+        }
         let session = self.session_start()?;
         for file in &copies {
             let dest_blob = self.snapshot_dest(file)?;
@@ -355,7 +368,6 @@ impl ResolveEngine {
         let mut expected = vec![target.to_path_buf(), source.to_path_buf()];
         expected.extend(copies.iter().cloned());
         self.expect_changes(expected)?;
-        let merging = self.ensure_merge_started()?;
         for file in &copies {
             let bytes = source_version(&self.chezmoi, &self.chezmoi.source_path(file)?, file)?;
             if let Some(parent) = file.parent() {
@@ -542,11 +554,7 @@ impl ResolveEngine {
                     .into_iter()
                     .find(|path| path.starts_with(&rel))
                 {
-                    return Err(ResolveError::Failed(format!(
-                        "{} is mid-merge with origin — its source file holds conflict \
-                         markers; resolve the origin difference in the merge editor first",
-                        hit.display()
-                    )));
+                    return Err(conflict_refusal(&hit));
                 }
             }
             return self.keep_source_type_change(target, &change);
@@ -2094,6 +2102,16 @@ fn kind_word(kind: &EntryKind) -> &'static str {
         EntryKind::Folder => "folder",
         EntryKind::Link(_) => "link",
     }
+}
+
+/// Keep source's refusal for a source path the merge left conflicted, named
+/// by its path in the source repo.
+fn conflict_refusal(rel: &Path) -> ResolveError {
+    ResolveError::Failed(format!(
+        "{} is mid-merge with origin — its source file holds conflict markers; \
+         resolve the origin difference in the merge editor first",
+        rel.display()
+    ))
 }
 
 fn copy_picks_refused() -> ResolveError {

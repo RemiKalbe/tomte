@@ -3420,3 +3420,38 @@ fn keep_link_mid_merge_concludes_without_sweeping_conflicts() {
         "the new entry is staged, got {staged:?}"
     );
 }
+
+/// Mid-merge, a copy pick whose source file the merge left conflicted is
+/// refused before anything is journaled or written: its raw bytes are
+/// conflict markers, and they would land in the link target.
+///
+/// MUTATION: drop the conflicted-copy check in `keep_disk_type_change` →
+/// the decision lands and `~/.real/gone` holds `<<<<<<<` markers.
+#[test]
+fn keep_link_mid_merge_refuses_a_copy_of_a_conflicted_file() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    managed_folder(&lab);
+    diverge_with_conflicts(&lab, &[("dot_d/gone", OTHER_ORIGIN, OTHER_LOCAL)]);
+    replace_with_link(&lab, ".d", ".real");
+
+    let err = lab
+        .engine
+        .keep_disk_with(&lab.s.home.join(".d"), &[PathBuf::from("gone")])
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "dot_d/gone is mid-merge with origin — its source file holds conflict markers; \
+         resolve the origin difference in the merge editor first"
+    );
+    assert!(
+        !lab.s.home.join(".real/gone").exists(),
+        "nothing is written into the link target"
+    );
+    assert!(
+        lab.s.source.join("dot_d").exists(),
+        "the source is untouched"
+    );
+    assert_eq!(link_text(&lab.s.home.join(".d")), ".real");
+}
