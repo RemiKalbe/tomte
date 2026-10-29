@@ -810,3 +810,69 @@ fn type_change_is_journaled_once_and_published() {
     });
     assert!(pushed, "a Drift event carried the type change");
 }
+
+/// A managed folder `~/.d` (`dot_d/one`) committed, pushed and applied.
+fn applied_folder(s: &Scratch) -> std::path::PathBuf {
+    std::fs::create_dir(s.source.join("dot_d")).unwrap();
+    std::fs::write(s.source.join("dot_d/one"), "1\n").unwrap();
+    git(&s.source, &["add", "-A"]);
+    git(&s.source, &["commit", "-m", "folder"]);
+    git(&s.source, &["push"]);
+    s.chezmoi().apply(None).unwrap();
+    s.home.join(".d")
+}
+
+/// The user puts back a folder a link had replaced: the per-event path
+/// probes the in-sync folder, clears its "replaced by a link" row, and goes
+/// on to the rest of the batch.
+///
+/// MUTATION: drop `|| kinds.folders.contains(target)` from `probe_one`'s
+/// `Detected::Same` arm → `hash_file` reads the folder, EISDIR, and
+/// `handle_paths_changed` fails before `.testrc`.
+#[test]
+fn a_folder_put_back_clears_its_row_on_the_per_event_path() {
+    let s = Scratch::new();
+    let target = applied_folder(&s);
+    std::fs::rename(&target, s.home.join(".real")).unwrap();
+    std::os::unix::fs::symlink(".real", &target).unwrap();
+    let mut core = core_for(&s);
+    core.full_rescan(100).unwrap();
+    let (list, _, _) = core.status_snapshot();
+    assert!(
+        list.iter().any(|d| d.target == target),
+        "sanity: the link shows a row"
+    );
+
+    std::fs::remove_file(&target).unwrap();
+    std::fs::rename(s.home.join(".real"), &target).unwrap();
+    let testrc = s.home.join(".testrc");
+    std::fs::write(&testrc, "a=2\n").unwrap();
+    core.handle_paths_changed(&[target.clone(), testrc.clone()], 200)
+        .unwrap();
+
+    let (list, _, _) = core.status_snapshot();
+    assert!(
+        !list.iter().any(|d| d.target == target),
+        "the folder row is cleared: {list:?}"
+    );
+    assert!(
+        kinds(&core, &testrc).contains(&"dest_changed".to_string()),
+        "the rest of the batch is probed"
+    );
+}
+
+/// A folder the app announced (Restore the folder, Undo) lands as an
+/// expected change: recorded without a snapshot, never read as a file.
+///
+/// MUTATION: drop the `not_a_file` skip in `record_expected_apply` →
+/// `snapshot_file` reads the folder, EISDIR, and the call fails.
+#[test]
+fn an_expected_folder_is_recorded_without_a_snapshot() {
+    let s = Scratch::new();
+    let target = applied_folder(&s);
+    let mut core = core_for(&s);
+    core.expect_changes(std::slice::from_ref(&target), 60, 100);
+    core.handle_paths_changed(std::slice::from_ref(&target), 110)
+        .unwrap();
+    assert_eq!(kinds(&core, &target), vec!["applied".to_string()]);
+}

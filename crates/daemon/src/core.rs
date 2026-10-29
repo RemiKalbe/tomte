@@ -503,7 +503,15 @@ impl DaemonCore {
 
     fn record_expected_apply(&mut self, target: &Path, now_ts: u64) -> Result<(), DaemonError> {
         let last = self.journal.last_event_hash(target)?;
-        let (blob_hash, extra) = self.snapshot_file(target, now_ts)?;
+        // A folder or link the app restored has no content of its own to
+        // snapshot (reading a folder is EISDIR); the app's session journals
+        // the entry.
+        let not_a_file = std::fs::symlink_metadata(target).is_ok_and(|m| !m.is_file());
+        let (blob_hash, extra) = if not_a_file {
+            (None, None)
+        } else {
+            self.snapshot_file(target, now_ts)?
+        };
         let mut meta = serde_json::json!({"expected": true});
         if let Some(serde_json::Value::Object(e)) = extra {
             for (k, v) in e {

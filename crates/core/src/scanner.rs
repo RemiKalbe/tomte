@@ -441,7 +441,12 @@ impl DriftScanner {
                 .and_then(|abs| abs.strip_prefix(&source_dir).ok().map(Path::to_path_buf))
         };
         match self.detect(target, &kinds, &dump)? {
-            Detected::Same if kinds.links.contains(target) => return Ok(None),
+            // An entry that is not a file has no content to probe: a link or
+            // folder whose kind matches the source is in sync (its files
+            // have their own rows).
+            Detected::Same if kinds.links.contains(target) || kinds.folders.contains(target) => {
+                return Ok(None);
+            }
             Detected::Same => {}
             d => return Ok(row(target.to_path_buf(), source_rel(), d)),
         }
