@@ -617,6 +617,92 @@ pub(super) struct TypeChangeDetail {
     pub failure: Option<String>,
 }
 
+/// Names per [`CompareItem::Names`] item: a long run of names is split so
+/// the list measures and draws only the chunks in view.
+const NAMES_PER_ITEM: usize = 24;
+
+/// One item of the type-change pane's list (a gpui `list`, mixed heights).
+/// Also the item's key: the list is spliced over the window of items whose
+/// key changed, so a pick re-measures one row, not the folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CompareItem {
+    Label(SharedString),
+    /// A file on its own row: it carries the copy pick, opens its diff, or
+    /// both.
+    File {
+        rel: PathBuf,
+        pickable: bool,
+        picked: bool,
+        opens_diff: bool,
+        open: bool,
+    },
+    /// Up to [`NAMES_PER_ITEM`] names that need no decision, wrapped.
+    Names(Vec<PathBuf>),
+    /// What Restore does to disk.
+    Footer,
+}
+
+/// The items under a type-change header, in order: each group's label and
+/// its rows (files that carry a pick or a diff one per row, the rest as
+/// wrapped name runs), then the footer. Empty when the pane draws no list:
+/// a line diff, a load in flight, or a load that failed.
+pub(super) fn compare_items(
+    change: &WireTypeChange,
+    detail: Option<&TypeChangeDetail>,
+    picks: &BTreeSet<PathBuf>,
+    open: Option<&Path>,
+) -> Vec<CompareItem> {
+    let kind = type_change_body(change);
+    if kind == TypeChangeBody::Nothing {
+        return vec![CompareItem::Footer];
+    }
+    let Some(detail) = detail.filter(|d| d.failure.is_none()) else {
+        return Vec::new();
+    };
+    let names = |items: &mut Vec<CompareItem>, names: Vec<PathBuf>| {
+        items.extend(
+            names
+                .chunks(NAMES_PER_ITEM)
+                .map(|chunk| CompareItem::Names(chunk.to_vec())),
+        );
+    };
+    let mut items = Vec::new();
+    match kind {
+        TypeChangeBody::Comparison => {
+            let Some(cmp) = &detail.comparison else {
+                return Vec::new();
+            };
+            for (label, rows) in comparison_plan(cmp, picks).groups {
+                items.push(CompareItem::Label(label.into()));
+                if rows.iter().any(|r| r.pickable || r.opens_diff) {
+                    items.extend(rows.into_iter().map(|row| CompareItem::File {
+                        open: row.opens_diff && open == Some(row.rel.as_path()),
+                        rel: row.rel,
+                        pickable: row.pickable,
+                        picked: row.picked,
+                        opens_diff: row.opens_diff,
+                    }));
+                } else {
+                    names(&mut items, rows.into_iter().map(|r| r.rel).collect());
+                }
+            }
+        }
+        TypeChangeBody::Deletes => {
+            let (_, restore) = type_change_buttons(change);
+            items.push(CompareItem::Label(
+                format!("On disk · deleted if you {}", restore.to_lowercase()).into(),
+            ));
+            names(
+                &mut items,
+                detail.deletes.iter().map(PathBuf::from).collect(),
+            );
+        }
+        TypeChangeBody::LineDiff | TypeChangeBody::Nothing => return Vec::new(),
+    }
+    items.push(CompareItem::Footer);
+    items
+}
+
 /// The folder comparison under a type-change header, as the rows it draws.
 pub(super) struct ComparisonPlan {
     pub groups: Vec<(&'static str, Vec<ComparisonRow>)>,
@@ -1435,7 +1521,7 @@ pub(super) fn row_keys(plan: &SidebarPlan, queue: &QueueSnapshot) -> Vec<RowKey>
 /// row: `(old_range, new_count)` for the middle that differs, `None` when
 /// the two lists are identical. `splice(0..old, new)` would snap the
 /// anchor to item 0 on every rebuild (gpui 0.2.2 `list.rs`, `splice_focusable`).
-pub(super) fn splice_window(old: &[RowKey], new: &[RowKey]) -> Option<(Range<usize>, usize)> {
+pub(super) fn splice_window<K: PartialEq>(old: &[K], new: &[K]) -> Option<(Range<usize>, usize)> {
     if old == new {
         return None;
     }
@@ -1690,6 +1776,12 @@ pub struct ReviewView {
     /// The Differs file of the comparison whose line diff is open below the
     /// list (relative to the selected target).
     pub(super) compare_open: Option<PathBuf>,
+    /// The type-change pane's list (spec rule: no plain scroll columns),
+    /// the items it holds, and the target they were planned for (a new
+    /// target resets the list; anything else splices the changed window).
+    pub(super) compare_list: ListState,
+    pub(super) compare_keys: Rc<Vec<CompareItem>>,
+    compare_for: Option<PathBuf>,
     /// The diff is a read-only [`ui::TextArea`] (2026-08-23 feedback: "diffs
     /// should be selectable"): same editor as the merge result, minus the
     /// decision strips — so a diff can be selected and copied like text.
@@ -1787,6 +1879,9 @@ impl ReviewView {
             copy_picks: BTreeSet::new(),
             type_change: None,
             compare_open: None,
+            compare_list: ListState::new(0, ListAlignment::Top, px(200.)),
+            compare_keys: Rc::new(Vec::new()),
+            compare_for: None,
             preview_editor: None,
             preview_dirty: true,
             preview_appearance: None,
@@ -3447,6 +3542,35 @@ impl ReviewView {
         }
     }
 
+    /// Keep the type-change list's items (and its height cache) in step
+    /// with [`compare_items`]: a new target replaces them wholesale, a pick
+    /// or an opened diff splices only the items whose key changed.
+    fn sync_compare_list(&mut self, cx: &App) {
+        let change = self
+            .selected
+            .as_deref()
+            .and_then(|t| self.type_change_of(t, cx));
+        let items = change
+            .map(|change| {
+                compare_items(
+                    &change,
+                    self.type_change.as_ref(),
+                    &self.copy_picks,
+                    self.compare_open.as_deref(),
+                )
+            })
+            .unwrap_or_default();
+        if self.compare_for != self.selected {
+            self.compare_list.reset(items.len());
+            self.compare_for = self.selected.clone();
+        } else if let Some((range, count)) = splice_window(&self.compare_keys, &items) {
+            self.compare_list.splice(range, count);
+        } else {
+            return;
+        }
+        self.compare_keys = Rc::new(items);
+    }
+
     /// Under a type-change header: the comparison, the line diff or the
     /// list of what Restore deletes, then the footer saying what Restore
     /// does to disk (spec 2026-10-29 §The Review screen).
@@ -3457,84 +3581,74 @@ impl ReviewView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let footer = div()
-            .text_xs()
-            .text_color(theme.text_muted)
-            .child(footer_text(change, target));
+        let footer = || {
+            div()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child(footer_text(change, target))
+        };
         let kind = type_change_body(change);
-        if kind == TypeChangeBody::LineDiff {
+        // No list to draw: the line diff, or the load's own state, then the
+        // footer.
+        if self.compare_keys.is_empty() {
+            let body = if kind == TypeChangeBody::LineDiff {
+                self.preview_body(theme)
+            } else if let Some(why) = self.type_change.as_ref().and_then(|d| d.failure.clone()) {
+                message_box(theme, "could not compare", why, None)
+            } else {
+                centered_note(theme, "loading…".into(), theme.text_muted)
+            };
             return div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .child(self.preview_body(theme)),
-                )
-                .child(div().flex_none().px_3().py_2().child(footer))
+                .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+                .child(div().flex_none().px_3().py_2().child(footer()))
                 .into_any_element();
         }
-        let loading = self.type_change.is_none() && kind != TypeChangeBody::Nothing;
-        let groups: Vec<AnyElement> = match &self.type_change {
-            _ if loading => vec![
-                div()
-                    .text_xs()
-                    .text_color(theme.text_muted)
-                    .child("loading…")
-                    .into_any_element(),
-            ],
-            Some(TypeChangeDetail {
-                failure: Some(why), ..
-            }) => vec![message_box(theme, "could not compare", why.clone(), None)],
-            Some(TypeChangeDetail {
-                comparison: Some(cmp),
-                ..
-            }) => self.comparison_groups(cmp, theme, cx),
-            Some(detail) if kind == TypeChangeBody::Deletes => {
-                let (_, restore) = type_change_buttons(change);
-                vec![
-                    ui::compare_group(
-                        theme,
-                        format!("On disk · deleted if you {}", restore.to_lowercase()),
-                        ui::compare_names(
-                            theme,
-                            detail.deletes.iter().map(|n| n.clone().into()).collect(),
-                        ),
-                    )
-                    .into_any_element(),
-                ]
-            }
-            _ => Vec::new(),
-        };
-        let diff_open = self.compare_open.is_some();
-        let list = div()
+        let items = self.compare_keys.clone();
+        let weak = cx.weak_entity();
+        let footer_line: SharedString = footer_text(change, target).into();
+        // Same shape as the sidebar's list: the item closure runs in the
+        // list's prepaint, after this render released the view, so the
+        // update below is a fresh one that gives each row its listeners.
+        // It must not touch `compare_list` (the list holds it borrowed).
+        let rows = list(self.compare_list.clone(), move |ix, _window, cx| {
+            let Some(view) = weak.upgrade() else {
+                return div().into_any_element();
+            };
+            let item = view.update(cx, |view, cx| {
+                view.compare_item_el(ix, &items, footer_line.clone(), theme, cx)
+            });
+            div()
+                .w_full()
+                .px_3()
+                .flex()
+                .flex_col()
+                .child(item)
+                .into_any_element()
+        })
+        .size_full();
+        let list_box = div()
             .id("type-change-list")
-            .px_3()
+            .debug_selector(|| "type-change-list".into())
             .py_2()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .overflow_y_scroll()
-            // As tall as its groups, shrinking (and scrolling) when the pane
-            // is shorter, so the footer sits right under it; shorter still
-            // above an open file's diff.
-            .min_h_0()
-            .when(diff_open, |el| el.flex_none().max_h(px(COMPARE_LIST_MAX_H)))
-            .children(groups);
+            .map(|el| match self.compare_open {
+                // Shorter, above the open file's diff.
+                Some(_) => el.flex_none().h(px(COMPARE_LIST_MAX_H)),
+                None => el.flex_1().min_h_0(),
+            })
+            .child(rows);
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .child(list)
-            // Outside the scroll: what Restore does stays on screen however
-            // long the list.
-            .child(div().flex_none().px_3().pb_2().child(footer))
+            .child(list_box)
+            // The open file's diff is the existing diff view, which scrolls
+            // on its own; it sits under the list rather than inside it, so
+            // the wheel never has two scrollers under it.
             .when_some(self.compare_open.clone(), |el, rel| {
                 el.child(
                     div()
@@ -3561,58 +3675,65 @@ impl ReviewView {
             .into_any_element()
     }
 
-    /// The folder comparison's groups as [`comparison_plan`] lays them out:
-    /// a picked or Differs file on its own row, the rest wrapped inline.
-    fn comparison_groups(
+    /// One item of the type-change list, drawn verbatim from its key.
+    fn compare_item_el(
         &self,
-        cmp: &FolderComparison,
+        ix: usize,
+        items: &[CompareItem],
+        footer: SharedString,
         theme: Theme,
         cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let plan = comparison_plan(cmp, &self.copy_picks);
-        plan.groups
-            .into_iter()
-            .enumerate()
-            .map(|(g, (label, rows))| {
-                let body: AnyElement = if rows.iter().any(|r| r.pickable || r.opens_diff) {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .children(rows.into_iter().enumerate().map(|(ix, row)| {
-                            let open = self.compare_open.as_deref() == Some(row.rel.as_path());
-                            let pick_rel = row.rel.clone();
-                            let open_rel = row.rel.clone();
-                            ui::compare_row(
-                                theme,
-                                ElementId::Name(format!("compare-{g}-{ix}").into()),
-                                row.rel.display().to_string().into(),
-                                ui::CompareRowSpec {
-                                    pick: row.pickable.then_some((row.picked, COPY_PICK_LABEL)),
-                                    opens: row.opens_diff,
-                                    open,
-                                },
-                                cx.listener(move |view, _ev, _w, cx| {
-                                    view.toggle_copy_pick(&pick_rel, cx)
-                                }),
-                                cx.listener(move |view, _ev, _w, cx| {
-                                    view.open_compare_diff(open_rel.clone(), cx)
-                                }),
-                            )
-                            .into_any_element()
-                        }))
-                        .into_any_element()
-                } else {
-                    ui::compare_names(
-                        theme,
-                        rows.iter()
-                            .map(|r| r.rel.display().to_string().into())
-                            .collect(),
-                    )
-                    .into_any_element()
-                };
-                ui::compare_group(theme, label, body).into_any_element()
-            })
-            .collect()
+    ) -> AnyElement {
+        let Some(item) = items.get(ix) else {
+            return div().into_any_element();
+        };
+        match item {
+            // Space above every group but the first.
+            CompareItem::Label(label) => ui::compare_label(theme, label.clone())
+                .when(ix > 0, |el| el.pt_3())
+                .pb_0p5()
+                .into_any_element(),
+            CompareItem::File {
+                rel,
+                pickable,
+                picked,
+                opens_diff,
+                open,
+            } => {
+                let pick_rel = rel.clone();
+                let open_rel = rel.clone();
+                ui::compare_row(
+                    theme,
+                    ElementId::named_usize("compare", ix),
+                    rel.display().to_string().into(),
+                    ui::CompareRowSpec {
+                        pick: pickable.then_some((*picked, COPY_PICK_LABEL)),
+                        opens: *opens_diff,
+                        open: *open,
+                    },
+                    cx.listener(move |view, _ev, _w, cx| view.toggle_copy_pick(&pick_rel, cx)),
+                    cx.listener(move |view, _ev, _w, cx| {
+                        view.open_compare_diff(open_rel.clone(), cx)
+                    }),
+                )
+                .into_any_element()
+            }
+            CompareItem::Names(names) => ui::compare_names(
+                theme,
+                names
+                    .iter()
+                    .map(|n| n.display().to_string().into())
+                    .collect(),
+            )
+            .pb_0p5()
+            .into_any_element(),
+            CompareItem::Footer => div()
+                .pt_3()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child(footer)
+                .into_any_element(),
+        }
     }
 
     fn diff_preview(&self, theme: Theme) -> AnyElement {
@@ -3666,6 +3787,7 @@ impl ReviewView {
     fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         self.sync_preview_editor(theme, window, cx);
+        self.sync_compare_list(cx);
         let now = system_now();
         let model = self.state.read(cx);
         let in_sync = model.in_sync;
@@ -4058,14 +4180,14 @@ mod tests {
     use super::super::BatchResult;
 
     use super::{
-        BannerTint, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner, QueueSnapshot,
-        QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, RowKey, Selection, SidebarInputs,
-        SidebarPlan, SidebarRow, UndoAffordance, blocked_reason, bulk_actions, bulk_decision,
-        comparison_plan, display_name, entry_name, flatten_document, footer_text, next_after,
-        origin_diffs, origin_hint, per_line_ranges, preview_decors, queued_outcome_banner,
-        re_anchor_index, refused_banner, row_keys, severity_groups, sidebar_rows, source_actions,
-        splice_window, type_change_body, type_change_buttons, type_change_decision,
-        type_change_line, undo_affordance, undo_banner,
+        BannerTint, CompareItem, DiffLine, DiffPair, LineTint, ORIGIN_HINT, OutcomeBanner,
+        QueueSnapshot, QueuedDecision, QueuedStatus, ResolveAction, ReviewMode, RowKey, Selection,
+        SidebarInputs, SidebarPlan, SidebarRow, TypeChangeDetail, UndoAffordance, blocked_reason,
+        bulk_actions, bulk_decision, compare_items, comparison_plan, display_name, entry_name,
+        flatten_document, footer_text, next_after, origin_diffs, origin_hint, per_line_ranges,
+        preview_decors, queued_outcome_banner, re_anchor_index, refused_banner, row_keys,
+        severity_groups, sidebar_rows, source_actions, splice_window, type_change_body,
+        type_change_buttons, type_change_decision, type_change_line, undo_affordance, undo_banner,
     };
     use tomte_app::theme::Theme;
 
@@ -4210,6 +4332,136 @@ mod tests {
         assert_eq!(
             type_change_line(&tc(".real", "absent")),
             "link → removed  .real"
+        );
+    }
+
+    fn humanizer_cmp(differs: bool) -> tomte_core::type_change::FolderComparison {
+        use tomte_core::type_change::{CompareGroup, FolderComparison};
+        let mut entries = vec![(p("WARP.md"), CompareGroup::OnlyInSource)];
+        if differs {
+            entries.push((p("SKILL.md"), CompareGroup::Differs));
+        }
+        entries.extend([
+            (p("agents/"), CompareGroup::OnlyOnDisk),
+            (p("LICENSE"), CompareGroup::OnlyOnDisk),
+            (p("README.md"), CompareGroup::Same),
+        ]);
+        FolderComparison { entries }
+    }
+
+    fn detail_with(cmp: tomte_core::type_change::FolderComparison) -> TypeChangeDetail {
+        TypeChangeDetail {
+            comparison: Some(cmp),
+            deletes: Vec::new(),
+            failure: None,
+        }
+    }
+
+    fn file(rel: &str, pickable: bool, picked: bool, opens_diff: bool, open: bool) -> CompareItem {
+        CompareItem::File {
+            rel: p(rel),
+            pickable,
+            picked,
+            opens_diff,
+            open,
+        }
+    }
+
+    /// The list's items in the spec's order: a group's label, then its files
+    /// one per row when they carry a pick or a diff, else as a name run;
+    /// the footer last.
+    /// MUTATION: always take the name-run branch in `compare_items` (drop
+    /// the `rows.iter().any(..)` test) → WARP.md becomes part of a `Names`
+    /// item and loses its pick.
+    #[test]
+    fn compare_items_lay_out_the_groups_then_the_footer() {
+        let change = tc("folder", "../../.agents/skills/humanizer");
+        let detail = detail_with(humanizer_cmp(false));
+        let picks = BTreeSet::from([p("WARP.md")]);
+        assert_eq!(
+            compare_items(&change, Some(&detail), &picks, None),
+            vec![
+                CompareItem::Label(
+                    "Only in source · removed from source if you keep the link".into()
+                ),
+                file("WARP.md", true, true, false, false),
+                CompareItem::Label("Only in the link target · not managed".into()),
+                CompareItem::Names(vec![p("agents/"), p("LICENSE")]),
+                CompareItem::Label("Same on both sides".into()),
+                CompareItem::Names(vec![p("README.md")]),
+                CompareItem::Footer,
+            ]
+        );
+    }
+
+    /// The open Differs file is marked on its own row, and a pick changes
+    /// exactly that row's key, so the list splices one item.
+    /// MUTATION: `open: false` in `compare_items`' file rows → the SKILL.md
+    /// row is not marked open.
+    #[test]
+    fn compare_items_mark_the_open_file_and_a_pick_splices_one_row() {
+        let change = tc("folder", "../h");
+        let detail = detail_with(humanizer_cmp(true));
+        let none = BTreeSet::new();
+        let open = compare_items(&change, Some(&detail), &none, Some(Path::new("SKILL.md")));
+        assert_eq!(open[3], file("SKILL.md", true, false, true, true));
+        let before = compare_items(&change, Some(&detail), &none, None);
+        let after = compare_items(
+            &change,
+            Some(&detail),
+            &BTreeSet::from([p("WARP.md")]),
+            None,
+        );
+        assert_eq!(splice_window(&before, &after), Some((1..2, 1)));
+    }
+
+    /// A long run of names is split into items the list can measure one by
+    /// one.
+    /// MUTATION: chunk by `names.len().max(1)` instead of `NAMES_PER_ITEM`
+    /// in `compare_items` → the 30 names are one item.
+    #[test]
+    fn compare_items_split_long_name_runs() {
+        let change = tc(".real", "folder");
+        let detail = TypeChangeDetail {
+            comparison: None,
+            deletes: (0..30).map(|i| format!("f{i:02}")).collect(),
+            failure: None,
+        };
+        let items = compare_items(&change, Some(&detail), &BTreeSet::new(), None);
+        let runs: Vec<usize> = items
+            .iter()
+            .filter_map(|i| match i {
+                CompareItem::Names(n) => Some(n.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs, [24, 6]);
+        assert_eq!(
+            items[0],
+            CompareItem::Label("On disk · deleted if you restore the link".into())
+        );
+        assert_eq!(items.last(), Some(&CompareItem::Footer));
+    }
+
+    /// No list while loading or after a failure (the pane says which); a
+    /// retargeted link has only its footer.
+    /// MUTATION: drop `.filter(|d| d.failure.is_none())` in `compare_items`
+    /// → a failed load lists a footer under its error.
+    #[test]
+    fn compare_items_draw_no_list_while_loading_or_failed() {
+        let change = tc("folder", "../h");
+        assert!(compare_items(&change, None, &BTreeSet::new(), None).is_empty());
+        let failed = TypeChangeDetail {
+            comparison: None,
+            deletes: Vec::new(),
+            failure: Some("chezmoi exited 1".into()),
+        };
+        for change in [change.clone(), tc(".real", "folder")] {
+            assert!(compare_items(&change, Some(&failed), &BTreeSet::new(), None).is_empty());
+        }
+        assert_eq!(
+            compare_items(&tc(".a", ".b"), None, &BTreeSet::new(), None),
+            [CompareItem::Footer]
         );
     }
 

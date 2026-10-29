@@ -3867,6 +3867,30 @@ mod render_smoke {
         );
     }
 
+    /// The type-change pane rides a gpui `list`: rendering the posed folder
+    /// fills the list with the planned items, one list item each.
+    ///
+    /// MUTATION: drop `self.sync_compare_list(cx)` from `render_inner` →
+    /// the list holds no items and the keys stay empty.
+    #[gpui::test]
+    fn the_type_change_pane_fills_its_list_from_the_plan(cx: &mut TestAppContext) {
+        let (shell, vis) = cx.add_window_view(|_window, cx| {
+            fixtures::build("review-type-folder-link", smoke_paths(), cx)
+                .expect("type-change fixture")
+        });
+        vis.run_until_parked();
+        let review = vis
+            .update(|_window, cx| shell.read(cx).review.clone())
+            .expect("the fixture poses a review view");
+        vis.update(|_window, cx| {
+            let view = review.read(cx);
+            // Three labels, WARP.md, two name runs, the footer.
+            assert_eq!(view.compare_keys.len(), 7);
+            assert_eq!(view.compare_list.item_count(), 7);
+            assert_eq!(view.compare_keys.last(), Some(&review::CompareItem::Footer));
+        });
+    }
+
     /// A press on a type-change row queues under the words on its button,
     /// carrying the picks, and the picks are gone from the view once the
     /// decision has them. The model holds the one row, so the selection has

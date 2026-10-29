@@ -1,5 +1,5 @@
 //! The groups of a folder comparison (a folder in the source against what
-//! the disk holds there now): a muted label over its rows. A row that
+//! the disk holds there now): a muted label, then its rows. A row that
 //! carries a decision has a checkbox; names that need none are listed
 //! inline, wrapped, in the same column as the rows' names.
 
@@ -19,20 +19,14 @@ const NAME_INDENT: f32 = 14. + 8.;
 /// (`line_clamp` measures against it) instead of pushing the note away.
 const NAME_W: f32 = 200.;
 
-/// A group: `label` (text_xs, semibold, muted) over `body`.
-pub fn compare_group(theme: Theme, label: impl Into<SharedString>, body: impl IntoElement) -> Div {
+/// A group's label: text_xs, semibold, muted. The rows under it are
+/// separate elements, so a long group can ride a virtualized list.
+pub fn compare_label(theme: Theme, label: impl Into<SharedString>) -> Div {
     div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text_muted)
-                .child(label.into()),
-        )
-        .child(body)
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.text_muted)
+        .child(label.into())
 }
 
 /// What a [`compare_row`] carries besides its name.
@@ -111,7 +105,7 @@ pub fn compare_row(
         }))
 }
 
-/// Names that carry no decision, wrapped inline under the rows' names.
+/// Names that carry no decision, wrapped inline in the rows' name column.
 pub fn compare_names(theme: Theme, names: Vec<SharedString>) -> Div {
     div()
         .pl(px(NAME_INDENT))
