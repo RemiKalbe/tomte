@@ -114,6 +114,36 @@ fn git_automation_off(config: &mut serde_json::Value, state: &Path) -> Result<()
     Ok(())
 }
 
+/// Write `config` to `chezmoi.json` in a new temporary folder only the user
+/// can open (0700, the file 0600): it is a copy of the user's whole chezmoi
+/// config, template data and secret-manager settings included, and the
+/// temporary folder may be the shared `/tmp`.
+fn write_private_config(
+    config: &serde_json::Value,
+) -> Result<(tempfile::TempDir, PathBuf), ChezmoiError> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let written = |e: std::io::Error| {
+        ChezmoiError::Failed(format!(
+            "could not write a config without git automation: {e}"
+        ))
+    };
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(written)?;
+    let path = dir.path().join("chezmoi.json");
+    let bytes = serde_json::to_vec(config).map_err(|e| ChezmoiError::Failed(e.to_string()))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| file.write_all(&bytes))
+        .map_err(written)?;
+    Ok((dir, path))
+}
+
 /// `base_args` reading `config` (JSON) instead of any config file they named.
 fn with_config_file(base_args: &[String], config: &Path) -> Vec<String> {
     let mut args = Vec::with_capacity(base_args.len() + 4);
@@ -373,15 +403,7 @@ impl ChezmoiClient {
                 ))
             })?;
         git_automation_off(&mut config, &state)?;
-        let written = |e: std::io::Error| {
-            ChezmoiError::Failed(format!(
-                "could not write a config without git automation: {e}"
-            ))
-        };
-        let dir = tempfile::tempdir().map_err(written)?;
-        let path = dir.path().join("chezmoi.json");
-        let bytes = serde_json::to_vec(&config).map_err(|e| ChezmoiError::Failed(e.to_string()))?;
-        std::fs::write(&path, bytes).map_err(written)?;
+        let (dir, path) = write_private_config(&config)?;
         let mut opts = self.opts.clone();
         opts.base_args = with_config_file(&self.opts.base_args, &path);
         Ok(ChezmoiClient {
@@ -1569,5 +1591,20 @@ mod tests {
             .map(String::from)
             .to_vec()
         );
+    }
+
+    /// The derived config copies the user's whole chezmoi config, so only
+    /// the user may read it: folder 0700, file 0600.
+    ///
+    /// MUTATION: create the folder with `tempfile::tempdir()` in
+    /// `write_private_config` → it is 0755 under the usual umask.
+    #[test]
+    fn the_derived_config_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, path) = write_private_config(&serde_json::json!({ "data": {} })).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.path()), 0o700, "the folder");
+        assert_eq!(mode(&path), 0o600, "the file");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"data":{}}"#);
     }
 }
