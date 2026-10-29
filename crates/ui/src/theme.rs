@@ -66,7 +66,7 @@ impl Theme {
     pub fn class_color(&self, class: &str) -> Rgba {
         match class {
             "conflict" | "local_source_diverged" | "eval_failed" => self.conflict,
-            "destination_drift" | "source_ahead" => self.drift,
+            "destination_drift" | "source_ahead" | "type_changed" => self.drift,
             "remote_ahead" => self.accent,
             _ => self.ok,
         }
@@ -77,11 +77,15 @@ impl Theme {
 mod tests {
     use super::*;
 
+    /// MUTATION: drop "type_changed" from `class_color`'s drift arm → it falls to
+    /// `ok`, the in-sync green.
     #[test]
     fn class_colors_are_distinct_per_severity() {
         let t = Theme::dark();
         assert_eq!(t.class_color("conflict"), t.conflict);
         assert_eq!(t.class_color("destination_drift"), t.drift);
+        // A type change is disk drift with one decision; green would read as in sync.
+        assert_eq!(t.class_color("type_changed"), t.drift);
         assert_eq!(t.class_color("remote_ahead"), t.accent);
         assert_eq!(t.class_color("in_sync"), t.ok);
     }

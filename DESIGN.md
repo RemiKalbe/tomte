@@ -18,7 +18,7 @@ The style is settled and approved: GitHub palette, Zed density and idioms, GPUI 
 
 Rules:
 - No raw hex in views; semantic tokens only. `Theme::wash(token, alpha)` for hover layers and chip fills (Zed-style ghost layering).
-- Severity classes map through `class_color()`: conflict/eval red, disk-drift amber, remote-ahead blue, in-sync green.
+- Severity classes map through `class_color()`: conflict/eval red, disk-drift and type-change amber, remote-ahead blue, in-sync green.
 - Accent is for actions/selection/state, never decoration. Restrained strategy.
 
 ## Typography
