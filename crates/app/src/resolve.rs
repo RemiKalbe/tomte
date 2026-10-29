@@ -9,15 +9,20 @@
 //! commit still leaves the resolution DONE locally, reported honestly via
 //! `ResolveOutcome::Done { committed: false, note, .. }` (spec §10).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tomte_core::chezmoi::{ChezmoiClient, ChezmoiError};
+use tomte_core::drift::ContentHash;
 use tomte_core::git::{GitClient, GitError};
 use tomte_core::template::anchor::SpanMap;
 use tomte_core::template::verify::{VerifyError, verify_write_back};
 use tomte_core::template::writeback::write_back;
+use tomte_core::type_change::{
+    EntryKind, FolderComparison, TypeChange, compare_folder, disk_kind, type_change,
+};
 use tomte_journal::{Journal, JournalError};
 use tomte_proto::{Request, Response};
 
@@ -158,6 +163,11 @@ pub struct ResolveEngine {
 pub use crate::ipc::DAEMON_PATIENCE;
 
 impl ResolveEngine {
+    /// [`Self::keep_disk_with`], copying nothing.
+    pub fn keep_disk(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
+        self.keep_disk_with(target, &[])
+    }
+
     /// Keep the on-disk version: re-add it into the source state.
     ///
     /// A templated source cannot be re-added — `chezmoi re-add` silently
@@ -168,9 +178,25 @@ impl ResolveEngine {
     /// does, minus the clicks. The one thing that path refuses is a disk edit
     /// inside a templated VALUE, and it says so (`ProtectedSpan`) rather than
     /// sending every templated file to the editor unasked.
-    pub fn keep_disk(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
+    ///
+    /// A type change (a folder that became a link, a file that became a
+    /// link, …) is checked FIRST: `re-add` silently does nothing for one, so
+    /// the row came back after a "successful" decision. It goes through
+    /// [`Self::keep_disk_type_change`] instead. `copies` (paths relative to
+    /// `target`) are only for a folder replaced by a link.
+    pub fn keep_disk_with(
+        &self,
+        target: &Path,
+        copies: &[PathBuf],
+    ) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "keep_disk {}", target.display());
         let source = self.chezmoi.source_path(target)?;
+        if let Some(change) = self.type_change_at(target, &source)? {
+            return self.keep_disk_type_change(target, &source, &change, copies);
+        }
+        if !copies.is_empty() {
+            return Err(copy_picks_refused());
+        }
         if is_absent(target) {
             return self.keep_deletion(target, &source);
         }
@@ -261,6 +287,228 @@ impl ResolveEngine {
         })
     }
 
+    /// The type change at `target`, or `None` when the disk holds the kind
+    /// the source says. The scanner's check for one target: the source kind
+    /// is read from the source path, the disk kind with [`disk_kind`]. Which
+    /// side moved is not asked (`state_kind` is `None`): the engine acts the
+    /// same either way.
+    pub fn type_change_of(&self, target: &Path) -> Result<Option<TypeChange>, ResolveError> {
+        let source = self.chezmoi.source_path(target)?;
+        self.type_change_at(target, &source)
+    }
+
+    fn type_change_at(
+        &self,
+        target: &Path,
+        source: &Path,
+    ) -> Result<Option<TypeChange>, ResolveError> {
+        let source_kind = source_kind(&self.chezmoi, target, source)?;
+        let disk = disk_kind(target)?;
+        Ok(type_change(&source_kind, &disk, None))
+    }
+
+    /// Keep disk for a type change: the source entry becomes what the disk
+    /// holds, via `chezmoi add`, which replaces an entry of any kind. A
+    /// removed link is a deletion ([`Self::keep_deletion`]).
+    ///
+    /// Copies (folder → link only) write the source's version of the picked
+    /// files into the link target BEFORE the swap: `add` removes those source
+    /// files. Each copy is journaled with what it overwrote, so Undo takes it
+    /// back out. The keep-disk decision itself changes nothing on disk, so
+    /// it records no disk entry and Undo restores nothing for it, as for a
+    /// file.
+    fn keep_disk_type_change(
+        &self,
+        target: &Path,
+        source: &Path,
+        change: &TypeChange,
+        copies: &[PathBuf],
+    ) -> Result<ResolveOutcome, ResolveError> {
+        let link_over_folder = matches!(
+            (&change.source, &change.disk),
+            (EntryKind::Folder, EntryKind::Link(_))
+        );
+        if !copies.is_empty() && !link_over_folder {
+            return Err(copy_picks_refused());
+        }
+        if change.disk == EntryKind::Absent {
+            return self.keep_deletion(target, source);
+        }
+        let copies: Vec<PathBuf> = copies.iter().map(|rel| target.join(rel)).collect();
+        let session = self.session_start()?;
+        for file in &copies {
+            let dest_blob = self.snapshot_dest(file)?;
+            let decision = build_decision("copy_into_link", file, dest_blob.as_deref(), None);
+            self.session_decision(session, decision)?;
+        }
+        self.session_decision(
+            session,
+            serde_json::json!({
+                "action": "keep_disk",
+                "target": target.to_string_lossy(),
+                "type_change": {
+                    "source": kind_word(&change.source),
+                    "disk": kind_word(&change.disk),
+                },
+            }),
+        )?;
+        let mut expected = vec![target.to_path_buf(), source.to_path_buf()];
+        expected.extend(copies.iter().cloned());
+        self.expect_changes(expected)?;
+        let merging = self.ensure_merge_started()?;
+        for file in &copies {
+            let bytes = source_version(&self.chezmoi, &self.chezmoi.source_path(file)?, file)?;
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(file, bytes)?;
+        }
+        let (committed, pushed, note) = if merging {
+            self.swap_source_entry(target, source)?;
+            self.conclude_merge()
+        } else {
+            self.chezmoi
+                .add(std::slice::from_ref(&target.to_path_buf()))?;
+            self.commit_phase("keep_disk", target)
+        };
+        self.session_end(session, &format!("keep_disk {}", display_name(target)))?;
+        self.rescan()?;
+        Ok(ResolveOutcome::Done {
+            session,
+            committed,
+            pushed,
+            note,
+        })
+    }
+
+    /// The mid-merge half of a type-change keep disk. `chezmoi add` cannot
+    /// run here, for the reason `keep_disk` does not `re-add`: its autoCommit
+    /// stages the whole index and would sweep up every other file the merge
+    /// left conflicted. So chezmoi adds the target into a SCRATCH source with
+    /// an empty config (no git), which encodes the new entry exactly as `add`
+    /// would (`symlink_`, attributes and all); the old entry is `git rm`ed,
+    /// the scratch leaf moved into its place, and only that leaf staged.
+    fn swap_source_entry(&self, target: &Path, source: &Path) -> Result<(), ResolveError> {
+        let scratch = tempfile::tempdir()?;
+        let scratch_source = scratch.path().join("source");
+        let config_dir = scratch.path().join("config");
+        std::fs::create_dir_all(&scratch_source)?;
+        std::fs::create_dir_all(&config_dir)?;
+        let config = config_dir.join("chezmoi.toml");
+        std::fs::write(&config, "")?;
+        let leaf = self
+            .chezmoi
+            .add_into_source(target, &scratch_source, &config)?;
+        let (Some(parent), Some(name)) = (source.parent(), leaf.file_name()) else {
+            return Err(ResolveError::Failed(format!(
+                "cannot place {} beside {}",
+                leaf.display(),
+                source.display()
+            )));
+        };
+        let new_entry = parent.join(name);
+        self.git.rm_path(&self.repo_rel(source)?)?;
+        // An untracked file left under the old entry would keep it a source
+        // entry beside the new one.
+        remove_entry(source)?;
+        move_entry(&leaf, &new_entry)?;
+        self.git.add_path(&self.repo_rel(&new_entry)?)?;
+        Ok(())
+    }
+
+    /// Keep source for a type change: `chezmoi apply` writes the source's
+    /// entry over whatever the disk holds. The journal records what was on
+    /// disk (`dest_entry`, a folder walked without following links) and, for
+    /// a folder the source restores, the paths that apply writes into it
+    /// (`applied`), so Undo can tell Tomte's own files from ones added later.
+    fn keep_source_type_change(
+        &self,
+        target: &Path,
+        change: &TypeChange,
+    ) -> Result<ResolveOutcome, ResolveError> {
+        let applied = match change.source {
+            EntryKind::Folder => Some(
+                self.chezmoi
+                    .managed_under(target, None)?
+                    .iter()
+                    .map(|path| path.strip_prefix(target).unwrap_or(path).to_path_buf())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        let session = self.session_start()?;
+        let dest_entry = self.snapshot_entry(target, &change.disk)?;
+        let decision = build_entry_decision("keep_source", target, dest_entry, applied.as_deref());
+        self.session_decision(session, decision)?;
+        self.expect_changes(vec![target.to_path_buf()])?;
+        self.chezmoi.apply(Some(target))?;
+        self.session_end(session, &format!("keep_source {}", display_name(target)))?;
+        self.rescan()?;
+        Ok(ResolveOutcome::Done {
+            session,
+            committed: false,
+            pushed: false,
+            note: None,
+        })
+    }
+
+    /// What is at `target` now, as the journal's `dest_entry`, its file
+    /// contents snapshotted as blobs.
+    fn snapshot_entry(
+        &self,
+        target: &Path,
+        disk: &EntryKind,
+    ) -> Result<serde_json::Value, ResolveError> {
+        Ok(match disk {
+            EntryKind::Absent => serde_json::json!({ "kind": "absent" }),
+            EntryKind::Link(text) => serde_json::json!({ "kind": "link", "text": text }),
+            EntryKind::File => {
+                let blob = self.snapshot_files(vec![target.to_path_buf()])?.remove(0);
+                serde_json::json!({ "kind": "file", "blob": blob })
+            }
+            EntryKind::Folder => {
+                let walked = walk_folder(target)?;
+                let files: Vec<PathBuf> = walked
+                    .iter()
+                    .filter(|(_, kind)| *kind == Walked::File)
+                    .map(|(rel, _)| target.join(rel))
+                    .collect();
+                let mut blobs = self.snapshot_files(files)?.into_iter();
+                let mut entries = Vec::new();
+                for (rel, kind) in walked {
+                    let path = rel.to_string_lossy().into_owned();
+                    match kind {
+                        Walked::Folder => {}
+                        Walked::File => {
+                            let blob = blobs.next().unwrap_or_default();
+                            entries.push(serde_json::json!({ "path": path, "blob": blob }));
+                        }
+                        Walked::Link(text) => {
+                            entries.push(serde_json::json!({ "path": path, "link": text }));
+                        }
+                    }
+                }
+                serde_json::json!({ "kind": "folder", "entries": entries })
+            }
+        })
+    }
+
+    /// Snapshot `paths` (files that exist), one blob each, in order.
+    fn snapshot_files(&self, paths: Vec<PathBuf>) -> Result<Vec<String>, ResolveError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted = paths.len();
+        let hashes = self.snapshot_blobs(paths)?;
+        if hashes.len() != wanted {
+            return Err(ResolveError::Failed(format!(
+                "snapshot returned {} blobs for {wanted} paths",
+                hashes.len()
+            )));
+        }
+        Ok(hashes)
+    }
+
     /// Restore chezmoi's version: apply the target. No commit phase — apply
     /// never touches the source repo, so it decides nothing about a
     /// divergence with origin and never starts a merge.
@@ -271,6 +519,8 @@ impl ResolveEngine {
     /// difference has to be answered first, in the merge editor.
     pub fn keep_source(&self, target: &Path) -> Result<ResolveOutcome, ResolveError> {
         tomte_core::log_info!("resolve", "keep_source {}", target.display());
+        let source = self.chezmoi.source_path(target)?;
+        let change = self.type_change_at(target, &source)?;
         // Catch up first, exactly as `keep_disk` does. This one never FAILED
         // while behind — `chezmoi apply` does not dirty the source, so there
         // was nothing to push and `commit_phase`'s rebase-and-retry recovery
@@ -281,15 +531,32 @@ impl ResolveEngine {
         // The mid-merge guard below runs after this deliberately, so it sees
         // the state the join actually produced.
         self.ensure_merge_started()?;
-        if self.git.merge_in_progress() {
-            let source = self.chezmoi.source_path(target)?;
-            if self.is_mid_merge_conflict(&source)? {
-                return Err(ResolveError::Failed(format!(
-                    "{} is mid-merge with origin — its source file holds conflict markers; \
-                     resolve the origin difference in the merge editor first",
-                    display_name(target)
-                )));
+        if let Some(change) = change {
+            // Apply writes every file under the entry, conflict markers
+            // included, so any conflicted path under it refuses.
+            if self.git.merge_in_progress() {
+                let rel = self.repo_rel(&source)?;
+                if let Some(hit) = self
+                    .git
+                    .conflicted_files()?
+                    .into_iter()
+                    .find(|path| path.starts_with(&rel))
+                {
+                    return Err(ResolveError::Failed(format!(
+                        "{} is mid-merge with origin — its source file holds conflict \
+                         markers; resolve the origin difference in the merge editor first",
+                        hit.display()
+                    )));
+                }
             }
+            return self.keep_source_type_change(target, &change);
+        }
+        if self.is_mid_merge_conflict(&source)? {
+            return Err(ResolveError::Failed(format!(
+                "{} is mid-merge with origin — its source file holds conflict markers; \
+                 resolve the origin difference in the merge editor first",
+                display_name(target)
+            )));
         }
         let session = self.session_start()?;
         let dest_blob = self.snapshot_dest(target)?;
@@ -1028,22 +1295,33 @@ impl ResolveEngine {
         else {
             return Ok(None);
         };
-        let restores = parse_undo_restores(&decisions);
+        let steps = parse_undo_restores(&decisions);
+        // Refusals first, so a refused undo touches nothing.
+        for step in steps.iter().filter(|step| step.replace) {
+            refuse_foreign_folder(step)?;
+        }
+        let blob = |hash: &str, path: &Path| -> Result<Vec<u8>, ResolveError> {
+            journal.get_blob(hash)?.ok_or_else(|| {
+                ResolveError::Failed(format!(
+                    "undo: blob {hash} for {} is missing from the journal",
+                    path.display()
+                ))
+            })
+        };
         let (mut restored, mut removed) = (0usize, 0usize);
-        for (target, restore) in &restores {
-            self.expect_changes(vec![target.clone()])?;
-            match restore {
+        for step in &steps {
+            let target = &step.target;
+            let mut expected = vec![target.clone()];
+            if let UndoRestore::Folder(entries) = &step.restore {
+                expected.extend(entries.iter().map(|entry| target.join(entry.path())));
+            }
+            self.expect_changes(expected)?;
+            if step.replace {
+                remove_entry(target)?;
+            }
+            match &step.restore {
                 UndoRestore::Content(dest_blob) => {
-                    let bytes = journal.get_blob(dest_blob)?.ok_or_else(|| {
-                        ResolveError::Failed(format!(
-                            "undo: blob {dest_blob} for {} is missing from the journal",
-                            target.display()
-                        ))
-                    })?;
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(target, &bytes)?;
+                    write_creating_parents(target, &blob(dest_blob, target)?)?;
                     restored += 1;
                 }
                 // The file was not on disk before the decision: back to that.
@@ -1054,6 +1332,23 @@ impl ResolveEngine {
                         Err(e) => return Err(e.into()),
                     }
                     removed += 1;
+                }
+                UndoRestore::Link(text) => {
+                    link_creating_parents(text, target)?;
+                    restored += 1;
+                }
+                UndoRestore::Folder(entries) => {
+                    std::fs::create_dir_all(target)?;
+                    for entry in entries {
+                        let path = target.join(entry.path());
+                        match entry {
+                            FolderEntry::File { blob: hash, .. } => {
+                                write_creating_parents(&path, &blob(hash, &path)?)?;
+                            }
+                            FolderEntry::Link { text, .. } => link_creating_parents(text, &path)?,
+                        }
+                        restored += 1;
+                    }
                 }
             }
         }
@@ -1725,6 +2020,167 @@ pub fn is_templated(source_path: &Path) -> bool {
     source_path.extension().is_some_and(|ext| ext == "tmpl")
 }
 
+/// The source's version of one managed file, as `chezmoi apply` would write
+/// it: the raw source bytes, or `chezmoi cat` when those bytes are not what
+/// lands on disk (a template, an encrypted file, a `modify_` script).
+pub fn source_version(
+    chezmoi: &ChezmoiClient,
+    source_file: &Path,
+    target_file: &Path,
+) -> Result<Vec<u8>, ResolveError> {
+    let name = source_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // chezmoi's file prefixes come in a fixed order: `create_` or `modify_`
+    // first, then `encrypted_`.
+    let after_create = name.strip_prefix("create_").unwrap_or(&name);
+    if is_templated(source_file)
+        || name.starts_with("modify_")
+        || after_create.starts_with("encrypted_")
+    {
+        return Ok(chezmoi.cat(target_file)?);
+    }
+    Ok(std::fs::read(source_file)?)
+}
+
+/// How the folder the source holds at `target` compares with what the disk
+/// holds there now (followed through a link): every managed file under it,
+/// hashed from [`source_version`], against the disk.
+pub fn folder_comparison(
+    chezmoi: &ChezmoiClient,
+    target: &Path,
+) -> Result<FolderComparison, ResolveError> {
+    let files = chezmoi.managed_under(target, Some("files"))?;
+    let sources = chezmoi.source_paths(&files)?;
+    let mut hashed = Vec::with_capacity(files.len());
+    for (file, source) in files.iter().zip(sources) {
+        let source = source.ok_or_else(|| {
+            ResolveError::Failed(format!("{} has no source path", file.display()))
+        })?;
+        let rel = file.strip_prefix(target).unwrap_or(file).to_path_buf();
+        hashed.push((
+            rel,
+            ContentHash::of(&source_version(chezmoi, &source, file)?),
+        ));
+    }
+    Ok(compare_folder(&hashed, target)?)
+}
+
+/// What the source says `target` is, read from its source path: a
+/// `symlink_` file is a link (its text rendered by chezmoi), a directory a
+/// folder, anything else a file.
+fn source_kind(
+    chezmoi: &ChezmoiClient,
+    target: &Path,
+    source: &Path,
+) -> Result<EntryKind, ResolveError> {
+    let is_link = source
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("symlink_"));
+    if is_link {
+        return Ok(EntryKind::Link(chezmoi.link_text(target)?));
+    }
+    if std::fs::symlink_metadata(source)?.is_dir() {
+        return Ok(EntryKind::Folder);
+    }
+    Ok(EntryKind::File)
+}
+
+fn kind_word(kind: &EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Absent => "absent",
+        EntryKind::File => "file",
+        EntryKind::Folder => "folder",
+        EntryKind::Link(_) => "link",
+    }
+}
+
+fn copy_picks_refused() -> ResolveError {
+    ResolveError::Failed("copy picks apply only to a folder replaced by a link".into())
+}
+
+/// One path found by [`walk_folder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Walked {
+    Folder,
+    File,
+    Link(String),
+}
+
+/// Every path under `root`, relative to it, sorted, parents before their
+/// children. Links are read, never followed.
+fn walk_folder(root: &Path) -> std::io::Result<Vec<(PathBuf, Walked)>> {
+    fn walk(root: &Path, rel: &Path, out: &mut Vec<(PathBuf, Walked)>) -> std::io::Result<()> {
+        let mut items: Vec<_> = std::fs::read_dir(root.join(rel))?.collect::<Result<_, _>>()?;
+        items.sort_by_key(|item| item.file_name());
+        for item in items {
+            let path = rel.join(item.file_name());
+            let kind = item.file_type()?;
+            if kind.is_symlink() {
+                let text = std::fs::read_link(item.path())?;
+                out.push((path, Walked::Link(text.to_string_lossy().into_owned())));
+            } else if kind.is_dir() {
+                out.push((path.clone(), Walked::Folder));
+                walk(root, &path, out)?;
+            } else {
+                out.push((path, Walked::File));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, Path::new(""), &mut out)?;
+    Ok(out)
+}
+
+/// Remove whatever is at `path`, a folder with everything in it; nothing
+/// there is fine. A link is removed, never followed.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match disk_kind(path)? {
+        EntryKind::Absent => Ok(()),
+        EntryKind::Folder => std::fs::remove_dir_all(path),
+        EntryKind::File | EntryKind::Link(_) => std::fs::remove_file(path),
+    }
+}
+
+/// Move a file or folder, copying when the two sit on different volumes.
+fn move_entry(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_entry(from, to)?;
+            remove_entry(from)
+        }
+        other => other,
+    }
+}
+
+fn copy_entry(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !std::fs::symlink_metadata(from)?.is_dir() {
+        return std::fs::copy(from, to).map(|_| ());
+    }
+    std::fs::create_dir_all(to)?;
+    for item in std::fs::read_dir(from)? {
+        let item = item?;
+        copy_entry(&item.path(), &to.join(item.file_name()))?;
+    }
+    Ok(())
+}
+
+fn write_creating_parents(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)
+}
+
+fn link_creating_parents(text: &str, path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(text, path)
+}
+
 /// The target is gone from disk. `symlink_metadata`, so a dangling symlink
 /// still counts as present: that is a link to re-add, not a deletion.
 fn is_absent(target: &Path) -> bool {
@@ -1770,6 +2226,30 @@ fn build_decision(
     decision
 }
 
+/// A type-change decision: `dest_entry` is what was on disk (see
+/// [`ResolveEngine::snapshot_entry`]), `applied` the paths a restored folder
+/// receives. `dest_blob: null` is still written so `session_landed` counts
+/// the decision; undo prefers `dest_entry`.
+fn build_entry_decision(
+    action: &str,
+    target: &Path,
+    dest_entry: serde_json::Value,
+    applied: Option<&[PathBuf]>,
+) -> serde_json::Value {
+    let mut decision = build_decision(action, target, None, None);
+    if let Some(map) = decision.as_object_mut() {
+        map.insert("dest_entry".to_string(), dest_entry);
+        if let Some(applied) = applied {
+            let paths: Vec<String> = applied
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            map.insert("applied".to_string(), serde_json::json!(paths));
+        }
+    }
+    decision
+}
+
 /// How many finished sessions `undo_last` walks back looking for one that
 /// landed. Rejections come one per refused attempt, so a handful is plenty;
 /// the bound keeps a pathological journal from being read whole.
@@ -1809,31 +2289,140 @@ fn decision_target(d: &serde_json::Value) -> Option<&str> {
 /// What undo does to one target: put its journaled content back, or remove
 /// it — a `keep_source` on a file that was not on disk journals
 /// `dest_blob: null`, and the only way back is to delete what `apply` made.
+/// A type change puts back the link or the folder that was there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UndoRestore {
     Content(String),
     Absent,
+    Link(String),
+    Folder(Vec<FolderEntry>),
 }
 
-/// Extract `(target, restore)` pairs from a session's decisions array.
-/// Decisions without both fields (e.g. `sync_all`, `undo`) restore nothing;
-/// a `dest_blob` of `null` is [`UndoRestore::Absent`].
-fn parse_undo_restores(decisions: &serde_json::Value) -> Vec<(PathBuf, UndoRestore)> {
+/// One file or link inside a journaled folder, by path relative to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FolderEntry {
+    File { path: PathBuf, blob: String },
+    Link { path: PathBuf, text: String },
+}
+
+impl FolderEntry {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File { path, .. } | Self::Link { path, .. } => path,
+        }
+    }
+}
+
+/// One target's undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UndoStep {
+    target: PathBuf,
+    restore: UndoRestore,
+    /// The decision journaled a `dest_entry` (a type change): whatever is at
+    /// the target now is removed before the entry is written back. A folder
+    /// is removed only when every path in it is in `applied`.
+    replace: bool,
+    /// The paths, relative to the target, that the decision's apply wrote
+    /// into a folder.
+    applied: Option<BTreeSet<PathBuf>>,
+}
+
+/// Extract the undo steps from a session's decisions array. A `dest_entry`
+/// is preferred over `dest_blob`. Decisions with neither, or without a
+/// target (e.g. `sync_all`, `undo`), restore nothing; a `dest_blob` of
+/// `null` is [`UndoRestore::Absent`].
+fn parse_undo_restores(decisions: &serde_json::Value) -> Vec<UndoStep> {
     decisions
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|decision| {
-                    let target = decision.get("target")?.as_str()?;
+                    let target = PathBuf::from(decision.get("target")?.as_str()?);
+                    if let Some(entry) = decision.get("dest_entry") {
+                        let applied =
+                            decision
+                                .get("applied")
+                                .and_then(|a| a.as_array())
+                                .map(|paths| {
+                                    paths
+                                        .iter()
+                                        .filter_map(|p| p.as_str())
+                                        .map(PathBuf::from)
+                                        .collect()
+                                });
+                        return Some(UndoStep {
+                            target,
+                            restore: entry_restore(entry)?,
+                            replace: true,
+                            applied,
+                        });
+                    }
                     let restore = match decision.get("dest_blob")? {
                         serde_json::Value::Null => UndoRestore::Absent,
                         blob => UndoRestore::Content(blob.as_str()?.to_string()),
                     };
-                    Some((PathBuf::from(target), restore))
+                    Some(UndoStep {
+                        target,
+                        restore,
+                        replace: false,
+                        applied: None,
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A journaled `dest_entry` as the restore it asks for.
+fn entry_restore(entry: &serde_json::Value) -> Option<UndoRestore> {
+    let text = |value: &serde_json::Value, key: &str| -> Option<String> {
+        Some(value.get(key)?.as_str()?.to_string())
+    };
+    match entry.get("kind")?.as_str()? {
+        "absent" => Some(UndoRestore::Absent),
+        "file" => Some(UndoRestore::Content(text(entry, "blob")?)),
+        "link" => Some(UndoRestore::Link(text(entry, "text")?)),
+        "folder" => entry
+            .get("entries")?
+            .as_array()?
+            .iter()
+            .map(|item| {
+                let path = PathBuf::from(text(item, "path")?);
+                match (text(item, "blob"), text(item, "link")) {
+                    (Some(blob), _) => Some(FolderEntry::File { path, blob }),
+                    (None, Some(text)) => Some(FolderEntry::Link { path, text }),
+                    (None, None) => None,
+                }
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(UndoRestore::Folder),
+        _ => None,
+    }
+}
+
+/// Refuse to undo over a folder that holds something the decision's apply
+/// did not write: removing it would delete the user's own later file.
+fn refuse_foreign_folder(step: &UndoStep) -> Result<(), ResolveError> {
+    if disk_kind(&step.target)? != EntryKind::Folder {
+        return Ok(());
+    }
+    let Some(applied) = &step.applied else {
+        return Err(ResolveError::Failed(format!(
+            "{} is a folder Tomte did not write; move it away and undo again",
+            step.target.display()
+        )));
+    };
+    match walk_folder(&step.target)?
+        .into_iter()
+        .find(|(rel, _)| !applied.contains(rel))
+    {
+        Some((rel, _)) => Err(ResolveError::Failed(format!(
+            "{}/{} was added after the decision; move it away and undo again",
+            step.target.display(),
+            rel.display()
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn now_ts() -> u64 {
@@ -2018,8 +2607,12 @@ mod tests {
             absent,
             { "action": "sync_all" },
         ]);
+        let restores: Vec<(PathBuf, UndoRestore)> = parse_undo_restores(&decisions)
+            .into_iter()
+            .map(|step| (step.target, step.restore))
+            .collect();
         assert_eq!(
-            parse_undo_restores(&decisions),
+            restores,
             vec![
                 (
                     PathBuf::from("/Users/x/.zshrc"),
@@ -2030,6 +2623,72 @@ mod tests {
                     UndoRestore::Content("abc123".to_string())
                 ),
                 (PathBuf::from("/Users/x/.newrc"), UndoRestore::Absent),
+            ]
+        );
+    }
+
+    /// A type change's `dest_entry` survives the journal round trip: a link,
+    /// a folder of files and links, and `applied`.
+    ///
+    /// MUTATION: ignore `dest_entry` in `parse_undo_restores` (read
+    /// `dest_blob` only) → both decisions parse as `Absent`, not replacing.
+    #[test]
+    fn decision_json_roundtrips_link_and_folder_entries() {
+        let link = build_entry_decision(
+            "keep_source",
+            Path::new("/Users/x/.d"),
+            serde_json::json!({ "kind": "link", "text": ".real" }),
+            Some(&[
+                PathBuf::from("one"),
+                PathBuf::from("sub"),
+                PathBuf::from("sub/b"),
+            ]),
+        );
+        assert!(link["dest_blob"].is_null(), "still counted as landed");
+        assert!(session_landed(&serde_json::json!([
+            link.clone(),
+            { "action": "keep_disk_rejected", "target": "/Users/x/.other" },
+        ])));
+        let folder = build_entry_decision(
+            "keep_source",
+            Path::new("/Users/x/.l"),
+            serde_json::json!({ "kind": "folder", "entries": [
+                { "path": "a", "blob": "h1" },
+                { "path": "sub/c", "link": "x" },
+            ] }),
+            None,
+        );
+        assert!(folder.get("applied").is_none());
+        let steps = parse_undo_restores(&serde_json::json!([link, folder]));
+        assert_eq!(
+            steps,
+            vec![
+                UndoStep {
+                    target: PathBuf::from("/Users/x/.d"),
+                    restore: UndoRestore::Link(".real".into()),
+                    replace: true,
+                    applied: Some(
+                        ["one", "sub", "sub/b"]
+                            .into_iter()
+                            .map(PathBuf::from)
+                            .collect()
+                    ),
+                },
+                UndoStep {
+                    target: PathBuf::from("/Users/x/.l"),
+                    restore: UndoRestore::Folder(vec![
+                        FolderEntry::File {
+                            path: PathBuf::from("a"),
+                            blob: "h1".into()
+                        },
+                        FolderEntry::Link {
+                            path: PathBuf::from("sub/c"),
+                            text: "x".into()
+                        },
+                    ]),
+                    replace: true,
+                    applied: None,
+                },
             ]
         );
     }

@@ -24,6 +24,7 @@ use tomte_core::merge::{Choice, RegionKind};
 use tomte_core::scanner::FileDrift;
 use tomte_core::structured::{Pick, StructuredDocument};
 use tomte_core::testsupport::{Scratch, git, sh};
+use tomte_core::type_change::CompareGroup;
 use tomte_daemon::core::DaemonCore;
 use tomte_daemon::server::{ServeCtx, serve};
 use tomte_journal::Journal;
@@ -2141,7 +2142,7 @@ const LOCAL_SOURCE: &[u8] = b"a=this-machine\n";
 /// how the 0.1.15 field bug shipped green.
 fn chezmoi_commits_and_pushes_for_itself(lab: &DriftLab) {
     std::fs::write(
-        lab.s.root.path().join("chezmoi.toml"),
+        lab.s.config_path(),
         "[git]\nautoCommit = true\nautoPush = true\n",
     )
     .unwrap();
@@ -3091,5 +3092,331 @@ fn aborting_is_idempotent_when_there_is_nothing_to_abort_and_real_when_there_is(
         head_before,
         "sanity: the fixture moved HEAD, so `merge_in_progress` is not just \
          answering about an untouched repo"
+    );
+}
+
+/// Content of `dot_d/gone`, the managed file the link target lacks.
+const GONE: &[u8] = b"gone=1\n";
+
+/// A managed folder `~/.d` (`dot_d/one` = [`MANAGED_BASE`], `dot_d/gone` =
+/// [`GONE`]) committed, pushed and applied, and a folder `~/.real` holding
+/// only `one`, the same: what a link to it will show in place of `~/.d`.
+fn managed_folder(lab: &DriftLab) {
+    let dir = lab.s.source.join("dot_d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("one"), MANAGED_BASE).unwrap();
+    std::fs::write(dir.join("gone"), GONE).unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "a managed folder"]);
+    git(&lab.s.source, &["push"]);
+    lab.s.chezmoi().apply(None).unwrap();
+    std::fs::create_dir_all(lab.s.home.join(".real")).unwrap();
+    std::fs::write(lab.s.home.join(".real/one"), MANAGED_BASE).unwrap();
+}
+
+/// A managed link `~/.l` → `.real` (`symlink_dot_l`), committed, pushed and
+/// applied.
+fn managed_link(lab: &DriftLab) {
+    std::fs::write(lab.s.source.join("symlink_dot_l"), ".real\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "a managed link"]);
+    git(&lab.s.source, &["push"]);
+    lab.s.chezmoi().apply(None).unwrap();
+}
+
+/// Replace whatever is at `~/<name>` on disk with a link reading `text`.
+fn replace_with_link(lab: &DriftLab, name: &str, text: &str) {
+    let path = lab.s.home.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path).unwrap(),
+        Ok(_) => std::fs::remove_file(&path).unwrap(),
+        Err(_) => {}
+    }
+    std::os::unix::fs::symlink(text, &path).unwrap();
+}
+
+fn link_text(path: &std::path::Path) -> String {
+    std::fs::read_link(path)
+        .unwrap_or_else(|e| panic!("{} must be a link: {e}", path.display()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The humanizer case (2026-10-26): a managed folder replaced on disk by a
+/// link. Keep the link swaps the source's folder for a `symlink_` entry in
+/// one commit, and the next scan is clean.
+///
+/// MUTATION: `re_add` instead of `add` in `keep_disk_type_change` → re-add
+/// does not swap the entry: `dot_d/` stays and `symlink_dot_d` never appears.
+#[test]
+fn keep_link_swaps_the_source_folder_for_a_link() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    managed_folder(&lab);
+    replace_with_link(&lab, ".d", ".real");
+    let commits_before = commit_count(&lab.s.bare);
+
+    match lab.engine.keep_disk(&lab.s.home.join(".d")) {
+        Ok(ResolveOutcome::Done {
+            committed, pushed, ..
+        }) => assert!(committed && pushed, "the swap must reach origin"),
+        other => panic!("keep the link: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(lab.s.source.join("symlink_dot_d")).unwrap(),
+        b".real\n"
+    );
+    assert!(!lab.s.source.join("dot_d").exists(), "the folder is gone");
+    assert_eq!(commit_count(&lab.s.bare) - commits_before, 1, "one commit");
+    assert_eq!(link_text(&lab.s.home.join(".d")), ".real", "disk untouched");
+    assert!(
+        lab.rescan_and_settle().is_empty(),
+        "nothing is left to resolve"
+    );
+}
+
+/// A copy pick writes the source's version of a file the link target lacks
+/// before the swap removes it from the source; Undo takes the copy back out.
+/// The comparison the detail pane shows names that file as source-only.
+///
+/// MUTATION: write the copies after `add` in `keep_disk_type_change` → the
+/// copy's source path is no longer managed and the decision fails.
+#[test]
+fn keep_link_with_copies_writes_them_first_and_undo_removes_them() {
+    let lab = DriftLab::new();
+    managed_folder(&lab);
+    replace_with_link(&lab, ".d", ".real");
+    let target = lab.s.home.join(".d");
+    let comparison = tomte_app::resolve::folder_comparison(&lab.engine.chezmoi, &target).unwrap();
+    assert_eq!(
+        comparison.entries,
+        vec![
+            (PathBuf::from("gone"), CompareGroup::OnlyInSource),
+            (PathBuf::from("one"), CompareGroup::Same),
+        ]
+    );
+
+    let outcome = lab
+        .engine
+        .keep_disk_with(&target, &[PathBuf::from("gone")])
+        .unwrap();
+    let ResolveOutcome::Done { session, .. } = outcome else {
+        panic!("keep the link with a copy: {outcome:?}");
+    };
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".real/gone")).unwrap(),
+        GONE,
+        "the picked file is in the link target"
+    );
+    assert!(lab.s.source.join("symlink_dot_d").exists());
+
+    assert_eq!(lab.engine.undo_last().unwrap(), Some(session));
+    assert!(
+        !lab.s.home.join(".real/gone").exists(),
+        "undo removes the copy"
+    );
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".real/one")).unwrap(),
+        MANAGED_BASE,
+        "and leaves the rest of the link target alone"
+    );
+    assert_eq!(link_text(&target), ".real");
+}
+
+/// A folder replaced by a link to nowhere is still a link to keep, not a
+/// deleted folder (Review Focus 2).
+///
+/// MUTATION: read the disk kind through the link (`std::fs::metadata` in
+/// `tomte_core::type_change::disk_kind`) → the dangling link reads as absent,
+/// which is no type change, and the decision falls through to `re-add`.
+#[test]
+fn keep_link_over_a_dangling_link() {
+    let lab = DriftLab::new();
+    managed_folder(&lab);
+    replace_with_link(&lab, ".d", ".nowhere");
+
+    lab.engine
+        .keep_disk(&lab.s.home.join(".d"))
+        .expect("keep a dangling link");
+    assert_eq!(
+        std::fs::read(lab.s.source.join("symlink_dot_d")).unwrap(),
+        b".nowhere\n"
+    );
+    assert!(!lab.s.source.join("dot_d").exists());
+}
+
+/// A file replaced by a link, and a link pointed elsewhere: Keep disk records
+/// the new link in the source.
+///
+/// MUTATION: route a file → link through the ordinary `re_add` path (skip
+/// the type-change branch in `keep_disk_with`) → re-add silently keeps
+/// `dot_testrc`, the field bug.
+#[test]
+fn keep_disk_file_replaced_by_link_and_link_retargeted() {
+    let lab = DriftLab::new();
+    managed_link(&lab);
+    std::fs::write(lab.s.home.join(".elsewhere"), b"a=elsewhere\n").unwrap();
+    replace_with_link(&lab, ".testrc", ".elsewhere");
+    replace_with_link(&lab, ".l", ".other");
+
+    lab.engine.keep_disk(&lab.target).expect("keep the link");
+    assert_eq!(
+        std::fs::read(lab.s.source.join("symlink_dot_testrc")).unwrap(),
+        b".elsewhere\n"
+    );
+    assert!(!lab.s.source.join("dot_testrc").exists());
+
+    lab.engine
+        .keep_disk(&lab.s.home.join(".l"))
+        .expect("keep the new link");
+    assert_eq!(
+        std::fs::read(lab.s.source.join("symlink_dot_l")).unwrap(),
+        b".other\n"
+    );
+    assert!(
+        lab.rescan_and_settle().is_empty(),
+        "nothing is left to resolve"
+    );
+}
+
+/// Restore the folder replaces the link with the source's folder, leaving
+/// the link target alone; Undo puts the link back.
+///
+/// MUTATION: drop `UndoRestore::Link` (parse a `link` entry as `None` in
+/// `entry_restore`) → Undo restores nothing and `~/.d` stays a folder.
+#[test]
+fn restore_folder_over_a_link_then_undo_restores_the_link() {
+    let lab = DriftLab::new();
+    managed_folder(&lab);
+    replace_with_link(&lab, ".d", ".real");
+    let target = lab.s.home.join(".d");
+
+    let ResolveOutcome::Done { session, .. } = lab.engine.keep_source(&target).unwrap() else {
+        panic!("restore the folder must land");
+    };
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+    assert_eq!(std::fs::read(target.join("gone")).unwrap(), GONE);
+    assert!(
+        !lab.s.home.join(".real/gone").exists(),
+        "the link target is untouched"
+    );
+
+    assert_eq!(lab.engine.undo_last().unwrap(), Some(session));
+    assert_eq!(link_text(&target), ".real");
+    assert_eq!(
+        std::fs::read(lab.s.home.join(".real/one")).unwrap(),
+        MANAGED_BASE
+    );
+}
+
+/// Restore the link deletes the folder that replaced it; Undo brings the
+/// folder back with its files and the link inside it.
+///
+/// MUTATION: drop `UndoRestore::Folder` (parse a `folder` entry as `None` in
+/// `entry_restore`) → Undo restores nothing and `~/.l` stays a link.
+#[test]
+fn restore_link_over_a_folder_then_undo_restores_the_folder_and_its_files() {
+    let lab = DriftLab::new();
+    managed_link(&lab);
+    let target = lab.s.home.join(".l");
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir_all(target.join("sub")).unwrap();
+    std::fs::write(target.join("a"), b"a\n").unwrap();
+    std::fs::write(target.join("sub/b"), b"b\n").unwrap();
+    std::os::unix::fs::symlink("x", target.join("sub/c")).unwrap();
+
+    let ResolveOutcome::Done { session, .. } = lab.engine.keep_source(&target).unwrap() else {
+        panic!("restore the link must land");
+    };
+    assert_eq!(link_text(&target), ".real");
+
+    assert_eq!(lab.engine.undo_last().unwrap(), Some(session));
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+    assert_eq!(std::fs::read(target.join("a")).unwrap(), b"a\n");
+    assert_eq!(std::fs::read(target.join("sub/b")).unwrap(), b"b\n");
+    assert_eq!(link_text(&target.join("sub/c")), "x");
+}
+
+/// Undo of a restored folder refuses when the folder now holds a file the
+/// restore did not write: removing the folder would delete it (Review
+/// Focus 5). Nothing is touched.
+///
+/// MUTATION: drop the `applied` check (`refuse_foreign_folder` returns
+/// `Ok(())`) → Undo deletes `new` with the folder and puts the link back.
+#[test]
+fn undo_restore_folder_refuses_when_the_folder_gained_a_file() {
+    let lab = DriftLab::new();
+    managed_folder(&lab);
+    replace_with_link(&lab, ".d", ".real");
+    let target = lab.s.home.join(".d");
+    lab.engine.keep_source(&target).unwrap();
+    std::fs::write(target.join("new"), b"mine\n").unwrap();
+
+    let err = lab.engine.undo_last().unwrap_err().to_string();
+    assert_eq!(
+        err,
+        format!(
+            "{}/new was added after the decision; move it away and undo again",
+            target.display()
+        )
+    );
+    assert_eq!(std::fs::read(target.join("new")).unwrap(), b"mine\n");
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+}
+
+/// Mid-merge, Keep the link swaps the entry by hand and stages only it: the
+/// other conflicted file stays conflicted, markers uncommitted, and the
+/// merge stays open.
+///
+/// MUTATION: call `chezmoi add` mid-merge (drop the `merging` branch in
+/// `keep_disk_type_change`) → chezmoi's autoCommit stages the whole index
+/// and concludes the merge with `dot_other`'s markers in it.
+#[test]
+fn keep_link_mid_merge_concludes_without_sweeping_conflicts() {
+    let lab = DriftLab::new();
+    chezmoi_commits_and_pushes_for_itself(&lab);
+    managed_folder(&lab);
+    std::fs::write(lab.s.source.join("dot_other"), b"b=1\n").unwrap();
+    git(&lab.s.source, &["add", "."]);
+    git(&lab.s.source, &["commit", "-m", "a second managed file"]);
+    git(&lab.s.source, &["push"]);
+    diverge_with_conflicts(&lab, &[("dot_other", OTHER_ORIGIN, OTHER_LOCAL)]);
+    replace_with_link(&lab, ".d", ".real");
+
+    let outcome = lab.engine.keep_disk(&lab.s.home.join(".d")).unwrap();
+    let ResolveOutcome::Done {
+        committed,
+        pushed,
+        note,
+        ..
+    } = outcome
+    else {
+        panic!("keep the link mid-merge: {outcome:?}");
+    };
+    assert!(!committed && !pushed, "one conflict is still open");
+    assert!(
+        note.as_deref().unwrap_or_default().contains("still differ"),
+        "the user is told the merge waits on another file, got {note:?}"
+    );
+    let git_c = lab.source_git();
+    assert!(git_c.merge_in_progress(), "the merge must stay open");
+    assert_eq!(
+        git_c.conflicted_files().unwrap(),
+        vec![PathBuf::from("dot_other")]
+    );
+    assert!(
+        std::fs::read_to_string(lab.s.source.join("dot_other"))
+            .unwrap()
+            .contains("<<<<<<<")
+    );
+    assert_eq!(
+        std::fs::read(lab.s.source.join("symlink_dot_d")).unwrap(),
+        b".real\n"
+    );
+    assert!(!lab.s.source.join("dot_d").exists());
+    let staged = git_c.staged_files().unwrap();
+    assert!(
+        staged.contains(&PathBuf::from("symlink_dot_d")),
+        "the new entry is staged, got {staged:?}"
     );
 }

@@ -419,6 +419,15 @@ impl GitClient {
         Ok(())
     }
 
+    /// Remove a tracked path (a folder recursively) from the index and the
+    /// working tree, staging the removal. Mid-merge this also answers a
+    /// conflict on any file under it, as deleted.
+    pub fn rm_path(&self, rel_path: &Path) -> Result<(), GitError> {
+        let path = rel_path.display().to_string();
+        self.run(&["rm", "-r", "-q", "--", &path], Duration::from_secs(30))?;
+        Ok(())
+    }
+
     /// Conclude an in-progress (fully resolved) merge with the default
     /// merge-commit message.
     pub fn merge_commit(&self) -> Result<String, GitError> {

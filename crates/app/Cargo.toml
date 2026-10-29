@@ -24,6 +24,7 @@ objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
@@ -31,4 +32,3 @@ toml.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 tomte-daemon = { path = "../daemon" }
 tomte-core = { path = "../core", features = ["test-support"] }
-tempfile.workspace = true

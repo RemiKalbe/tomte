@@ -3296,7 +3296,7 @@ mod render_smoke {
     /// `Shell` and nothing can live in one place for both.
     fn chezmoi_commits_and_pushes_for_itself(s: &tomte_core::testsupport::Scratch) {
         std::fs::write(
-            s.root.path().join("chezmoi.toml"),
+            s.config_path(),
             "[git]\nautoCommit = true\nautoPush = true\n",
         )
         .expect("the scratch chezmoi config is writable");

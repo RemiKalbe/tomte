@@ -722,6 +722,68 @@ impl ChezmoiClient {
         Ok(())
     }
 
+    /// Add `target` into ANOTHER source directory, `scratch_source`, under an
+    /// empty `scratch_config`, and return the source path chezmoi wrote for
+    /// it there. The destination is this client's own. With an empty config
+    /// there is no autoCommit and no autoPush: the real source repo is never
+    /// touched, which is the point mid-merge, where chezmoi's own commit would
+    /// sweep up every other conflicted file. The config must not sit in a
+    /// folder that holds `target`: chezmoi refuses to add from the config's
+    /// folder ("is protected").
+    pub fn add_into_source(
+        &self,
+        target: &Path,
+        scratch_source: &Path,
+        scratch_config: &Path,
+    ) -> Result<PathBuf, ChezmoiError> {
+        let destination = self.run_utf8(&["target-path"])?.trim().to_string();
+        let source = scratch_source.to_string_lossy();
+        let config = scratch_config.to_string_lossy();
+        let target = target.to_string_lossy();
+        let scoped = |command: &[&str]| -> Vec<String> {
+            let mut args: Vec<String> = [
+                "--source",
+                &source,
+                "--config",
+                &config,
+                "--destination",
+                &destination,
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            args.extend(command.iter().map(|s| s.to_string()));
+            args
+        };
+        let add = scoped(&["add", "--force", &target]);
+        self.run_ok(&add.iter().map(String::as_str).collect::<Vec<_>>(), None)?;
+        let path = scoped(&["source-path", &target]);
+        let out = self.run_ok(&path.iter().map(String::as_str).collect::<Vec<_>>(), None)?;
+        Ok(PathBuf::from(String::from_utf8_lossy(&out).trim()))
+    }
+
+    /// The managed entries strictly under `folder`, as the source says,
+    /// absolute. `include` narrows the kinds (`"files"`); `None` lists every
+    /// kind, folders and links included.
+    pub fn managed_under(
+        &self,
+        folder: &Path,
+        include: Option<&str>,
+    ) -> Result<Vec<PathBuf>, ChezmoiError> {
+        let folder_arg = folder.to_string_lossy();
+        let mut args = vec!["managed", "--path-style=absolute"];
+        if let Some(kind) = include {
+            args.extend(["--include", kind]);
+        }
+        args.push(&folder_arg);
+        Ok(self
+            .run_utf8(&args)?
+            .lines()
+            .map(PathBuf::from)
+            .filter(|p| p != folder && p.starts_with(folder))
+            .collect())
+    }
+
     /// Remove the listed targets from the source state, in ONE invocation:
     /// chezmoi deletes their source files (and, with autoCommit, commits the
     /// removal). `--force` skips chezmoi's confirmation prompt, which under
@@ -1105,6 +1167,73 @@ mod tests {
         assert_eq!(
             fake.calls()[0].args,
             vec!["--no-tty", "--no-pager", "add", "--force", "/.a", "/.b"]
+        );
+    }
+
+    /// MUTATION: drop the scratch `--config` from `add_into_source` → the
+    /// args differ (chezmoi would autoCommit into the real repo); return the
+    /// destination instead of `source-path`'s answer → the path differs.
+    #[test]
+    fn add_into_source_scopes_add_to_the_scratch_source() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "/home\n", "");
+        fake.push_ok(0, "", "");
+        fake.push_ok(0, "/tmp/s/dot_d/symlink_h\n", "");
+        let leaf = client(fake.clone())
+            .add_into_source(
+                Path::new("/home/.d/h"),
+                Path::new("/tmp/s"),
+                Path::new("/tmp/c/chezmoi.toml"),
+            )
+            .unwrap();
+        assert_eq!(leaf, PathBuf::from("/tmp/s/dot_d/symlink_h"));
+        let calls = fake.calls();
+        assert_eq!(calls[0].args, vec!["--no-tty", "--no-pager", "target-path"]);
+        let scoped = |command: &[&str]| -> Vec<String> {
+            let mut args: Vec<String> = [
+                "--no-tty",
+                "--no-pager",
+                "--source",
+                "/tmp/s",
+                "--config",
+                "/tmp/c/chezmoi.toml",
+                "--destination",
+                "/home",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            args.extend(command.iter().map(|s| s.to_string()));
+            args
+        };
+        assert_eq!(calls[1].args, scoped(&["add", "--force", "/home/.d/h"]));
+        assert_eq!(calls[2].args, scoped(&["source-path", "/home/.d/h"]));
+    }
+
+    /// MUTATION: drop the `p != folder` filter from `managed_under` → the
+    /// folder itself is listed.
+    #[test]
+    fn managed_under_lists_only_what_is_inside() {
+        let fake = Arc::new(FakeRunner::new());
+        fake.push_ok(0, "/h/.d\n/h/.d/a\n/h/.d/sub/b\n", "");
+        let got = client(fake.clone())
+            .managed_under(Path::new("/h/.d"), Some("files"))
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![PathBuf::from("/h/.d/a"), PathBuf::from("/h/.d/sub/b")]
+        );
+        assert_eq!(
+            fake.calls()[0].args,
+            vec![
+                "--no-tty",
+                "--no-pager",
+                "managed",
+                "--path-style=absolute",
+                "--include",
+                "files",
+                "/h/.d"
+            ]
         );
     }
 

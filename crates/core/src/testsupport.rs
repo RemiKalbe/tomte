@@ -109,9 +109,14 @@ impl Scratch {
         ChezmoiClient::new(Arc::new(SystemRunner), opts)
     }
 
+    /// In its own folder, not at the root: chezmoi refuses to `add` anything
+    /// under the config file's folder ("is protected"), and the root holds
+    /// the home.
     pub fn config_path(&self) -> PathBuf {
-        let p = self.root.path().join("chezmoi.toml");
+        let dir = self.root.path().join("config");
+        let p = dir.join("chezmoi.toml");
         if !p.exists() {
+            std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(&p, "").unwrap();
         }
         p
