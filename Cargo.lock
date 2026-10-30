@@ -5899,7 +5899,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tomte-app"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "gpui",
  "libc",
@@ -5921,7 +5921,7 @@ dependencies = [
 
 [[package]]
 name = "tomte-core"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "imara-diff",
  "libc",
@@ -5934,7 +5934,7 @@ dependencies = [
 
 [[package]]
 name = "tomte-daemon"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "gethostname",
  "libc",
@@ -5951,7 +5951,7 @@ dependencies = [
 
 [[package]]
 name = "tomte-journal"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5964,7 +5964,7 @@ dependencies = [
 
 [[package]]
 name = "tomte-proto"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "serde",
  "serde_json",
@@ -5973,7 +5973,7 @@ dependencies = [
 
 [[package]]
 name = "tomte-ui"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "gpui",
  "unicode-segmentation",
